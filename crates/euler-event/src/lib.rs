@@ -54,6 +54,14 @@ impl EventKind {
     pub const SESSION_START: &'static str = "session.start";
     pub const SESSION_RENAMED: &'static str = "session.renamed";
     pub const SESSION_SUMMARY: &'static str = "session.summary";
+    pub const RUN_STARTED: &'static str = "run.started";
+    pub const RUN_COMPLETED: &'static str = "run.completed";
+    pub const RUN_FAILED: &'static str = "run.failed";
+    pub const RUN_CANCELLED: &'static str = "run.cancelled";
+    pub const RUN_INTERRUPTED: &'static str = "run.interrupted";
+    pub const QUEUE_ENQUEUED: &'static str = "queue.enqueued";
+    pub const QUEUE_CANCELLED: &'static str = "queue.cancelled";
+    pub const QUEUE_DELIVERED: &'static str = "queue.delivered";
     pub const ERROR: &'static str = "error";
     pub const ALL: &[&str] = &[
         Self::USER_MESSAGE,
@@ -90,6 +98,14 @@ impl EventKind {
         Self::SESSION_START,
         Self::SESSION_RENAMED,
         Self::SESSION_SUMMARY,
+        Self::RUN_STARTED,
+        Self::RUN_COMPLETED,
+        Self::RUN_FAILED,
+        Self::RUN_CANCELLED,
+        Self::RUN_INTERRUPTED,
+        Self::QUEUE_ENQUEUED,
+        Self::QUEUE_CANCELLED,
+        Self::QUEUE_DELIVERED,
         Self::ERROR,
     ];
 
@@ -143,7 +159,7 @@ impl EventEnvelope {
     ) -> Self {
         Self {
             v: 1,
-            id: Ulid::new().to_string(),
+            id: new_event_id(),
             ts: now_rfc3339_millis(),
             session: session.into(),
             agent: agent.into(),
@@ -168,6 +184,10 @@ pub fn object(entries: impl IntoIterator<Item = (&'static str, JsonValue)>) -> J
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))
         .collect()
+}
+
+pub fn new_event_id() -> String {
+    Ulid::new().to_string()
 }
 
 pub fn now_rfc3339_millis() -> String {
@@ -421,6 +441,14 @@ mod tests {
             EventKind::SESSION_START,
             EventKind::SESSION_RENAMED,
             EventKind::SESSION_SUMMARY,
+            EventKind::RUN_STARTED,
+            EventKind::RUN_COMPLETED,
+            EventKind::RUN_FAILED,
+            EventKind::RUN_CANCELLED,
+            EventKind::RUN_INTERRUPTED,
+            EventKind::QUEUE_ENQUEUED,
+            EventKind::QUEUE_CANCELLED,
+            EventKind::QUEUE_DELIVERED,
             EventKind::ERROR,
         ];
 

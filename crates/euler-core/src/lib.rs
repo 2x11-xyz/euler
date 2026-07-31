@@ -88,8 +88,8 @@ pub use resume::{
 pub use session::{
     fold_model_target, fold_reasoning_effort, AgentReporter, AgentResultSummary, BackgroundAgent,
     BackgroundAgentPoll, BackgroundAgentReportDrain, ContextLimitConfig, ExtensionExecutionError,
-    ModelTarget, RoundObserverConfig, Session, SessionConfig, SessionError,
-    WorkspaceRestoreOutcome,
+    ModelTarget, QueueError, QueueItem, QueueMode, RoundObserverConfig, RunHandle, Session,
+    SessionConfig, SessionError, WorkspaceRestoreOutcome,
 };
 pub use session_kind::SessionKind;
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};

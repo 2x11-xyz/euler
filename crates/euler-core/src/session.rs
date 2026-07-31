@@ -39,12 +39,12 @@ use round_loop::{
 };
 use serde_json::{json, Value};
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::Instant;
 use thiserror::Error;
@@ -163,6 +163,135 @@ impl SessionConfig {
             compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
             round_observer: None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueueMode {
+    Steer,
+    FollowUp,
+}
+
+impl QueueMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::FollowUp => "follow_up",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueItem {
+    pub queue_item_id: String,
+    pub mode: QueueMode,
+    pub target_run_id: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueueError {
+    NoActiveRun,
+    ExpectedRunMismatch { expected: String, actual: String },
+    EmptyInput,
+    QueueItemNotPending,
+    QueueItemNotFound,
+}
+
+impl std::fmt::Display for QueueError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoActiveRun => formatter.write_str("no active run"),
+            Self::ExpectedRunMismatch { expected, actual } => {
+                write!(formatter, "expected active run {expected}, found {actual}")
+            }
+            Self::EmptyInput => formatter.write_str("input is empty"),
+            Self::QueueItemNotPending => formatter.write_str("queue item is not pending"),
+            Self::QueueItemNotFound => formatter.write_str("queue item not found"),
+        }
+    }
+}
+
+impl std::error::Error for QueueError {}
+
+#[derive(Clone, Debug)]
+struct RunState {
+    run_id: String,
+    steering: VecDeque<QueueItem>,
+}
+
+struct RunInbox {
+    accepting: bool,
+    events: VecDeque<EventEnvelope>,
+}
+
+impl Default for RunInbox {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            events: VecDeque::new(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RunHandle {
+    run_id: String,
+    session_id: String,
+    agent_id: String,
+    provenance: Option<Arc<ProvenanceWriter>>,
+    inbox: Arc<Mutex<RunInbox>>,
+}
+
+impl RunHandle {
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    pub fn steer(&self, content: impl Into<String>) -> Result<String, QueueError> {
+        self.enqueue(content.into(), QueueMode::Steer)
+    }
+
+    pub fn follow_up(&self, content: impl Into<String>) -> Result<String, QueueError> {
+        self.enqueue(content.into(), QueueMode::FollowUp)
+    }
+
+    fn enqueue(&self, content: String, mode: QueueMode) -> Result<String, QueueError> {
+        if content.trim().is_empty() {
+            return Err(QueueError::EmptyInput);
+        }
+        let item = QueueItem {
+            queue_item_id: euler_event::new_event_id(),
+            mode,
+            target_run_id: self.run_id.clone(),
+            content,
+        };
+        let event = EventEnvelope::new(
+            self.session_id.clone(),
+            self.agent_id.clone(),
+            None,
+            EventKind::QUEUE_ENQUEUED,
+            queue_payload(&item, true, None),
+        );
+        let mut inbox = self
+            .inbox
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !inbox.accepting {
+            return Err(QueueError::NoActiveRun);
+        }
+        let event = if let Some(writer) = &self.provenance {
+            writer
+                .append_parented(|_| vec![event])
+                .map_err(|_| QueueError::QueueItemNotPending)?
+                .into_iter()
+                .next()
+                .expect("queue event persists")
+        } else {
+            event
+        };
+        inbox.events.push_back(event);
+        Ok(item.queue_item_id)
     }
 }
 
@@ -431,6 +560,9 @@ pub struct Session<D> {
     context_limit_emitted: Option<ModelTarget>,
     open_agent_spawns: BTreeMap<String, String>,
     observer_extension: Option<Arc<dyn Extension>>,
+    active_run: Option<RunState>,
+    follow_ups: VecDeque<QueueItem>,
+    run_inbox: Option<Arc<Mutex<RunInbox>>>,
 }
 
 /// Session-side adapter driving the shared [`RoundLoop`]: bundles the
@@ -555,7 +687,16 @@ where
                 object([("content", data.content.into())]),
                 Some(model_result_id),
             )?;
+            self.session.drain_run_inbox()?;
             self.sink.flush(self.session.bus.events());
+            if self
+                .session
+                .active_run
+                .as_ref()
+                .is_some_and(|run| !run.steering.is_empty())
+            {
+                return Ok(RoundOutcome::Continue);
+            }
             return Ok(RoundOutcome::Complete(()));
         }
 
@@ -668,6 +809,9 @@ impl<D> Session<D> {
             context_limit_emitted: None,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            active_run: None,
+            follow_ups: VecDeque::new(),
+            run_inbox: None,
         }
     }
 
@@ -701,6 +845,100 @@ impl<D> Session<D> {
 
     pub fn events(&self) -> &[EventEnvelope] {
         self.bus.events()
+    }
+
+    pub fn new_run_handle(&self) -> RunHandle {
+        RunHandle {
+            run_id: euler_event::new_event_id(),
+            session_id: self.config.session_id.clone(),
+            agent_id: self.config.agent_id.clone(),
+            provenance: self.provenance.clone(),
+            inbox: Arc::new(Mutex::new(RunInbox::default())),
+        }
+    }
+
+    pub fn active_run_id(&self) -> Option<&str> {
+        self.active_run.as_ref().map(|run| run.run_id.as_str())
+    }
+
+    pub fn pending_queue_items(&self) -> Vec<QueueItem> {
+        self.active_run
+            .iter()
+            .flat_map(|run| run.steering.iter())
+            .chain(self.follow_ups.iter())
+            .cloned()
+            .collect()
+    }
+
+    pub fn steer(
+        &mut self,
+        expected_run_id: &str,
+        content: impl Into<String>,
+    ) -> Result<String, QueueError> {
+        self.enqueue(expected_run_id, content.into(), QueueMode::Steer)
+    }
+
+    pub fn follow_up(
+        &mut self,
+        expected_run_id: &str,
+        content: impl Into<String>,
+    ) -> Result<String, QueueError> {
+        self.enqueue(expected_run_id, content.into(), QueueMode::FollowUp)
+    }
+
+    pub fn cancel_queue_item(&mut self, queue_item_id: &str) -> Result<(), QueueError> {
+        let item = self
+            .active_run
+            .as_mut()
+            .and_then(|run| remove_queue_item(&mut run.steering, queue_item_id))
+            .or_else(|| remove_queue_item(&mut self.follow_ups, queue_item_id))
+            .ok_or(QueueError::QueueItemNotFound)?;
+        self.emit_control_event_required(
+            EventKind::QUEUE_CANCELLED,
+            queue_payload(&item, false, None),
+        )
+        .map_err(|_| QueueError::QueueItemNotPending)
+    }
+
+    fn enqueue(
+        &mut self,
+        expected_run_id: &str,
+        content: String,
+        mode: QueueMode,
+    ) -> Result<String, QueueError> {
+        if content.trim().is_empty() {
+            return Err(QueueError::EmptyInput);
+        }
+        let actual = self
+            .active_run
+            .as_ref()
+            .ok_or(QueueError::NoActiveRun)?
+            .run_id
+            .clone();
+        if actual != expected_run_id {
+            return Err(QueueError::ExpectedRunMismatch {
+                expected: expected_run_id.to_owned(),
+                actual,
+            });
+        }
+        let item = QueueItem {
+            queue_item_id: euler_event::new_event_id(),
+            mode,
+            target_run_id: expected_run_id.to_owned(),
+            content,
+        };
+        self.emit_control_event_required(EventKind::QUEUE_ENQUEUED, queue_payload(&item, true, None))
+            .map_err(|_| QueueError::QueueItemNotPending)?;
+        match mode {
+            QueueMode::Steer => self
+                .active_run
+                .as_mut()
+                .expect("active run checked")
+                .steering
+                .push_back(item.clone()),
+            QueueMode::FollowUp => self.follow_ups.push_back(item.clone()),
+        }
+        Ok(item.queue_item_id)
     }
 
     pub fn extension_enabled(&self, id: &str) -> bool {
@@ -931,6 +1169,7 @@ impl<D> Session<D> {
     ) -> Self {
         let tools = ToolRegistry::new(config.root.clone());
         let persisted_events = events.len();
+        let follow_ups = fold_pending_follow_ups(&events);
         let mut permissions = PermissionGate::new(decider);
         let _ = permissions.load_project_grants(&config.root);
         Self {
@@ -948,6 +1187,9 @@ impl<D> Session<D> {
             context_limit_emitted,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            active_run: None,
+            follow_ups,
+            run_inbox: None,
         }
     }
 }
@@ -1384,12 +1626,66 @@ impl<D: PermissionDecider> Session<D> {
     }
 
     pub fn run_turn(&mut self, user_message: &str) -> Result<Vec<EventEnvelope>, SessionError> {
-        self.run_turn_with_sink(user_message, Arc::new(AtomicBool::new(false)), |_| {})
+        let handle = self.new_run_handle();
+        self.run_turn_with_handle_and_sink(
+            user_message,
+            handle,
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
     }
 
     pub fn run_turn_with_sink<F>(
         &mut self,
         user_message: &str,
+        cancel_flag: Arc<AtomicBool>,
+        on_event: F,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let handle = self.new_run_handle();
+        self.run_turn_with_handle_and_sink(user_message, handle, cancel_flag, on_event)
+    }
+
+    pub fn run_turn_with_handle_and_sink<F>(
+        &mut self,
+        user_message: &str,
+        handle: RunHandle,
+        cancel_flag: Arc<AtomicBool>,
+        on_event: F,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        self.run_turn_from_queue_with_sink(user_message, handle, None, cancel_flag, on_event)
+    }
+
+    pub fn run_follow_up_with_sink<F>(
+        &mut self,
+        queue_item_id: &str,
+        cancel_flag: Arc<AtomicBool>,
+        on_event: F,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let index = self
+            .follow_ups
+            .iter()
+            .position(|item| item.queue_item_id == queue_item_id)
+            .ok_or_else(|| SessionError::InvalidModelSwitch("follow-up queue item not pending".to_owned()))?;
+        let item = self.follow_ups.remove(index).expect("follow-up index exists");
+        let handle = self.new_run_handle();
+        let content = item.content.clone();
+        self.run_turn_from_queue_with_sink(&content, handle, Some(item), cancel_flag, on_event)
+    }
+
+    fn run_turn_from_queue_with_sink<F>(
+        &mut self,
+        user_message: &str,
+        handle: RunHandle,
+        source: Option<QueueItem>,
         cancel_flag: Arc<AtomicBool>,
         mut on_event: F,
     ) -> Result<Vec<EventEnvelope>, SessionError>
@@ -1400,13 +1696,52 @@ impl<D: PermissionDecider> Session<D> {
             return Ok(Vec::new());
         }
         self.auto_compact_if_triggered()?;
+        let run_id = handle.run_id.clone();
+        self.run_inbox = Some(Arc::clone(&handle.inbox));
+        self.active_run = Some(RunState {
+            run_id: run_id.clone(),
+            steering: VecDeque::new(),
+        });
 
         let start = self.bus.events().len();
         crate::diagnostics::turn_start(&self.config.session_id);
         let mut sink = EventSink::new(start, &mut on_event);
+        let (trigger, queue_item_id, source_run_id) = source.as_ref().map_or_else(
+            || ("direct", Value::Null, Value::Null),
+            |item| {
+                (
+                    "follow_up",
+                    item.queue_item_id.clone().into(),
+                    item.target_run_id.clone().into(),
+                )
+            },
+        );
+        self.emit(
+            EventKind::RUN_STARTED,
+            object([
+                ("run_id", run_id.clone().into()),
+                ("trigger", trigger.into()),
+                ("queue_item_id", queue_item_id.clone()),
+                ("source_run_id", source_run_id),
+            ]),
+        )?;
+        if let Some(item) = source.as_ref() {
+            self.emit(
+                EventKind::QUEUE_DELIVERED,
+                queue_payload(item, false, Some(&run_id)),
+            )?;
+        }
         self.emit(
             EventKind::USER_MESSAGE,
-            object([("content", user_message.into())]),
+            object([
+                ("content", user_message.into()),
+                ("run_id", run_id.clone().into()),
+                ("queue_item_id", queue_item_id),
+                (
+                    "delivery",
+                    if source.is_some() { "follow_up" } else { "direct" }.into(),
+                ),
+            ]),
         )?;
         sink.flush(self.bus.events());
         // Intentionally uses the latest recorded model.result usage
@@ -1421,11 +1756,53 @@ impl<D: PermissionDecider> Session<D> {
                 Some(context_limit_id),
             )?;
             sink.flush(self.bus.events());
+            self.finish_run(EventKind::RUN_COMPLETED, &run_id, None)?;
+            sink.flush(self.bus.events());
             crate::diagnostics::turn_end(&self.config.session_id, 0);
             return Ok(self.bus.events()[start..].to_vec());
         }
 
-        self.run_model_rounds(start, &cancel_flag, &mut sink)
+        let result = self.run_model_rounds(start, &cancel_flag, &mut sink);
+        let terminal = match &result {
+            Ok(_) => EventKind::RUN_COMPLETED,
+            Err(SessionError::Cancelled) => EventKind::RUN_CANCELLED,
+            Err(_) => EventKind::RUN_FAILED,
+        };
+        let message = result.as_ref().err().map(ToString::to_string);
+        self.finish_run(terminal, &run_id, message.as_deref())?;
+        sink.flush(self.bus.events());
+        result.map(|_| self.bus.events()[start..].to_vec())
+    }
+
+    fn finish_run(
+        &mut self,
+        kind: &'static str,
+        run_id: &str,
+        message: Option<&str>,
+    ) -> Result<(), SessionError> {
+        if let Some(inbox) = &self.run_inbox {
+            inbox
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .accepting = false;
+        }
+        self.drain_run_inbox()?;
+        let mut payload = object([("run_id", run_id.into())]);
+        if let Some(message) = message {
+            payload.insert("message".to_owned(), message.into());
+        }
+        self.emit(kind, payload)?;
+        let pending_steering = self
+            .active_run
+            .as_mut()
+            .map(|run| run.steering.drain(..).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for item in pending_steering {
+            self.emit(EventKind::QUEUE_CANCELLED, queue_payload(&item, false, None))?;
+        }
+        self.active_run = None;
+        self.run_inbox = None;
+        Ok(())
     }
 
     fn run_model_rounds<F>(
@@ -1461,6 +1838,66 @@ impl<D: PermissionDecider> Session<D> {
         result.map(|()| self.bus.events()[start..].to_vec())
     }
 
+    fn drain_run_inbox(&mut self) -> Result<(), SessionError> {
+        let events = self
+            .run_inbox
+            .as_ref()
+            .map(|inbox| {
+                inbox
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .events
+                    .drain(..)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for event in events {
+            let mode = event.payload.get("mode").and_then(Value::as_str).map(str::to_owned);
+            let item = queue_item_from_event(&event);
+            self.bus.push(event);
+            if self.provenance.is_some() {
+                self.persisted_events = self.bus.events().len();
+            }
+            if let Some(item) = item {
+                match mode.as_deref() {
+                    Some("steer") => {
+                        if let Some(run) = self.active_run.as_mut() {
+                            run.steering.push_back(item);
+                        }
+                    }
+                    Some("follow_up") => self.follow_ups.push_back(item),
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deliver_one_steering(&mut self) -> Result<bool, SessionError> {
+        let Some(item) = self
+            .active_run
+            .as_mut()
+            .and_then(|run| run.steering.pop_front())
+        else {
+            return Ok(false);
+        };
+        let run_id = self.active_run.as_ref().expect("active run").run_id.clone();
+        self.emit(
+            EventKind::QUEUE_DELIVERED,
+            queue_payload(&item, false, Some(&run_id)),
+        )?;
+        self.emit(
+            EventKind::USER_MESSAGE,
+            object([
+                ("content", item.content.into()),
+                ("run_id", run_id.into()),
+                ("queue_item_id", item.queue_item_id.into()),
+                ("delivery", "steer".into()),
+            ]),
+        )?;
+        Ok(true)
+    }
+
     fn prepare_model_request<F>(
         &mut self,
         target: &ModelTarget,
@@ -1469,6 +1906,9 @@ impl<D: PermissionDecider> Session<D> {
     where
         F: FnMut(&EventEnvelope),
     {
+        self.drain_run_inbox()?;
+        let _ = self.deliver_one_steering()?;
+        sink.flush(self.bus.events());
         let policy = self.effective_stub_policy();
         let canvas = assemble_canvas(self.bus.events(), &policy);
         if let Some(error) = context_budget_exhausted(policy, &canvas) {
@@ -2003,9 +2443,14 @@ impl<D: PermissionDecider> Session<D> {
     fn emit_with_parent(
         &mut self,
         kind: &'static str,
-        payload: JsonObject,
+        mut payload: JsonObject,
         parent: Option<String>,
     ) -> Result<String, SessionError> {
+        if let Some(run) = &self.active_run {
+            payload
+                .entry("run_id".to_owned())
+                .or_insert_with(|| run.run_id.clone().into());
+        }
         self.bus.push(EventEnvelope::new(
             self.config.session_id.clone(),
             self.config.agent_id.clone(),
@@ -2023,6 +2468,59 @@ impl<D: PermissionDecider> Session<D> {
         self.persist_new_events()?;
         Ok(id)
     }
+}
+
+fn fold_pending_follow_ups(events: &[EventEnvelope]) -> VecDeque<QueueItem> {
+    let settled = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                EventKind::QUEUE_DELIVERED | EventKind::QUEUE_CANCELLED
+            )
+        })
+        .filter_map(|event| event.payload.get("queue_item_id")?.as_str())
+        .collect::<BTreeSet<_>>();
+    events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::QUEUE_ENQUEUED)
+        .filter_map(queue_item_from_event)
+        .filter(|item| item.mode == QueueMode::FollowUp)
+        .filter(|item| !settled.contains(item.queue_item_id.as_str()))
+        .collect()
+}
+
+fn queue_item_from_event(event: &EventEnvelope) -> Option<QueueItem> {
+    Some(QueueItem {
+        queue_item_id: event.payload.get("queue_item_id")?.as_str()?.to_owned(),
+        mode: match event.payload.get("mode")?.as_str()? {
+            "steer" => QueueMode::Steer,
+            "follow_up" => QueueMode::FollowUp,
+            _ => return None,
+        },
+        target_run_id: event.payload.get("target_run_id")?.as_str()?.to_owned(),
+        content: event.payload.get("content")?.as_str()?.to_owned(),
+    })
+}
+
+fn remove_queue_item(queue: &mut VecDeque<QueueItem>, id: &str) -> Option<QueueItem> {
+    let index = queue.iter().position(|item| item.queue_item_id == id)?;
+    queue.remove(index)
+}
+
+fn queue_payload(item: &QueueItem, include_content: bool, delivered_run_id: Option<&str>) -> JsonObject {
+    let mut payload = object([
+        ("queue_item_id", item.queue_item_id.clone().into()),
+        ("mode", item.mode.as_str().into()),
+        ("target_run_id", item.target_run_id.clone().into()),
+    ]);
+    if include_content {
+        payload.insert("content".to_owned(), item.content.clone().into());
+    }
+    if let Some(run_id) = delivered_run_id {
+        payload.insert("delivered_run_id".to_owned(), run_id.into());
+    }
+    payload
 }
 
 /// Off-tier honest stop (ADR D4): when auto-compaction is disabled and the

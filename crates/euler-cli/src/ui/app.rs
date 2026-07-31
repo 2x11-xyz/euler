@@ -45,7 +45,8 @@ use euler_core::{
     fold_session, heuristic_projection, load_extension_package, read_resume_prefix,
     resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, EulerHome,
     ExtensionEnablement, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
-    ProvenanceWriter, ReasoningEffort, ScopePattern, Session, SessionStore,
+    ProvenanceWriter, QueueMode, ReasoningEffort, RunHandle, ScopePattern, Session,
+    SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -74,6 +75,13 @@ const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume re
 const DENIED_COMPOSER_GHOST: &str = "denied — tell euler what to do instead";
 
 type CrosstermTerminal = terminal::InlineTerminal<CrosstermBackend<terminal::FrameBufferedStdout>>;
+
+fn queue_mode_label(mode: QueueMode) -> &'static str {
+    match mode {
+        QueueMode::Steer => "steer",
+        QueueMode::FollowUp => "follow-up",
+    }
+}
 
 fn text_entry_modifiers(modifiers: KeyModifiers) -> bool {
     modifiers.is_empty()
@@ -163,7 +171,7 @@ pub struct AppCore {
     editor: Box<dyn ExternalEditorRunner>,
     clipboard: Box<dyn ClipboardSink>,
     pending_runs: VecDeque<PendingRunRequest>,
-    queued_inputs: VecDeque<String>,
+    queued_inputs: VecDeque<QueuedInput>,
     queued_selection: Option<usize>,
     queue_auto_flush_paused: bool,
     /// Empty-composer ghost override (deny-with-instruction empty path).
@@ -190,6 +198,7 @@ enum AppState {
     TurnInFlight {
         worker_rx: Receiver<TurnEvent>,
         interrupt_flag: Arc<AtomicBool>,
+        run_handle: Option<RunHandle>,
         started_at: Instant,
     },
 }
@@ -256,6 +265,13 @@ struct ExtensionRunRequest {
 #[derive(Clone, Debug)]
 struct CompanionRunRequest {
     task: AgentTask,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedInput {
+    text: String,
+    mode: QueueMode,
+    queue_item_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -789,10 +805,10 @@ impl AppCore {
         self.queued_inputs
             .iter()
             .enumerate()
-            .map(|(index, text)| QueuedComposerLine {
+            .map(|(index, input)| QueuedComposerLine {
                 position: index + 1,
                 total,
-                text: text.clone(),
+                text: format!("{}  {}", queue_mode_label(input.mode), input.text),
                 selected: Some(index) == selected,
             })
             .collect()
@@ -1406,7 +1422,11 @@ impl AppCore {
             self.bottom.replace_composer_text("");
             self.empty_composer_ghost = None;
             // Front of queue: next user turn after the denied tool turn finishes.
-            self.queued_inputs.push_front(draft.clone());
+            self.queued_inputs.push_front(QueuedInput {
+                text: draft.clone(),
+                mode: QueueMode::FollowUp,
+                queue_item_id: None,
+            });
             self.queued_selection = Some(0);
             self.reply_to_modal(PermissionReply::DenyWithInstruction(draft))
         }
@@ -1470,7 +1490,24 @@ impl AppCore {
         if prompt.trim().is_empty() {
             return CoreEffect::None;
         }
-        self.queued_inputs.push_back(prompt);
+        let (mode, queue_item_id) = match &self.state {
+            AppState::TurnInFlight {
+                run_handle: Some(run_handle),
+                ..
+            } => match run_handle.follow_up(prompt.clone()) {
+                Ok(id) => (QueueMode::FollowUp, Some(id)),
+                Err(error) => {
+                    self.notice = Some(format!("could not queue follow-up: {error}"));
+                    return CoreEffect::Render;
+                }
+            },
+            _ => (QueueMode::FollowUp, None),
+        };
+        self.queued_inputs.push_back(QueuedInput {
+            text: prompt,
+            mode,
+            queue_item_id,
+        });
         self.queued_selection = self.queued_inputs.len().checked_sub(1);
         self.bottom.replace_composer_text("");
         self.notice = None;
@@ -1481,9 +1518,10 @@ impl AppCore {
         let AppState::Idle { .. } = self.state else {
             return CoreEffect::None;
         };
-        let Some(prompt) = self.pop_next_queued_input() else {
+        let Some(input) = self.pop_next_queued_input() else {
             return CoreEffect::None;
         };
+        let prompt = input.text;
         self.queue_auto_flush_paused = false;
         self.visual_scroll_offset = 0;
         self.bottom.record_submission(&prompt);
@@ -1506,10 +1544,15 @@ impl AppCore {
         let (worker_tx, worker_rx) = mpsc::channel();
         let interrupt_flag = Arc::new(AtomicBool::new(false));
         let worker_interrupt = Arc::clone(&interrupt_flag);
+        let run_handle = session.new_run_handle();
+        let worker_handle = run_handle.clone();
         std::thread::spawn(move || {
             let stream_tx = worker_tx.clone();
-            let result =
-                session.run_turn_with_sink(&prompt, Arc::clone(&worker_interrupt), move |event| {
+            let result = session.run_turn_with_handle_and_sink(
+                &prompt,
+                worker_handle,
+                Arc::clone(&worker_interrupt),
+                move |event| {
                     let _ = stream_tx.send(TurnEvent::Event(event.clone()));
                 });
             let outcome = match result {
@@ -1522,6 +1565,7 @@ impl AppCore {
         self.state = AppState::TurnInFlight {
             worker_rx,
             interrupt_flag,
+            run_handle: Some(run_handle),
             started_at: Instant::now(),
         };
         self.in_flight_label = Some("turn".to_owned());
@@ -2001,6 +2045,7 @@ impl AppCore {
         self.state = AppState::TurnInFlight {
             worker_rx,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
+            run_handle: None,
             started_at: Instant::now(),
         };
         self.in_flight_label = Some(label);
@@ -2060,6 +2105,7 @@ impl AppCore {
         self.state = AppState::TurnInFlight {
             worker_rx,
             interrupt_flag: Arc::new(AtomicBool::new(false)),
+            run_handle: None,
             started_at: Instant::now(),
         };
         self.in_flight_label = Some("companion run".to_owned());
@@ -2477,10 +2523,10 @@ impl AppCore {
         if !self.bottom.composer().submit_text().is_empty() {
             return self.move_composer_up_or_history();
         }
-        let Some(text) = self.queued_inputs.remove(index) else {
+        let Some(input) = self.queued_inputs.remove(index) else {
             return CoreEffect::None;
         };
-        self.bottom.replace_composer_text(&text);
+        self.bottom.replace_composer_text(&input.text);
         self.normalize_queue_selection();
         CoreEffect::Render
     }
@@ -2507,7 +2553,7 @@ impl AppCore {
         CoreEffect::Render
     }
 
-    fn pop_next_queued_input(&mut self) -> Option<String> {
+    fn pop_next_queued_input(&mut self) -> Option<QueuedInput> {
         let prompt = self.queued_inputs.pop_front();
         self.normalize_queue_selection();
         prompt
@@ -2786,9 +2832,9 @@ impl AppCore {
             return;
         }
         if auto_flush && !self.queue_auto_flush_paused {
-            if let Some(prompt) = self.pop_next_queued_input() {
-                self.bottom.record_submission(&prompt);
-                self.spawn_turn(prompt, session);
+            if let Some(input) = self.pop_next_queued_input() {
+                self.bottom.record_submission(&input.text);
+                self.spawn_turn(input.text, session);
                 return;
             }
         }
