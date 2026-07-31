@@ -2,13 +2,13 @@ use super::*;
 
 impl AppCore {
     pub(super) fn check_stall_notification(&mut self) {
-        if !self.turn_in_flight() || self.stall_notified {
+        if !self.turn_in_flight()
+            || self.in_flight_label.as_deref() != Some(MODEL_TURN_IN_FLIGHT_LABEL)
+            || self.stall_notified
+        {
             return;
         }
-        let Some(last) = self.last_turn_activity_at else {
-            return;
-        };
-        if last.elapsed() < STALL_THRESHOLD {
+        if !self.activity.is_stalled_at(Utc::now()) {
             return;
         }
         self.stall_notified = true;
@@ -69,10 +69,11 @@ impl AppCore {
         match event {
             TurnEvent::Event(event) => {
                 let is_tool_call = event.kind.as_str() == EventKind::TOOL_CALL;
-                self.note_turn_activity();
+                if self.activity.observe(&event) {
+                    self.stall_notified = false;
+                }
                 self.record_in_flight_error(&event);
                 self.update_token_usage_from_event(&event);
-                self.update_phase_verb(&event);
                 self.transcript.push_event(event);
                 self.queue_finalized_visual_output_for_latest_event();
                 if is_tool_call {
@@ -134,54 +135,6 @@ impl AppCore {
         );
     }
 
-    /// Working HUD phase verb (issue #27, #62): thinking / exploring /
-    /// reading X / writing X / running bash / running tests, falling back to
-    /// "working" only when nothing more specific applies. Tool-call events
-    /// set a new phase; a tool result — success, failure, *or* auto-denial
-    /// via the turn denial cache (#62) — clears it back to `None` so the HUD
-    /// falls back to the live phase (working, or whatever the next
-    /// reasoning/tool-call event sets) instead of parroting the verb of a
-    /// tool call that has already finished.
-    ///
-    /// "thinking" is driven by the live `model.reasoning` DELTAS, not the
-    /// finalized `MODEL_REASONING` event: deltas arrive first, so keying off
-    /// finalize showed the verb only after thinking had already ended. It
-    /// clears when answer text starts streaming or the reasoning finalizes
-    /// (turn end resets it in `accept_worker_session_or_continue`). Answer
-    /// text deltas otherwise leave the verb alone so a tool phase doesn't
-    /// flicker mid-stream.
-    fn update_phase_verb(&mut self, event: &EventEnvelope) {
-        match event.kind.as_str() {
-            EventKind::MODEL_DELTA => {
-                match event
-                    .payload
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    Some("reasoning") => {
-                        self.current_phase_verb = Some("thinking".to_owned());
-                    }
-                    Some("text") if self.current_phase_verb.as_deref() == Some("thinking") => {
-                        self.current_phase_verb = None;
-                    }
-                    _ => {}
-                }
-            }
-            EventKind::MODEL_REASONING => {
-                if self.current_phase_verb.as_deref() == Some("thinking") {
-                    self.current_phase_verb = None;
-                }
-            }
-            EventKind::TOOL_CALL => {
-                self.current_phase_verb = Some(phase_verb_for_tool_call(event));
-            }
-            EventKind::TOOL_RESULT => {
-                self.current_phase_verb = None;
-            }
-            _ => {}
-        }
-    }
-
     fn accept_worker_session_or_continue(
         &mut self,
         mut session: Box<Session<TuiDecider>>,
@@ -225,7 +178,6 @@ impl AppCore {
         self.in_flight_label = None;
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;
-        self.current_phase_verb = None;
         self.spinner_frame = 0;
         self.spinner_last_tick = None;
     }
@@ -344,6 +296,8 @@ impl AppCore {
         }
         match outcome {
             ExtensionOutcome::Complete(output) => {
+                self.activity
+                    .finish_at(ActivityTerminal::Completed, Utc::now());
                 // Foldable artifact row with pretty JSON, not a one-line dump
                 // (calibration finding E4).
                 let rendered =
@@ -362,6 +316,8 @@ impl AppCore {
                 }
             }
             ExtensionOutcome::Failed(message) => {
+                self.activity
+                    .finish_at(ActivityTerminal::Failed, Utc::now());
                 self.push_finalized_visual_item(TranscriptItem::Error {
                     source: format!("extension {}.{}", request.id, request.command),
                     message: message.clone(),
@@ -371,7 +327,9 @@ impl AppCore {
                     request.id, request.command
                 ));
             }
-            ExtensionOutcome::Cancelled => self.record_auxiliary_interruption(),
+            ExtensionOutcome::Cancelled => {
+                self.record_auxiliary_interruption();
+            }
         }
     }
 
@@ -388,6 +346,8 @@ impl AppCore {
         }
         match outcome {
             CompanionOutcome::Complete(result) => {
+                self.activity
+                    .finish_at(ActivityTerminal::Completed, Utc::now());
                 self.push_finalized_visual_item(TranscriptItem::SessionSummary(format!(
                     "companion run result: {}",
                     serde_json::to_string(&crate::companion_run::agent_result_json(&result))
@@ -396,17 +356,23 @@ impl AppCore {
                 self.notice = Some("companion run complete".to_owned());
             }
             CompanionOutcome::Failed(message) => {
+                self.activity
+                    .finish_at(ActivityTerminal::Failed, Utc::now());
                 self.push_finalized_visual_item(TranscriptItem::Error {
                     source: "companion run".to_owned(),
                     message: message.clone(),
                 });
                 self.notice = Some(format!("companion run failed: {message}"));
             }
-            CompanionOutcome::Cancelled => self.record_auxiliary_interruption(),
+            CompanionOutcome::Cancelled => {
+                self.record_auxiliary_interruption();
+            }
         }
     }
 
     fn record_auxiliary_interruption(&mut self) {
+        self.activity
+            .finish_at(ActivityTerminal::Interrupted, Utc::now());
         self.queued_inputs.set_paused(true);
         self.transcript.clear_transient_live_tail();
         self.interrupted_guidance = false;
@@ -455,6 +421,14 @@ impl AppCore {
             .get("source")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("error");
+        // Only provider errors terminalize a live model call here. Extension,
+        // guardian, and ordinary session errors are recoverable milestones;
+        // replacing the Activity block for them would falsely claim that the
+        // whole turn had failed. Cancellation has its own path above, while a
+        // recovery closure is a resume boundary rather than a live turn gap.
+        if source != "provider" {
+            return;
+        }
         let message = event
             .payload
             .get("message")
@@ -465,6 +439,12 @@ impl AppCore {
     }
 
     pub(super) fn handle_turn_outcome(&mut self, outcome: TurnOutcome, elapsed: Option<Duration>) {
+        let terminal = match &outcome {
+            TurnOutcome::Complete => ActivityTerminal::Completed,
+            TurnOutcome::Failed(_) => ActivityTerminal::Failed,
+            TurnOutcome::Cancelled => ActivityTerminal::Cancelled,
+        };
+        self.activity.finish_at(terminal, Utc::now());
         let emit_recap = match &outcome {
             TurnOutcome::Complete => {
                 self.interrupted_guidance = false;
@@ -514,7 +494,6 @@ impl AppCore {
             TurnOutcome::Failed(_) => self.queue_notification(NotifyEvent::Failure),
             TurnOutcome::Cancelled => {}
         }
-        self.last_turn_activity_at = None;
         self.stall_notified = false;
     }
 
@@ -524,67 +503,6 @@ impl AppCore {
             .last()
             .is_some_and(|event| event.kind.as_str() == EventKind::ERROR)
     }
-}
-
-/// Phase verb for a `tool.call` event, matching the tool taxonomy the
-/// transcript projector already uses (`tool_projection_from_call` /
-/// `exploration_summary_from_call` in transcript.rs): `run_shell` -> running
-/// bash (or running tests, judged from the command text — there is no
-/// dedicated "test" tool), `edit_file`/`apply_patch`/`write_file` -> writing
-/// X, `read_file` -> reading X, everything else exploration-shaped
-/// (`git_status`, `git_diff`, `list_files`, `search`) -> exploring.
-fn phase_verb_for_tool_call(event: &EventEnvelope) -> String {
-    let name = event
-        .payload
-        .get("name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    let input = event.payload.get("input");
-    match name {
-        "run_shell" => {
-            let command = input
-                .and_then(|input| input.get("command"))
-                .and_then(serde_json::Value::as_str)
-                .map(super::transcript::normalized_shell_command)
-                .unwrap_or_default();
-            if is_test_runner_command(&command) {
-                "running tests".to_owned()
-            } else {
-                "running bash".to_owned()
-            }
-        }
-        "read_file" => tool_call_path(input)
-            .map(|path| format!("reading {path}"))
-            .unwrap_or_else(|| "reading".to_owned()),
-        "edit_file" | "apply_patch" | "apply-patch" | "write_file" => tool_call_path(input)
-            .map(|path| format!("writing {path}"))
-            .unwrap_or_else(|| "writing".to_owned()),
-        "git_status" | "git_diff" | "list_files" | "search" | "tool_result_get" => {
-            "exploring".to_owned()
-        }
-        _ => "working".to_owned(),
-    }
-}
-
-fn tool_call_path(input: Option<&serde_json::Value>) -> Option<&str> {
-    input
-        .and_then(|input| input.get("path"))
-        .and_then(serde_json::Value::as_str)
-}
-
-/// Judged from the command text — there is no dedicated "test" tool, so a
-/// `run_shell` call reads as "running tests" when it plainly looks like one
-/// (deliberate heuristic, not exhaustive: matches common test-runner
-/// invocations from CLAUDE.md's own convention — `cargo nextest run` — plus
-/// other ecosystems' idiomatic commands).
-fn is_test_runner_command(command: &str) -> bool {
-    let lower = command.to_ascii_lowercase();
-    lower
-        .split_whitespace()
-        .any(|token| token == "test" || token == "tests")
-        || ["nextest", "pytest", "jest", "vitest"]
-            .iter()
-            .any(|needle| lower.contains(needle))
 }
 
 /// #58: the completion line must read per-reviewer `ok` flags from the

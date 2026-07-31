@@ -1140,7 +1140,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     )));
     render_compact_frame(&mut terminal, &mut core);
     let before_done = terminal.backend().screen_contents();
-    assert!(before_done.contains("⠋ working"));
+    assert!(before_done.contains("⠋ Preparing next step"));
     assert!(!before_done.contains("■ Turn failed"));
 
     core.handle_turn_event(TurnEvent::TurnDone {

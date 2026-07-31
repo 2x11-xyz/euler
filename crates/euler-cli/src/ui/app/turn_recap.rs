@@ -37,8 +37,7 @@ impl TurnRecapAccumulator {
                     .and_then(|value| value.as_str())
                     .map(count_diff_lines)
                     .unwrap_or((0, 0));
-                self.latest_files
-                    .insert(path.to_owned(), (added, removed));
+                self.latest_files.insert(path.to_owned(), (added, removed));
             }
             EventKind::FILE_CHANGE => {
                 let path = payload_str(event, "path").unwrap_or("");
@@ -55,7 +54,8 @@ impl TurnRecapAccumulator {
                     .and_then(|value| value.as_str());
                 if !id.is_empty() {
                     if let Some(command) = command {
-                        self.shell_commands.insert(id.to_owned(), command.to_owned());
+                        self.shell_commands
+                            .insert(id.to_owned(), command.to_owned());
                     }
                 }
             }
@@ -72,18 +72,18 @@ impl TurnRecapAccumulator {
                 }
 
                 let exit_code = shell_exit_code(event);
-                self.test_status = Some(if exit_code.is_some_and(|code| code != 0) {
-                    // Legacy logs can say `ok: true` even when the command
-                    // failed. A present nonzero process exit is authoritative.
+                self.test_status = Some(if !effective_tool_result_ok(event) {
+                    // Legacy logs can say `ok: true` even when the process
+                    // exited nonzero. Effective success requires both the
+                    // result flag and, when present, a zero process exit.
                     TestStatus::Fail
                 } else if let Some(status) = parse_test_summary(output) {
                     status
                 } else {
                     match exit_code {
-                        Some(0) if effective_tool_result_ok(event) => TestStatus::Pass,
-                        Some(0) => TestStatus::Fail,
-                        Some(_) => TestStatus::Fail,
+                        Some(0) => TestStatus::Pass,
                         None => TestStatus::Unknown,
+                        Some(_) => unreachable!("nonzero exit handled as effective failure"),
                     }
                 });
             }
@@ -167,15 +167,6 @@ pub fn turn_recap_from_events(events: &[EventEnvelope], start: usize) -> TurnRec
     accumulator.recap()
 }
 
-fn aggregate_turn_files(events: &[EventEnvelope]) -> (Vec<String>, usize, usize) {
-    let mut accumulator = TurnRecapAccumulator::default();
-    for event in events {
-        accumulator.observe(event);
-    }
-    let recap = accumulator.recap();
-    (recap.paths, recap.added, recap.removed)
-}
-
 fn count_diff_lines(diff: &str) -> (usize, usize) {
     let mut added = 0usize;
     let mut removed = 0usize;
@@ -189,7 +180,8 @@ fn count_diff_lines(diff: &str) -> (usize, usize) {
     (added, removed)
 }
 
-pub fn detect_test_status(events: &[EventEnvelope]) -> Option<TestStatus> {
+#[cfg(test)]
+fn detect_test_status(events: &[EventEnvelope]) -> Option<TestStatus> {
     let mut accumulator = TurnRecapAccumulator::default();
     for event in events {
         accumulator.observe(event);
@@ -221,7 +213,7 @@ fn looks_test_like(command: &str, output: &str) -> bool {
     // Runners with per-runner summary parsing (see parse_test_summary) plus
     // runners that are merely recognized so they fall through to the
     // exit-code-based Pass/Fail/Unknown classification in
-    // `detect_test_status` instead of having their turn recap silently
+    // the shared recap accumulator instead of having their turn recap silently
     // suppressed by turn_events.rs's "no tests ran" check.
     const TEST_COMMAND_NEEDLES: &[&str] = &[
         "cargo test",
@@ -488,6 +480,31 @@ mod tests {
                     ("ok", true.into()),
                     ("exit_code", 101.into()),
                     ("output", "some unparseable output".into()),
+                ]),
+            ),
+        ];
+        assert_eq!(detect_test_status(&events), Some(TestStatus::Fail));
+    }
+
+    #[test]
+    fn ok_false_cannot_be_overridden_by_a_pass_looking_summary() {
+        let events = vec![
+            event(
+                EventKind::TOOL_CALL,
+                object([
+                    ("id", "c1".into()),
+                    ("name", "run_shell".into()),
+                    ("input", json!({"command": "cargo test -q"})),
+                ]),
+            ),
+            event(
+                EventKind::TOOL_RESULT,
+                object([
+                    ("id", "c1".into()),
+                    ("name", "run_shell".into()),
+                    ("ok", false.into()),
+                    ("exit_code", 0.into()),
+                    ("output", "test result: ok. 3 passed; 0 failed".into()),
                 ]),
             ),
         ];
