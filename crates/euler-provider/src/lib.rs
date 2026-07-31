@@ -32,6 +32,10 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
+/// Version of the provider client implementation linked into this build.
+/// Runtime provenance freezes this compile-time value into `session.start`.
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelRequest {
     pub model: String,

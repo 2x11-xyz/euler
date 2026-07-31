@@ -22,6 +22,7 @@ pub mod project_context;
 pub mod provenance;
 pub mod redaction;
 pub mod resume;
+pub mod runtime_identity;
 pub mod sandbox;
 pub mod scrub;
 pub mod session;
@@ -102,6 +103,10 @@ pub use resume::{
     resume_session_from_folded_prefix, resume_session_from_prefix,
     resume_session_from_prefix_with_outcome, resume_session_with_outcome, FoldedSession,
     RelocationRequired, ResumeError, ResumeOutcome, ResumeWarning,
+};
+pub use runtime_identity::{
+    runtime_identity_from_events, RecordedRuntimeIdentity, RuntimeIdentity, RuntimeIdentityError,
+    RUNTIME_IDENTITY_SCHEMA_VERSION,
 };
 pub use sandbox::{
     probe_workspace_sandbox, SandboxAvailability, SandboxProfile, SandboxUnavailableReason,

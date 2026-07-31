@@ -279,8 +279,10 @@ fn listing_backfills_projection_cache_and_reuses_it_without_projecting() {
     let sidecar: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
             .expect("json");
-    assert!(sidecar["projected_events_len"].is_u64());
-    assert!(sidecar["projected_events_modified_ns"].is_u64());
+    assert!(sidecar["projected_events"]["accepted_byte_len"].is_u64());
+    assert!(sidecar["projected_events"]["tail_event_id"].is_string());
+    assert!(sidecar.get("projected_events_len").is_none());
+    assert!(sidecar.get("projected_events_modified_ns").is_none());
 
     // Hand-edit the cached name while keeping the key. Within a matching
     // key the cache is served verbatim — the observation here is the proof
@@ -332,7 +334,7 @@ fn invalid_projection_is_never_cached_and_can_recover() {
     let sidecar: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
             .expect("json");
-    assert!(sidecar.get("projected_events_len").is_none());
+    assert!(sidecar.get("projected_events").is_none());
 
     // Repairing the log recovers on the next listing — nothing pinned the
     // Invalid status.
@@ -343,6 +345,39 @@ fn invalid_projection_is_never_cached_and_can_recover() {
         .expect("record");
     assert_eq!(recovered.status(), SessionStatus::Active);
     assert_eq!(recovered.invalid_reason(), None);
+}
+
+#[test]
+fn malformed_runtime_identity_is_invalid_and_never_cached() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let start = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_START,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("runtime", serde_json::json!({"schema_version": 1})),
+        ]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(&[start]).expect("append");
+    drop(writer);
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.status(), SessionStatus::Invalid);
+    assert!(listed
+        .invalid_reason()
+        .is_some_and(|reason| reason.starts_with("session runtime identity is malformed:")));
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert!(sidecar.get("projected_events").is_none());
 }
 
 #[test]
@@ -390,7 +425,7 @@ fn interior_nul_run_projects_invalid_with_corruption_reason() {
     let sidecar: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
             .expect("json");
-    assert!(sidecar.get("projected_events_len").is_none());
+    assert!(sidecar.get("projected_events").is_none());
 }
 
 #[test]
@@ -425,6 +460,107 @@ fn torn_final_line_still_projects_accepted_prefix() {
 
     assert_eq!(listed.status(), SessionStatus::Active);
     assert_eq!(listed.invalid_reason(), None);
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    let accepted_len = fs::read_to_string(record.events_path())
+        .expect("events")
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    assert_eq!(
+        sidecar["projected_events"]["accepted_byte_len"],
+        accepted_len
+    );
+    assert_eq!(sidecar["projected_events"]["tail_event_id"], start.id);
+}
+
+#[test]
+fn legacy_4f1_shaped_stale_sidecar_reprojects_from_durable_tail() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let start = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_START,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    let failed = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        Some(start.id.clone()),
+        EventKind::ERROR,
+        object([
+            ("source", "provider".into()),
+            ("message", "stream failed".into()),
+        ]),
+    );
+    let resumed = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        Some(failed.id.clone()),
+        EventKind::SESSION_RESUMED,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("events_folded", 2.into()),
+            ("resumed_from_event_id", failed.id.clone().into()),
+        ]),
+    );
+    let recovered = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        Some(resumed.id.clone()),
+        EventKind::MODEL_RESULT,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("content", "recovered".into()),
+            ("stop_reason", "completed".into()),
+            (
+                "usage",
+                serde_json::json!({"input_tokens": 1, "output_tokens": 1}),
+            ),
+            ("tool_calls", serde_json::Value::Array(Vec::new())),
+        ]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer
+        .append(&[start, failed, resumed, recovered])
+        .expect("append");
+    drop(writer);
+
+    let stale = serde_json::json!({
+        "version": 1,
+        "id": record.id(),
+        "created_at_ms": record.created_at_ms(),
+        "updated_at_ms": record.updated_at_ms(),
+        "status": "failed",
+        "events_path": "events.jsonl",
+        "blobs_dir": "blobs",
+        "projected_events_len": 17,
+        "projected_events_modified_ns": 1
+    });
+    fs::write(
+        record.session_json_path(),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&stale).expect("sidecar")
+        ),
+    )
+    .expect("stale sidecar");
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.status(), SessionStatus::Active);
+    let refreshed: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(record.session_json_path()).expect("refreshed sidecar"),
+    )
+    .expect("json");
+    assert!(refreshed.get("projected_events").is_some());
+    assert!(refreshed.get("projected_events_len").is_none());
 }
 
 #[test]
@@ -443,12 +579,135 @@ fn touch_preserves_projection_cache_fields() {
     let sidecar: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
             .expect("json");
-    assert!(sidecar["projected_events_len"].is_u64());
-    assert!(sidecar["projected_events_modified_ns"].is_u64());
+    assert!(sidecar["projected_events"]["accepted_byte_len"].is_u64());
+    assert!(sidecar["projected_events"]["tail_event_id"].is_null());
 }
 
 #[test]
-fn touch_bumps_updated_at_without_reading_the_event_log() {
+fn same_length_tail_disagreement_invalidates_projection_cache() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    store.name_session(record.id(), "event name").expect("name");
+    store
+        .find_session(record.id())
+        .expect("find")
+        .expect("warm cache");
+
+    let sidecar_path = record.session_json_path();
+    let mut sidecar: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(sidecar_path).expect("sidecar")).expect("json");
+    sidecar["name"] = "stale cached name".into();
+    fs::write(
+        sidecar_path,
+        serde_json::to_string_pretty(&sidecar).expect("serialize"),
+    )
+    .expect("tamper sidecar");
+
+    let log = fs::read_to_string(record.events_path()).expect("events");
+    let mut lines = log.lines().map(str::to_owned).collect::<Vec<_>>();
+    let tail = lines.last_mut().expect("tail line");
+    let mut event = EventEnvelope::from_json_line(tail).expect("tail event");
+    let replacement = if event.id.starts_with('0') { '1' } else { '0' };
+    event.id.replace_range(0..1, &replacement.to_string());
+    *tail = event.to_json_line().expect("serialize event");
+    let rewritten = format!("{}\n", lines.join("\n"));
+    assert_eq!(
+        rewritten.len(),
+        log.len(),
+        "test requires a same-size rewrite"
+    );
+    fs::write(record.events_path(), rewritten).expect("rewrite tail");
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.name(), Some("event name"));
+}
+
+#[test]
+fn oversized_tail_declines_cache_fast_path_without_invalidating_session() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let start = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_START,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    let large = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        Some(start.id.clone()),
+        EventKind::ASSISTANT_MESSAGE,
+        object([(
+            "content",
+            "x".repeat(EVENT_PROJECTION_TAIL_SCAN_BYTES as usize + 1)
+                .into(),
+        )]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(&[start, large]).expect("append");
+    drop(writer);
+
+    assert!(event_projection_key(record.events_path()).is_err());
+    let first = store
+        .find_session(record.id())
+        .expect("first find")
+        .expect("record");
+    assert_eq!(first.status(), SessionStatus::Active);
+    assert_eq!(first.invalid_reason(), None);
+
+    reset_event_log_projections();
+    let second = store
+        .find_session(record.id())
+        .expect("second find")
+        .expect("record");
+    assert_eq!(second.status(), SessionStatus::Active);
+    assert_eq!(second.invalid_reason(), None);
+    assert_eq!(event_log_projections(), 1);
+}
+
+#[test]
+fn log_truncation_invalidates_projection_cache() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let start = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_START,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    let rename = session_renamed_event(
+        record.id().to_owned(),
+        "store-agent".to_owned(),
+        Some(start.id.clone()),
+        "event name".to_owned(),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(&[start.clone(), rename]).expect("append");
+    drop(writer);
+    store
+        .find_session(record.id())
+        .expect("find")
+        .expect("warm cache");
+
+    fs::write(
+        record.events_path(),
+        format!("{}\n", start.to_json_line().expect("start line")),
+    )
+    .expect("truncate events");
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.name(), None);
+}
+
+#[test]
+fn touch_reprojects_when_sidecar_has_no_durable_log_identity() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");
     let stale_metadata = format!(
@@ -459,8 +718,8 @@ fn touch_bumps_updated_at_without_reading_the_event_log() {
         record.created_at_ms()
     );
     fs::write(record.session_json_path(), stale_metadata).expect("stale metadata");
-    // A corrupt event log proves the touch never projects events: the
-    // projecting refresh would surface this as an Invalid status rewrite.
+    // A legacy/stale sidecar has no durable-prefix key, so the turn-boundary
+    // touch must reconcile it before carrying fields forward.
     fs::write(record.events_path(), "not json\n").expect("corrupt events");
 
     store
@@ -468,10 +727,11 @@ fn touch_bumps_updated_at_without_reading_the_event_log() {
         .expect("touch metadata");
 
     let metadata = fs::read_to_string(record.session_json_path()).expect("metadata");
-    // Sidecar fields carry forward verbatim; only the recency stamp moves.
-    assert!(metadata.contains("kept name"));
     let parsed: serde_json::Value = serde_json::from_str(&metadata).expect("json");
     assert!(parsed["updated_at_ms"].as_u64().expect("updated") > record.created_at_ms());
+    assert_eq!(parsed["status"], "invalid");
+    assert!(parsed.get("name").is_none());
+    assert!(parsed.get("projected_events").is_none());
 }
 
 #[test]
@@ -511,8 +771,8 @@ fn touch_keeps_event_derived_name_authoritative_in_listings() {
         .touch_session_updated_at(record.id())
         .expect("touch metadata");
 
-    // The touch carried the stale sidecar name forward, but projections
-    // still derive the name from events.
+    // The touch reconciled the keyless sidecar from the durable log, so the
+    // canonical event-derived name is retained.
     let listed = store
         .find_session(record.id())
         .expect("find")
@@ -1138,7 +1398,7 @@ fn refresh_metadata_persists_event_root_over_stale_sidecar_root() {
 }
 
 #[test]
-fn root_projection_uses_first_session_start() {
+fn duplicate_session_start_is_invalid_instead_of_selecting_a_root() {
     let (temp, store) = test_store();
     let first_root = project_root(temp.path(), "first-root");
     let later_root = project_root(temp.path(), "later-root");
@@ -1151,8 +1411,12 @@ fn root_projection_uses_first_session_start() {
         .expect("find")
         .expect("record");
 
-    let expected = expected_root(&first_root);
-    assert_eq!(listed.root(), Some(expected.as_path()));
+    assert_eq!(listed.status(), SessionStatus::Invalid);
+    assert_eq!(listed.root(), None);
+    assert_eq!(
+        listed.invalid_reason(),
+        Some("session runtime identity is invalid: session contains multiple session.start events")
+    );
 }
 
 #[test]
@@ -1297,10 +1561,9 @@ fn cold_listing_projections(count: usize) -> u64 {
 #[test]
 fn submit_path_touch_never_projects_event_logs_regardless_of_store_size() {
     // Enter-stall guard. The submit/turn-end hot path bumps the active
-    // session's recency via `touch_session_updated_at`, which must read only
-    // the sidecar — never project any event log, not the active session's and
-    // certainly not all N. A regression that reintroduces a projecting refresh
-    // (or a stray `list_sessions`) on this path trips this assertion.
+    // session's recency via `touch_session_updated_at`. A matching durable
+    // tail key must avoid every full event/blob projection (it performs only
+    // the bounded tail check), and certainly must not scan all N sessions.
     let (_temp, store) = test_store();
     let sessions = seed_sessions_with_events(&store, 24);
     let active = &sessions[0];
@@ -1560,7 +1823,7 @@ fn malformed_relocation_root_projection_is_invalid_not_projected() {
         serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
             .expect("json");
     assert!(
-        sidecar.get("projected_events_len").is_none(),
+        sidecar.get("projected_events").is_none(),
         "invalid relocation projections must not be cached"
     );
 }

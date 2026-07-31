@@ -1213,6 +1213,23 @@ fn normalize_events(
                             Value::String("<root>".to_owned()),
                         );
                     }
+                    if let Some(runtime) = payload.get_mut("runtime").and_then(Value::as_object_mut)
+                    {
+                        // Equivalence cases deliberately create the two
+                        // sessions under different temporary roots. Runtime
+                        // provenance commits to that exact root and to the
+                        // session-start projection containing it, so only
+                        // those two derivative fields vary between otherwise
+                        // equivalent runs. Keep every build-identity field in
+                        // the comparison.
+                        replace_allowed(runtime, allowlist, "attached_roots", json!(["<root>"]));
+                        replace_allowed(
+                            runtime,
+                            allowlist,
+                            "session_start_projection_sha256",
+                            Value::String("<session-start-projection-sha256>".to_owned()),
+                        );
+                    }
                 }
             }
             Ok(value)
@@ -1439,6 +1456,8 @@ fn nondeterministic_fields() -> BTreeSet<&'static str> {
         "canvas_snapshot_id",
         "file_change_id",
         "root",
+        "attached_roots",
+        "session_start_projection_sha256",
     ])
 }
 

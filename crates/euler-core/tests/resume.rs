@@ -547,6 +547,10 @@ fn fold_leaves_original_target_empty_for_legacy_logs() {
     .expect("fold");
 
     assert_eq!(folded.original_target, None);
+    assert_eq!(
+        folded.runtime_identity,
+        euler_core::RecordedRuntimeIdentity::LegacyUnknown
+    );
 }
 
 #[test]
@@ -565,6 +569,10 @@ fn fold_replays_compaction_policy_changes_and_legacy_tier_off() {
     let folded = fold_session(&config, session.events().to_vec()).expect("fold");
     assert!(!folded.auto_compaction.automatic);
     assert_eq!(folded.auto_compaction.tier, CompactionTier::Stubs);
+    assert!(matches!(
+        folded.runtime_identity,
+        euler_core::RecordedRuntimeIdentity::Recorded(_)
+    ));
 
     let legacy_start = EventEnvelope::new(
         "session",
