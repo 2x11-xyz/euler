@@ -1,4 +1,5 @@
-use super::{elapsed_ms, push_reasoning_chunk, ModelTarget, SessionError};
+use super::{elapsed_ms, push_reasoning_chunk, ModelTarget, ProviderRuntimeContext, SessionError};
+use crate::{ProviderRuntimeObserver, ProviderRuntimeScope};
 use euler_event::{object, EventEnvelope, JsonObject};
 use euler_provider::{
     ModelRequest, ModelStreamEvent, ProviderError, ProviderErrorCategory, ProviderStream,
@@ -95,8 +96,8 @@ pub(crate) struct RoundLoopConfig {
     /// (and cancellation), not an arbitrary ceiling.
     pub(crate) max_rounds: Option<usize>,
     /// Extra attempts after a transient transport or rate-limit provider
-    /// failure on a round that has processed no stream events. Other failures
-    /// and rounds with partial output are never retried.
+    /// failure before provider-neutral progress. Other failures and rounds
+    /// with readable/visible output, tool calls, or completion are not retried.
     pub(crate) provider_retries: usize,
     /// Backoff before each retry; the last entry repeats if retries exceed it.
     pub(crate) provider_retry_backoff_ms: Vec<u64>,
@@ -113,6 +114,8 @@ pub(crate) trait RoundLoopIo {
 
     fn session_id(&self) -> &str;
     fn target(&self) -> ModelTarget;
+    fn provider_runtime_observer(&self) -> &ProviderRuntimeObserver;
+    fn provider_runtime_scope(&self) -> ProviderRuntimeScope;
     fn prepare_model_request(
         &mut self,
         target: &ModelTarget,
@@ -276,13 +279,13 @@ where
     ) -> Result<ModelRoundData, SessionError> {
         let mut attempt = 0usize;
         loop {
-            let mut events_processed = false;
+            let mut provider_neutral_progress = false;
             let error = match self.collect_model_round_attempt(
                 target,
                 model_call_id,
                 request.clone(),
                 cancellation,
-                &mut events_processed,
+                &mut provider_neutral_progress,
             ) {
                 Ok(data) => return Ok(data),
                 Err(AttemptFailure::Session(error)) => return Err(error),
@@ -292,7 +295,7 @@ where
             let retryable = matches!(
                 category,
                 ProviderErrorCategory::Transport | ProviderErrorCategory::RateLimit
-            ) && !events_processed
+            ) && !provider_neutral_progress
                 && attempt < self.config.provider_retries;
             if !retryable {
                 self.io
@@ -308,10 +311,15 @@ where
                 .copied()
                 .unwrap_or(0);
             attempt += 1;
-            crate::diagnostics::provider_retry(
+            ProviderRuntimeContext::new(
                 self.io.session_id(),
-                category,
-                attempt as u64,
+                target,
+                self.io.provider_runtime_scope(),
+                self.io.provider_runtime_observer(),
+            )
+            .retry_scheduled(
+                &error,
+                u64::try_from(attempt).unwrap_or(u64::MAX),
                 backoff_ms,
             );
             sleep_with_cancel(backoff_ms, cancellation)?;
@@ -321,14 +329,16 @@ where
     /// One provider invocation and stream drain. Provider failures are
     /// returned WITHOUT emitting an error event so the caller can decide
     /// between a silent retry and the terminal emit-then-fail path.
-    /// `events_processed` reports whether any stream event reached the bus.
+    /// `provider_neutral_progress` reports whether visible/readable model
+    /// output, a tool call, or a finished record was observed. Empty deltas
+    /// and provider-opaque artifacts do not make automatic replay unsafe.
     fn collect_model_round_attempt(
         &mut self,
         target: &ModelTarget,
         model_call_id: &str,
         request: ModelRequest,
         cancellation: &CancellationToken,
-        events_processed: &mut bool,
+        provider_neutral_progress: &mut bool,
     ) -> Result<ModelRoundData, AttemptFailure> {
         let mut stream = match self.io.invoke_model(target, request) {
             Ok(stream) => stream,
@@ -348,7 +358,7 @@ where
                 Ok(event) => event,
                 Err(error) => return Err(AttemptFailure::Provider(error)),
             };
-            *events_processed = true;
+            *provider_neutral_progress |= event.is_provider_neutral_progress();
             self.io
                 .after_stream_event(&event, model_call_id)
                 .map_err(AttemptFailure::Session)?;
@@ -418,6 +428,7 @@ mod tests {
 
     struct CancelAfterCompletedRound {
         cancellation: CancellationSource,
+        provider_runtime_observer: ProviderRuntimeObserver,
         boundary_calls: usize,
         limit_calls: usize,
     }
@@ -431,6 +442,14 @@ mod tests {
 
         fn target(&self) -> ModelTarget {
             ModelTarget::new("test", "test")
+        }
+
+        fn provider_runtime_observer(&self) -> &ProviderRuntimeObserver {
+            &self.provider_runtime_observer
+        }
+
+        fn provider_runtime_scope(&self) -> ProviderRuntimeScope {
+            ProviderRuntimeScope::Root
         }
 
         fn prepare_model_request(
@@ -532,6 +551,7 @@ mod tests {
         let token = cancellation.token();
         let mut io = CancelAfterCompletedRound {
             cancellation,
+            provider_runtime_observer: ProviderRuntimeObserver::default(),
             boundary_calls: 0,
             limit_calls: 0,
         };

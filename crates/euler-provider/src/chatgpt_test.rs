@@ -1,8 +1,14 @@
 use super::*;
+use crate::{
+    CancellationCheck, ProviderAttemptEvent, ProviderAttemptObserver, ProviderLivenessConfig,
+    ProviderSet, ProviderTimeoutStage,
+};
 use std::io::Write as _;
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[test]
 fn unauthorized_error_does_not_contain_token_substring() {
@@ -275,6 +281,146 @@ fn stored_euler_auth_invoke_error_does_not_expose_echoed_values() {
     assert!(message.contains("HTTP 500"));
     assert!(!message.contains(access_token));
     assert!(!message.contains(account_id));
+}
+
+#[test]
+fn cancelling_luna_websocket_closes_the_blocked_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let endpoint = format!(
+        "http://{}/codex/responses",
+        listener.local_addr().expect("addr")
+    );
+    let (request_tx, request_rx) = mpsc::channel();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("read timeout");
+        let mut socket = tungstenite::accept(stream).expect("websocket handshake");
+        socket.read().expect("response.create request");
+        request_tx.send(()).expect("request received");
+        let closed = !matches!(
+            socket.read(),
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                )
+        );
+        closed_tx.send(closed).expect("closed result");
+    });
+    let provider = luna_provider(endpoint);
+    let providers = ProviderSet::single(provider);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancellation_probe = Arc::clone(&cancelled);
+    let mut stream = providers
+        .invoke_interruptibly(
+            "chatgpt",
+            luna_request(),
+            CancellationCheck::new(move || cancellation_probe.load(Ordering::Acquire)),
+            ProviderLivenessConfig {
+                response_header_timeout: Duration::from_secs(1),
+                first_byte_timeout: Duration::from_secs(1),
+                semantic_idle_timeout: Duration::from_secs(1),
+            },
+            ProviderAttemptObserver::default(),
+        )
+        .expect("provider worker");
+    request_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("websocket request");
+    let cancel_flag = Arc::clone(&cancelled);
+    let cancel = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        cancel_flag.store(true, Ordering::Release);
+    });
+    let started = Instant::now();
+
+    assert!(stream.next().is_none());
+    assert!(started.elapsed() < Duration::from_millis(150));
+    assert!(closed_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server observes close"));
+    cancel.join().expect("cancel thread");
+    server.join().expect("server");
+}
+
+#[test]
+fn luna_websocket_ping_frames_do_not_reset_semantic_idle() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let endpoint = format!(
+        "http://{}/codex/responses",
+        listener.local_addr().expect("addr")
+    );
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let mut socket = tungstenite::accept(stream).expect("websocket handshake");
+        socket.read().expect("response.create request");
+        for _ in 0..30 {
+            if socket
+                .send(tungstenite::Message::Ping(Vec::new().into()))
+                .is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let providers = ProviderSet::single(luna_provider(endpoint));
+    let attempt_events = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&attempt_events);
+    let mut stream = providers
+        .invoke_interruptibly(
+            "chatgpt",
+            luna_request(),
+            CancellationCheck::new(|| false),
+            ProviderLivenessConfig {
+                response_header_timeout: Duration::from_secs(1),
+                first_byte_timeout: Duration::from_secs(1),
+                semantic_idle_timeout: Duration::from_millis(60),
+            },
+            ProviderAttemptObserver::new(move |event| {
+                observed.lock().expect("attempt events").push(event);
+            }),
+        )
+        .expect("provider worker");
+
+    let error = stream
+        .next()
+        .expect("timeout")
+        .expect_err("semantic idle timeout");
+
+    assert_eq!(
+        error.timeout_stage(),
+        Some(ProviderTimeoutStage::SemanticIdle)
+    );
+    let events = attempt_events.lock().expect("attempt events");
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ProviderAttemptEvent::FirstByte { .. })));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ProviderAttemptEvent::FirstSemantic { .. })));
+    drop(events);
+    server.join().expect("server");
+}
+
+fn luna_provider(endpoint: String) -> ChatGptProvider {
+    ChatGptProvider::with_endpoint(
+        ChatGptAuthMode::StoredEulerAuth(Arc::new(FakeStoredAuth {
+            access_token: "stored-access-secret",
+            account_id: "acct-secret",
+        })),
+        endpoint,
+    )
+}
+
+fn luna_request() -> ModelRequest {
+    ModelRequest {
+        model: "gpt-5.6-luna".to_owned(),
+        ..minimal_request()
+    }
 }
 
 struct FakeStoredAuth {

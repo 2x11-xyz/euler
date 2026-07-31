@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use crate::auth::{ApiKeyAuth, EnvApiKeyAuth, SecretString};
 use crate::chat_completions::{ChatCompletionsOptions, ChatCompletionsStream};
-use crate::{ModelProvider, ModelRequest, ProviderError, ProviderStream};
+use crate::{
+    observed_http_agent, ModelProvider, ModelRequest, ProviderError, ProviderStream,
+    ProviderTransportObserver, TransportReader,
+};
 
 /// Static description of a built-in chat-completions provider.
 #[derive(Debug)]
@@ -92,6 +95,24 @@ impl ModelProvider for ChatCompletionsProvider {
     }
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.invoke_inner(request, None)
+    }
+
+    fn invoke_observed(
+        &self,
+        request: ModelRequest,
+        observer: ProviderTransportObserver,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.invoke_inner(request, Some(observer))
+    }
+}
+
+impl ChatCompletionsProvider {
+    fn invoke_inner(
+        &self,
+        request: ModelRequest,
+        observer: Option<ProviderTransportObserver>,
+    ) -> Result<ProviderStream, ProviderError> {
         let api_key = self.load_api_key()?;
         let options = (self.spec.options)();
         let body = crate::chat_completions::request_body_with_options(&request, &options);
@@ -100,9 +121,12 @@ impl ModelProvider for ChatCompletionsProvider {
         send_chat_completions(
             &self.endpoint,
             [("Authorization", authorization.as_str())],
-            body,
-            spec.display,
-            options,
+            ChatCompletionsCall {
+                body,
+                stream_label: spec.display.to_owned(),
+                options,
+                observer,
+            },
             |failure| match failure {
                 SendFailure::Rejection { status, response } => {
                     // Only drain (a bounded slice of) the body when the spec
@@ -165,6 +189,14 @@ macro_rules! define_chat_completions_provider {
             fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
                 self.0.invoke(request)
             }
+
+            fn invoke_observed(
+                &self,
+                request: ModelRequest,
+                observer: crate::ProviderTransportObserver,
+            ) -> Result<ProviderStream, ProviderError> {
+                self.0.invoke_observed(request, observer)
+            }
         }
     };
 }
@@ -184,6 +216,13 @@ pub(crate) enum SendFailure {
     Transport(Box<ureq::Error>),
 }
 
+pub(crate) struct ChatCompletionsCall {
+    pub(crate) body: serde_json::Value,
+    pub(crate) stream_label: String,
+    pub(crate) options: ChatCompletionsOptions,
+    pub(crate) observer: Option<ProviderTransportObserver>,
+}
+
 /// Perform a streaming chat-completions POST and wrap the response, or map the
 /// failure through the caller's classifiers. The single ureq request + error
 /// skeleton, shared by every provider so it is not copied per file. Headers are
@@ -193,16 +232,20 @@ pub(crate) enum SendFailure {
 pub(crate) fn send_chat_completions<'h, H, E>(
     endpoint: &str,
     headers: H,
-    body: serde_json::Value,
-    stream_label: impl Into<String>,
-    options: ChatCompletionsOptions,
+    request: ChatCompletionsCall,
     on_error: E,
 ) -> Result<ProviderStream, ProviderError>
 where
     H: IntoIterator<Item = (&'h str, &'h str)>,
     E: FnOnce(SendFailure) -> ProviderError,
 {
-    let agent = ureq::builder().redirects(0).build();
+    let ChatCompletionsCall {
+        body,
+        stream_label,
+        options,
+        observer,
+    } = request;
+    let agent = observed_http_agent(observer.as_ref());
     let mut call = agent
         .post(endpoint)
         .set("Content-Type", "application/json")
@@ -213,7 +256,7 @@ where
     match call.send_json(body) {
         Ok(response) => Ok(Box::new(ChatCompletionsStream::new_with_options(
             stream_label,
-            response.into_reader(),
+            TransportReader::new(response.into_reader(), observer),
             options,
         ))),
         // Hand the raw response to the caller UNREAD: only providers whose

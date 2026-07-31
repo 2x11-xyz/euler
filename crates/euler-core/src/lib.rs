@@ -20,6 +20,7 @@ pub mod home;
 pub mod permissions;
 pub mod project_context;
 pub mod provenance;
+mod provider_runtime;
 pub mod redaction;
 pub mod resume;
 pub mod runtime_identity;
@@ -97,6 +98,9 @@ pub use provenance::{
     ProvenanceQueryError, ProvenanceReadError, ProvenanceWriter, ProvenanceWriterError,
     DEFAULT_PROVENANCE_QUERY_BLOB_BYTE_LIMIT, DEFAULT_PROVENANCE_QUERY_EVENT_LIMIT,
     DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT,
+};
+pub use provider_runtime::{
+    ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope, ProviderRuntimeTarget,
 };
 pub use resume::{
     fold_session, plan_relocation, read_resume_prefix, resume_session,

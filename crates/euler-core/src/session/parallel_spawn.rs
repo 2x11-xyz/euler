@@ -10,12 +10,14 @@ use super::companion::{
     companion_failure, companion_success, model_result_payload, ModelResultRecord, ParentedAppender,
 };
 use super::{
-    canvas_snapshot_payload, context_budget_exhausted, model_input_item, AgentResultSummary,
-    ContextLimitConfig, ModelRoundData, ModelTarget, RoundLoop, RoundLoopConfig, RoundLoopIo,
-    RoundOutcome, Session, SessionError, SYSTEM_INSTRUCTIONS,
+    add_provider_error_metadata, canvas_snapshot_payload, context_budget_exhausted,
+    model_input_item, AgentResultSummary, ContextLimitConfig, ModelRoundData, ModelTarget,
+    ProviderRuntimeContext, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, Session,
+    SessionError, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::assemble_canvas_prefolded;
 use crate::permissions::PermissionDecider;
+use crate::{ProviderRuntimeObserver, ProviderRuntimeScope};
 use euler_agents::{AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, EventKind, JsonObject};
 use euler_provider::{
@@ -153,17 +155,7 @@ impl<D: PermissionDecider> Session<D> {
 
         // Phase 2 (worker threads): concurrent provider calls. Workers
         // append nothing; they buffer round data or the terminal error.
-        let outcomes = run_workers(
-            &self.providers,
-            &self.config.session_id,
-            RoundLoopConfig {
-                max_rounds: Some(1),
-                provider_retries: self.config.provider_transport_retries,
-                provider_retry_backoff_ms: self.config.provider_transport_retry_backoff_ms.clone(),
-            },
-            &prepared,
-            cancellation,
-        );
+        let outcomes = self.run_reviewer_workers(&prepared, cancellation);
 
         // Phase 3 (session thread, batch order): record each reviewer's
         // round events and terminal agent.result.
@@ -176,6 +168,31 @@ impl<D: PermissionDecider> Session<D> {
             return Err(SessionError::Cancelled);
         }
         Ok(summaries)
+    }
+
+    fn run_reviewer_workers(
+        &self,
+        prepared: &[PreparedReviewer],
+        cancellation: &CancellationToken,
+    ) -> Vec<WorkerOutcome> {
+        run_workers(
+            &self.providers,
+            ReviewerProviderConfig {
+                session_id: &self.config.session_id,
+                round_loop: RoundLoopConfig {
+                    max_rounds: Some(1),
+                    provider_retries: self.config.provider_transport_retries,
+                    provider_retry_backoff_ms: self
+                        .config
+                        .provider_transport_retry_backoff_ms
+                        .clone(),
+                },
+                liveness: self.config.provider_liveness,
+                runtime_observer: self.provider_runtime_observer.clone(),
+            },
+            prepared,
+            cancellation,
+        )
     }
 
     /// Phase 1 for one task: record `agent.spawn` and `canvas.snapshot`, admit
@@ -622,10 +639,16 @@ fn reviewer_input(task_canvas: &[crate::CanvasItem], task: &AgentTask) -> Vec<Mo
     input
 }
 
+struct ReviewerProviderConfig<'a> {
+    session_id: &'a str,
+    round_loop: RoundLoopConfig,
+    liveness: euler_provider::ProviderLivenessConfig,
+    runtime_observer: ProviderRuntimeObserver,
+}
+
 fn run_workers(
     providers: &ProviderSet,
-    session_id: &str,
-    config: RoundLoopConfig,
+    config: ReviewerProviderConfig<'_>,
     prepared: &[PreparedReviewer],
     cancellation: &CancellationToken,
 ) -> Vec<WorkerOutcome> {
@@ -641,14 +664,17 @@ fn run_workers(
                     return None;
                 };
                 let worker_config = RoundLoopConfig {
-                    max_rounds: config.max_rounds,
-                    provider_retries: config.provider_retries,
-                    provider_retry_backoff_ms: config.provider_retry_backoff_ms.clone(),
+                    max_rounds: config.round_loop.max_rounds,
+                    provider_retries: config.round_loop.provider_retries,
+                    provider_retry_backoff_ms: config.round_loop.provider_retry_backoff_ms.clone(),
                 };
                 let worker_cancellation = cancellation.clone();
                 let target = reviewer.target.clone();
                 let model_call_id = model_call_id.clone();
                 let request = request.clone();
+                let session_id = config.session_id;
+                let provider_liveness = config.liveness;
+                let provider_runtime_observer = config.runtime_observer.clone();
                 Some(scope.spawn(move || {
                     let mut io = WorkerIo {
                         session_id,
@@ -658,6 +684,8 @@ fn run_workers(
                         round: None,
                         buffered_error: None,
                         cancellation: worker_cancellation.clone(),
+                        provider_liveness,
+                        provider_runtime_observer,
                     };
                     let run = RoundLoop::new(&mut io, worker_config).run(&worker_cancellation);
                     WorkerOutcome::Ran(Box::new(WorkerRunOutcome {
@@ -704,6 +732,8 @@ struct WorkerIo<'a> {
     round: Option<ModelRoundData>,
     buffered_error: Option<(JsonObject, String)>,
     cancellation: CancellationToken,
+    provider_liveness: euler_provider::ProviderLivenessConfig,
+    provider_runtime_observer: ProviderRuntimeObserver,
 }
 
 impl RoundLoopIo for WorkerIo<'_> {
@@ -715,6 +745,14 @@ impl RoundLoopIo for WorkerIo<'_> {
 
     fn target(&self) -> ModelTarget {
         self.target.clone()
+    }
+
+    fn provider_runtime_observer(&self) -> &ProviderRuntimeObserver {
+        &self.provider_runtime_observer
+    }
+
+    fn provider_runtime_scope(&self) -> ProviderRuntimeScope {
+        ProviderRuntimeScope::ParallelReviewer
     }
 
     fn prepare_model_request(
@@ -733,10 +771,19 @@ impl RoundLoopIo for WorkerIo<'_> {
         target: &ModelTarget,
         request: ModelRequest,
     ) -> Result<ProviderStream, ProviderError> {
+        let observer = ProviderRuntimeContext::new(
+            self.session_id,
+            target,
+            ProviderRuntimeScope::ParallelReviewer,
+            &self.provider_runtime_observer,
+        )
+        .attempt_observer();
         self.providers.invoke_interruptibly(
             &target.provider,
             request,
             super::provider_cancellation(self.cancellation.clone()),
+            self.provider_liveness,
+            observer,
         )
     }
 
@@ -755,7 +802,7 @@ impl RoundLoopIo for WorkerIo<'_> {
             ("source", "provider".into()),
             ("message", error.to_string().into()),
         ]);
-        payload.insert("category".to_owned(), error.category().as_str().into());
+        add_provider_error_metadata(&mut payload, error);
         self.buffered_error = Some((payload, model_call_id));
         Ok(String::new())
     }

@@ -1,11 +1,13 @@
 use super::*;
 use crate::permissions::ScriptedDecider;
-use crate::ProvenanceWriter;
+use crate::{
+    ProvenanceWriter, ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope,
+};
 use euler_agents::AgentBudget;
 use euler_event::EventEnvelope;
 use euler_provider::{
-    FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ProviderSet,
-    ProviderStream, ScriptedProvider, StopReason, Usage,
+    FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderAttemptEvent,
+    ProviderError, ProviderSet, ProviderStream, ScriptedProvider, StopReason, Usage,
 };
 use serde_json::json;
 use std::sync::{Arc, Condvar, Mutex};
@@ -168,6 +170,48 @@ fn batch_returns_outcomes_in_task_order_with_ordered_events() {
             spawn.payload["child_agent_id"]
         );
     }
+}
+
+#[test]
+fn parallel_reviewers_share_the_content_free_runtime_observer() {
+    let providers = scripted_set(&[
+        ("p1", FixtureResponse::Assistant("one".to_owned())),
+        ("p2", FixtureResponse::Assistant("two".to_owned())),
+    ]);
+    let (_temp, _log, mut session) = session_with_providers(providers);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+        sink.lock().expect("runtime observer").push(event);
+    }));
+
+    session
+        .spawn_reviewers_parallel(
+            vec![
+                reviewer_task("p1", "m1", "code-swarm-correctness"),
+                reviewer_task("p2", "m2", "code-swarm-safety"),
+            ],
+            &CancellationToken::new(),
+        )
+        .expect("batch");
+
+    let observed = observed.lock().expect("runtime observer");
+    let mut started_targets = observed
+        .iter()
+        .filter_map(|event| match event {
+            ProviderRuntimeEvent::Attempt {
+                target,
+                event: ProviderAttemptEvent::Started { .. },
+            } => {
+                assert_eq!(target.scope, ProviderRuntimeScope::ParallelReviewer);
+                assert!(!target.scope.is_foreground());
+                Some((target.provider.as_str(), target.model.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    started_targets.sort_unstable();
+    assert_eq!(started_targets, vec![("p1", "m1"), ("p2", "m2")]);
 }
 
 #[test]

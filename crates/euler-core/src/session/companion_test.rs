@@ -1,11 +1,15 @@
 use super::*;
 use crate::canvas::{assemble_canvas, canvas_prompt, CompactionTier};
 use crate::permissions::{DeciderVerdict, PermissionRequest, ScriptedDecider};
-use crate::{read_provenance, ProvenanceWriter, SessionConfig};
+use crate::{
+    read_provenance, ProvenanceWriter, ProviderRuntimeEvent, ProviderRuntimeObserver,
+    ProviderRuntimeScope, SessionConfig,
+};
 use crate::{GrantScope, ScopePattern};
 use euler_agents::{AgentBudget, MAX_OUTPUT_BYTES};
 use euler_provider::{
-    FixtureResponse, ModelProvider, ProviderStream, ScriptedProvider, StopReason, ToolCall,
+    FixtureResponse, ModelProvider, ProviderAttemptEvent, ProviderStream, ScriptedProvider,
+    StopReason, ToolCall,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -885,6 +889,36 @@ fn companion_transport_error_at_invoke_retries_silently_and_recovers() {
         events_of_kind(session.events(), EventKind::ERROR).is_empty(),
         "silent retry emits no error event"
     );
+}
+
+#[test]
+fn companion_inherits_the_session_provider_runtime_observer() {
+    let (_temp, _log, mut session) = session_with_provider(
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+        sink.lock().expect("runtime observer").push(event);
+    }));
+
+    let summary = session
+        .spawn_companion(task_with_caps([]))
+        .expect("companion");
+
+    assert!(summary.result.ok());
+    let observed = observed.lock().expect("runtime observer");
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        ProviderRuntimeEvent::Attempt {
+            target,
+            event: ProviderAttemptEvent::Started { .. },
+        } if target.scope == ProviderRuntimeScope::Companion
+            && !target.scope.is_foreground()
+            && target.provider == summary.provider
+            && target.model == summary.model
+    )));
 }
 
 #[test]

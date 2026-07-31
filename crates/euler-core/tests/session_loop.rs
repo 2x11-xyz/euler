@@ -6,15 +6,17 @@ use euler_core::permissions::{
 use euler_core::{
     assemble_canvas, fold_model_target, fold_reasoning_effort, runtime_identity_from_events,
     AutoCompactionPolicy, CanvasItem, CompactionTier, ContextLimitConfig, GrantScope, ModelTarget,
-    ProvenanceWriter, ReasoningEffort, RecordedRuntimeIdentity, RuntimeIdentity, ScopePattern,
-    Session, SessionConfig, SessionError, SteeringQueue, ToolRegistry, WorkingStateProjection,
+    ProvenanceWriter, ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope,
+    ReasoningEffort, RecordedRuntimeIdentity, RuntimeIdentity, ScopePattern, Session,
+    SessionConfig, SessionError, SteeringQueue, ToolRegistry, WorkingStateProjection,
     RUNTIME_IDENTITY_SCHEMA_VERSION,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::{
     catalog::MergedModelCatalog, FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent,
-    ProviderError, ProviderSet, ProviderStream, ReasoningChunk, ScriptedProvider, StopReason,
-    ToolCall, Usage,
+    ProviderAttemptEvent, ProviderAttemptOutcome, ProviderError, ProviderErrorCategory,
+    ProviderLivenessConfig, ProviderSet, ProviderStream, ReasoningChunk, ScriptedProvider,
+    StopReason, ToolCall, Usage,
 };
 use euler_sdk::Capability;
 use serde_json::json;
@@ -918,6 +920,53 @@ fn shadow_projection_does_not_block_driver_and_swaps_at_a_settled_boundary() {
 
     session.run_turn("continue after swap").expect("next turn");
     assert_eq!(root_calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn shadow_compaction_timeout_keeps_attempt_stage_metadata() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
+    let provider = ShadowTimeoutProvider {
+        root_calls: AtomicUsize::new(0),
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.auto_compaction.automatic = false;
+    config.auto_compaction.tier = CompactionTier::Off;
+    config.compaction_keep_recent = 0;
+    config.provider_transport_retries = 0;
+    config.provider_liveness = ProviderLivenessConfig {
+        response_header_timeout: Duration::from_millis(100),
+        first_byte_timeout: Duration::from_millis(200),
+        semantic_idle_timeout: Duration::from_millis(200),
+    };
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn(&format!("read, then finish {}", "x".repeat(20_000)))
+        .expect("driver turn");
+    assert_eq!(
+        session.begin_compaction().expect("start compaction"),
+        euler_core::CompactionStatus::InProgress
+    );
+    assert_eq!(
+        session.compact_and_wait().expect("finish compaction"),
+        euler_core::CompactionStatus::Failed
+    );
+
+    let error = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && payload_str(event, "purpose") == Some("compaction")
+        })
+        .expect("compaction provider error");
+    assert_eq!(payload_str(error, "category"), Some("transport"));
+    assert_eq!(
+        payload_str(error, "timeout_stage"),
+        Some("response_headers")
+    );
+    assert!(payload_str(error, "provider_attempt_id").is_some());
 }
 
 #[test]
@@ -3424,11 +3473,16 @@ fn provider_stream_without_finished_emits_truncation_error_without_model_result(
     let temp = tempfile::tempdir().expect("temp dir");
     let provider =
         RawStreamProvider::new(vec![Ok(ModelStreamEvent::TextDelta("partial".to_owned()))]);
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
     let mut session = Session::new(
         SessionConfig::new(temp.path()),
         provider,
         ScriptedDecider::new(vec![]),
     );
+    session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+        sink.lock().expect("runtime observer").push(event);
+    }));
 
     let error = session.run_turn("truncate").expect_err("truncated stream");
 
@@ -3436,6 +3490,7 @@ fn provider_stream_without_finished_emits_truncation_error_without_model_result(
         panic!("expected provider error");
     };
     assert_eq!(error.category().as_str(), "stream_truncation");
+    let attempt_id = error.attempt_id().expect("physical attempt id");
     assert_eq!(count_kind(session.events(), EventKind::MODEL_RESULT), 0);
     assert_eq!(
         count_kind(session.events(), EventKind::ASSISTANT_MESSAGE),
@@ -3455,6 +3510,26 @@ fn provider_stream_without_finished_emits_truncation_error_without_model_result(
             .and_then(serde_json::Value::as_str),
         Some("stream_truncation")
     );
+    assert_eq!(
+        payload_str(provider_error, "provider_attempt_id"),
+        Some(attempt_id)
+    );
+    let observed = observed.lock().expect("runtime observer");
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        ProviderRuntimeEvent::Attempt {
+            event: ProviderAttemptEvent::Started { attempt_id: started },
+            ..
+        } if started == attempt_id
+    )));
+    assert!(observed.iter().any(|event| matches!(
+        event,
+        ProviderRuntimeEvent::Attempt {
+            event: ProviderAttemptEvent::Ended(summary),
+            ..
+        } if summary.attempt_id == attempt_id
+            && summary.outcome == ProviderAttemptOutcome::StreamEnded
+    )));
 }
 
 #[test]
@@ -6618,6 +6693,46 @@ struct ShadowBlockingProvider {
     root_calls: Arc<AtomicUsize>,
 }
 
+struct ShadowTimeoutProvider {
+    root_calls: AtomicUsize,
+}
+
+impl ModelProvider for ShadowTimeoutProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        if request.tools.is_empty() {
+            std::thread::sleep(Duration::from_millis(500));
+            return Ok(Box::new(std::iter::empty()));
+        }
+        let call = self.root_calls.fetch_add(1, Ordering::SeqCst);
+        let events = if call == 0 {
+            vec![
+                Ok(ModelStreamEvent::ToolCall(ToolCall {
+                    id: "shadow-timeout-read".to_owned(),
+                    name: "read_file".to_owned(),
+                    input: json!({"path": "note.txt"}),
+                })),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::ToolUse,
+                    usage: Some(test_usage(190, 10)),
+                }),
+            ]
+        } else {
+            vec![
+                Ok(ModelStreamEvent::TextDelta("driver done".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: Some(test_usage(40, 10)),
+                }),
+            ]
+        };
+        Ok(Box::new(events.into_iter()))
+    }
+}
+
 struct BytePressureProvider {
     gate: Arc<ShadowGate>,
     root_calls: Arc<AtomicUsize>,
@@ -6942,6 +7057,191 @@ fn transport_error_at_invoke_retries_silently_and_recovers() {
 }
 
 #[test]
+fn provider_runtime_observer_reports_attempt_transitions_without_entering_events() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]),
+        ScriptedDecider::new(vec![]),
+    );
+    session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+        sink.lock().expect("runtime observer").push(event);
+    }));
+
+    session.run_turn("hello").expect("turn");
+
+    let observed = observed.lock().expect("runtime observer");
+    assert_eq!(observed.len(), 5);
+    assert!(matches!(
+        &observed[0],
+        ProviderRuntimeEvent::Attempt {
+            event: ProviderAttemptEvent::Started { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &observed[1],
+        ProviderRuntimeEvent::Attempt {
+            event: ProviderAttemptEvent::ResponseHeaders { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &observed[2],
+        ProviderRuntimeEvent::Attempt {
+            event: ProviderAttemptEvent::FirstByte { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &observed[3],
+        ProviderRuntimeEvent::Attempt {
+            event: ProviderAttemptEvent::FirstSemantic { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        &observed[4],
+        ProviderRuntimeEvent::Attempt {
+            event: ProviderAttemptEvent::Ended(summary),
+            ..
+        } if summary.outcome == ProviderAttemptOutcome::Completed
+    ));
+    assert!(observed.iter().all(|event| match event {
+        ProviderRuntimeEvent::Attempt { target, .. }
+        | ProviderRuntimeEvent::RetryScheduled { target, .. } => {
+            target.scope == ProviderRuntimeScope::Root
+                && target.scope.is_foreground()
+                && target.provider == "fixture"
+                && target.model == "fixture"
+        }
+    }));
+    drop(observed);
+    let canonical = serde_json::to_string(session.events()).expect("serialize events");
+    assert!(!canonical.contains("provider_attempt_id"));
+    assert!(!canonical.contains("response_headers"));
+    assert!(!canonical.contains("first_semantic"));
+}
+
+#[test]
+fn provider_runtime_observer_places_retry_between_physical_attempts() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let invokes = Arc::new(AtomicUsize::new(0));
+    let provider = FlakyThenScriptedProvider::new(
+        vec![ProviderError::transport("connection reset")],
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("recovered".to_owned())]),
+        Arc::clone(&invokes),
+    );
+    let mut config = SessionConfig::new(temp.path());
+    config.provider_transport_retries = 2;
+    config.provider_transport_retry_backoff_ms = vec![0];
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&observed);
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+    session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+        sink.lock().expect("runtime observer").push(event);
+    }));
+
+    session.run_turn("hello").expect("retry recovers");
+
+    let observed = observed.lock().expect("runtime observer");
+    let first_attempt_id = observed
+        .iter()
+        .find_map(|event| match event {
+            ProviderRuntimeEvent::Attempt {
+                event: ProviderAttemptEvent::Started { attempt_id },
+                ..
+            } => Some(attempt_id.as_str()),
+            _ => None,
+        })
+        .expect("first attempt");
+    let retry = observed
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                ProviderRuntimeEvent::RetryScheduled {
+                    failed_attempt_id: Some(failed_attempt_id),
+                    category: ProviderErrorCategory::Transport,
+                    retry_ordinal: 1,
+                    backoff_ms: 0,
+                    ..
+                } if failed_attempt_id == first_attempt_id
+            )
+        })
+        .expect("retry transition");
+    let starts = observed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            matches!(
+                event,
+                ProviderRuntimeEvent::Attempt {
+                    event: ProviderAttemptEvent::Started { .. },
+                    ..
+                }
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 2);
+    assert!(starts[0] < retry && retry < starts[1]);
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SlowInvokeProvider {
+    delay: Duration,
+}
+
+impl ModelProvider for SlowInvokeProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        std::thread::sleep(self.delay);
+        Ok(Box::new(std::iter::empty()))
+    }
+}
+
+#[test]
+fn provider_header_timeout_records_stage_and_attempt_identity() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = SessionConfig::new(temp.path());
+    config.provider_transport_retries = 0;
+    config.provider_transport_retry_backoff_ms.clear();
+    config.provider_liveness = ProviderLivenessConfig {
+        response_header_timeout: Duration::from_millis(30),
+        first_byte_timeout: Duration::from_secs(1),
+        semantic_idle_timeout: Duration::from_secs(1),
+    };
+    let provider = SlowInvokeProvider {
+        delay: Duration::from_millis(250),
+    };
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    let error = session.run_turn("hello").expect_err("provider timeout");
+
+    assert!(matches!(error, SessionError::Provider(_)));
+    let terminal = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && payload_str(event, "source") == Some("provider")
+        })
+        .expect("provider terminal");
+    assert_eq!(payload_str(terminal, "category"), Some("transport"));
+    assert_eq!(
+        payload_str(terminal, "timeout_stage"),
+        Some("response_headers")
+    );
+    assert!(payload_str(terminal, "provider_attempt_id").is_some());
+}
+
+#[test]
 fn rate_limit_error_at_invoke_retries_silently_and_recovers() {
     let temp = tempfile::tempdir().expect("temp dir");
     let invokes = Arc::new(AtomicUsize::new(0));
@@ -7114,6 +7414,44 @@ fn partial_stream_rate_limit_error_is_not_retried() {
         other => panic!("expected provider error, got {other:?}"),
     }
     assert_eq!(count_kind(session.events(), EventKind::ERROR), 1);
+}
+
+#[test]
+fn empty_and_opaque_stream_events_do_not_suppress_safe_retry() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![
+            vec![
+                Ok(ModelStreamEvent::TextDelta(String::new())),
+                Ok(ModelStreamEvent::ReasoningDelta(
+                    ReasoningChunk::opaque_artifact("provider-owned"),
+                )),
+                Err(ProviderError::transport("network closed")),
+            ],
+            text_stream("recovered"),
+        ],
+        Arc::clone(&requests),
+    );
+    let mut config = SessionConfig::new(temp.path());
+    config.provider_transport_retries = 1;
+    config.provider_transport_retry_backoff_ms = vec![0];
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+
+    session
+        .run_turn("retry control-only prefix")
+        .expect("retry");
+
+    assert_eq!(request_log_guard(&requests).len(), 2);
+    assert_eq!(count_kind(session.events(), EventKind::ERROR), 0);
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ASSISTANT_MESSAGE
+            && payload_str(event, "content") == Some("recovered")
+    }));
+    assert!(!serde_json::to_string(session.events())
+        .expect("serialize events")
+        .contains("provider-owned"));
 }
 
 #[test]

@@ -294,16 +294,26 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
 - The provider request driver and tool supervisor observe that same signal.
   The session/UI stops waiting even when a synchronous provider adapter is
   blocked, and provider events observed after cancellation are rejected at the
-  request boundary. This detaches the cancelled session; it does not physically
-  abort an adapter's synchronous network/OS call. Its request thread may remain
-  alive until that underlying I/O returns, with no route back into the session.
+  request boundary. Built-in HTTP and WebSocket adapters additionally use
+  bounded socket I/O and cancellation-aware polling, so a connected detached
+  worker leaves the transport within the adapter bound; the WebSocket path
+  actively shuts down its control socket. OS name resolution or an arbitrary
+  compatibility provider that does not implement the provider liveness
+  contract can only be detached, with no route back into the session.
+  Transport heartbeats and attempt-control signals never become
+  transcript/model content or meaningful progress.
   A `model.call` that had no `model.result` receives exactly one parented,
   cancellation-attributed session error. That error is canonical provenance,
   while the TUI renders its ordinary interruption row instead of treating it
   as a driver failure. If the root turn and a shadow compaction are both
   running, root cancellation also terminalizes and fences the shadow before
   the session returns; late output from either provider call cannot append
-  events or swap the canvas.
+  events or swap the canvas. A shadow whose physical attempt has already
+  published its content-free terminal boundary settles its result and usage
+  before interruption closes it, but interruption still discards the candidate
+  rather than swapping the canvas. Before that boundary, the ordinary finite
+  grace and detach behavior preserves prompt cancellation for a genuinely
+  blocked compatibility provider.
 - A permission ask observes the same signal. Cancellation closes the active
   prompt without converting it into denial, installs no grant, and cannot let a
   stale modal reply satisfy a later ask. Write tools recheck cancellation at
@@ -415,25 +425,32 @@ dashboards, and boilerplate panels in the core CLI.
 
 ## Activity and thinking
 
-The pinned Activity block is a deterministic projection of the canonical
-session event stream, not an independent activity log. It reports observable
-system state while a run is live and is never persisted once per tick. The
-block is one or two lines: its first line carries the spinner (or stall
-marker), high-level phase, **phase age**, and the sole esc-to-interrupt
-affordance; an optional second line carries changed-file aggregation, the
-latest completed milestone, and **time since meaningful progress**. The esc
-affordance appears there exactly once — nowhere else, including the
-transcript's live thinking header.
+The pinned Activity block has one deterministic, replayable projection of the
+canonical session event stream, not an independent activity log. While a root
+turn is live, the process-local provider observer may refine that same
+projection with content-free attempt stages (waiting for headers, first byte,
+or semantic output; retrying; timed out; cancelled). Those controls are an
+ephemeral overlay: they are never inserted into the transcript, visual-canvas
+history, provenance, or model canvas, and replay ignores them. Companion,
+reviewer, and compaction scopes never alter the foreground block. The block is
+one or two lines: its first line carries the spinner (or stall marker),
+high-level phase, **phase age**, and the sole esc-to-interrupt affordance; an
+optional second line carries changed-file aggregation, the latest completed
+milestone, and **time since meaningful progress**. The esc affordance appears
+there exactly once — nowhere else, including the transcript's live thinking
+header.
 
 Phase age and progress age are separate event-timestamp clocks. Accepted user
 input, response text/reasoning delta kinds, completed tools/checks, file
 changes, and terminal outcomes establish meaningful progress. Context
-assembly, a new model call, and transport/control liveness may advance the
-phase or last-observed-event clock but do not reset meaningful progress. A
-stall becomes visible after 30 seconds without meaningful progress in a phase
-that can advance; waiting for user approval is exempt. Replayed events use
-their provenance timestamps, while live rendering injects only the current
-clock used to calculate ages.
+assembly, a new model call, and root provider attempt/control liveness may
+advance the phase or last-observed-event clock but do not reset meaningful
+progress or replace the latest completed milestone. A retry therefore remains
+visibly stalled when no substantive work preceded it within the threshold,
+even though its phase age restarts. A stall becomes visible after 30 seconds
+without meaningful progress in a phase that can advance; waiting for user
+approval is exempt. Replayed events use their provenance timestamps, while
+live rendering injects only the current clock used to calculate ages.
 
 Ordinary extension, guardian, and nonterminal session errors are failed
 operation milestones, not authority to terminalize the Activity projection.

@@ -668,7 +668,11 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `error`: `source`, `message`, optional `category` (`auth` |
   `transport` | `rate_limit` | `rejected` | `stream_truncation` |
   `internal`) carrying the provider error taxonomy from
-  `docs/contracts/provider.md` when the source is a provider. When
+  `docs/contracts/provider.md` when the source is a provider. Provider errors
+  may also carry `provider_attempt_id`; inactivity failures additionally carry
+  `timeout_stage` (`response_headers` | `first_byte` | `semantic_idle`) while
+  retaining `category: "transport"`. These are content-free terminal
+  diagnostics, not model output or a second event vocabulary. When
   a shadow projection request fails, `purpose: "compaction"` attributes the
   error to that request; it remains provenance-only while the TUI reports the
   compact failure without replacing the driver transcript or driver-failure

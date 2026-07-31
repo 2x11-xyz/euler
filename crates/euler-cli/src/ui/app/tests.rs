@@ -2,12 +2,13 @@ use super::*;
 use crate::ui::patch_approval::PatchPreview;
 use crate::ui::test_backend::VT100Backend;
 use crate::ui::test_support::{Gate, GateProvider};
+use euler_core::{ProviderRuntimeScope, ProviderRuntimeTarget};
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
     catalog::{MergedModelCatalog, EMBEDDED_CATALOG_JSON},
-    EchoProvider, FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError,
-    ProviderStream, ReasoningEffort, ScriptedProvider, ScriptedStreamStep, StopReason, ToolCall,
-    Usage,
+    EchoProvider, FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent,
+    ProviderAttemptEvent, ProviderAttemptOutcome, ProviderError, ProviderStream, ReasoningEffort,
+    ScriptedProvider, ScriptedStreamStep, StopReason, ToolCall, Usage,
 };
 use ratatui::{
     layout::Rect,
@@ -287,7 +288,7 @@ fn core_gated() -> (AppCore, Gate) {
 struct CompactionRaceFlags {
     shadow_started: bool,
     shadow_released: bool,
-    shadow_completed: bool,
+    shadow_attempt_ended: bool,
     driver_started: bool,
     driver_released: bool,
 }
@@ -335,22 +336,22 @@ impl CompactionRaceState {
         flags.driver_started
     }
 
-    fn wait_for_shadow_completion(&self) -> bool {
+    fn wait_for_shadow_attempt_end(&self) -> bool {
         let flags = self.flags.lock().expect("compaction race lock");
         let (flags, _) = self
             .changed
             .wait_timeout_while(flags, Duration::from_secs(2), |flags| {
-                !flags.shadow_completed
+                !flags.shadow_attempt_ended
             })
             .expect("compaction race wait");
-        flags.shadow_completed
+        flags.shadow_attempt_ended
     }
 
-    fn mark_shadow_completed(&self) {
+    fn mark_shadow_attempt_ended(&self) {
         self.flags
             .lock()
             .expect("compaction race lock")
-            .shadow_completed = true;
+            .shadow_attempt_ended = true;
         self.changed.notify_all();
     }
 
@@ -416,32 +417,12 @@ impl ModelProvider for CompactionRaceProvider {
                     }),
                 ]
             };
-            return Ok(Box::new(CompactionRaceStream {
-                events: events.into_iter(),
-                state: Arc::clone(&self.state),
-            }));
+            return Ok(Box::new(events.into_iter()));
         }
         if self.root_calls.fetch_add(1, Ordering::SeqCst) > 0 {
             self.state.park_driver();
         }
         EchoProvider.invoke(request)
-    }
-}
-
-struct CompactionRaceStream {
-    events: std::vec::IntoIter<Result<ModelStreamEvent, ProviderError>>,
-    state: Arc<CompactionRaceState>,
-}
-
-impl Iterator for CompactionRaceStream {
-    type Item = Result<ModelStreamEvent, ProviderError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let event = self.events.next()?;
-        if event.is_err() || matches!(&event, Ok(ModelStreamEvent::Finished { .. })) {
-            self.state.mark_shadow_completed();
-        }
-        Some(event)
     }
 }
 
@@ -463,6 +444,28 @@ fn core_with_compaction_failure_provider() -> (AppCore, Arc<CompactionRaceState>
         shadow_fails: true,
     };
     (TestCore::builder().provider(provider).build(), state)
+}
+
+fn install_compaction_race_observer(core: &mut AppCore, state: &Arc<CompactionRaceState>) {
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("test core must begin idle");
+    };
+    let state = Arc::clone(state);
+    session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+        if matches!(
+            event,
+            ProviderRuntimeEvent::Attempt {
+                target,
+                event: ProviderAttemptEvent::Ended(summary),
+            } if target.scope == ProviderRuntimeScope::Compaction
+                && matches!(
+                    summary.outcome,
+                    ProviderAttemptOutcome::Completed | ProviderAttemptOutcome::Failed
+                )
+        ) {
+            state.mark_shadow_attempt_ended();
+        }
+    }));
 }
 
 struct ChatGptEchoProvider;
@@ -725,6 +728,7 @@ fn base_escape_cancels_idle_shadow_and_fences_late_output() {
 fn base_escape_records_ready_shadow_usage_but_discards_its_candidate() {
     let (mut core, state) = core_with_compaction_race_provider();
     submit_text_and_wait(&mut core, &"history ".repeat(400));
+    install_compaction_race_observer(&mut core, &state);
 
     assert_eq!(core.compact_session(), CoreEffect::Render);
     assert!(
@@ -733,8 +737,8 @@ fn base_escape_records_ready_shadow_usage_but_discards_its_candidate() {
     );
     state.release_shadow();
     assert!(
-        state.wait_for_shadow_completion(),
-        "compactor never produced its terminal result"
+        state.wait_for_shadow_attempt_end(),
+        "compactor never published its terminal attempt"
     );
     type_text(&mut core, "draft survives");
 
@@ -781,6 +785,7 @@ fn base_escape_records_ready_shadow_usage_but_discards_its_candidate() {
 fn base_escape_reports_a_ready_provider_failure_as_failure_not_cancellation() {
     let (mut core, state) = core_with_compaction_failure_provider();
     submit_text_and_wait(&mut core, &"history ".repeat(400));
+    install_compaction_race_observer(&mut core, &state);
 
     assert_eq!(core.compact_session(), CoreEffect::Render);
     assert!(
@@ -789,8 +794,8 @@ fn base_escape_reports_a_ready_provider_failure_as_failure_not_cancellation() {
     );
     state.release_shadow();
     assert!(
-        state.wait_for_shadow_completion(),
-        "compactor never produced its terminal failure"
+        state.wait_for_shadow_attempt_end(),
+        "compactor never published its terminal failed attempt"
     );
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
@@ -889,6 +894,7 @@ fn escape_cancels_driver_and_shadow_without_late_canvas_swap() {
 fn escape_discards_a_ready_shadow_while_cancelling_the_concurrent_driver() {
     let (mut core, state) = core_with_compaction_race_provider();
     submit_text_and_wait(&mut core, &"history ".repeat(400));
+    install_compaction_race_observer(&mut core, &state);
     assert_eq!(core.compact_session(), CoreEffect::Render);
     assert!(
         state.wait_for_shadow(),
@@ -899,8 +905,8 @@ fn escape_discards_a_ready_shadow_while_cancelling_the_concurrent_driver() {
     assert!(state.wait_for_driver(), "driver never reached its provider");
     state.release_shadow();
     assert!(
-        state.wait_for_shadow_completion(),
-        "compactor never produced its terminal result"
+        state.wait_for_shadow_attempt_end(),
+        "compactor never published its terminal attempt"
     );
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
@@ -4849,6 +4855,40 @@ fn working_hud_activity_reflects_streamed_turn_events() {
         core.activity.phase(),
         activity::ActivityPhase::RunningChecks { .. }
     ));
+}
+
+#[test]
+fn provider_runtime_control_updates_only_the_live_activity_hud() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.activity.begin_at(Utc::now());
+    let event_count = core.transcript.events().len();
+    let item_count = core.transcript.items().len();
+    let finalized_count = core.visual_canvas.finalized_items().len();
+
+    core.handle_turn_event(TurnEvent::ProviderRuntime(ProviderRuntimeEvent::Attempt {
+        target: ProviderRuntimeTarget {
+            scope: ProviderRuntimeScope::Root,
+            provider: "fixture".to_owned(),
+            model: "echo".to_owned(),
+        },
+        event: ProviderAttemptEvent::Started {
+            attempt_id: "attempt-1".to_owned(),
+        },
+    }));
+
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::WaitingForResponseHeaders
+    );
+    assert_eq!(core.transcript.events().len(), event_count);
+    assert_eq!(core.transcript.items().len(), item_count);
+    assert_eq!(core.visual_canvas.finalized_items().len(), finalized_count);
 }
 
 /// #62: a result closes its active tool for success, failure, and denial.
