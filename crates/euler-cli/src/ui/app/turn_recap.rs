@@ -1,7 +1,7 @@
 //! Turn-end recap and exit-recap formatting (Warm Ledger §5.7 / §5.8).
 
 use crate::ui::status::short_session_id;
-use euler_event::{EventEnvelope, EventKind};
+use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,15 +158,14 @@ pub fn detect_test_status(events: &[EventEnvelope]) -> Option<TestStatus> {
                 if !looks_test_like(command, output) {
                     continue;
                 }
-                if let Some(status) = parse_test_summary(output) {
+                if !tool_result_succeeded(&event.payload) {
+                    last = Some(TestStatus::Fail);
+                } else if let Some(status) = parse_test_summary(output) {
                     last = Some(status);
                 } else {
-                    // `ok` on a run_shell result only reflects whether the
-                    // shell itself executed successfully — a test command
-                    // can run fine and still report failing tests via a
-                    // nonzero exit code. Classify off the exit code, not
-                    // `ok`, and fall back to Unknown (never a silent Pass)
-                    // when the exit code isn't available.
+                    // A successful process with no parseable runner summary
+                    // is classified by its exit evidence. Without either,
+                    // remain Unknown rather than inventing a pass.
                     let exit_code = event.payload.get("exit_code").and_then(|v| v.as_i64());
                     last = Some(match exit_code {
                         Some(0) => TestStatus::Pass,
@@ -432,10 +431,9 @@ mod tests {
 
     #[test]
     fn ok_true_with_nonzero_exit_code_is_fail_not_pass() {
-        // euler-core's run_shell sets `ok: true` for successful *execution*
-        // even when the shell command itself exited nonzero (e.g. `cargo
-        // test` ran fine but found failing tests). The recap must classify
-        // off exit_code, not `ok`, when no summary line is parseable.
+        // Legacy producers confused executor completion with command success.
+        // The nonzero exit remains authoritative even if output contains a
+        // superficially successful runner summary.
         let events = vec![
             event(
                 EventKind::TOOL_CALL,
@@ -452,7 +450,10 @@ mod tests {
                     ("name", "run_shell".into()),
                     ("ok", true.into()),
                     ("exit_code", 101.into()),
-                    ("output", "some unparseable output".into()),
+                    (
+                        "output",
+                        "test result: ok. 1 passed; 0 failed; 0 ignored".into(),
+                    ),
                 ]),
             ),
         ];

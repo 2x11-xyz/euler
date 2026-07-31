@@ -184,7 +184,16 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `tool.call`: `id`, `name`, `input` (structured JSON).
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
-  accompany `error` when the tool produced partial output before failing).
+  accompany `error` when the tool produced output before failing; cancellation
+  output may be partial, while a normally exited process output is complete).
+  `ok` is the canonical tool-operation outcome, not merely a statement that
+  the executor returned. For a process-backed tool, a nonzero `exit_code`
+  requires `ok: false` and `error`; collected `output` and the exit code remain
+  failure evidence. Readers derive the effective outcome as declared `ok`
+  AND a zero exit when `exit_code` is present. This rule is also the boundary
+  compatibility mapping for legacy events that recorded `ok: true` beside a
+  nonzero exit: preserve the event bytes, but project the operation as failed
+  in diagnostics, transcript, canvas/provider input, activity, and recaps.
   `output` is the complete redacted text supplied by the tool (and may be
   partial on the failure path described above). A producer that bounds the
   active display may add `output_preview_max_bytes` and
@@ -219,7 +228,7 @@ envelope `v` per `docs/contracts/persistence.md`.
   `docs/contracts/capabilities.md`). Both are ledger provenance tags rendered
   on the tool header, not fresh decisions.
   This payload is the canonical tool-result shape; provider adapters map
-  exactly this shape onto their wire formats.
+  exactly this effective shape onto their wire formats.
   Extension-backed model-tool calls/results additionally carry host-derived
   `extension_id` and `command`. A causally descended, identically attributed
   `plan.update` lets the TUI suppress the successful generic JSON result row

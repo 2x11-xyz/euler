@@ -3631,8 +3631,8 @@ fn permission_events_match_approval_mode() {
 }
 
 #[test]
-fn shell_tool_result_records_exit_code_separately_from_invocation_ok() {
-    let events = run_shell_with_mode(ApprovalMode::SessionAllow, vec![], "exit 7", "");
+fn shell_tool_result_nonzero_exit_is_a_canonical_failure() {
+    let events = run_shell_with_mode(ApprovalMode::SessionAllow, vec![], "exit 101", "");
     let result = events
         .iter()
         .find(|event| {
@@ -3650,15 +3650,66 @@ fn shell_tool_result_records_exit_code_separately_from_invocation_ok() {
             .payload
             .get("ok")
             .and_then(serde_json::Value::as_bool),
-        Some(true)
+        Some(false)
     );
     assert_eq!(
         result
             .payload
             .get("exit_code")
             .and_then(serde_json::Value::as_i64),
-        Some(7)
+        Some(101)
     );
+    assert_eq!(
+        payload_str(result, "error"),
+        Some("process exited with code 101")
+    );
+    assert_eq!(payload_str(result, "output"), Some("exit 101\n"));
+}
+
+#[test]
+fn shell_nonzero_exit_reaches_the_next_provider_as_failed_output() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![
+            vec![
+                Ok(ModelStreamEvent::ToolCall(ToolCall {
+                    id: "call-check".to_owned(),
+                    name: "run_shell".to_owned(),
+                    input: json!({"command": "exit 101"}),
+                })),
+                finished(StopReason::ToolUse),
+            ],
+            text_stream("done"),
+        ],
+        requests.clone(),
+    );
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    );
+    session.set_permission_mode(Capability::ShellExec, ApprovalMode::SessionAllow);
+
+    session.run_turn("check command").expect("turn");
+
+    let requests = request_log_guard(&requests);
+    let retry = requests.get(1).expect("request after tool result");
+    assert!(matches!(
+        retry
+            .input
+            .iter()
+            .find(|item| matches!(item, euler_provider::ModelInputItem::ToolOutput { .. })),
+        Some(euler_provider::ModelInputItem::ToolOutput {
+            ok: false,
+            exit_code: Some(101),
+            ..
+        })
+    ));
+    let prompt = retry.prompt_text();
+    assert!(prompt.contains("exit_code=101"), "{prompt}");
+    assert!(prompt.contains("[tool failed] exit 101"), "{prompt}");
 }
 
 #[test]
@@ -3702,7 +3753,7 @@ fn shell_tool_result_keeps_complete_output_with_a_bounded_preview() {
 }
 
 #[test]
-fn git_tool_result_records_exit_code_separately_from_invocation_ok() {
+fn git_tool_result_nonzero_exit_is_a_canonical_failure() {
     let temp = tempfile::tempdir().expect("temp dir");
     let provider = ScriptedProvider::new(vec![
         FixtureResponse::ToolCalls(vec![ToolCall {
@@ -3737,9 +3788,16 @@ fn git_tool_result_records_exit_code_separately_from_invocation_ok() {
             .payload
             .get("ok")
             .and_then(serde_json::Value::as_bool),
-        Some(true)
+        Some(false)
     );
-    assert!(result.payload.get("exit_code").is_some());
+    let exit_code = result
+        .payload
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .expect("git process exit code");
+    assert_ne!(exit_code, 0);
+    let expected_error = format!("process exited with code {exit_code}");
+    assert_eq!(payload_str(result, "error"), Some(expected_error.as_str()));
 }
 
 #[test]

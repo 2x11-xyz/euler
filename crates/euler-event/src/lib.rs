@@ -206,6 +206,23 @@ pub fn object(entries: impl IntoIterator<Item = (&'static str, JsonValue)>) -> J
         .collect()
 }
 
+/// Return the effective outcome of a canonical `tool.result` payload.
+///
+/// `ok` records the tool operation's outcome. An optional process exit code is
+/// additional evidence and can only narrow that outcome: a nonzero exit is a
+/// failure even in legacy events whose producer recorded `ok: true` after the
+/// executor itself returned successfully. Missing or malformed `ok` values and
+/// malformed exit codes also fail closed.
+pub fn tool_result_succeeded(payload: &JsonObject) -> bool {
+    if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    match payload.get("exit_code") {
+        None | Some(Value::Null) => true,
+        Some(exit_code) => exit_code.as_i64() == Some(0),
+    }
+}
+
 pub fn now_rfc3339_millis() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -959,5 +976,24 @@ mod tests {
                 event.kind
             );
         }
+    }
+
+    #[test]
+    fn tool_result_outcome_fails_closed_and_honors_process_exit() {
+        assert!(tool_result_succeeded(&object([("ok", true.into())])));
+        assert!(tool_result_succeeded(&object([
+            ("ok", true.into()),
+            ("exit_code", 0.into()),
+        ])));
+        assert!(!tool_result_succeeded(&object([
+            ("ok", true.into()),
+            ("exit_code", 101.into()),
+        ])));
+        assert!(!tool_result_succeeded(&object([("ok", false.into())])));
+        assert!(!tool_result_succeeded(&object([("exit_code", 0.into())])));
+        assert!(!tool_result_succeeded(&object([
+            ("ok", true.into()),
+            ("exit_code", "not-a-code".into()),
+        ])));
     }
 }

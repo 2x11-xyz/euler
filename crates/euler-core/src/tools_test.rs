@@ -1717,6 +1717,70 @@ fn tool_result_get_rehydrates_session_tool_result_by_event_id() {
 }
 
 #[test]
+fn tool_result_get_labels_legacy_nonzero_exit_as_failed() {
+    use euler_event::{object, EventEnvelope, EventKind};
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-check".into()),
+            ("name", "run_shell".into()),
+            ("ok", true.into()),
+            ("output", "cargo check output".into()),
+            ("exit_code", 101.into()),
+        ]),
+    );
+    let event_id = event.id.clone();
+    let registry = ToolRegistry::new(".");
+
+    let execution = registry
+        .execute_with_events("tool_result_get", &json!({"event_id": event_id}), &[event])
+        .expect("rehydrate failed legacy result");
+
+    assert!(execution.output.contains("[rehydrated run_shell event"));
+    assert!(
+        execution.output.contains("(failed)"),
+        "{}",
+        execution.output
+    );
+    assert!(execution.output.contains("cargo check output"));
+}
+
+#[test]
+fn tool_result_get_rehydrates_failed_process_output_before_summary_error() {
+    use euler_event::{object, EventEnvelope, EventKind};
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-check".into()),
+            ("name", "run_shell".into()),
+            ("ok", false.into()),
+            ("error", "process exited with code 101".into()),
+            ("output", "complete compiler diagnostic".into()),
+            ("exit_code", 101.into()),
+        ]),
+    );
+    let registry = ToolRegistry::new(".");
+
+    let execution = registry
+        .execute_with_events("tool_result_get", &json!({"event_id": event.id}), &[event])
+        .expect("rehydrate failed process output");
+
+    assert!(
+        execution.output.contains("(failed)"),
+        "{}",
+        execution.output
+    );
+    assert!(execution.output.contains("complete compiler diagnostic"));
+    assert!(!execution.output.contains("process exited with code 101"));
+}
+
+#[test]
 fn child_tool_result_get_enforces_and_preserves_project_context_classification() {
     use euler_event::{object, EventEnvelope, EventKind};
     let digest = "d".repeat(64);
