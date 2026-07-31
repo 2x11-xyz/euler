@@ -4652,6 +4652,37 @@ fn ordinary_errors_do_not_replace_or_terminalize_the_activity_hud() {
     }
 }
 
+#[test]
+fn child_provider_error_does_not_replace_the_primary_activity_hud() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.in_flight_label = Some(MODEL_TURN_IN_FLIGHT_LABEL.to_owned());
+    core.in_flight_cancellable = true;
+    core.activity.begin_at(Utc::now());
+
+    let mut child_error = event(
+        EventKind::ERROR,
+        object([
+            ("source", "provider".into()),
+            ("message", "child transport failed".into()),
+        ]),
+    );
+    child_error.agent = "reviewer-child".to_owned();
+    core.handle_turn_event(TurnEvent::Event(child_error));
+
+    assert_eq!(core.in_flight_error, None);
+    let hud = core
+        .live_status_line()
+        .expect("primary activity remains live");
+    assert!(hud.contains("Preparing next step"), "{hud}");
+    assert!(!hud.contains("turn failed"), "{hud}");
+}
+
 /// Issue #27: the spinner frame is a pure tick counter, advanced only by
 /// `advance_spinner` (the periodic background poll) never by reading
 /// `Instant::now()` fresh in render — so the animation is testable by

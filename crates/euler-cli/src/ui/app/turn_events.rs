@@ -421,12 +421,13 @@ impl AppCore {
             .get("source")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("error");
-        // Only provider errors terminalize a live model call here. Extension,
-        // guardian, and ordinary session errors are recoverable milestones;
+        // Only a provider error owned by the primary agent terminalizes this
+        // live model call. Child/reviewer provider failures and ordinary
+        // extension, guardian, or session errors are recoverable milestones;
         // replacing the Activity block for them would falsely claim that the
         // whole turn had failed. Cancellation has its own path above, while a
         // recovery closure is a resume boundary rather than a live turn gap.
-        if source != "provider" {
+        if source != "provider" || self.primary_agent_id.as_deref() != Some(event.agent.as_str()) {
             return;
         }
         let message = event
