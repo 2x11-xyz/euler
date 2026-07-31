@@ -32,7 +32,7 @@
 use super::digest::{skill_digest_v1, source_digest_v1};
 use super::manifest::{
     validate_skill_description, validate_skill_name, ManifestDiagnostic, ManifestSkill,
-    ManifestSource, SkillScope,
+    ManifestSource, SkillScope, SKILL_NAME_DIRECTORY_MISMATCH_REASON, USER_SKILL_IDENTITY_ROOT,
 };
 use super::{
     MAX_CHAIN_LEVELS, MAX_COMBINED_EULER_MD_BYTES, MAX_COMBINED_SKILL_BODY_BYTES, MAX_DIR_ENTRIES,
@@ -72,8 +72,8 @@ pub(crate) enum DiagnosticReason {
     /// level must never widen discovery upward across a possible nested
     /// repository boundary.
     MarkerIndeterminate,
-    /// The bounded preflight itself produced more diagnostics than the
-    /// manifest bound; the whole preflight collapsed to this single record
+    /// The bounded preflight itself exceeded an omission or advisory
+    /// diagnostic bound; the whole preflight collapsed to this single record
     /// and no source was admitted.
     DiagnosticOverflow,
     /// Defensive collapse: the preflight assembled a manifest that failed
@@ -86,7 +86,7 @@ pub(crate) enum DiagnosticReason {
     SkillCatalogLimitExceeded,
     SkillFrontmatterInvalid,
     SkillNameInvalid,
-    SkillNameMismatch,
+    SkillNameDirectoryMismatch,
     SkillDescriptionInvalid,
     SkillNameAmbiguous,
     /// Constructed only on platforms without a ratified no-follow read path.
@@ -119,7 +119,7 @@ impl DiagnosticReason {
             Self::SkillCatalogLimitExceeded => "skill_catalog_limit_exceeded",
             Self::SkillFrontmatterInvalid => "skill_frontmatter_invalid",
             Self::SkillNameInvalid => "skill_name_invalid",
-            Self::SkillNameMismatch => "skill_name_mismatch",
+            Self::SkillNameDirectoryMismatch => SKILL_NAME_DIRECTORY_MISMATCH_REASON,
             Self::SkillDescriptionInvalid => "skill_description_invalid",
             Self::SkillNameAmbiguous => "skill_name_ambiguous",
             Self::NoFollowUnsupported => "no_follow_unsupported",
@@ -134,7 +134,8 @@ pub(crate) struct DiscoveryOutcome {
     pub sources: Vec<ManifestSource>,
     /// Accepted user- and project-scope skills, sorted by normalized name.
     pub skills: Vec<ManifestSkill>,
-    /// Ordered content-free diagnostics for everything omitted.
+    /// Ordered content-free diagnostics for omissions and accepted
+    /// compatibility advisories.
     pub diagnostics: Vec<ManifestDiagnostic>,
 }
 
@@ -186,11 +187,12 @@ mod imp {
         scope: SkillScope,
         path: String,
         body: String,
+        advisory: Option<DiagnosticReason>,
     }
 
     #[derive(serde::Deserialize)]
     struct SkillFrontmatter {
-        name: String,
+        name: Option<String>,
         description: String,
         #[serde(flatten)]
         _inert: std::collections::BTreeMap<String, serde_yaml::Value>,
@@ -658,12 +660,19 @@ mod imp {
         let Some(fd) = open_absolute_dir_nofollow(root) else {
             scan.diagnostics.push(diagnostic(
                 DiagnosticReason::SymlinkRejected,
-                Some("user/skills".to_owned()),
+                Some(USER_SKILL_IDENTITY_ROOT.to_owned()),
                 None,
             ));
             return;
         };
-        scan_skills_tree(&fd, false, "user/skills", SkillScope::User, 0, scan);
+        scan_skills_tree(
+            &fd,
+            false,
+            USER_SKILL_IDENTITY_ROOT,
+            SkillScope::User,
+            0,
+            scan,
+        );
     }
 
     fn scan_project_skills_entry(
@@ -843,23 +852,32 @@ mod imp {
         };
         let parsed: SkillFrontmatter = serde_yaml::from_str(frontmatter)
             .map_err(|_| DiagnosticReason::SkillFrontmatterInvalid)?;
-        validate_skill_name(&parsed.name).map_err(|_| DiagnosticReason::SkillNameInvalid)?;
         validate_skill_description(&parsed.description)
             .map_err(|_| DiagnosticReason::SkillDescriptionInvalid)?;
         let basename = directory_identity.rsplit('/').next().unwrap_or("");
-        if basename != parsed.name {
-            return Err(DiagnosticReason::SkillNameMismatch);
-        }
+        let (name, advisory) = match parsed.name {
+            Some(name) => {
+                validate_skill_name(&name).map_err(|_| DiagnosticReason::SkillNameInvalid)?;
+                let advisory =
+                    (basename != name).then_some(DiagnosticReason::SkillNameDirectoryMismatch);
+                (name, advisory)
+            }
+            None => {
+                validate_skill_name(basename).map_err(|_| DiagnosticReason::SkillNameInvalid)?;
+                (basename.to_owned(), None)
+            }
+        };
         let body = redactor.redact(body);
         if body.len() > super::super::MAX_SKILL_BODY_BYTES {
             return Err(DiagnosticReason::SourceTooLarge);
         }
         Ok(SkillCandidate {
-            name: parsed.name,
+            name,
             description: redactor.redact(&parsed.description),
             scope,
             path: join_rel(directory_identity, SKILL_FILE_NAME),
             body,
+            advisory,
         })
     }
 
@@ -934,6 +952,9 @@ mod imp {
                 admitted.push(skill);
                 if super::super::framing::skill_catalog_fits(&admitted) {
                     combined += candidate.body.len();
+                    if let Some(reason) = candidate.advisory {
+                        diagnostics.push(diagnostic(reason, Some(candidate.path.clone()), None));
+                    }
                 } else {
                     admitted.pop();
                     diagnostics.push(diagnostic(

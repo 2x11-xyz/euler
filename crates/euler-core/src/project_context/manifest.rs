@@ -9,8 +9,9 @@
 use super::digest::source_digest_v1;
 use super::{
     MAX_COMBINED_EULER_MD_BYTES, MAX_COMBINED_SKILL_BODY_BYTES, MAX_EULER_MD_BYTES,
-    MAX_EULER_MD_SOURCES, MAX_IDENTITY_BYTES, MAX_MANIFEST_DIAGNOSTICS, MAX_SKILLS,
-    MAX_SKILL_BODY_BYTES, MAX_SKILL_DESCRIPTION_BYTES, MAX_SKILL_NAME_BYTES,
+    MAX_EULER_MD_SOURCES, MAX_IDENTITY_BYTES, MAX_MANIFEST_ADVISORY_DIAGNOSTICS,
+    MAX_MANIFEST_OMISSION_DIAGNOSTICS, MAX_SKILLS, MAX_SKILL_BODY_BYTES,
+    MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_NAME_BYTES,
 };
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,8 @@ use std::fmt;
 
 pub(crate) const LEGACY_MANIFEST_VERSION: u32 = 1;
 pub(crate) const MANIFEST_VERSION: u32 = 2;
+pub(crate) const USER_SKILL_IDENTITY_ROOT: &str = "user/skills";
+pub(crate) const SKILL_NAME_DIRECTORY_MISMATCH_REASON: &str = "skill_name_directory_mismatch";
 
 /// One accepted `EULER.md` source: normalized project-root-relative identity
 /// plus the frozen post-redaction content and its domain-separated digest.
@@ -75,6 +78,40 @@ pub(crate) struct ManifestDiagnostic {
     pub observed: Option<u64>,
 }
 
+impl ManifestDiagnostic {
+    /// Accepted compatibility diagnostics are a closed, contract-bound subset
+    /// of reason codes. Every other diagnostic records an omission.
+    pub(crate) fn is_advisory(&self) -> bool {
+        self.reason == SKILL_NAME_DIRECTORY_MISMATCH_REASON
+    }
+
+    /// User-global skill diagnostics do not participate in repository
+    /// acknowledgment or its disclosure card.
+    pub(crate) fn applies_to_project(&self) -> bool {
+        self.path
+            .as_deref()
+            .is_none_or(|path| !is_user_skill_identity(path))
+    }
+}
+
+fn is_user_skill_identity(path: &str) -> bool {
+    path.strip_prefix(USER_SKILL_IDENTITY_ROOT)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+}
+
+/// Keep omission and accepted-advisory pressure independent. The advisory
+/// limit follows the maximum admitted skill count because each current
+/// advisory names exactly one catalog-admitted skill.
+pub(crate) fn diagnostics_within_bounds(diagnostics: &[ManifestDiagnostic]) -> bool {
+    let advisory_count = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.is_advisory())
+        .count();
+    let omission_count = diagnostics.len() - advisory_count;
+    omission_count <= MAX_MANIFEST_OMISSION_DIAGNOSTICS
+        && advisory_count <= MAX_MANIFEST_ADVISORY_DIAGNOSTICS
+}
+
 /// The complete bounded preflight result. Field order is the canonical
 /// encoding order; do not reorder fields.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -102,12 +139,7 @@ impl CandidateManifest {
             diagnostics: self
                 .diagnostics
                 .iter()
-                .filter(|record| {
-                    record
-                        .path
-                        .as_deref()
-                        .is_none_or(|path| path != "user" && !path.starts_with("user/"))
-                })
+                .filter(|record| record.applies_to_project())
                 .cloned()
                 .collect(),
             reason_counts: BTreeMap::new(),
@@ -292,9 +324,9 @@ impl CandidateManifest {
     }
 
     fn validate_diagnostics(&self) -> Result<(), ManifestError> {
-        if self.diagnostics.len() > MAX_MANIFEST_DIAGNOSTICS {
+        if !diagnostics_within_bounds(&self.diagnostics) {
             return Err(ManifestError(format!(
-                "manifest lists {} diagnostics; the limit is {MAX_MANIFEST_DIAGNOSTICS}",
+                "manifest lists diagnostics beyond the omission or advisory bound: {} total",
                 self.diagnostics.len()
             )));
         }
@@ -347,7 +379,7 @@ pub(crate) fn validate_skill_name(name: &str) -> Result<(), ManifestError> {
 
 pub(crate) fn validate_skill_description(description: &str) -> Result<(), ManifestError> {
     let valid = !description.trim().is_empty()
-        && description.len() <= MAX_SKILL_DESCRIPTION_BYTES
+        && description.chars().count() <= MAX_SKILL_DESCRIPTION_CHARS
         && !description
             .chars()
             .any(|character| character.is_control() && !matches!(character, '\n' | '\r' | '\t'));
@@ -527,6 +559,65 @@ mod tests {
         let decoded = CandidateManifest::from_canonical_json(&json).expect("round trip");
         assert_eq!(decoded, manifest);
         assert_eq!(decoded.to_canonical_json(), json);
+    }
+
+    #[test]
+    fn advisory_classification_does_not_reinterpret_the_legacy_mismatch_reason() {
+        let legacy_omission = ManifestDiagnostic {
+            reason: "skill_name_mismatch".to_owned(),
+            path: Some("user/skills/shared-folder/SKILL.md".to_owned()),
+            observed: None,
+        };
+        let accepted_advisory = ManifestDiagnostic {
+            reason: SKILL_NAME_DIRECTORY_MISMATCH_REASON.to_owned(),
+            path: Some("user/skills/shared-folder/SKILL.md".to_owned()),
+            observed: None,
+        };
+
+        let mut persisted = manifest();
+        persisted.diagnostics = vec![legacy_omission];
+        persisted.derive_reason_counts();
+        let decoded = CandidateManifest::from_canonical_json(&persisted.to_canonical_json())
+            .expect("legacy omission round trip");
+
+        assert!(!decoded.diagnostics[0].is_advisory());
+        assert!(accepted_advisory.is_advisory());
+    }
+
+    #[test]
+    fn advisory_diagnostic_budget_has_its_own_fail_closed_bound() {
+        let advisory = ManifestDiagnostic {
+            reason: SKILL_NAME_DIRECTORY_MISMATCH_REASON.to_owned(),
+            path: Some(".euler/skills/shared-folder/SKILL.md".to_owned()),
+            observed: None,
+        };
+
+        assert!(diagnostics_within_bounds(&vec![
+            advisory.clone();
+            MAX_MANIFEST_ADVISORY_DIAGNOSTICS
+        ]));
+        assert!(!diagnostics_within_bounds(&vec![
+            advisory;
+            MAX_MANIFEST_ADVISORY_DIAGNOSTICS
+                + 1
+        ]));
+    }
+
+    #[test]
+    fn project_filter_uses_the_owned_user_skill_namespace_only() {
+        let user_skill = ManifestDiagnostic {
+            reason: "skill_name_invalid".to_owned(),
+            path: Some("user/skills/broken/SKILL.md".to_owned()),
+            observed: None,
+        };
+        let project_source = ManifestDiagnostic {
+            reason: "source_too_large".to_owned(),
+            path: Some("user/EULER.md".to_owned()),
+            observed: None,
+        };
+
+        assert!(!user_skill.applies_to_project());
+        assert!(project_source.applies_to_project());
     }
 
     #[test]

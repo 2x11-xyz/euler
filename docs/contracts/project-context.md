@@ -100,6 +100,13 @@ Catalog selection measures the exact core-rendered catalog entry, including
 scope and source identity. Every admitted skill appears in the rendered
 catalog; a skill that would cross the catalog bound is omitted whole with
 `skill_catalog_limit_exceeded`, never accepted and then silently hidden.
+Diagnostics normally record an omission. `skill_name_directory_mismatch` is
+the one non-fatal compatibility advisory: it is emitted only after that skill
+is admitted, so warning counts never describe an omitted skill as loaded.
+Omissions and accepted advisories have independent bounded budgets, so a
+warning can never crowd an omission out of provenance.
+The normalized diagnostic identity namespace reserves `user/skills` for the
+user-global skills root. It is not the user's absolute filesystem path.
 
 ## Preflight and redaction
 
@@ -234,12 +241,12 @@ per-project trust store.
   policy, resolution reason, acknowledgment basis, candidate digest, source
   and diagnostic counts) must agree exactly with the snapshot it announces;
   any mismatch fails the bootstrap shape.
-- `project.context.diagnostic` events record omissions without embedding
-  unsafe content. Their payload is limited to a stable reason code, bounded
-  normalized relative identity when one exists, and non-content numeric
-  metadata such as an offset or observed count. It contains no excerpts, raw
-  parser errors, outside-workspace paths, or exception strings derived from a
-  candidate.
+- `project.context.diagnostic` events record omissions and accepted
+  compatibility advisories without embedding unsafe content. Their payload is
+  limited to a stable reason code, bounded normalized relative identity when
+  one exists, and non-content numeric metadata such as an offset or observed
+  count. It contains no excerpts, raw parser errors, outside-workspace paths,
+  or exception strings derived from a candidate.
 - The durable bootstrap order is exactly `session.start`, one
   `project.context.snapshot`, then the snapshot's declared number of
   `project.context.diagnostic` events. `session.start` records that a snapshot
@@ -455,12 +462,17 @@ truncated or demoted to make either equation pass.
 
 ## Skills
 
-- Grammar: `name` is 1-64 ASCII lowercase letters, digits, and hyphens (no
-  leading/trailing/consecutive hyphens); parent directory basename must equal
-  `name`; `description` is non-empty, at most 1024 UTF-8 bytes; frontmatter
-  must parse; body is bounded UTF-8. Known cross-agent fields (`license`,
-  `compatibility`, `metadata`, `allowed-tools`) are accepted but inert;
-  unknown fields are inert.
+- Grammar: the effective `name` is 1-64 ASCII lowercase letters, digits, and
+  hyphens (no leading, trailing, or consecutive hyphens). A missing or YAML
+  null `name` is derived from the exact parent directory basename, which must
+  satisfy that grammar. A present valid name is authoritative even when it
+  differs from the basename; Euler admits it with
+  `skill_name_directory_mismatch`, while authors should keep the two equal for
+  portability. An invalid present name never falls back to the directory.
+  `description` is non-empty and at most 1024 Unicode scalar values after YAML
+  decoding; frontmatter must parse; body is bounded UTF-8.
+  Known cross-agent fields (`license`, `compatibility`, `metadata`,
+  `allowed-tools`) are accepted but inert; unknown fields are inert.
 - Duplicate normalized names exclude every claimant with an ambiguity
   diagnostic naming their paths; no first-wins or nearest-wins.
 - `skill_read` accepts an exact catalogued name (never a path and with no

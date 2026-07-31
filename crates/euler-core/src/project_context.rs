@@ -54,11 +54,15 @@ pub const MAX_CHAIN_LEVELS: usize = 32;
 pub const MAX_EULER_MD_SOURCES: usize = 16;
 pub const MAX_EULER_MD_BYTES: usize = 32 * 1024;
 pub const MAX_COMBINED_EULER_MD_BYTES: usize = 64 * 1024;
-/// Implementation bound keeping recorded identities and diagnostic lists
+/// Implementation bounds keeping recorded identities and diagnostic lists
 /// bounded (the contract requires "bounded normalized identities" without
-/// freezing a number).
+/// freezing a number). Omission and advisory budgets stay independent so an
+/// accepted warning can never crowd an omission out of provenance.
 pub(crate) const MAX_IDENTITY_BYTES: usize = 1024;
-pub(crate) const MAX_MANIFEST_DIAGNOSTICS: usize = 512;
+pub(crate) const MAX_MANIFEST_OMISSION_DIAGNOSTICS: usize = 512;
+pub(crate) const MAX_MANIFEST_ADVISORY_DIAGNOSTICS: usize = MAX_SKILLS;
+pub(crate) const MAX_MANIFEST_DIAGNOSTICS: usize =
+    MAX_MANIFEST_OMISSION_DIAGNOSTICS + MAX_MANIFEST_ADVISORY_DIAGNOSTICS;
 /// Frozen contract bound: directory entries examined per directory level.
 /// A level whose listing exceeds this is omitted whole with a typed
 /// diagnostic — deterministic selection over a truncated listing is
@@ -72,7 +76,7 @@ pub const MAX_SKILL_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_COMBINED_SKILL_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_SKILL_CATALOG_BYTES: usize = 16 * 1024;
 pub const MAX_SKILL_NAME_BYTES: usize = 64;
-pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 1024;
+pub const MAX_SKILL_DESCRIPTION_CHARS: usize = 1024;
 
 /// Version of the `project.context.snapshot` / `project.context.diagnostic`
 /// payload schemas.
@@ -227,10 +231,24 @@ impl PendingAcknowledgment {
         &self.preflight.source_identities
     }
 
-    /// How many files were discovered but skipped (the diagnostic count). The
-    /// card shows this only when non-zero.
+    /// How many repository-context candidates were omitted. Accepted
+    /// compatibility advisories are counted separately.
     pub fn skipped_count(&self) -> usize {
-        self.preflight.diagnostics.len()
+        self.preflight
+            .diagnostics
+            .iter()
+            .filter(|record| record.applies_to_project() && !record.is_advisory())
+            .count()
+    }
+
+    /// How many admitted project skills carry a non-fatal compatibility
+    /// advisory. Each current advisory names one admitted skill.
+    pub fn compatibility_warning_count(&self) -> usize {
+        self.preflight
+            .diagnostics
+            .iter()
+            .filter(|record| record.applies_to_project() && record.is_advisory())
+            .count()
     }
 
     pub fn skill_count(&self) -> usize {
@@ -890,8 +908,8 @@ impl ProjectContextBootstrap {
             .unwrap_or_default()
     }
 
-    /// One `project.context.diagnostic` payload per omission, in order, each
-    /// citing the snapshot event.
+    /// One `project.context.diagnostic` payload per omission or accepted
+    /// compatibility advisory, in order, each citing the snapshot event.
     pub(crate) fn diagnostic_payloads(&self, snapshot_event_id: &str) -> Vec<JsonObject> {
         self.diagnostics
             .iter()
@@ -914,14 +932,14 @@ impl ProjectContextBootstrap {
 }
 
 /// Turn a raw discovery outcome into a manifest that always satisfies its
-/// own validation. A preflight whose diagnostics exceed the manifest bound
-/// (or that fails validation for any other reason) collapses to a single
-/// typed diagnostic with nothing admitted; the collapse is itself part of
-/// the digested manifest, so it changes the candidate digest honestly. A
-/// preflight problem must never yield a bootstrap-less (legacy-shaped)
-/// fresh session.
+/// own validation. A preflight whose omission or advisory diagnostics exceed
+/// their independent manifest bounds (or that fails validation for any other
+/// reason) collapses to a single typed diagnostic with nothing admitted; the
+/// collapse is itself part of the digested manifest, so it changes the
+/// candidate digest honestly. A preflight problem must never yield a
+/// bootstrap-less (legacy-shaped) fresh session.
 fn sanitize_preflight(outcome: discovery::DiscoveryOutcome) -> (CandidateManifest, bool) {
-    let overflow = outcome.diagnostics.len() > MAX_MANIFEST_DIAGNOSTICS;
+    let overflow = !manifest::diagnostics_within_bounds(&outcome.diagnostics);
     if overflow {
         return (
             collapsed_manifest(discovery::diagnostic(

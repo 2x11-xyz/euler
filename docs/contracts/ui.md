@@ -499,6 +499,12 @@ acknowledgment card, Cancel for the relocation card). Because this system has no
 horizontal button row, the choices are a stacked single-key list, exactly like
 the permission panels.
 
+The acknowledgment card distinguishes candidates that were omitted from
+skills that were admitted with a compatibility advisory. It never describes
+an admitted skill as skipped. `skill_name_directory_mismatch` warnings are
+counted only after final catalog admission and render separately from the
+skipped count.
+
 The relocation card's content is facts only, never a guessed reason for the
 change: the recorded workspace path, the current workspace path, and when the
 session was last active, followed by a plain-language statement that resuming
