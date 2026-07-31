@@ -2,7 +2,7 @@
 
 use crate::ui::status::short_session_id;
 use euler_event::{EventEnvelope, EventKind};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnRecap {
@@ -11,6 +11,103 @@ pub struct TurnRecap {
     pub removed: usize,
     pub paths: Vec<String>,
     pub test_status: Option<TestStatus>,
+}
+
+/// Incremental turn facts shared by the end-of-turn recap and the live
+/// activity projection. Keeping this fold in one place prevents the HUD from
+/// disagreeing with the durable recap about changed files or check outcomes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct TurnRecapAccumulator {
+    latest_files: BTreeMap<String, (usize, usize)>,
+    shell_commands: HashMap<String, String>,
+    test_status: Option<TestStatus>,
+}
+
+impl TurnRecapAccumulator {
+    pub(super) fn observe(&mut self, event: &EventEnvelope) {
+        match event.kind.as_str() {
+            EventKind::FILE_DIFF => {
+                let path = payload_str(event, "path").unwrap_or("");
+                if path.is_empty() {
+                    return;
+                }
+                let (added, removed) = event
+                    .payload
+                    .get("diff")
+                    .and_then(|value| value.as_str())
+                    .map(count_diff_lines)
+                    .unwrap_or((0, 0));
+                self.latest_files
+                    .insert(path.to_owned(), (added, removed));
+            }
+            EventKind::FILE_CHANGE => {
+                let path = payload_str(event, "path").unwrap_or("");
+                if !path.is_empty() {
+                    self.latest_files.entry(path.to_owned()).or_insert((0, 0));
+                }
+            }
+            EventKind::TOOL_CALL if payload_str(event, "name") == Some("run_shell") => {
+                let id = payload_str(event, "id").unwrap_or("");
+                let command = event
+                    .payload
+                    .get("input")
+                    .and_then(|value| value.get("command"))
+                    .and_then(|value| value.as_str());
+                if !id.is_empty() {
+                    if let Some(command) = command {
+                        self.shell_commands.insert(id.to_owned(), command.to_owned());
+                    }
+                }
+            }
+            EventKind::TOOL_RESULT if payload_str(event, "name") == Some("run_shell") => {
+                let id = payload_str(event, "id").unwrap_or("");
+                let command = self
+                    .shell_commands
+                    .get(id)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let output = payload_str(event, "output").unwrap_or("");
+                if !looks_test_like(command, output) {
+                    return;
+                }
+
+                let exit_code = shell_exit_code(event);
+                self.test_status = Some(if exit_code.is_some_and(|code| code != 0) {
+                    // Legacy logs can say `ok: true` even when the command
+                    // failed. A present nonzero process exit is authoritative.
+                    TestStatus::Fail
+                } else if let Some(status) = parse_test_summary(output) {
+                    status
+                } else {
+                    match exit_code {
+                        Some(0) if effective_tool_result_ok(event) => TestStatus::Pass,
+                        Some(0) => TestStatus::Fail,
+                        Some(_) => TestStatus::Fail,
+                        None => TestStatus::Unknown,
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn recap(&self) -> TurnRecap {
+        let mut added = 0usize;
+        let mut removed = 0usize;
+        let mut paths = Vec::with_capacity(self.latest_files.len());
+        for (path, (path_added, path_removed)) in &self.latest_files {
+            added += path_added;
+            removed += path_removed;
+            paths.push(path.clone());
+        }
+        TurnRecap {
+            file_count: paths.len(),
+            added,
+            removed,
+            paths,
+            test_status: self.test_status,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,54 +160,20 @@ impl TurnRecap {
 }
 
 pub fn turn_recap_from_events(events: &[EventEnvelope], start: usize) -> TurnRecap {
-    let slice = events.get(start..).unwrap_or(&[]);
-    let (paths, added, removed) = aggregate_turn_files(slice);
-    let test_status = detect_test_status(slice);
-    TurnRecap {
-        file_count: paths.len(),
-        added,
-        removed,
-        paths,
-        test_status,
+    let mut accumulator = TurnRecapAccumulator::default();
+    for event in events.get(start..).unwrap_or(&[]) {
+        accumulator.observe(event);
     }
+    accumulator.recap()
 }
 
 fn aggregate_turn_files(events: &[EventEnvelope]) -> (Vec<String>, usize, usize) {
-    let mut latest: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut accumulator = TurnRecapAccumulator::default();
     for event in events {
-        match event.kind.as_str() {
-            EventKind::FILE_DIFF => {
-                let path = payload_str(event, "path").unwrap_or("");
-                if path.is_empty() {
-                    continue;
-                }
-                let (added, removed) = event
-                    .payload
-                    .get("diff")
-                    .and_then(|v| v.as_str())
-                    .map(count_diff_lines)
-                    .unwrap_or((0, 0));
-                latest.insert(path.to_owned(), (added, removed));
-            }
-            EventKind::FILE_CHANGE => {
-                let path = payload_str(event, "path").unwrap_or("");
-                if path.is_empty() {
-                    continue;
-                }
-                latest.entry(path.to_owned()).or_insert((0, 0));
-            }
-            _ => {}
-        }
+        accumulator.observe(event);
     }
-    let mut added = 0usize;
-    let mut removed = 0usize;
-    let mut paths = Vec::with_capacity(latest.len());
-    for (path, (a, r)) in latest {
-        added += a;
-        removed += r;
-        paths.push(path);
-    }
-    (paths, added, removed)
+    let recap = accumulator.recap();
+    (recap.paths, recap.added, recap.removed)
 }
 
 fn count_diff_lines(diff: &str) -> (usize, usize) {
@@ -127,58 +190,30 @@ fn count_diff_lines(diff: &str) -> (usize, usize) {
 }
 
 pub fn detect_test_status(events: &[EventEnvelope]) -> Option<TestStatus> {
-    let mut last: Option<TestStatus> = None;
-    let mut call_commands = std::collections::HashMap::<String, String>::new();
+    let mut accumulator = TurnRecapAccumulator::default();
     for event in events {
-        match event.kind.as_str() {
-            EventKind::TOOL_CALL => {
-                if payload_str(event, "name") != Some("run_shell") {
-                    continue;
-                }
-                let id = payload_str(event, "id").unwrap_or("").to_owned();
-                if id.is_empty() {
-                    continue;
-                }
-                if let Some(command) = event
-                    .payload
-                    .get("input")
-                    .and_then(|v| v.get("command"))
-                    .and_then(|v| v.as_str())
-                {
-                    call_commands.insert(id, command.to_owned());
-                }
-            }
-            EventKind::TOOL_RESULT => {
-                if payload_str(event, "name") != Some("run_shell") {
-                    continue;
-                }
-                let id = payload_str(event, "id").unwrap_or("");
-                let command = call_commands.get(id).map(String::as_str).unwrap_or("");
-                let output = payload_str(event, "output").unwrap_or("");
-                if !looks_test_like(command, output) {
-                    continue;
-                }
-                if let Some(status) = parse_test_summary(output) {
-                    last = Some(status);
-                } else {
-                    // `ok` on a run_shell result only reflects whether the
-                    // shell itself executed successfully — a test command
-                    // can run fine and still report failing tests via a
-                    // nonzero exit code. Classify off the exit code, not
-                    // `ok`, and fall back to Unknown (never a silent Pass)
-                    // when the exit code isn't available.
-                    let exit_code = event.payload.get("exit_code").and_then(|v| v.as_i64());
-                    last = Some(match exit_code {
-                        Some(0) => TestStatus::Pass,
-                        Some(_) => TestStatus::Fail,
-                        None => TestStatus::Unknown,
-                    });
-                }
-            }
-            _ => {}
-        }
+        accumulator.observe(event);
     }
-    last
+    accumulator.recap().test_status
+}
+
+/// Effective command/tool success for live UI compatibility. In legacy
+/// events `ok` described executor transport success, so a present nonzero
+/// process exit always overrides it.
+pub(super) fn effective_tool_result_ok(event: &EventEnvelope) -> bool {
+    let ok = event
+        .payload
+        .get("ok")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    ok && shell_exit_code(event).is_none_or(|code| code == 0)
+}
+
+pub(super) fn shell_exit_code(event: &EventEnvelope) -> Option<i64> {
+    event
+        .payload
+        .get("exit_code")
+        .and_then(|value| value.as_i64())
 }
 
 fn looks_test_like(command: &str, output: &str) -> bool {
