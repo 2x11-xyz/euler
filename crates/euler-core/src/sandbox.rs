@@ -371,6 +371,13 @@ impl WorkspaceSandbox {
             .get_or_init(|| self.probe_current_profile())
     }
 
+    /// Return a previously established result without starting the potentially
+    /// expensive complete authority probe. Construction-time failures are
+    /// already cached; a valid profile remains unknown until first use.
+    pub(crate) fn cached_availability(&self) -> Option<SandboxAvailability> {
+        self.availability.get().copied()
+    }
+
     fn probe_current_profile(&self) -> SandboxAvailability {
         let read_only_surfaces =
             match freeze_read_only_workspace_surfaces_for_roots(&self.writable_roots) {
@@ -492,7 +499,6 @@ const RUNTIME_MOUNTS: &[&str] = &[
     "/usr/lib",
     "/usr/lib64",
     "/usr/libexec",
-    "/usr/share",
     "/bin",
     "/lib",
     "/lib64",
@@ -2311,6 +2317,9 @@ mod tests {
         assert!(!arguments
             .windows(3)
             .any(|triple| triple == ["--ro-bind", "/usr", "/usr"]));
+        assert!(!arguments
+            .windows(3)
+            .any(|triple| triple == ["--ro-bind", "/usr/share", "/usr/share"]));
         assert!(!arguments.windows(3).any(|triple| {
             triple[0] == "--ro-bind"
                 && (triple[1] == "/usr/local"

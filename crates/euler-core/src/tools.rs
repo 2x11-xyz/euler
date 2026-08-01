@@ -419,6 +419,15 @@ impl ToolRegistry {
             .map(WorkspaceSandbox::availability)
     }
 
+    /// A cached enforcement result, if the configured profile has already
+    /// failed construction or completed its first-use probe. This never starts
+    /// an authority scan.
+    pub(crate) fn cached_sandbox_availability(&self) -> Option<SandboxAvailability> {
+        self.workspace_sandbox
+            .as_ref()
+            .and_then(WorkspaceSandbox::cached_availability)
+    }
+
     pub fn required_capability(&self, name: &str) -> Option<Capability> {
         match name {
             "read_file" | "tool_result_get" => Some(Capability::FsRead),

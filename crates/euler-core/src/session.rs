@@ -1074,6 +1074,12 @@ impl<D> Session<D> {
         self.tools.sandbox_availability()
     }
 
+    /// Return the profile's cached enforcement result without performing the
+    /// complete first-use authority probe.
+    pub fn cached_sandbox_availability(&self) -> Option<crate::SandboxAvailability> {
+        self.tools.cached_sandbox_availability()
+    }
+
     /// Build the fresh session `/new` composes, with the bootstrap obtained
     /// from [`Session::prepare_fresh_project_context`]. Every fresh session
     /// gets its own immutable snapshot: the previous session's bootstrap (or

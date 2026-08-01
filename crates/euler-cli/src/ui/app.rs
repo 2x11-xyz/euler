@@ -915,15 +915,17 @@ fn workspace_authority_status(session: &Session<TuiDecider>) -> (String, bool) {
         euler_core::SubprocessSandbox::Disabled => {
             ("disabled · subprocesses blocked".to_owned(), false)
         }
-        euler_core::SubprocessSandbox::Enforce(profile) => match session.sandbox_availability() {
-            Some(euler_core::SandboxAvailability::Enforced(_)) => {
-                (format!("enforced · {}", profile.as_str()), true)
+        euler_core::SubprocessSandbox::Enforce(profile) => {
+            match session.cached_sandbox_availability() {
+                Some(euler_core::SandboxAvailability::Enforced(_)) => {
+                    (format!("enforced · {}", profile.as_str()), true)
+                }
+                Some(euler_core::SandboxAvailability::Unavailable(reason)) => {
+                    (format!("unavailable · {}", reason.message()), false)
+                }
+                None => (format!("configured · {}", profile.as_str()), false),
             }
-            Some(euler_core::SandboxAvailability::Unavailable(reason)) => {
-                (format!("unavailable · {}", reason.message()), false)
-            }
-            None => ("unavailable · subprocesses blocked".to_owned(), false),
-        },
+        }
     }
 }
 

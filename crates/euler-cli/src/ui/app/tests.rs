@@ -96,8 +96,24 @@ fn unsafe_workspace_node_is_shown_as_requested_not_enforced_authority() {
     let core = AppCore::new(session, channels);
 
     assert!(!core.status.workspace_authority_enforced);
-    assert!(core.status.workspace_authority.starts_with("unavailable ·"));
+    assert_eq!(
+        core.status.workspace_authority,
+        "configured · workspace-no-network"
+    );
     assert_eq!(core.status.writable_roots, vec![temp.path().to_path_buf()]);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("new app is idle");
+    };
+    assert_eq!(
+        session.sandbox_availability(),
+        Some(euler_core::SandboxAvailability::Unavailable(
+            euler_core::SandboxUnavailableReason::UnsafeSpecialNode
+        ))
+    );
+    assert!(workspace_authority_status(session)
+        .0
+        .starts_with("unavailable ·"));
 }
 
 /// Fluent builder for the tests' `AppCore`. Replaces the former six positional

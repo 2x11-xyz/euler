@@ -49,10 +49,10 @@ invariants:
 - the root-level `.worktrees` collection, when present, overlaid read-only so
   sibling checkouts are not implicitly writable or recursively observed;
 - a small read-only system runtime allowlist (`/usr/bin`, `/usr/include`,
-  `/usr/lib`, `/usr/lib64`, `/usr/libexec`, `/usr/share`, `/bin`, `/lib`, and
-  `/lib64`) plus up to eight explicit canonical, non-overlapping
-  `--runtime-root` directories; `/usr/local` and other host-installed
-  toolchains remain explicit runtime authority;
+  `/usr/lib`, `/usr/lib64`, `/usr/libexec`, `/bin`, `/lib`, and `/lib64`) plus
+  up to eight explicit canonical, non-overlapping `--runtime-root`
+  directories; host data trees such as `/usr/share`, `/usr/local`, and other
+  host-installed toolchains remain explicit runtime authority;
 - private `/tmp`, `/proc`, `/dev`, home, and cache mounts;
 - a cleared minimal environment and no implicit host home, Euler home, package
   cache, Git config, credential store, SSH key, or provider secret;
@@ -109,7 +109,9 @@ launch, after the writable-root pre-snapshot. The aggregate walk is capped at
 permission to run. An unavailable `openat2` or mount-table inspection also
 fails closed. Construction freezes identities and topology without walking
 contents, so ordinary startup remains independent of workspace and runtime
-tree size while every subprocess still receives both inspections.
+tree size. The UI reports a valid but unprobed profile as configured, without
+forcing that walk during startup; first subprocess use establishes the cached
+enforcement result. Every subprocess still receives both inspections.
 
 The backend probes the complete requested profile and every writable root,
 rather than merely locating `bwrap`. An unsupported platform, missing launcher,
