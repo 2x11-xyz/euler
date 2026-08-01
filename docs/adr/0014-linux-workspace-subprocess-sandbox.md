@@ -48,9 +48,11 @@ invariants:
   non-overlapping attached roots as the only writable host directory mounts;
 - the root-level `.worktrees` collection, when present, overlaid read-only so
   sibling checkouts are not implicitly writable or recursively observed;
-- a small read-only system runtime allowlist (`/usr`, `/bin`, `/lib`,
+- a small read-only system runtime allowlist (`/usr/bin`, `/usr/include`,
+  `/usr/lib`, `/usr/lib64`, `/usr/libexec`, `/usr/share`, `/bin`, `/lib`, and
   `/lib64`) plus up to eight explicit canonical, non-overlapping
-  `--runtime-root` directories;
+  `--runtime-root` directories; `/usr/local` and other host-installed
+  toolchains remain explicit runtime authority;
 - private `/tmp`, `/proc`, `/dev`, home, and cache mounts;
 - a cleared minimal environment and no implicit host home, Euler home, package
   cache, Git config, credential store, SSH key, or provider secret;
@@ -76,9 +78,12 @@ post-fork descriptor table. The profile/readiness probe fails closed if a
 launcher version does not preserve that path.
 
 Canonical root paths, directory device/inode identities, and kernel mount IDs
-are frozen with the profile. Every later launch requires the same real
-directories and mount identities; path, directory, or mount replacement makes
-the boundary unavailable instead of redefining its authority.
+are frozen with the profile. This identity and topology check is bounded and
+does not recursively walk directory contents, so constructing the session tool
+registry is not proportional to the size of the workspace or host image.
+Every later profile probe and launch requires the same real directories and
+mount identities; path, directory, or mount replacement makes the boundary
+unavailable instead of redefining its authority.
 
 Read-only bind mounts do not neutralize Unix sockets, FIFOs, or device nodes:
 those nodes can convey host IPC or device authority without a normal file
@@ -97,12 +102,14 @@ same-device bind mounts; it does not infer mount identity from path spelling or
 `st_dev`.
 
 Euler also walks those sources without following symlinks. It rejects all
-special nodes and blocks when the bounded walk is incomplete. Mount validation
-and the walk occur while constructing the profile and again immediately before
-each subprocess launch, after the writable-root pre-snapshot. The aggregate
-walk is capped at 1,000,000 entries; reaching the cap is an unavailable
-boundary, never permission to run. An unavailable `openat2` or mount-table
-inspection also fails closed.
+special nodes and blocks when the bounded walk is incomplete. The walk occurs
+during the cached profile probe and again immediately before each subprocess
+launch, after the writable-root pre-snapshot. The aggregate walk is capped at
+1,000,000 entries; reaching the cap is an unavailable boundary, never
+permission to run. An unavailable `openat2` or mount-table inspection also
+fails closed. Construction freezes identities and topology without walking
+contents, so ordinary startup remains independent of workspace and runtime
+tree size while every subprocess still receives both inspections.
 
 The backend probes the complete requested profile and every writable root,
 rather than merely locating `bwrap`. An unsupported platform, missing launcher,

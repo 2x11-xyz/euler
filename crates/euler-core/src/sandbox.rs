@@ -132,10 +132,12 @@ impl SandboxAvailability {
     }
 }
 
-/// A workspace-specific profile whose host roots are inspected at construction
-/// and whose complete Bubblewrap probe is cached on first use. It retains that
-/// stable availability result so callers can fail closed without copying raw
-/// launcher diagnostics into tool output or provenance.
+/// A workspace-specific profile whose host-root identities are frozen at
+/// construction and whose complete Bubblewrap probe is cached on first use.
+/// All bind sources are walked during that probe and again at the final launch
+/// boundary. It retains that stable availability result so
+/// callers can fail closed without copying raw launcher diagnostics into tool
+/// output or provenance.
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceSandbox {
     writable_roots: Vec<PathBuf>,
@@ -320,16 +322,13 @@ impl WorkspaceSandbox {
                 SandboxUnavailableReason::AuthorityInspectionFailed,
             );
         };
-        let authority_mounts = match inspect_authority_roots(
-            &writable_roots,
-            &runtime_roots,
-            &system_runtime_mounts,
-        ) {
-            Ok(mounts) => mounts,
-            Err(reason) => {
-                return Self::unavailable(profile, writable_roots, runtime_roots, reason);
-            }
-        };
+        let authority_mounts =
+            match freeze_authority_roots(&writable_roots, &runtime_roots, &system_runtime_mounts) {
+                Ok(mounts) => mounts,
+                Err(reason) => {
+                    return Self::unavailable(profile, writable_roots, runtime_roots, reason);
+                }
+            };
         let Some(bwrap) = bwrap_path() else {
             return Self::unavailable(
                 profile,
@@ -487,7 +486,17 @@ const SANDBOX_HOME: &str = "/tmp/home";
 const SANDBOX_CACHE: &str = "/tmp/cache";
 const PRIVATE_SANDBOX_MOUNT_TARGETS: &[&str] =
     &["/tmp", "/proc", "/dev", SANDBOX_HOME, SANDBOX_CACHE];
-const RUNTIME_MOUNTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
+const RUNTIME_MOUNTS: &[&str] = &[
+    "/usr/bin",
+    "/usr/include",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/libexec",
+    "/usr/share",
+    "/bin",
+    "/lib",
+    "/lib64",
+];
 /// Repository-local checkout collections can contain many independent roots.
 /// They are readable substrate, not part of the primary root's implicit write
 /// authority. A user must launch in a nested checkout to mutate it; only a
@@ -853,12 +862,15 @@ pub(crate) fn open_structured_file_beneath(
     Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
 }
 
-/// Inspect every host-backed bind source without following symlinks. Unix
-/// sockets, FIFOs, and device nodes carry authority independently of normal
-/// filesystem permissions, so exposing even a read-only node would weaken the
-/// workspace boundary. A bounded or incomplete walk fails closed.
+/// Freeze the directory and mount identity of every host-backed bind source.
+///
+/// The content walk is deliberately separate: it is required before the
+/// profile is reported as available and again at the final launch boundary,
+/// but a complete walk here would make every ordinary Euler startup
+/// proportional to the workspace and host runtime even when no subprocess is
+/// requested.
 #[cfg(target_os = "linux")]
-fn inspect_authority_roots(
+fn freeze_authority_roots(
     writable_roots: &[PathBuf],
     runtime_roots: &[PathBuf],
     system_runtime_mounts: &[SystemRuntimeMount],
@@ -866,7 +878,6 @@ fn inspect_authority_roots(
     use std::os::unix::fs::MetadataExt as _;
 
     let mount_table = MountTable::read()?;
-    let mut inspected = 0_usize;
     let roots = writable_roots
         .iter()
         .cloned()
@@ -883,7 +894,6 @@ fn inspect_authority_roots(
             .then_with(|| left.cmp(right))
     });
     let mut authority_mounts = Vec::with_capacity(roots.len());
-    let mut inspected_roots = Vec::<PathBuf>::new();
     for root in roots {
         let canonical = root
             .canonicalize()
@@ -894,13 +904,6 @@ fn inspect_authority_roots(
             return Err(SandboxUnavailableReason::AuthorityInspectionFailed);
         }
         let (mount_id, mount_point) = mount_table.validate_root(&canonical)?;
-        if !inspected_roots
-            .iter()
-            .any(|inspected_root| root.starts_with(inspected_root))
-        {
-            inspect_authority_root(&root, &mut inspected)?;
-            inspected_roots.push(root.clone());
-        }
         authority_mounts.push(AuthorityMount {
             root,
             mount_id,
@@ -908,6 +911,49 @@ fn inspect_authority_roots(
             device: metadata.dev(),
             inode: metadata.ino(),
         });
+    }
+    Ok(authority_mounts)
+}
+
+/// Inspect every host-backed bind source without following symlinks.
+/// Unix sockets, FIFOs, and device nodes carry authority independently of
+/// normal filesystem permissions, so exposing even a read-only node would
+/// weaken the workspace boundary. A bounded or incomplete walk fails closed.
+#[cfg(target_os = "linux")]
+fn inspect_authority_roots(
+    writable_roots: &[PathBuf],
+    runtime_roots: &[PathBuf],
+    system_runtime_mounts: &[SystemRuntimeMount],
+) -> Result<Vec<AuthorityMount>, SandboxUnavailableReason> {
+    let authority_mounts =
+        freeze_authority_roots(writable_roots, runtime_roots, system_runtime_mounts)?;
+    let mut roots = writable_roots
+        .iter()
+        .cloned()
+        .chain(read_only_mount_sources(
+            runtime_roots,
+            system_runtime_mounts,
+        ))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    let mut inspected = 0_usize;
+    let mut inspected_roots = Vec::<PathBuf>::new();
+    for root in roots {
+        if inspected_roots
+            .iter()
+            .any(|inspected_root| root.starts_with(inspected_root))
+        {
+            continue;
+        }
+        inspect_authority_root(&root, &mut inspected)?;
+        inspected_roots.push(root);
     }
     Ok(authority_mounts)
 }
@@ -1438,6 +1484,15 @@ fn inspect_requested_root_resolution(
 
 #[cfg(not(target_os = "linux"))]
 fn inspect_authority_roots(
+    _writable_roots: &[PathBuf],
+    _runtime_roots: &[PathBuf],
+    _system_runtime_mounts: &[SystemRuntimeMount],
+) -> Result<Vec<AuthorityMount>, SandboxUnavailableReason> {
+    Err(SandboxUnavailableReason::UnsupportedPlatform)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn freeze_authority_roots(
     _writable_roots: &[PathBuf],
     _runtime_roots: &[PathBuf],
     _system_runtime_mounts: &[SystemRuntimeMount],
@@ -2168,6 +2223,26 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn profile_construction_freezes_topology_before_the_complete_probe_walk() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let _listener = std::os::unix::net::UnixListener::bind(workspace.path().join("host.sock"))
+            .expect("host socket");
+        let writable_roots = vec![workspace
+            .path()
+            .canonicalize()
+            .expect("canonical workspace")];
+        let system_runtime_mounts =
+            canonical_system_runtime_mounts().expect("system runtime mounts");
+
+        assert!(freeze_authority_roots(&writable_roots, &[], &system_runtime_mounts).is_ok());
+        assert_eq!(
+            inspect_authority_roots(&writable_roots, &[], &system_runtime_mounts),
+            Err(SandboxUnavailableReason::UnsafeSpecialNode)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn profile_uses_private_root_workspace_bind_and_network_namespace() {
         let temp = tempfile::tempdir().expect("temp workspace");
         let workspace = temp.path().canonicalize().expect("canonical workspace");
@@ -2211,7 +2286,17 @@ mod tests {
             .any(|triple| triple == ["--tmpfs", "/tmp", "--dir"]));
         assert!(arguments
             .windows(3)
+            .any(|triple| triple == ["--ro-bind", "/usr/bin", "/usr/bin"]));
+        assert!(!arguments
+            .windows(3)
             .any(|triple| triple == ["--ro-bind", "/usr", "/usr"]));
+        assert!(!arguments.windows(3).any(|triple| {
+            triple[0] == "--ro-bind"
+                && (triple[1] == "/usr/local"
+                    || triple[1].starts_with("/usr/local/")
+                    || triple[2] == "/usr/local"
+                    || triple[2].starts_with("/usr/local/"))
+        }));
         assert!(!arguments
             .windows(3)
             .any(|triple| triple == ["--ro-bind", "/", "/"]));

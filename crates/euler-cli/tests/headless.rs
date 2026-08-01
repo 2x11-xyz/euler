@@ -145,7 +145,7 @@ fn agent_shell_uses_private_home_and_clears_parent_controls() {
         .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
         .and_then(|event| event.payload.get("output"))
         .and_then(serde_json::Value::as_str)
-        .expect("nested Euler tool output");
+        .unwrap_or_else(|| panic!("nested Euler tool output; events: {events:#?}"));
     assert!(tool_output.contains("rust-log=\n"));
     assert!(tool_output.contains("euler-home=\n"));
     assert!(!tool_output.contains("host-home-visible"));
@@ -7883,6 +7883,7 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
 }
 
+#[cfg(target_os = "linux")]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }

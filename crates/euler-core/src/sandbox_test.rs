@@ -286,7 +286,7 @@ fn selected_workspace_profile_routes_shell_and_git_or_fails_closed() {
                 .as_array()
                 .expect("selected read-only roots")
                 .iter()
-                .any(|root| root == "/usr"));
+                .any(|root| root == "/usr/bin"));
             let shell = shell.expect("sandboxed shell");
             assert_eq!(shell.exit_code, Some(0));
             assert_eq!(

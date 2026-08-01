@@ -198,8 +198,11 @@ runtime directory may expose read-only toolchain/configuration data, but
 workflows must not be made to work by exposing host home or the shared host
 network namespace.
 
-Every host-backed bind source is completely inspected at profile construction.
-Each user-selected root must resolve through Linux
+Every host-backed bind source has its canonical directory and mount identity
+frozen at profile construction. That bounded topology check does not walk the
+directory contents, so constructing the session tool registry does not
+recursively scan the workspace or host image. Each user-selected root
+must resolve through Linux
 `openat2(RESOLVE_NO_MAGICLINKS)`. Euler freezes its canonical directory
 device/inode identity and reads kernel mount identities from
 `/proc/self/mountinfo`: the root must remain that same directory and select
@@ -217,10 +220,10 @@ Euler walks the resulting sources without following symlinks and rejects Unix
 sockets, FIFOs, block devices, character devices, and unknown special node
 types even in a read-only source. A bounded or unreadable walk, unavailable
 `openat2`, or incomplete mount table makes the boundary unavailable. Every
-writable root and explicit runtime root is inspected again immediately before
-each launch; the fixed root-owned system runtime sources are included in the
-same final inspection. The aggregate 1,000,000-entry limit is a launch limit,
-not a partial-success mode. A successful `tool.call` profile probe therefore
+writable root, explicit runtime root, and fixed system runtime source is
+inspected during the cached profile probe and again immediately before each
+launch. The aggregate 1,000,000-entry limit is a launch limit, not a
+partial-success mode. A successful `tool.call` profile probe therefore
 identifies selected bind sources, while the terminal result remains
 authoritative about whether the final inspection and launch succeeded.
 
