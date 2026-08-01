@@ -4,11 +4,12 @@ use euler_sdk::{event_wake::EventWakeRegistry, EventWakeError, EventWakeRegistra
 use fs4::TryLockError;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -28,16 +29,73 @@ pub struct ProvenanceWriter {
     threshold: usize,
     policy: PersistPolicy,
     append_lock: Mutex<AppendState>,
+    accepted_feed: Mutex<Weak<AcceptedEventFeedInner>>,
     event_wakes: EventWakeRegistry,
     _lock: SessionLock,
 }
 
 #[derive(Debug)]
 struct AppendState {
+    /// Last complete persisted line, including a trailing `session.resumed`
+    /// leaf. This binds prefix identity and event-wake cursors to physical
+    /// evidence.
     durable_tail: Option<EventId>,
+    /// Writer-linear parent for the next ordinary event. A
+    /// `session.resumed` leaf never advances this frontier.
+    parent_frontier: Option<EventId>,
     durable_len: u64,
     pending_resume_marker: Option<EventEnvelope>,
-    unresolved_append: Option<UnresolvedAppend>,
+    /// Exact logical batch ownership installed before the first fallible
+    /// persistence step, then enriched with physical suffix identity once it
+    /// is known. Every producer is fenced until this batch commits or the
+    /// writer is reopened.
+    pending_append: Option<PendingAppend>,
+    accepted_generation: u64,
+}
+
+/// Opt-in, process-local mirror of events this writer has confirmed durable.
+///
+/// The provenance log remains the authority. This single-owner feed exists so
+/// a live Session can publish events appended by concurrent queue/extension
+/// producers into its in-memory bus in exactly the writer's accepted order.
+/// Dropping the feed disables collection; a writer with no consumer retains
+/// no event payloads.
+#[derive(Clone, Debug)]
+pub(crate) struct AcceptedEventFeed {
+    inner: Arc<AcceptedEventFeedInner>,
+}
+
+#[derive(Debug)]
+struct AcceptedEventFeedInner {
+    state: Mutex<AcceptedEventFeedState>,
+}
+
+#[derive(Debug)]
+struct AcceptedEventFeedState {
+    next_generation: u64,
+    ready: VecDeque<EventEnvelope>,
+    pending: BTreeMap<u64, Vec<EventEnvelope>>,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub(crate) enum AcceptedEventFeedError {
+    #[error("this provenance writer already has an accepted-event feed owner")]
+    AlreadyAttached,
+}
+
+impl AcceptedEventFeed {
+    pub(crate) fn drain(&self) -> Vec<EventEnvelope> {
+        recover_mutex(&self.inner.state).ready.drain(..).collect()
+    }
+
+    /// Drain the accepted prefix through `event_id`, leaving every later
+    /// writer generation queued. `None` means the requested cutoff has not
+    /// reached the contiguous ready prefix and no event is removed.
+    pub(crate) fn drain_through(&self, event_id: &str) -> Option<Vec<EventEnvelope>> {
+        let mut state = recover_mutex(&self.inner.state);
+        let index = state.ready.iter().position(|event| event.id == event_id)?;
+        Some(state.ready.drain(..=index).collect())
+    }
 }
 
 /// One append whose bytes may be complete but whose sync outcome is unknown.
@@ -52,8 +110,39 @@ struct UnresolvedAppend {
     logical_sha256: String,
     batch_event_ids: Vec<EventId>,
     new_tail: EventId,
+    new_parent_frontier: Option<EventId>,
     event_count: usize,
     session_id: String,
+}
+
+/// Content-free fingerprint of the one batch allowed to retry after any
+/// append failure. Event payloads remain only in the owning caller.
+#[derive(Debug)]
+struct AppendReservation {
+    base_frontier: Option<EventId>,
+    logical_sha256: String,
+    batch_event_ids: Vec<EventId>,
+}
+
+#[derive(Debug)]
+struct PendingAppend {
+    reservation: AppendReservation,
+    physical: Option<UnresolvedAppend>,
+}
+
+struct LogicalAppend {
+    resume_marker: Option<EventEnvelope>,
+    logical_sha256: String,
+    batch_event_ids: Vec<EventId>,
+    event_count: usize,
+    session_id: String,
+}
+
+struct PhysicalAppend {
+    file: File,
+    serialized: Vec<u8>,
+    unresolved: UnresolvedAppend,
+    log_dir: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,14 +175,14 @@ impl ProvenanceWriter {
         threshold: usize,
     ) -> Result<Self, ProvenanceWriterError> {
         let lock = SessionLock::acquire(&log_path)?;
-        let (durable_tail, durable_len) = match latest_accepted_state(&log_path) {
+        let (durable_tail, parent_frontier, durable_len) = match latest_accepted_state(&log_path) {
             Ok(state) => state,
             // A directory at the log path opens with an empty tail on purpose:
             // failure-path tests (and the failure surface they pin) expect
             // writer construction to succeed and the APPEND to fail with the
             // real I/O error. See session_loop.rs failed-switch coverage.
             Err(EventWakeError::Io(source)) if source.kind() == io::ErrorKind::IsADirectory => {
-                (None, 0)
+                (None, None, 0)
             }
             Err(EventWakeError::Io(source)) => return Err(ProvenanceWriterError::Io(source)),
             Err(EventWakeError::InvalidLine { source }) => {
@@ -112,10 +201,13 @@ impl ProvenanceWriter {
             policy: PersistPolicy,
             append_lock: Mutex::new(AppendState {
                 durable_tail,
+                parent_frontier,
                 durable_len,
                 pending_resume_marker: None,
-                unresolved_append: None,
+                pending_append: None,
+                accepted_generation: 0,
             }),
+            accepted_feed: Mutex::new(Weak::new()),
             event_wakes: EventWakeRegistry::default(),
             _lock: lock,
         })
@@ -123,13 +215,26 @@ impl ProvenanceWriter {
 
     pub fn append(&self, events: &[EventEnvelope]) -> io::Result<()> {
         let mut append_guard = recover_mutex(&self.append_lock);
-        self.append_locked(&mut append_guard, events).map(|_| ())
+        let generation = self.append_locked(&mut append_guard, events)?;
+        let accepted = persisted_events(events, self.policy);
+        self.publish_accepted(generation, accepted);
+        drop(append_guard);
+        Ok(())
     }
 
-    /// Whether a prior append has an ambiguous durability outcome and only
-    /// an exact-batch retry may proceed.
+    /// Whether any reserved append failed and only its exact-batch retry may
+    /// proceed, including failure before physical log bytes were identified.
+    /// A currently held append lock also reports true: lifecycle replacement
+    /// must not block waiting for or overtake an authoritative writer whose
+    /// outcome is not known yet.
     pub(crate) fn has_unresolved_append(&self) -> bool {
-        recover_mutex(&self.append_lock).unresolved_append.is_some()
+        match self.append_lock.try_lock() {
+            Ok(state) => state.pending_append.is_some(),
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                error.into_inner().pending_append.is_some()
+            }
+        }
     }
 
     /// Append a batch parented from this writer's durable tail.
@@ -147,14 +252,91 @@ impl ProvenanceWriter {
         build: impl FnOnce(Option<EventId>) -> Vec<EventEnvelope>,
     ) -> io::Result<Vec<EventEnvelope>> {
         let mut append_guard = recover_mutex(&self.append_lock);
-        let tail_at_acquisition = append_guard.durable_tail.clone();
+        let tail_at_acquisition = append_guard.parent_frontier.clone();
         let mut events = build(tail_at_acquisition.clone());
         self.assign_batch_parents(&mut events, tail_at_acquisition);
-        self.append_locked(&mut append_guard, &events)?;
-        Ok(events
-            .into_iter()
-            .filter(|event| self.policy.classify(event.kind.as_str()) == PersistDecision::Persist)
-            .collect())
+        let generation = self.append_locked(&mut append_guard, &events)?;
+        let accepted = persisted_events(&events, self.policy);
+        self.publish_accepted(generation, accepted.clone());
+        drop(append_guard);
+        Ok(accepted)
+    }
+
+    /// Append caller-retained events on the writer-owned linear spine.
+    ///
+    /// Unlike [`Self::append_parented`], parent assignment mutates the
+    /// caller's envelopes before I/O. If sync becomes ambiguous, the caller
+    /// therefore still owns the exact ids, timestamps, payloads, and assigned
+    /// parents required for reconciliation.
+    pub(crate) fn append_ordered(&self, events: &mut [EventEnvelope]) -> io::Result<()> {
+        let mut append_guard = recover_mutex(&self.append_lock);
+        if append_guard.pending_append.is_none() {
+            let tail = append_guard.parent_frontier.clone();
+            self.assign_batch_parents(events, tail);
+        }
+        let generation = self.append_locked(&mut append_guard, events)?;
+        let accepted = persisted_events(events, self.policy);
+        self.publish_accepted(generation, accepted);
+        drop(append_guard);
+        Ok(())
+    }
+
+    /// Attach the one live Session consumer for confirmed durable events.
+    /// Existing history is never replayed through this process-local feed.
+    pub(crate) fn attach_accepted_event_feed(
+        &self,
+    ) -> Result<AcceptedEventFeed, AcceptedEventFeedError> {
+        // Append -> feed-owner is the universal lock order. Publication is a
+        // passive in-memory enqueue (never a callback) performed before an
+        // append releases this guard, so every committed generation is ready
+        // before a later scrub cutoff can be observed.
+        let append = recover_mutex(&self.append_lock);
+        let mut owner = recover_mutex(&self.accepted_feed);
+        if owner.upgrade().is_some() {
+            return Err(AcceptedEventFeedError::AlreadyAttached);
+        }
+        // Holding the owner slot while sampling the append generation makes
+        // attachment linearizable with post-commit publication. A concurrent
+        // append is either wholly before this feed (and intentionally not
+        // replayed) or publishes to it; it cannot fall between the sample and
+        // owner installation.
+        let next_generation = append.accepted_generation.saturating_add(1);
+        let inner = Arc::new(AcceptedEventFeedInner {
+            state: Mutex::new(AcceptedEventFeedState {
+                next_generation,
+                ready: VecDeque::new(),
+                pending: BTreeMap::new(),
+            }),
+        });
+        *owner = Arc::downgrade(&inner);
+        drop(owner);
+        drop(append);
+        Ok(AcceptedEventFeed { inner })
+    }
+
+    fn publish_accepted(&self, generation: Option<u64>, events: Vec<EventEnvelope>) {
+        let Some(generation) = generation else {
+            return;
+        };
+        if events.is_empty() {
+            return;
+        }
+        let Some(feed) = recover_mutex(&self.accepted_feed).upgrade() else {
+            return;
+        };
+        let mut state = recover_mutex(&feed.state);
+        if generation < state.next_generation {
+            return;
+        }
+        state.pending.insert(generation, events);
+        loop {
+            let next = state.next_generation;
+            let Some(events) = state.pending.remove(&next) else {
+                break;
+            };
+            state.ready.extend(events);
+            state.next_generation = state.next_generation.saturating_add(1);
+        }
     }
 
     pub fn durable_tail(&self) -> Option<EventId> {
@@ -173,7 +355,7 @@ impl ProvenanceWriter {
             ));
         }
         let mut state = recover_mutex(&self.append_lock);
-        if state.unresolved_append.is_some() {
+        if state.pending_append.is_some() {
             return Err(unresolved_append_fence());
         }
         if state.pending_resume_marker.is_some() {
@@ -182,7 +364,7 @@ impl ProvenanceWriter {
                 "a resume marker is already pending",
             ));
         }
-        if marker.parent != state.durable_tail {
+        if marker.parent != state.parent_frontier {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "resume marker does not parent the durable tail",
@@ -196,43 +378,118 @@ impl ProvenanceWriter {
         &self,
         state: &mut AppendState,
         events: &[EventEnvelope],
-    ) -> io::Result<usize> {
+    ) -> io::Result<Option<u64>> {
         let started = Instant::now();
         let persisted_events = events
             .iter()
             .filter(|event| self.policy.classify(event.kind.as_str()) == PersistDecision::Persist)
             .collect::<Vec<_>>();
-        if state.unresolved_append.is_some() {
+        if persisted_events.is_empty() {
+            if state.pending_append.is_some() {
+                return Err(unresolved_append_fence());
+            }
+            return Ok(None);
+        }
+        let logical = self.reserve_logical_append(state, &persisted_events)?;
+        if state
+            .pending_append
+            .as_ref()
+            .is_some_and(|pending| pending.physical.is_some())
+        {
             return self.reconcile_unresolved_append(state, &persisted_events, started);
         }
-        if persisted_events.is_empty() {
-            return Ok(0);
+        let mut physical = self.prepare_physical_append(state, &persisted_events, logical)?;
+        let write = physical
+            .file
+            .write_all(&physical.serialized)
+            .and_then(|()| physical.file.flush())
+            .and_then(|()| sync_file_data(&physical.file, &self.log_path))
+            // Keep a newly created log name durable; this dir fsync is cheap
+            // relative to the log fsync and harmless for later appends.
+            .and_then(|()| sync_dir(&physical.log_dir));
+        if let Err(error) = write {
+            self.remember_unresolved_append(state, physical.unresolved);
+            return Err(error);
         }
-        let pending_resume_marker = state.pending_resume_marker.clone();
-        let logical = serialize_event_batch(
-            pending_resume_marker
-                .iter()
-                .chain(persisted_events.iter().copied()),
-        )?;
-        let session_id = pending_resume_marker
+        Ok(Some(self.commit_append(
+            state,
+            &physical.unresolved,
+            started,
+        )))
+    }
+
+    fn reserve_logical_append(
+        &self,
+        state: &mut AppendState,
+        persisted_events: &[&EventEnvelope],
+    ) -> io::Result<LogicalAppend> {
+        let resume_marker = state.pending_resume_marker.clone();
+        let logical =
+            serialize_event_batch(resume_marker.iter().chain(persisted_events.iter().copied()))?;
+        let session_id = resume_marker
             .as_ref()
             .or_else(|| persisted_events.first().copied())
-            .map_or("unknown", |event| event.session.as_str());
+            .map_or_else(|| "unknown".to_owned(), |event| event.session.clone());
+        let batch_event_ids = resume_marker
+            .iter()
+            .map(|event| event.id.clone())
+            .chain(persisted_events.iter().map(|event| event.id.clone()))
+            .collect::<Vec<_>>();
+        let event_count = batch_event_ids.len();
+        let logical_sha256 = hash_bytes(&logical);
+        if let Some(pending) = state.pending_append.as_ref() {
+            if pending.reservation.base_frontier != state.parent_frontier
+                || pending.reservation.batch_event_ids != batch_event_ids
+                || pending.reservation.logical_sha256 != logical_sha256
+            {
+                return Err(unresolved_append_fence());
+            }
+        } else {
+            state.pending_append = Some(PendingAppend {
+                reservation: AppendReservation {
+                    base_frontier: state.parent_frontier.clone(),
+                    logical_sha256: logical_sha256.clone(),
+                    batch_event_ids: batch_event_ids.clone(),
+                },
+                physical: None,
+            });
+        }
+        Ok(LogicalAppend {
+            resume_marker,
+            logical_sha256,
+            batch_event_ids,
+            event_count,
+            session_id,
+        })
+    }
+
+    fn prepare_physical_append(
+        &self,
+        state: &AppendState,
+        persisted_events: &[&EventEnvelope],
+        logical: LogicalAppend,
+    ) -> io::Result<PhysicalAppend> {
         let log_dir = containing_dir(&self.log_path);
         create_dir_all_durable(log_dir)?;
         create_dir_all_durable(&self.blob_dir)?;
-        let event_count = persisted_events.len() + usize::from(pending_resume_marker.is_some());
-        let events = pending_resume_marker
+        let events = logical
+            .resume_marker
             .iter()
-            .chain(persisted_events)
+            .chain(persisted_events.iter().copied())
             .map(|event| self.externalize_large_payloads(event))
             .collect::<io::Result<Vec<_>>>()?;
         let new_tail = events
             .last()
             .map(|event| event.id.clone())
             .expect("persisted append is non-empty");
+        let new_parent_frontier = events
+            .iter()
+            .rev()
+            .find(|event| event_advances_parent_frontier(event.kind.as_str()))
+            .map(|event| event.id.clone())
+            .or_else(|| state.parent_frontier.clone());
         let serialized = serialize_event_batch(events.iter())?;
-        let mut file = OpenOptions::new()
+        let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.log_path)?;
@@ -249,32 +506,34 @@ impl ProvenanceWriter {
             start_offset,
             byte_len,
             bytes_sha256: hash_bytes(&serialized),
-            logical_sha256: hash_bytes(&logical),
-            batch_event_ids: events.iter().map(|event| event.id.clone()).collect(),
+            logical_sha256: logical.logical_sha256,
+            batch_event_ids: logical.batch_event_ids,
             new_tail,
-            event_count,
-            session_id: session_id.to_owned(),
+            new_parent_frontier,
+            event_count: logical.event_count,
+            session_id: logical.session_id,
         };
-        let write = file
-            .write_all(&serialized)
-            .and_then(|()| file.flush())
-            .and_then(|()| sync_file_data(&file, &self.log_path))
-            // Keep a newly created log name durable; this dir fsync is cheap
-            // relative to the log fsync and harmless for later appends.
-            .and_then(|()| sync_dir(log_dir));
-        if let Err(error) = write {
-            self.remember_unresolved_append(state, unresolved);
-            return Err(error);
-        }
-        self.commit_append(state, &unresolved, started);
-        Ok(event_count)
+        Ok(PhysicalAppend {
+            file,
+            serialized,
+            unresolved,
+            log_dir: log_dir.to_path_buf(),
+        })
     }
 
     fn remember_unresolved_append(&self, state: &mut AppendState, append: UnresolvedAppend) {
         // Even an absent suffix retains its fingerprint. That lets the exact
         // caller retry a zero-byte write while fencing every different batch.
         // Complete bytes are re-synced; partial/divergent bytes fail closed.
-        state.unresolved_append = Some(append);
+        let pending = state.pending_append.get_or_insert_with(|| PendingAppend {
+            reservation: AppendReservation {
+                base_frontier: state.parent_frontier.clone(),
+                logical_sha256: append.logical_sha256.clone(),
+                batch_event_ids: append.batch_event_ids.clone(),
+            },
+            physical: None,
+        });
+        pending.physical = Some(append);
     }
 
     fn reconcile_unresolved_append(
@@ -282,11 +541,15 @@ impl ProvenanceWriter {
         state: &mut AppendState,
         persisted_events: &[&EventEnvelope],
         started: Instant,
-    ) -> io::Result<usize> {
-        let pending = state
-            .unresolved_append
+    ) -> io::Result<Option<u64>> {
+        let pending_append = state
+            .pending_append
             .as_ref()
-            .expect("reconciliation requires an unresolved append");
+            .expect("reconciliation requires a pending append");
+        let pending = pending_append
+            .physical
+            .as_ref()
+            .expect("reconciliation requires physical suffix identity");
         let logical = serialize_event_batch(
             state
                 .pending_resume_marker
@@ -347,7 +610,6 @@ impl ProvenanceWriter {
                 ));
             }
         }
-        let event_count = pending.event_count;
         let committed = UnresolvedAppend {
             start_offset: pending.start_offset,
             byte_len: pending.byte_len,
@@ -355,11 +617,11 @@ impl ProvenanceWriter {
             logical_sha256: pending.logical_sha256.clone(),
             batch_event_ids: pending.batch_event_ids.clone(),
             new_tail: pending.new_tail.clone(),
-            event_count,
+            new_parent_frontier: pending.new_parent_frontier.clone(),
+            event_count: pending.event_count,
             session_id: pending.session_id.clone(),
         };
-        self.commit_append(state, &committed, started);
-        Ok(event_count)
+        Ok(Some(self.commit_append(state, &committed, started)))
     }
 
     fn inspect_unresolved_append(&self, append: &UnresolvedAppend) -> io::Result<AppendSuffix> {
@@ -386,14 +648,23 @@ impl ProvenanceWriter {
         Ok(AppendSuffix::Complete)
     }
 
-    fn commit_append(&self, state: &mut AppendState, append: &UnresolvedAppend, started: Instant) {
+    fn commit_append(
+        &self,
+        state: &mut AppendState,
+        append: &UnresolvedAppend,
+        started: Instant,
+    ) -> u64 {
         state.durable_tail = Some(append.new_tail.clone());
+        state
+            .parent_frontier
+            .clone_from(&append.new_parent_frontier);
         state.durable_len = append
             .start_offset
             .checked_add(append.byte_len)
             .expect("validated provenance append length");
         state.pending_resume_marker = None;
-        state.unresolved_append = None;
+        state.pending_append = None;
+        state.accepted_generation = state.accepted_generation.saturating_add(1);
         self.event_wakes.notify_advanced();
         crate::diagnostics::provenance_append_end(
             &append.session_id,
@@ -401,6 +672,7 @@ impl ProvenanceWriter {
             append.byte_len,
             elapsed_ms(started),
         );
+        state.accepted_generation
     }
 
     pub fn open_event_wake(&self) -> Result<EventWakeRegistration, EventWakeError> {
@@ -466,6 +738,7 @@ fn externalized_payload_fields(event: &EventEnvelope) -> &'static [&'static str]
         }
         EventKind::ASSISTANT_RESPONSE_CHUNK => &["content"],
         EventKind::PATCH_PROPOSED | EventKind::PATCH_APPLIED => &["old", "new"],
+        EventKind::QUEUE_ENQUEUED | EventKind::QUEUE_REPLACED => &["content"],
         // The admitted manifest is one top-level payload string; above the
         // threshold that complete string becomes one content-addressed blob
         // (project-context contract: individual bodies are never
@@ -518,10 +791,12 @@ impl Drop for ProvenanceWriter {
     }
 }
 
-fn latest_accepted_state(path: &Path) -> Result<(Option<String>, u64), EventWakeError> {
+fn latest_accepted_state(
+    path: &Path,
+) -> Result<(Option<String>, Option<String>, u64), EventWakeError> {
     let content = match fs::read_to_string(path) {
         Ok(content) => content,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((None, 0)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((None, None, 0)),
         Err(error) => return Err(error.into()),
     };
     let durable_len = if content.ends_with('\n') {
@@ -532,6 +807,7 @@ fn latest_accepted_state(path: &Path) -> Result<(Option<String>, u64), EventWake
     let durable_len = u64::try_from(durable_len)
         .map_err(|_| EventWakeError::Io(io::Error::other("provenance log is too large")))?;
     let mut latest = None;
+    let mut parent_frontier = None;
     for line in numbered_accepted_prefix_lines(&content) {
         if let Some(nul) = nul_offset_in_line(line.text) {
             // EventWakeError lives in euler-sdk and has no corruption
@@ -548,9 +824,12 @@ fn latest_accepted_state(path: &Path) -> Result<(Option<String>, u64), EventWake
         }
         let event = EventEnvelope::from_json_line(line.text)
             .map_err(|source| EventWakeError::InvalidLine { source })?;
-        latest = Some(event.id);
+        latest = Some(event.id.clone());
+        if event_advances_parent_frontier(event.kind.as_str()) {
+            parent_frontier = Some(event.id);
+        }
     }
-    Ok((latest, durable_len))
+    Ok((latest, parent_frontier, durable_len))
 }
 
 pub fn read_provenance(path: impl AsRef<Path>) -> Result<Vec<EventEnvelope>, ProvenanceReadError> {
@@ -1444,6 +1723,14 @@ pub enum PersistDecision {
     RuntimeOnly,
 }
 
+fn persisted_events(events: &[EventEnvelope], policy: PersistPolicy) -> Vec<EventEnvelope> {
+    events
+        .iter()
+        .filter(|event| policy.classify(event.kind.as_str()) == PersistDecision::Persist)
+        .cloned()
+        .collect()
+}
+
 /// Whether an event kind is runtime-only and must never be persisted or
 /// exported (e.g. `model.delta`; see `docs/contracts/persistence.md`).
 ///
@@ -1452,6 +1739,13 @@ pub enum PersistDecision {
 /// persistence classifier.
 pub fn event_is_runtime_only(kind: &str) -> bool {
     PersistPolicy.classify(kind) == PersistDecision::RuntimeOnly
+}
+
+/// Whether a durable event advances the writer-linear parent frontier.
+/// Runtime-only rows are never durable authority, and a `session.resumed`
+/// marker is a physical audit leaf rather than the parent of continued work.
+pub(crate) fn event_advances_parent_frontier(kind: &str) -> bool {
+    !event_is_runtime_only(kind) && kind != EventKind::SESSION_RESUMED
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {

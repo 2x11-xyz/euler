@@ -15,6 +15,7 @@ Every session event has:
   "ts": "rfc3339",
   "session": "session-id",
   "agent": "agent-id",
+  "run": "run-ulid-or-omitted",
   "parent": "causal-parent-event-id-or-null",
   "kind": "event.kind",
   "payload": {},
@@ -23,6 +24,11 @@ Every session event has:
 ```
 
 Large payloads are stored as content-addressed blobs and referenced from `blobs`.
+
+`run` attributes work to one product-level user run. New run-aware events use
+a ULID. Legacy events omit the field and decode conservatively as run-less;
+readers must not infer a run from adjacency. Omitting `run` remains the
+canonical JSON representation for such legacy or session-level events.
 
 Event ids are globally unique within one accepted session stream. Resume
 rejects a prefix containing any duplicate id before appending recovery or
@@ -75,6 +81,13 @@ authority.
 - `session.resumed`
 - `session.renamed`
 - `session.summary`
+- `run.started`
+- `run.terminal`
+- `queue.enqueued`
+- `queue.replaced`
+- `queue.cancelled`
+- `queue.delivered`
+- `queue.recovered`
 - `error`
 
 Unknown future event kinds are reader-specific. Inspection readers
@@ -90,6 +103,123 @@ Golden tests freeze these fields. Additive optional fields are allowed
 without a version bump; renames/removals/semantic changes bump the
 envelope `v` per `docs/contracts/persistence.md`.
 
+- `run.started`: `trigger` (`direct` | `follow_up`). Its envelope `run` is the
+  new run ULID. A direct start carries no `queue_id`; a follow-up start carries
+  the pending source `queue_id`. A run starts exactly once. The same envelope
+  `session` and `agent` own every lifecycle event for that run. A session has
+  at most one open root run. A pending follow-up reserves its preallocated run
+  id, so a direct start cannot claim it; when `source_run_id` is present, that
+  source must be terminal before the follow-up starts.
+- `run.terminal`: `status` (`completed` | `failed` | `cancelled` |
+  `interrupted`). A started run has at most one terminal event. Terminal is an
+  execution-control boundary, not a last-event barrier: an asynchronous
+  result that was spawned by the run may arrive later and keeps its origin
+  `run` attribution. New work cannot steer or otherwise reopen the terminal
+  run. Terminal admission atomically appends `queue.cancelled` for every
+  still-pending steer of that run before `run.terminal`; follow-ups remain
+  pending. An ambiguous terminal batch is not accepted live state and owns the
+  same exact-envelope retry fence as user admission. On replay, a contiguous
+  prefix of one or more terminal `queue.cancelled` rows is inert until the
+  matching `run.terminal` completes the batch. A complete retry supersedes
+  such a physical prefix and commits once as a logical terminal transaction.
+- `queue.enqueued`: `queue_id`, `mode` (`steering` | `follow_up`), `position`
+  (`front` | `back`), and `content`. Its envelope `run` is the open target run
+  for steering or the preallocated not-yet-started run for a follow-up. The
+  optional `source_run_id` is the run active when the input was submitted:
+  it equals the target for steering, names the source run for a follow-up
+  submitted during active work, and is absent for an idle or legacy follow-up.
+  Producers emit it for all new steering. When present on a new enqueue it
+  must name a currently open run; terminal history cannot be retroactively
+  claimed as submission context. Replacement repeats the already-admitted
+  historical source without requiring it to remain open. The event is durable
+  before the enqueue is acknowledged in memory. Queue ids are ULIDs and are
+  never reused. A Session without a provenance writer has no durable queue
+  claim. When it consumes a volatile steering row, it projects that row's
+  exact id, source, original front/back position, and content as an in-memory
+  `queue.enqueued` immediately before `queue.delivered + user.message`; this
+  lets the canonical lifecycle fold validate the live transaction without
+  implying that it can survive restart.
+- `queue.replaced`: `queue_id`, `replacement_queue_id`, `mode`, and `content`.
+  Replacement preserves the planned run, source run, mode, and FIFO position
+  while allocating a new queue identity. It repeats `source_run_id` when one
+  is known and becomes visible only after this exact event is durable.
+- `queue.cancelled`: `queue_id` and additive `reason` (`user` |
+  `run_completed` | `run_failed` | `run_cancelled` | `run_interrupted`).
+  Cancellation may select any pending item and becomes visible only after this
+  exact event is durable. Legacy events without `reason` are interpreted as
+  non-recoverable user cancellation. A `run_*` reason is valid only for
+  steering, must agree with the following terminal status for that run, and
+  retains the private input in the recoverable-cancelled projection without
+  making it pending or deliverable. A standalone `user` cancellation settles
+  immediately; the transactional replay rule applies only to `run_*` reasons.
+- `queue.delivered`: `queue_id`. Delivery settles only the eligible FIFO head.
+  Steering delivery targets an open run. Follow-up delivery follows its
+  `run.started` in the same admission batch and cannot be admitted through the
+  top-level steering-delivery path. A delivered item is removed only with the
+  durable user-message admission described below.
+- `queue.recovered`: `queue_id`, `action` (`dismissed` | `requeued`), and, for
+  requeue, `replacement_queue_id`. It resolves only a terminal-cancelled
+  recoverable steering record and carries that original run on the envelope.
+  Dismissal removes the private recovery record in one row. Requeue is one
+  marker-first writer transaction: `queue.recovered(action = requeued)` then
+  an immediately adjacent, parent-linked explicit follow-up `queue.enqueued`
+  whose id equals `replacement_queue_id`. Only the complete pair removes the
+  recovery row and exposes the follow-up. A crash-prefix marker remains inert
+  but permanently reserves its proposed replacement id; a restart retry uses
+  a fresh marker and fresh replacement queue/run identity. Requeue never
+  revives steering against the terminal run or links an older pending row.
+
+Queue `content` is private pending user input. It is provenance content,
+eligible for content-addressed externalization and secret scrub, but it is not
+transcript or model-canvas content before delivery. Session sidecars and
+discovery caches must not copy it. Only the `user.message` in the delivery
+transaction makes that text ordinary transcript/canvas input.
+
+Live queue mutation uses stable identities, not presentation indexes. Core
+exposes one lock-consistent snapshot containing the currently open run and FIFO
+rows (`queue_id`, planned `run_id`, optional `source_run_id`, mode, and private
+content). Enqueue supplies an explicit mode, that observed run expectation, and
+front/back position. The expectation is checked under the same mutation lock
+as the terminal cutoff: a race returns typed no-active/stale-run failure and
+never converts steering into a follow-up or attributes a follow-up to a
+different source run. Cancel and replace select `queue_id`; if the snapshotted
+row settled first they return typed not-pending rather than targeting the row
+that moved into its former index.
+
+Run and queue lifecycle is reconstructed by a deterministic fold over the
+accepted stream. The fold rejects duplicate starts or terminals, reused queue
+ids, crossed run ownership, steering for an inactive run, follow-up runs that
+already started, a new enqueue naming an inactive source, invalid or changed
+source-run relationships, delivery out of FIFO order, terminal-cancellation
+reasons that disagree with their run, and a run terminal that would strand
+pending steering. Every non-lifecycle event with `run` must name a previously
+accepted run in the same session. An attributed `user.message` is valid only
+inside its direct, steering, or follow-up admission transaction, and adjacency
+alone cannot form that transaction: the group members must parent one another
+in the listed order. While a post-migration root run is open, root
+model/tool/error work must carry that run; runless work captured by a child,
+background task, or extension remains runless when it drains. Pending and
+recoverable-cancelled inputs are separate projections. Legacy streams with
+none of these lifecycle kinds remain valid and simply project no durable runs
+or queue items. Core exposes terminal status by run id so queue policy can
+evaluate an explicit `source_run_id` without reparsing events or inferring
+adjacency.
+
+The fold also establishes one stream owner. Every envelope has the same
+`session`. `session.start`, when present, is the unique first event and names
+the root agent; legacy streams may omit it, in which case the first root
+run/queue lifecycle event establishes the root owner. Root lifecycle events
+cannot change that owner. Synchronous root model/tool work must name the one
+currently open root run and cannot target a terminal or stale run.
+
+Late shadow-compaction output is the narrow asynchronous exception. A
+`model.reasoning`, `model.result`, or `error` marked with compaction purpose is
+accepted as late work only when its `parent` names an earlier open compaction
+`model.call` and its session, agent, and captured run exactly match that call.
+The lane closes on `model.result` or an error that is a semantic model-call
+terminal under the ordinary provider/session cancellation rule; an unrelated
+extension error does not consume the later result.
+
 - `user.message`: `content`. A turn is not limited to one: mid-turn
   steering (issue #146) appends additional `user.message` events at round
   boundaries — after a completed tool round's results or after the committed
@@ -98,10 +228,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   positions them like any other event, and readers must not assume a turn
   has exactly one leading user message. Queue entries are removed only after
   this event is durable: both mid-turn absorption and queued-turn dispatch
-  reserve by id first, and append failure leaves the entry queued. A queue-entry
-  id is opaque and includes both the queue instance and its row sequence; a
-  same-position, same-content row from another queue is never the same
-  reservation. Admission installs the pending candidate — including its exact
+  reserve by id first, and append failure leaves the entry queued. `queue_id`
+  is a globally unique ULID and is the complete durable row identity; a
+  same-position, same-content row from another queue has a different id and is
+  never the same reservation. Admission installs the pending candidate — including its exact
   envelope id, timestamp, parent, payload, and originating queue-entry id —
   before attempting to persist any older accepted backlog. It then reconciles
   that backlog, appends the candidate, and only then publishes the candidate to
@@ -111,7 +241,19 @@ envelope `v` per `docs/contracts/persistence.md`.
   unresolved entry, and dispatch selects it before any row inserted later,
   even when another row has identical content. Repair and retry therefore
   reconcile that event exactly once instead of persisting a failed bus copy or
-  acknowledging a content-equal duplicate.
+  acknowledging a content-equal duplicate. Direct admission atomically appends
+  `run.started + user.message`. Follow-up admission atomically appends
+  `run.started + queue.delivered + user.message`; steering admission atomically
+  appends `queue.delivered + user.message`. Every event in one of these batches
+  has the same `run`. A sync error publishes neither a run nor a user message
+  as accepted live state: the exact assigned envelopes remain the sole retry
+  owner, and all unrelated authoritative writes are fenced until
+  reconciliation. A crash may leave only `run.started`, `run.started +
+  queue.delivered`, or a steering `queue.delivered` as a readable durable
+  prefix before a torn or absent `user.message`. The lifecycle fold treats
+  every such incomplete admission group as inert: it neither starts the run
+  nor settles the queue row. A later complete retry group is validated and
+  applied exactly once.
 
   An explicit skill activation has canonical `content` in the form
   `/skill:<name> [request]` plus these additive fields:
@@ -204,13 +346,27 @@ envelope `v` per `docs/contracts/persistence.md`.
   or another reviewer's event rather than their logical call. A crossed-agent
   linear parent is never authority.
 
-  Resume applies this rule and closes every call left open
-  with a parented `error` carrying `source: "session"` and
-  `recovery_closure: true`; the message says that the call was interrupted and
-  its outcome is unknown. The closure preserves an originating `purpose`
-  (including `"compaction"`), but does not claim `cancelled: true`: restart
-  cannot know whether the remote provider completed. All such closures are
-  durable before the resume marker is armed or a new user turn is admitted.
+  A validated session-owned recovery closure is terminalization of
+  already-accepted model work, not new root-driver work. It may therefore
+  carry its call's originating `run` after that run is terminal. The exception
+  requires an `error` with `source: "session"` and `recovery_closure: true`
+  whose direct parent names a still-open `model.call`; session, agent, and run
+  must equal that call, purpose must match exactly, and provider/model must
+  match when the closure carries them. Any forged or already-settled
+  association is invalid. Ordinary late model work remains subject to the
+  active-run rule. Tool recovery has the separate restart-only rule in the
+  `tool.result` schema below.
+
+  Resume applies the association rule and closes every call left open with
+  such a parented recovery error; the message says that the call was
+  interrupted and its outcome is unknown. The closure preserves an
+  originating `purpose` (including `"compaction"`), but does not claim
+  `cancelled: true`: restart cannot know whether the remote provider completed.
+  Before append, resume preflights the exact durable-prefix-plus-closures
+  candidate through all envelope, session, run-lifecycle, and terminal rules,
+  then requires a second recovery projection to find no closure still needed.
+  Rejection appends nothing. All accepted closures are durable before the
+  resume marker is armed or a new user turn is admitted.
 - `plan.update`: canonical extension updates carry `source: "extension"`,
   host-derived `extension_id` and `command`, positive `revision`, overall
   `status` (`active` | `blocked` | `waiting` | `completed`), `explanation`
@@ -256,9 +412,16 @@ envelope `v` per `docs/contracts/persistence.md`.
   execution enforce the recorded `none | inherit` policy against it. This is
   distinct from the rendered-context digest recorded as
   `model.call.project_context_digest`.
-  Optional `recovery_closure: true` marks a resume-time canonical closure for
-  an interrupted tail `tool.call`; it records the resume observation, not the
-  original tool outcome.
+  Optional `recovery_closure: true` marks a resume-time canonical closure; it
+  records the resume observation, not the original tool outcome. The ordinary
+  root path closes only its interrupted tail call. In addition, for every
+  accepted `tool.call` authored by an incomplete child agent (an accepted
+  `agent.spawn` with no `agent.result`), resume emits one failed result when no
+  later same-agent result has that call event id as its exact semantic parent.
+  This narrow restart exception may occur anywhere in the accepted child
+  prefix, preserves call order, and uses exact event-parent identity rather
+  than provider call ids, which may repeat across rounds. It never synthesizes
+  an `agent.result`.
   Optional `cancelled: true` marks a live cancellation closure. Every
   `tool.call` already accepted from one provider batch that has no terminal
   result receives exactly one terminal failed result in batch order, including
@@ -601,11 +764,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   report or resume must not select one of several claimed identities.
 - `session.resumed`: `provider`, `model`, `events_folded`, optional
   `resumed_from_event_id`. A durable audit marker recording that the session
-  lifetime was continued, against which target and from which tail event.
-  Audit metadata only — never user or model content. Emitted with the first
-  durable activity of a resumed session (an open-and-inspect resume that never
-  mutates or continues emits none). It is a LOG-LEAF: appended to the log but
-  not the in-memory bus, so it never becomes the parent of continued activity.
+  lifetime was continued, against which target and from which logical parent
+  frontier. Its parent must be that frontier; when `resumed_from_event_id` is
+  present, it must be the same id. Audit metadata only — never user or model
+  content. Emitted with the first durable activity of a resumed session (an
+  open-and-inspect resume that never mutates or continues emits none). It is a
+  LOG-LEAF: appended to the log but excluded from both that lifetime's and all
+  later resumed lifetimes' in-memory buses, so it never becomes the parent of
+  continued activity.
 - `session.renamed`: `name`. Records the latest user-visible session name;
   sidecars and indexes are projections of this event, not naming authority.
   For sessions created by current new-Euler builds before this event existed,
@@ -767,7 +933,9 @@ envelope `v` per `docs/contracts/persistence.md`.
   optional `output`, optional `error`. The event is authored by the parent
   session's envelope `agent` and parents the matching `agent.spawn` event.
   `ok=true` permits `output` and forbids `error`; `ok=false` permits `error`
-  and optional bounded `output`.
+  and optional bounded `output`. A live result append owns one exact envelope
+  across retry. A retry with different result content or originating run is a
+  typed mismatch; it never creates a second candidate for the spawn.
 - `secret.exposure.detected`: `event` (id of the exposing event), `field`,
   `shapes` (array of non-secret shape labels, e.g. `sk-ant-` or `known-value`),
   `count`. A read-only marker that a credential shape was detected in a faithful
@@ -822,10 +990,12 @@ envelope `v` per `docs/contracts/persistence.md`.
   `snapshot_event_id`. The bootstrap sequence is contiguous:
   `session.start`, one snapshot, then exactly the snapshot's declared number
   of diagnostics, before any other persisted event.
-- `session.resumed` parents the accepted tail it continued from (the same
-  event the first continued turn parents off). It is a sibling LEAF of that
+- `session.resumed` parents the logical frontier it continued from (the same
+  event the first continued turn parents off). Its optional
+  `resumed_from_event_id` must repeat that parent. It is a sibling LEAF of that
   continuation, never its parent — so a resumed lifetime's causal chain is
-  identical to an uninterrupted run.
+  identical to an uninterrupted run. A later resume after a marker-only crash
+  attaches a new sibling marker to the same logical frontier.
 - `project.context.relocated` parents the accepted tail event the resume folded
   to. Unlike `session.resumed` it is an in-chain durable event, not a leaf: it
   must persist before any resumed activity, and it becomes the frontier the
@@ -845,6 +1015,20 @@ envelope `v` per `docs/contracts/persistence.md`.
   ordering.
 - `agent.result` parents its matching `agent.spawn` event. V0 has no child
   session event stream to join.
+- Run/queue lifecycle events use the writer-owned linear spine. Atomic
+  admission and terminal batches chain in their listed transaction order;
+  `run` and `queue_id` carry lifecycle identity and do not create a semantic
+  parent exception. The fold verifies every lifecycle row against the current
+  persisted writer frontier, excluding runtime-only events. The first row of a
+  retry batch therefore parents any readable physical crash fragment that
+  precedes it, while internal rows parent the prior member of that exact retry.
+  `session.resumed` remains the documented sibling exception. Its parent must
+  equal the current logical frontier and, when `resumed_from_event_id` is
+  present, that payload value must be the same event id. It advances the
+  physical accepted tail but neither advances the logical frontier nor becomes
+  the parent of the first continued lifecycle row. Multiple stranded markers
+  after repeated process deaths are valid sibling leaves only when each names
+  that same frontier.
 - A root-driver provider/cancellation `error` directly parents its
   `model.call`. Companion and parallel-reviewer errors follow the writer-owned
   linear spine; the `model.call` association rule above determines whether
@@ -901,6 +1085,27 @@ Cardinality and ordering invariants:
 - zero or more `agent.message` events may appear for a live background spawn
   while its `BackgroundAgent` handle exists. Queue acceptance is volatile; only
   drained `agent.message` events are durable and queryable after resume.
+- the lifecycle projection accepts exactly one completed `run.started`
+  admission and at most one `run.terminal` for each run id. A crash-prefix
+  `run.started` is inert and a later complete retry may therefore leave an
+  additional physical start fragment in the stream without becoming a second
+  logical start. Every accepted root model/tool/error event produced while
+  that run is active carries its `run`; asynchronous child, background, and
+  extension work captures that origin at spawn/host creation and does not move
+  to a later run merely because it drains late. A captured runless origin
+  remains `run: null`; it is not an instruction to inherit a later active run;
+- each accepted queue id has exactly one `queue.enqueued` or replacement
+  creation and at most one logically settling `queue.cancelled` or
+  `queue.delivered`. An inert crash-prefix delivery may precede the complete
+  retry that settles it.
+  Follow-up source identity is explicit when active work existed at enqueue;
+  replacement cannot change it. Terminal-cancelled steering is settled out of
+  the deliverable queue but remains a private recoverable record until one
+  `queue.recovered` dismisses it or begins the marker-first atomic pair that
+  links it to a new follow-up.
+  Follow-up delivery starts exactly its preallocated run once. Durable pending
+  order is the result of applying `front`/`back`, replacement-in-place, and
+  settlement events in accepted writer order.
 
 Ratification note: M1 wrote `parent` as "previous event". This ratification
 changes that meaning within envelope `v: 1`: payload fields and parentage
@@ -920,6 +1125,9 @@ on honest parents.
   not prompt content.
 - `file.diff` is excluded from model-canvas projection in v0.
 - `agent.message` is excluded from transcript/model-canvas projection in v0.
+- `run.started`, `run.terminal`, and every `queue.*` event are excluded from
+  transcript/model-canvas projection. A delivered queue row appears through
+  its canonical `user.message`, never by projecting private pending content.
 - Extensions observe events through the SDK, subject to capabilities and result bounds.
 
 ## Reasoning

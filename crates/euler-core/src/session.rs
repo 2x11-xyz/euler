@@ -16,7 +16,7 @@ use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
 use crate::guardian::PermissionReviewer;
 use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, PermissionGate};
 use crate::project_context::ProjectContextBootstrap;
-use crate::provenance::ProvenanceWriter;
+use crate::provenance::{AcceptedEventFeed, ProvenanceWriter};
 use crate::provider_runtime::{
     ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope, ProviderRuntimeTarget,
 };
@@ -50,6 +50,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use ulid::Ulid;
 
 mod background;
 mod compaction_worker;
@@ -61,9 +62,17 @@ mod observer;
 mod parallel_spawn;
 mod permissions_gate;
 mod round_loop;
+pub(crate) mod run_lifecycle;
 mod steering;
 
-pub use steering::{QueuedInput, SteeringQueue};
+pub use run_lifecycle::{
+    PendingQueueInput, QueueCancellationReason, QueueMode, RecoverableQueueInput,
+    RunLifecycleError, RunTerminalStatus,
+};
+pub use steering::{
+    QueueError, QueueLifecycleTransition, QueuePosition, QueuedInput, QueuedInputMetadata,
+    SteeringQueue, SteeringQueueSnapshot,
+};
 mod swarm_tool;
 mod tool_dispatch;
 pub use background::{
@@ -350,8 +359,24 @@ pub enum SessionError {
     SkillUnavailable { name: String },
     #[error("queued input is not the current dispatch reservation for this steering queue")]
     InvalidQueuedInput,
-    #[error("cannot replace a session while a user-message admission is unresolved")]
-    UnresolvedAdmissionTransition,
+    #[error(transparent)]
+    RunLifecycle(Box<RunLifecycleError>),
+    #[error(transparent)]
+    Queue(#[from] QueueError),
+    #[error("cannot replace a session while an authoritative session write is unresolved")]
+    UnresolvedAuthoritativeWriteTransition,
+    #[error("an agent result append is unresolved; retry that exact result first")]
+    UnresolvedAgentResult,
+    #[error("an authoritative provenance append is unresolved; retry its exact owner first")]
+    UnresolvedAuthoritativeAppend,
+    #[error(
+        "a parented provenance append failed; stop and restart Euler, then reopen the session to recover its durable prefix"
+    )]
+    ParentedAppendRecoveryRequired,
+    #[error(
+        "accepted session events are invalid; reopen the session to recover authoritative state"
+    )]
+    InvalidAcceptedState,
     #[error(transparent)]
     EventWake(#[from] EventWakeError),
     #[error("event wake requires provenance writer")]
@@ -378,6 +403,12 @@ pub enum SessionError {
     CheckpointMissingBlob { event_id: String },
     #[error("checkpoint blob unavailable: {0}")]
     CheckpointBlob(String),
+}
+
+impl From<RunLifecycleError> for SessionError {
+    fn from(error: RunLifecycleError) -> Self {
+        Self::RunLifecycle(Box::new(error))
+    }
 }
 
 /// Outcome of a successful workspace restore (`/rollback`).
@@ -427,6 +458,11 @@ pub enum ExtensionExecutionError {
 pub struct Session<D> {
     config: SessionConfig,
     active_target: ModelTarget,
+    active_run: Option<String>,
+    /// Durable product-level run and queued-input projection. The canonical
+    /// event log owns this state; the live steering queue is its concurrent
+    /// admission surface, not a second persistence authority.
+    run_lifecycle: run_lifecycle::RunLifecycleProjection,
     providers: ProviderSet,
     bus: EventBus,
     permissions: PermissionGate<D>,
@@ -443,11 +479,25 @@ pub struct Session<D> {
     /// costs at most one extra one-line error before re-escalation.
     tool_reteach: ReteachTracker,
     provenance: Option<Arc<ProvenanceWriter>>,
+    /// Single-owner, process-local mirror of writer-confirmed events. It
+    /// reconciles concurrent durable producers into the live bus; the log is
+    /// still the sole event authority.
+    accepted_events: Option<AcceptedEventFeed>,
     persisted_events: usize,
     extension_emission_degraded: bool, // sticky after queue divergence; reload-only recovery
     latest_model_usage: Option<ModelUsageSnapshot>,
     context_limit_emitted: Option<ModelTarget>,
-    open_agent_spawns: BTreeMap<String, String>,
+    open_agent_spawns: BTreeMap<String, OpenAgentSpawn>,
+    /// Exact event retained when a parented append (principally child-agent
+    /// work) fails after the writer has reserved its id and linear parent.
+    /// The reservation must reconcile before any later parented event or
+    /// orphaned child result can overtake it.
+    pending_parented_append: Option<EventEnvelope>,
+    /// Sticky after an ambiguous parented append. Continuing live would need
+    /// to reconstruct child model/tool phase ownership from an incomplete
+    /// call stack, so every later authoritative write fails closed and normal
+    /// durable resume owns recovery.
+    parented_append_recovery_required: bool,
     observer_extension: Option<Arc<dyn Extension>>,
     /// Process-local, content-free provider lifecycle attachment for hosts.
     /// It is neither persisted nor projected into transcript/model context.
@@ -470,11 +520,24 @@ pub struct Session<D> {
     /// matching retry reuses its id and timestamp; every unrelated admission
     /// is fenced until the owning writer confirms this candidate.
     pending_admission: Option<PendingAdmission>,
+    /// Exact terminal batch retained when its append is ambiguous. Retry owns
+    /// these envelopes until the writer confirms them; no new terminal ids or
+    /// queue cancellations may be synthesized meanwhile.
+    pending_run_terminal: Option<PendingRunTerminal>,
+    /// Terminal outcome captured before entering the queue's terminal cutoff.
+    /// If a cutoff enqueue/edit is unresolved, the boundary returns before it
+    /// can build `pending_run_terminal`; this intent keeps the open run fenced
+    /// until that queue write reconciles and termination can be retried.
+    deferred_run_terminal: Option<RunTerminalStatus>,
     /// Root response ownership ended with unresolved persistence, or a shadow
     /// worker detached without an accepted terminal child. Further
     /// authoritative writes fail closed until lifecycle reopen reconciles
     /// the durable prefix and closes any interrupted calls.
     terminalization_failed: bool,
+    /// A writer-confirmed event batch failed lifecycle validation after its
+    /// feed was drained. No later write may proceed from the rejected live
+    /// projection; reopening replays the durable log from first principles.
+    accepted_state_invalid: bool,
     /// Shared edge-triggered request from an interactive surface. The active
     /// driver consumes it only at a round boundary, where a fixed shadow
     /// canvas can be taken without interrupting the provider stream.
@@ -499,11 +562,48 @@ struct ShadowCompaction {
     model_call_id: String,
     worker: compaction_worker::CompactionWorker,
     started_at: Instant,
+    /// Exact run attribution captured when the shadow request began. `None`
+    /// remains explicitly runless even if another run is active at drain.
+    origin_run: Option<String>,
+}
+
+enum CompactionEventOrigin {
+    ActiveRun,
+    Captured(Option<String>),
 }
 
 struct PendingAdmission {
-    event: EventEnvelope,
+    events: Vec<EventEnvelope>,
     queue_id: Option<steering::QueueEntryId>,
+    run_id: String,
+    content: String,
+    kind: UserAdmissionKind,
+}
+
+struct PendingRunTerminal {
+    events: Vec<EventEnvelope>,
+    run_id: String,
+    queue_ids: Vec<String>,
+    terminal_id: String,
+}
+
+struct OpenAgentSpawn {
+    child_agent_id: String,
+    run_id: Option<String>,
+    pending_result: Option<PendingAgentResult>,
+}
+
+struct PendingAgentResult {
+    event: EventEnvelope,
+    append_attempted: bool,
+    orphaned: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UserAdmissionKind {
+    Direct,
+    FollowUp,
+    Steering,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -907,7 +1007,7 @@ where
             || cancellation.is_cancelled(),
             |input| {
                 self.session
-                    .admit_user_message(input.content(), Some(input.id()))
+                    .admit_user_message(input.content(), Some(input), false)
                     .map(|_| ())
             },
         );
@@ -1145,6 +1245,8 @@ impl<D> Session<D> {
         let session = Self {
             config,
             active_target,
+            active_run: None,
+            run_lifecycle: run_lifecycle::RunLifecycleProjection::default(),
             providers,
             bus,
             permissions,
@@ -1152,11 +1254,14 @@ impl<D> Session<D> {
             tools,
             tool_reteach: ReteachTracker::default(),
             provenance: None,
+            accepted_events: None,
             persisted_events: 0,
             extension_emission_degraded: false,
             latest_model_usage: None,
             context_limit_emitted: None,
             open_agent_spawns: BTreeMap::new(),
+            pending_parented_append: None,
+            parented_append_recovery_required: false,
             observer_extension: None,
             provider_runtime_observer: ProviderRuntimeObserver::default(),
             extensions: BTreeMap::new(),
@@ -1164,7 +1269,10 @@ impl<D> Session<D> {
             steering: None,
             queued_dispatch: None,
             pending_admission: None,
+            pending_run_terminal: None,
+            deferred_run_terminal: None,
             terminalization_failed: false,
+            accepted_state_invalid: false,
             compaction_request: None,
             shadow_compaction: None,
             code_swarm_extension: None,
@@ -1254,13 +1362,19 @@ impl<D> Session<D> {
     /// its absence — a resumed session carries none in config) is never
     /// reused, so a `/new` after resume still writes the full bootstrap.
     pub fn into_fresh_session(
-        self,
+        mut self,
         session_id: impl Into<String>,
         decider: D,
         project_context: ProjectContextBootstrap,
     ) -> Result<Self, (Box<Self>, SessionError)> {
-        if self.has_unresolved_admission() {
-            return Err((Box::new(self), SessionError::UnresolvedAdmissionTransition));
+        if let Err(error) = self.reconcile_accepted_events() {
+            return Err((Box::new(self), error));
+        }
+        if self.has_unresolved_authoritative_write_inner() {
+            return Err((
+                Box::new(self),
+                SessionError::UnresolvedAuthoritativeWriteTransition,
+            ));
         }
         let active_target = self.active_target;
         let code_swarm_extension = self.code_swarm_extension;
@@ -1290,6 +1404,11 @@ impl<D> Session<D> {
     }
 
     pub fn with_provenance(mut self, provenance: ProvenanceWriter) -> Self {
+        self.accepted_events = Some(
+            provenance
+                .attach_accepted_event_feed()
+                .expect("one live Session owns a provenance writer's accepted-event feed"),
+        );
         self.provenance = Some(Arc::new(provenance));
         self
     }
@@ -1306,35 +1425,75 @@ impl<D> Session<D> {
         self.provider_runtime_observer = observer;
     }
 
-    /// Wire the shared mid-turn steering queue and arm it for the next turn
-    /// (issue #146). The interactive surface keeps a clone and pushes while
-    /// a turn is in flight; the round loop absorbs it at round boundaries
-    /// into `user.message` events, so the next model call sees steering
-    /// in-turn.
-    ///
-    /// Arming opens a new steering group ON THE CALLER'S THREAD, before the
-    /// turn's worker exists. Everything explicitly tagged as steering after
-    /// this call belongs to the upcoming turn; ordinary follow-ups remain
-    /// separate. Ordering the group with the surface's own pushes (same
-    /// thread) makes that boundary race-free — re-wire on every spawn.
-    pub fn set_steering_queue(&mut self, queue: Arc<steering::SteeringQueue>) {
-        queue.begin_turn(None);
+    /// Wire the shared mid-turn steering queue for the next turn (issue
+    /// #146). The group remains closed until the run start and initial user
+    /// message are durably admitted. A host must not advertise an active
+    /// steering surface before that handoff completes. It may expose the
+    /// asynchronous worker as starting, while retaining unclassified input at
+    /// the host; core rejects explicit steering without an open run instead
+    /// of silently reclassifying its mode.
+    pub fn set_steering_queue(
+        &mut self,
+        queue: Arc<steering::SteeringQueue>,
+    ) -> Result<(), SessionError> {
+        self.ensure_steering_queue_identity(&queue)?;
+        // The queue writes through the shared provenance writer without a
+        // mutable Session borrow. Publish the existing session prefix before
+        // exposing that writer so a queue event can never overtake bootstrap
+        // or other accepted in-memory history.
+        self.persist_new_events()?;
+        self.bind_queue(&queue, None)?;
         self.steering = Some(queue);
         self.queued_dispatch = None;
+        Ok(())
     }
 
-    /// Wire steering for a queued input selected as the next turn. If the
-    /// input is the head of an interrupted steering group, its contiguous
-    /// siblings are rebound to this replacement turn; an ordinary follow-up
-    /// opens a clean group and absorbs nothing already queued.
+    /// Bind the queue to this session while an interactive owner-swap fence
+    /// is held. The guard proves cloned submitters are still excluded; the
+    /// new durable writer is installed before dropping that fence.
+    pub fn set_steering_queue_during_lifecycle_transition(
+        &mut self,
+        queue: Arc<steering::SteeringQueue>,
+        transition: &steering::QueueLifecycleTransition<'_>,
+    ) -> Result<(), SessionError> {
+        if !transition.owns(&queue) {
+            return Err(QueueError::LifecycleTransition.into());
+        }
+        self.ensure_steering_queue_identity(&queue)?;
+        self.persist_new_events()?;
+        let Some(writer) = self.provenance.clone() else {
+            transition.unbind_durable();
+            self.steering = Some(queue);
+            self.queued_dispatch = None;
+            return Ok(());
+        };
+        let pending = self
+            .run_lifecycle
+            .pending()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        transition.bind_durable(
+            writer,
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            None,
+            &pending,
+        )?;
+        self.steering = Some(queue);
+        self.queued_dispatch = None;
+        Ok(())
+    }
+
+    /// Wire steering for a queued follow-up selected as the next turn. The
+    /// group opens only after the follow-up's run start, delivery, and user
+    /// message have been durably admitted as one batch.
     pub fn set_steering_queue_for_queued_input(
         &mut self,
         queue: Arc<steering::SteeringQueue>,
         input: &steering::QueuedInput,
-    ) -> Result<(), SessionError> {
-        if !queue.is_current_dispatch(input) {
-            return Err(SessionError::InvalidQueuedInput);
-        }
+    ) -> Result<steering::QueuedInput, SessionError> {
+        self.reconcile_accepted_events()?;
         if self
             .pending_admission
             .as_ref()
@@ -1342,9 +1501,82 @@ impl<D> Session<D> {
         {
             return Err(pending_admission_error());
         }
-        queue.begin_turn(Some(input));
+        self.ensure_steering_queue_identity(&queue)?;
+        let Some(input) = self.bind_queue_for_dispatch(&queue, input.id())? else {
+            return Err(SessionError::InvalidQueuedInput);
+        };
+        if input.mode() != QueueMode::FollowUp {
+            return Err(QueueError::StaleRun {
+                queue_id: input.queue_id(),
+                run_id: input.run_id(),
+            }
+            .into());
+        }
         self.steering = Some(queue);
         self.queued_dispatch = Some(input.clone());
+        Ok(input)
+    }
+
+    fn ensure_steering_queue_identity(
+        &self,
+        queue: &Arc<SteeringQueue>,
+    ) -> Result<(), SessionError> {
+        if self
+            .steering
+            .as_ref()
+            .is_some_and(|current| !Arc::ptr_eq(current, queue))
+        {
+            return Err(QueueError::QueueAuthorityMismatch.into());
+        }
+        Ok(())
+    }
+
+    fn bind_queue_for_dispatch(
+        &self,
+        queue: &SteeringQueue,
+        expected_dispatch: steering::QueueEntryId,
+    ) -> Result<Option<steering::QueuedInput>, SessionError> {
+        let Some(writer) = self.provenance.clone() else {
+            return Ok(queue.canonical_dispatch(expected_dispatch));
+        };
+        let pending = self
+            .run_lifecycle
+            .pending()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        queue
+            .bind_durable_for_dispatch(
+                writer,
+                self.config.session_id.clone(),
+                self.config.agent_id.clone(),
+                &pending,
+                expected_dispatch,
+            )
+            .map_err(Into::into)
+    }
+
+    fn bind_queue(
+        &self,
+        queue: &SteeringQueue,
+        active_run: Option<&str>,
+    ) -> Result<(), SessionError> {
+        let Some(writer) = self.provenance.clone() else {
+            return Ok(());
+        };
+        let pending = self
+            .run_lifecycle
+            .pending()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        queue.bind_durable(
+            writer,
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            active_run,
+            &pending,
+        )?;
         Ok(())
     }
 
@@ -1358,12 +1590,43 @@ impl<D> Session<D> {
                 .is_some_and(|queue| queue.has_unresolved_admission())
     }
 
-    /// Whether a fresh user turn can be admitted under the active target's
-    /// context latch and the response-persistence reopen fence. TUI auto-flush
-    /// must leave queued work untouched when this is false.
+    /// Reconcile concurrent writer-confirmed events, then report whether any
+    /// authoritative writer still owns state that forbids `/new` or
+    /// `/resume`. A successful queue append waiting in the accepted feed is
+    /// folded before the answer, so lifecycle replacement cannot detach from
+    /// newly durable rows.
+    pub fn has_unresolved_authoritative_write(&mut self) -> Result<bool, SessionError> {
+        self.reconcile_accepted_events()?;
+        Ok(self.has_unresolved_authoritative_write_inner())
+    }
+
+    fn has_unresolved_authoritative_write_inner(&self) -> bool {
+        self.accepted_state_invalid
+            || self.parented_append_recovery_required
+            || self.pending_admission.is_some()
+            || self.pending_run_terminal.is_some()
+            || self.deferred_run_terminal.is_some()
+            || self.pending_parented_append.is_some()
+            || self.has_pending_agent_result()
+            || self.terminalization_failed
+            || self
+                .steering
+                .as_ref()
+                .is_some_and(|queue| queue.has_unresolved_authoritative_write())
+            || self
+                .provenance
+                .as_ref()
+                .is_some_and(|writer| writer.has_unresolved_append())
+    }
+
+    /// Whether a fresh user turn can be admitted: the active target's context
+    /// latch is clear and no authoritative writer — including the
+    /// response-persistence reopen fence — still owns unresolved state. TUI
+    /// auto-flush and deferred extension/companion requests must leave
+    /// queued work untouched when this is false.
     pub fn can_accept_turn(&self) -> bool {
-        !self.terminalization_failed
-            && self.context_limit_emitted.as_ref() != Some(&self.active_target)
+        self.context_limit_emitted.as_ref() != Some(&self.active_target)
+            && !self.has_unresolved_authoritative_write_inner()
     }
 
     /// Wire the interactive surface's edge-triggered manual-compaction
@@ -1390,6 +1653,88 @@ impl<D> Session<D> {
 
     pub fn events(&self) -> &[EventEnvelope] {
         self.bus.events()
+    }
+
+    /// Durable queued inputs reconstructed from canonical lifecycle events.
+    pub fn pending_queue_inputs(&mut self) -> Result<Vec<PendingQueueInput>, SessionError> {
+        self.reconcile_accepted_events()?;
+        Ok(self.run_lifecycle.pending().iter().cloned().collect())
+    }
+
+    /// Terminal-cancelled steering retained for explicit recovery.
+    ///
+    /// These rows are not pending or deliverable. A host must ask the user
+    /// before creating any new queued input from their private content.
+    pub fn recoverable_queue_inputs(&mut self) -> Result<Vec<RecoverableQueueInput>, SessionError> {
+        self.reconcile_accepted_events()?;
+        Ok(self.run_lifecycle.recoverable().to_vec())
+    }
+
+    /// Durably dismiss a terminal-cancelled steering row. The private
+    /// recovery projection changes only after `queue.recovered` is accepted.
+    pub fn dismiss_recoverable_queue_input(
+        &mut self,
+        queue: Arc<SteeringQueue>,
+        queue_id: &str,
+    ) -> Result<(), SessionError> {
+        let recovered = self.prepare_recoverable_queue_operation(&queue, queue_id)?;
+        queue.dismiss_recoverable(&recovered)?;
+        self.reconcile_accepted_events()?;
+        Ok(())
+    }
+
+    /// Atomically resolve a terminal-cancelled steering row into a new,
+    /// explicit follow-up. The replacement has a fresh queue/run identity;
+    /// its source run is checked against `expected_run_id` at the queue's
+    /// terminal linearization seam.
+    pub fn requeue_recoverable_queue_input(
+        &mut self,
+        queue: Arc<SteeringQueue>,
+        queue_id: &str,
+        expected_run_id: Option<&str>,
+        position: QueuePosition,
+        content: String,
+    ) -> Result<String, SessionError> {
+        let recovered = self.prepare_recoverable_queue_operation(&queue, queue_id)?;
+        let replacement_id =
+            queue.requeue_recoverable(&recovered, expected_run_id, position, content)?;
+        self.reconcile_accepted_events()?;
+        Ok(replacement_id)
+    }
+
+    fn prepare_recoverable_queue_operation(
+        &mut self,
+        queue: &Arc<SteeringQueue>,
+        queue_id: &str,
+    ) -> Result<RecoverableQueueInput, SessionError> {
+        self.reconcile_accepted_events()?;
+        let recovered = self
+            .run_lifecycle
+            .recoverable()
+            .iter()
+            .find(|item| item.queue_id() == queue_id)
+            .cloned()
+            .ok_or_else(|| QueueError::NotRecoverable {
+                queue_id: queue_id.to_owned(),
+            })?;
+        self.ensure_steering_queue_identity(queue)?;
+        self.persist_new_events()?;
+        let active_run = self.active_run.clone();
+        self.bind_queue(queue, active_run.as_deref())?;
+        self.steering = Some(Arc::clone(queue));
+        Ok(recovered)
+    }
+
+    /// Terminal status for a durable run id, if that run has ended.
+    ///
+    /// Queue consumers use this with `PendingQueueInput::source_run_id`
+    /// instead of inferring source outcome from event adjacency.
+    pub fn run_terminal_status(
+        &mut self,
+        run_id: &str,
+    ) -> Result<Option<RunTerminalStatus>, SessionError> {
+        self.reconcile_accepted_events()?;
+        Ok(self.run_lifecycle.terminal_status(run_id))
     }
 
     /// Register a known secret value for redaction from tool output (auth
@@ -1471,7 +1816,12 @@ impl<D> Session<D> {
             return false;
         };
         let tool_catalog = self.extension_tool_catalog_snapshot();
-        self.commit_compaction_candidate(candidate, None, &tool_catalog)
+        self.commit_compaction_candidate(
+            candidate,
+            None,
+            &tool_catalog,
+            &CompactionEventOrigin::ActiveRun,
+        )
     }
 
     fn commit_compaction_candidate(
@@ -1479,14 +1829,16 @@ impl<D> Session<D> {
         candidate: CompactionCandidate,
         shadow: Option<(&ModelTarget, Duration)>,
         tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+        origin: &CompactionEventOrigin,
     ) -> bool {
         if let Err(reason) = self.validate_proposed_compaction(&candidate, tool_catalog) {
-            self.emit_control_event(
+            self.emit_compaction_control_event(
                 EventKind::CANVAS_CANDIDATE_DISCARDED,
                 object([
                     ("reason", reason.into()),
                     ("policy_version", candidate.policy_version.into()),
                 ]),
+                origin,
             );
             return false;
         }
@@ -1503,7 +1855,21 @@ impl<D> Session<D> {
                 elapsed.as_millis().try_into().unwrap_or(u64::MAX).into(),
             );
         }
-        self.emit_control_event(EventKind::CANVAS_SWAP, payload)
+        self.emit_compaction_control_event(EventKind::CANVAS_SWAP, payload, origin)
+    }
+
+    fn emit_compaction_control_event(
+        &mut self,
+        kind: &'static str,
+        payload: JsonObject,
+        origin: &CompactionEventOrigin,
+    ) -> bool {
+        match origin {
+            CompactionEventOrigin::ActiveRun => self.emit_control_event(kind, payload),
+            CompactionEventOrigin::Captured(run) => self
+                .emit_control_event_required_with_captured_run(kind, payload, run.clone())
+                .is_ok(),
+        }
     }
 
     fn validate_proposed_compaction(
@@ -1627,15 +1993,61 @@ impl<D> Session<D> {
         self.accept_control_event(event)
     }
 
+    fn emit_control_event_required_with_captured_run(
+        &mut self,
+        kind: &'static str,
+        payload: JsonObject,
+        captured_run: Option<String>,
+    ) -> Result<(), SessionError> {
+        self.persist_new_events()?;
+        let parent = self
+            .bus
+            .events()
+            .iter()
+            .rev()
+            .find(|event| event.kind.as_str() != EventKind::MODEL_DELTA)
+            .map(|event| event.id.clone());
+        let event = EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            parent,
+            kind,
+            payload,
+        );
+        self.accept_control_event_with_captured_run(event, captured_run)
+    }
+
     fn accept_control_event(&mut self, event: EventEnvelope) -> Result<(), SessionError> {
-        self.append_before_accept(&event)?;
+        self.accept_control_event_inner(event, true)
+    }
+
+    /// Accept an event on behalf of work whose run was captured when that
+    /// work started. `None` is an explicit runless origin, not a request to
+    /// inherit whichever run happens to be active when the result arrives.
+    fn accept_control_event_with_captured_run(
+        &mut self,
+        mut event: EventEnvelope,
+        captured_run: Option<String>,
+    ) -> Result<(), SessionError> {
+        event.run = captured_run;
+        self.accept_control_event_inner(event, false)
+    }
+
+    fn accept_control_event_inner(
+        &mut self,
+        mut event: EventEnvelope,
+        inherit_active_run: bool,
+    ) -> Result<(), SessionError> {
         let is_swap = event.kind.as_str() == EventKind::CANVAS_SWAP;
-        self.bus.push(event);
-        let replaced_canvas =
-            is_swap
-                && self.bus.events().last().is_some_and(|event| {
-                    crate::canvas::canvas_swap_is_valid(self.bus.events(), event)
-                });
+        let event_id = event.id.clone();
+        self.accept_ordered_batch_inner(std::slice::from_mut(&mut event), inherit_active_run)?;
+        let replaced_canvas = is_swap
+            && self
+                .bus
+                .events()
+                .iter()
+                .find(|event| event.id == event_id)
+                .is_some_and(|event| crate::canvas::canvas_swap_is_valid(self.bus.events(), event));
         if replaced_canvas {
             // Usage belongs to the provider request assembled from the old
             // canvas. The swap is atomic authority for a new canvas, so its
@@ -1645,20 +2057,66 @@ impl<D> Session<D> {
             self.latest_model_usage = None;
             self.context_limit_emitted = None;
         }
-        if self.provenance.is_some() {
-            self.persisted_events = self.bus.events().len();
-        }
         Ok(())
     }
 
-    fn append_before_accept(&self, event: &EventEnvelope) -> Result<(), SessionError> {
-        self.ensure_no_pending_admission()?;
-        self.append_candidate(event)
+    fn accept_ordered_batch(&mut self, events: &mut [EventEnvelope]) -> Result<(), SessionError> {
+        self.accept_ordered_batch_inner(events, true)
     }
 
-    fn append_candidate(&self, event: &EventEnvelope) -> Result<(), SessionError> {
-        if let Some(writer) = &self.provenance {
-            writer.append(std::slice::from_ref(event))?;
+    fn accept_ordered_batch_inner(
+        &mut self,
+        events: &mut [EventEnvelope],
+        inherit_active_run: bool,
+    ) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission()?;
+        self.accept_ordered_batch_after_admission_check(events, inherit_active_run)
+    }
+
+    /// Retry a previously prepared agent message that owns an earlier writer
+    /// reservation. A result installed after that failed append must not
+    /// deadlock the older exact retry. Fresh reports never reach this path:
+    /// they prepare their envelope only after the ordinary admission fence.
+    fn accept_prepared_agent_message(
+        &mut self,
+        event: &mut EventEnvelope,
+    ) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission_except_agent_result()?;
+        self.accept_ordered_batch_after_admission_check(std::slice::from_mut(event), false)
+    }
+
+    fn accept_ordered_batch_after_admission_check(
+        &mut self,
+        events: &mut [EventEnvelope],
+        inherit_active_run: bool,
+    ) -> Result<(), SessionError> {
+        self.reconcile_accepted_events()?;
+        for event in events.iter_mut() {
+            if inherit_active_run && event.run.is_none() {
+                event.run.clone_from(&self.active_run);
+            }
+        }
+        let ids = events
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<BTreeSet<_>>();
+        if let Some(writer) = self.provenance.clone() {
+            writer.append_ordered(events)?;
+            self.reconcile_accepted_events()?;
+            debug_assert!(ids.iter().all(|id| {
+                self.bus
+                    .events()
+                    .iter()
+                    .any(|event| event.id.as_str() == id)
+            }));
+        } else {
+            let mut candidate = self.bus.events().to_vec();
+            candidate.extend(events.iter().cloned());
+            let lifecycle = run_lifecycle::fold_run_lifecycle(&candidate)?;
+            for event in events.iter().cloned() {
+                self.bus.push(event);
+            }
+            self.run_lifecycle = lifecycle;
         }
         Ok(())
     }
@@ -1677,29 +2135,192 @@ impl<D> Session<D> {
     fn admit_user_message(
         &mut self,
         content: &str,
-        queue_id: Option<steering::QueueEntryId>,
+        input: Option<&QueuedInput>,
+        initial: bool,
     ) -> Result<String, SessionError> {
         self.ensure_terminalization_intact()?;
-        let payload = self.user_message_payload(content)?;
+        let kind = match (initial, input.map(QueuedInput::mode)) {
+            (true, None) => UserAdmissionKind::Direct,
+            (true, Some(QueueMode::FollowUp)) => UserAdmissionKind::FollowUp,
+            (false, Some(QueueMode::Steering)) => UserAdmissionKind::Steering,
+            _ => return Err(SessionError::InvalidQueuedInput),
+        };
+        let run_id = self.prepare_user_admission(content, input, kind)?;
+        let id = self.append_pending_user_admission()?;
+        if matches!(
+            kind,
+            UserAdmissionKind::Direct | UserAdmissionKind::FollowUp
+        ) {
+            self.active_run = Some(run_id);
+        }
+        self.pending_admission = None;
+        Ok(id)
+    }
+
+    fn prepare_user_admission(
+        &mut self,
+        content: &str,
+        input: Option<&QueuedInput>,
+        kind: UserAdmissionKind,
+    ) -> Result<String, SessionError> {
+        self.retry_orphaned_agent_results()?;
+        self.ensure_no_pending_agent_result()?;
+        let queue_id = input.map(QueuedInput::id);
         if let Some(pending) = &self.pending_admission {
-            if pending.queue_id != queue_id
-                || pending.event.kind.as_str() != EventKind::USER_MESSAGE
-                || pending.event.payload != payload
-            {
+            if pending.queue_id != queue_id || pending.content != content || pending.kind != kind {
                 return Err(pending_admission_error());
             }
-        } else {
-            self.pending_admission = Some(PendingAdmission {
-                event: EventEnvelope::new(
+            return Ok(pending.run_id.clone());
+        }
+        if self
+            .provenance
+            .as_ref()
+            .is_some_and(|writer| writer.has_unresolved_append())
+        {
+            // A retained extension/agent/queue candidate owns the writer's
+            // exact retry. Installing a user admission first would make that
+            // owner fail the admission guard and deadlock both operations.
+            return Err(SessionError::UnresolvedAuthoritativeAppend);
+        }
+        let pending = self.new_user_admission(content, input, kind)?;
+        let run_id = pending.run_id.clone();
+        self.pending_admission = Some(pending);
+        Ok(run_id)
+    }
+
+    fn new_user_admission(
+        &self,
+        content: &str,
+        input: Option<&QueuedInput>,
+        kind: UserAdmissionKind,
+    ) -> Result<PendingAdmission, SessionError> {
+        let run_id = match kind {
+            UserAdmissionKind::Direct if self.active_run.is_none() => Ulid::new().to_string(),
+            UserAdmissionKind::FollowUp if self.active_run.is_none() => {
+                input.ok_or(SessionError::InvalidQueuedInput)?.run_id()
+            }
+            UserAdmissionKind::Steering => {
+                let input = input.ok_or(SessionError::InvalidQueuedInput)?;
+                let run_id = input.run_id();
+                if self.active_run.as_deref() != Some(run_id.as_str()) {
+                    return Err(QueueError::StaleRun {
+                        queue_id: input.queue_id(),
+                        run_id,
+                    }
+                    .into());
+                }
+                run_id
+            }
+            UserAdmissionKind::Direct | UserAdmissionKind::FollowUp => {
+                return Err(SessionError::InvalidQueuedInput);
+            }
+        };
+        let queue_id = input.map(QueuedInput::id);
+        let events = self.user_admission_events(content, kind, input, &run_id)?;
+        Ok(PendingAdmission {
+            events,
+            queue_id,
+            run_id,
+            content: content.to_owned(),
+            kind,
+        })
+    }
+
+    fn user_admission_events(
+        &self,
+        content: &str,
+        kind: UserAdmissionKind,
+        input: Option<&QueuedInput>,
+        run_id: &str,
+    ) -> Result<Vec<EventEnvelope>, SessionError> {
+        let mut events = Vec::new();
+        let queue_id = input.map(QueuedInput::queue_id);
+        if kind == UserAdmissionKind::Steering && self.provenance.is_none() {
+            let input = input.expect("steering input exists");
+            let mut payload = object([
+                (
+                    "queue_id",
+                    queue_id.as_deref().expect("queued input has an id").into(),
+                ),
+                ("mode", "steering".into()),
+                ("position", input.position().into()),
+                ("content", content.to_owned().into()),
+            ]);
+            if let Some(source_run_id) = input.source_run_id() {
+                payload.insert("source_run_id".to_owned(), source_run_id.into());
+            }
+            // A writer-less queue has no earlier durable enqueue row. Project
+            // its exact volatile enqueue immediately before delivery so the
+            // same lifecycle fold validates the in-memory steering batch.
+            events.push(
+                EventEnvelope::new(
                     self.config.session_id.clone(),
                     self.config.agent_id.clone(),
-                    self.previous_persisted_event_id(),
-                    EventKind::USER_MESSAGE,
+                    None,
+                    EventKind::QUEUE_ENQUEUED,
                     payload,
-                ),
-                queue_id,
-            });
+                )
+                .with_run(run_id.to_owned()),
+            );
         }
+        let start_payload = match kind {
+            UserAdmissionKind::Direct => Some(object([("trigger", "direct".into())])),
+            UserAdmissionKind::FollowUp if self.provenance.is_some() => Some(object([
+                ("trigger", "follow_up".into()),
+                (
+                    "queue_id",
+                    queue_id
+                        .as_deref()
+                        .expect("follow-up input has a queue id")
+                        .into(),
+                ),
+            ])),
+            // A writer-less Session keeps the pre-existing volatile queue
+            // mode: there was no accepted queue.enqueued event to consume,
+            // so the run starts directly rather than inventing provenance.
+            UserAdmissionKind::FollowUp => Some(object([("trigger", "direct".into())])),
+            UserAdmissionKind::Steering => None,
+        };
+        if let Some(payload) = start_payload {
+            events.push(
+                EventEnvelope::new(
+                    self.config.session_id.clone(),
+                    self.config.agent_id.clone(),
+                    None,
+                    EventKind::RUN_STARTED,
+                    payload,
+                )
+                .with_run(run_id.to_owned()),
+            );
+        }
+        if let Some(queue_id) =
+            queue_id.filter(|_| self.provenance.is_some() || kind == UserAdmissionKind::Steering)
+        {
+            events.push(
+                EventEnvelope::new(
+                    self.config.session_id.clone(),
+                    self.config.agent_id.clone(),
+                    None,
+                    EventKind::QUEUE_DELIVERED,
+                    object([("queue_id", queue_id.into())]),
+                )
+                .with_run(run_id.to_owned()),
+            );
+        }
+        events.push(
+            EventEnvelope::new(
+                self.config.session_id.clone(),
+                self.config.agent_id.clone(),
+                None,
+                EventKind::USER_MESSAGE,
+                self.user_message_payload(content)?,
+            )
+            .with_run(run_id.to_owned()),
+        );
+        Ok(events)
+    }
+
+    fn append_pending_user_admission(&mut self) -> Result<String, SessionError> {
         if let Err(error) = self.persist_pending_admission_backlog() {
             self.protect_pending_queue_row();
             return Err(error);
@@ -1708,16 +2329,45 @@ impl<D> Session<D> {
             .pending_admission
             .as_ref()
             .expect("admission was matched or created");
-        let event = pending.event.clone();
-        let id = event.id.clone();
-        if let Err(error) = self.append_candidate(&event) {
+        let mut events = pending.events.clone();
+        let id = events
+            .last()
+            .expect("admission always contains user.message")
+            .id
+            .clone();
+        let append = if let Some(writer) = self.provenance.clone() {
+            writer.append_ordered(&mut events)
+        } else {
+            let mut parent = self.previous_persisted_event_id();
+            for event in &mut events {
+                event.parent = parent;
+                parent = Some(event.id.clone());
+            }
+            Ok(())
+        };
+        self.pending_admission
+            .as_mut()
+            .expect("admission remains installed until acceptance")
+            .events = events.clone();
+        if let Err(error) = append {
+            let reconciliation = self.reconcile_accepted_events();
             self.protect_pending_queue_row();
-            return Err(error);
+            reconciliation?;
+            return Err(error.into());
         }
-        self.bus.push(event);
-        self.pending_admission = None;
         if self.provenance.is_some() {
-            self.persisted_events = self.bus.events().len();
+            if let Err(error) = self.reconcile_accepted_events() {
+                self.protect_pending_queue_row();
+                return Err(error);
+            }
+        } else {
+            let mut candidate = self.bus.events().to_vec();
+            candidate.extend(events.iter().cloned());
+            let lifecycle = run_lifecycle::fold_run_lifecycle(&candidate)?;
+            for event in events {
+                self.bus.push(event);
+            }
+            self.run_lifecycle = lifecycle;
         }
         Ok(id)
     }
@@ -1764,8 +2414,9 @@ impl<D> Session<D> {
         debug_assert!(self.pending_admission.is_some());
         self.ensure_terminalization_intact()?;
         if self.persisted_events < self.bus.events().len() {
-            if let Some(writer) = &self.provenance {
+            if let Some(writer) = self.provenance.clone() {
                 writer.append(&self.bus.events()[self.persisted_events..])?;
+                self.reconcile_accepted_events()?;
                 self.persisted_events = self.bus.events().len();
             }
         }
@@ -1783,16 +2434,41 @@ impl<D> Session<D> {
     }
 
     fn ensure_no_pending_admission(&self) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission_except_agent_result()?;
+        self.ensure_no_pending_agent_result()
+    }
+
+    fn ensure_no_pending_admission_except_agent_result(&self) -> Result<(), SessionError> {
         self.ensure_terminalization_intact()?;
-        if self.pending_admission.is_some() {
+        if self.pending_run_terminal.is_some() || self.deferred_run_terminal.is_some() {
+            Err(QueueError::UnresolvedTerminal.into())
+        } else if self.pending_admission.is_some() {
             Err(pending_admission_error())
         } else {
             Ok(())
         }
     }
 
+    fn ensure_no_pending_agent_result(&self) -> Result<(), SessionError> {
+        if self.has_pending_agent_result() {
+            Err(SessionError::UnresolvedAgentResult)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn has_pending_agent_result(&self) -> bool {
+        self.open_agent_spawns
+            .values()
+            .any(|open| open.pending_result.is_some())
+    }
+
     fn ensure_terminalization_intact(&self) -> Result<(), SessionError> {
-        if self.terminalization_failed {
+        if self.accepted_state_invalid {
+            Err(SessionError::InvalidAcceptedState)
+        } else if self.parented_append_recovery_required {
+            Err(SessionError::ParentedAppendRecoveryRequired)
+        } else if self.terminalization_failed {
             Err(terminalization_failed_error())
         } else {
             Ok(())
@@ -1809,12 +2485,152 @@ impl<D> Session<D> {
     }
 
     fn persist_new_events(&mut self) -> Result<(), SessionError> {
+        self.ensure_terminalization_intact()?;
+        self.retry_orphaned_agent_results()?;
+        self.persist_new_events_without_agent_result_retry()
+    }
+
+    fn persist_new_events_without_agent_result_retry(&mut self) -> Result<(), SessionError> {
         self.ensure_no_pending_admission()?;
+        self.reconcile_accepted_events()?;
         if let Some(writer) = &self.provenance {
             writer.append(&self.bus.events()[self.persisted_events..])?;
+            self.reconcile_accepted_events()?;
+            // Runtime-only events produce no feed item, but the persistence
+            // policy has still handled the complete suffix.
             self.persisted_events = self.bus.events().len();
         }
         Ok(())
+    }
+
+    fn persist_new_events_before_agent_result(&mut self) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission_except_agent_result()?;
+        self.reconcile_accepted_events()?;
+        if let Some(writer) = &self.provenance {
+            writer.append(&self.bus.events()[self.persisted_events..])?;
+            self.reconcile_accepted_events()?;
+            self.persisted_events = self.bus.events().len();
+        }
+        Ok(())
+    }
+
+    fn append_pending_agent_result(
+        &mut self,
+        spawn_event_id: &str,
+    ) -> Result<String, SessionError> {
+        let append_attempted = self
+            .open_agent_spawns
+            .get(spawn_event_id)
+            .and_then(|open| open.pending_result.as_ref())
+            .ok_or_else(|| AgentError::UnknownSpawn {
+                spawn_event_id: spawn_event_id.to_owned(),
+            })?
+            .append_attempted;
+        if !append_attempted {
+            // The exact result candidate was installed before flushing any
+            // older live backlog. A backlog failure therefore cannot lose the
+            // result that owns the eventual retry.
+            self.persist_new_events_before_agent_result()?;
+        }
+        let mut pending = self
+            .open_agent_spawns
+            .get_mut(spawn_event_id)
+            .and_then(|open| open.pending_result.take())
+            .ok_or_else(|| AgentError::UnknownSpawn {
+                spawn_event_id: spawn_event_id.to_owned(),
+            })?;
+        pending.append_attempted = true;
+        let result_event_id = pending.event.id.clone();
+        let append =
+            self.accept_ordered_batch_inner(std::slice::from_mut(&mut pending.event), false);
+        if let Err(error) = append {
+            self.open_agent_spawns
+                .get_mut(spawn_event_id)
+                .expect("spawn remains open after failed result append")
+                .pending_result = Some(pending);
+            return Err(error);
+        }
+        self.open_agent_spawns.remove(spawn_event_id);
+        Ok(result_event_id)
+    }
+
+    fn retry_orphaned_agent_results(&mut self) -> Result<(), SessionError> {
+        loop {
+            let Some(spawn_event_id) = self.open_agent_spawns.iter().find_map(|(id, open)| {
+                open.pending_result
+                    .as_ref()
+                    .is_some_and(|pending| pending.orphaned)
+                    .then(|| id.clone())
+            }) else {
+                return Ok(());
+            };
+            self.append_pending_agent_result(&spawn_event_id)?;
+        }
+    }
+
+    fn mark_pending_agent_result_orphaned(&mut self, spawn_event_id: &str) {
+        if let Some(pending) = self
+            .open_agent_spawns
+            .get_mut(spawn_event_id)
+            .and_then(|open| open.pending_result.as_mut())
+        {
+            pending.orphaned = true;
+        }
+    }
+
+    /// Publish writer-confirmed events into the live bus in the exact order
+    /// the writer accepted them. Existing ids are bootstrap/session events
+    /// that were already in memory before their first append and are skipped.
+    fn reconcile_accepted_events(&mut self) -> Result<(), SessionError> {
+        if self.accepted_state_invalid {
+            return Err(SessionError::InvalidAcceptedState);
+        }
+        let Some(feed) = &self.accepted_events else {
+            return Ok(());
+        };
+        let events = feed.drain();
+        let result = reconcile_accepted_events(
+            events,
+            &mut self.bus,
+            &mut self.persisted_events,
+            &mut self.run_lifecycle,
+        );
+        if result.is_err() {
+            self.mark_accepted_state_invalid();
+        }
+        result
+    }
+
+    fn reconcile_accepted_events_through(&mut self, event_id: &str) -> Result<(), SessionError> {
+        if self.accepted_state_invalid {
+            return Err(SessionError::InvalidAcceptedState);
+        }
+        let Some(feed) = &self.accepted_events else {
+            return Ok(());
+        };
+        let events = feed.drain_through(event_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("accepted-event scrub cutoff {event_id} is unavailable"),
+            )
+        })?;
+        let result = reconcile_accepted_events(
+            events,
+            &mut self.bus,
+            &mut self.persisted_events,
+            &mut self.run_lifecycle,
+        );
+        if result.is_err() {
+            self.mark_accepted_state_invalid();
+        }
+        result
+    }
+
+    fn mark_accepted_state_invalid(&mut self) {
+        self.accepted_state_invalid = true;
+        if let Some(queue) = &self.steering {
+            queue.mark_accepted_state_invalid();
+        }
     }
 
     pub fn set_permission_mode(&mut self, capability: Capability, mode: ApprovalMode) {
@@ -1950,7 +2766,15 @@ impl<D> Session<D> {
         active_target: ModelTarget,
         latest_model_usage_used_tokens: Option<u64>,
         context_limit_emitted: Option<ModelTarget>,
+        run_lifecycle: run_lifecycle::RunLifecycleProjection,
     ) -> Self {
+        // `session.resumed` is a durable log-only leaf. Historical markers
+        // remain available to provenance readers but never enter the live
+        // event bus, transcript, canvas, or the accepted-prefix cursor.
+        let events = events
+            .into_iter()
+            .filter(|event| event.kind.as_str() != EventKind::SESSION_RESUMED)
+            .collect::<Vec<_>>();
         let mut tools =
             ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
         if let Ok(fold) = crate::project_context::fold_project_context(&events) {
@@ -1966,6 +2790,8 @@ impl<D> Session<D> {
         let session = Self {
             config,
             active_target,
+            active_run: None,
+            run_lifecycle,
             providers,
             bus: EventBus { events },
             permissions,
@@ -1973,12 +2799,15 @@ impl<D> Session<D> {
             tools,
             tool_reteach: ReteachTracker::default(),
             provenance: None,
+            accepted_events: None,
             persisted_events,
             extension_emission_degraded: false,
             latest_model_usage: latest_model_usage_used_tokens
                 .map(|used_tokens| ModelUsageSnapshot { used_tokens }),
             context_limit_emitted,
             open_agent_spawns: BTreeMap::new(),
+            pending_parented_append: None,
+            parented_append_recovery_required: false,
             observer_extension: None,
             provider_runtime_observer: ProviderRuntimeObserver::default(),
             extensions: BTreeMap::new(),
@@ -1986,7 +2815,10 @@ impl<D> Session<D> {
             steering: None,
             queued_dispatch: None,
             pending_admission: None,
+            pending_run_terminal: None,
+            deferred_run_terminal: None,
             terminalization_failed: false,
+            accepted_state_invalid: false,
             compaction_request: None,
             shadow_compaction: None,
             code_swarm_extension: None,
@@ -2064,8 +2896,14 @@ impl<D: PermissionDecider> Session<D> {
         );
         let spawn_event_id = event.id.clone();
         self.accept_control_event(event)?;
-        self.open_agent_spawns
-            .insert(spawn_event_id.clone(), child_agent_id.clone());
+        self.open_agent_spawns.insert(
+            spawn_event_id.clone(),
+            OpenAgentSpawn {
+                child_agent_id: child_agent_id.clone(),
+                run_id: self.active_run.clone(),
+                pending_result: None,
+            },
+        );
         Ok(SpawnedAgent::new(child_agent_id, spawn_event_id))
     }
 
@@ -2074,37 +2912,74 @@ impl<D: PermissionDecider> Session<D> {
         spawned: &mut SpawnedAgent,
         result: AgentResult,
     ) -> Result<String, SessionError> {
+        let spawn_event_id = self.prepare_agent_result(spawned, &result)?;
+        let result_event_id = self.append_pending_agent_result(&spawn_event_id)?;
+        spawned.mark_result_recorded();
+        Ok(result_event_id)
+    }
+
+    fn prepare_agent_result(
+        &mut self,
+        spawned: &SpawnedAgent,
+        result: &AgentResult,
+    ) -> Result<String, SessionError> {
         spawned.ensure_result_open()?;
-        let child_agent_id = self
-            .open_agent_spawns
-            .get(spawned.spawn_event_id())
-            .ok_or_else(|| AgentError::UnknownSpawn {
-                spawn_event_id: spawned.spawn_event_id().to_owned(),
-            })?;
-        if child_agent_id != spawned.child_agent_id() {
-            return Err(AgentError::ChildAgentMismatch {
-                spawn_event_id: spawned.spawn_event_id().to_owned(),
-            }
-            .into());
-        }
+        let spawn_event_id = spawned.spawn_event_id().to_owned();
         let payload = euler_agents::agent_result_payload(
-            &result,
+            result,
             spawned.child_agent_id(),
             spawned.spawn_event_id(),
         );
-        self.persist_new_events()?;
-        let event = EventEnvelope::new(
-            self.config.session_id.clone(),
-            self.config.agent_id.clone(),
-            Some(spawned.spawn_event_id().to_owned()),
-            EventKind::AGENT_RESULT,
-            payload,
-        );
-        let result_event_id = event.id.clone();
-        self.accept_control_event(event)?;
-        self.open_agent_spawns.remove(spawned.spawn_event_id());
-        spawned.mark_result_recorded();
-        Ok(result_event_id)
+        let open = self.open_agent_spawns.get(&spawn_event_id).ok_or_else(|| {
+            AgentError::UnknownSpawn {
+                spawn_event_id: spawn_event_id.clone(),
+            }
+        })?;
+        if open.child_agent_id != spawned.child_agent_id() {
+            return Err(AgentError::ChildAgentMismatch { spawn_event_id }.into());
+        }
+        let origin_run = open.run_id.clone();
+        if let Some(pending) = open.pending_result.as_ref() {
+            if pending.event.payload != payload || pending.event.run != origin_run {
+                return Err(AgentError::ResultRetryMismatch { spawn_event_id }.into());
+            }
+        } else {
+            self.ensure_no_pending_admission()?;
+            let mut event = EventEnvelope::new(
+                self.config.session_id.clone(),
+                self.config.agent_id.clone(),
+                Some(spawn_event_id.clone()),
+                EventKind::AGENT_RESULT,
+                payload,
+            );
+            event.run = origin_run;
+            self.open_agent_spawns
+                .get_mut(&spawn_event_id)
+                .expect("validated open spawn")
+                .pending_result = Some(PendingAgentResult {
+                event,
+                append_attempted: false,
+                orphaned: false,
+            });
+        }
+        Ok(spawn_event_id)
+    }
+
+    /// Record the terminal result at a call site that cannot return the
+    /// `SpawnedAgent` handle to its caller. If persistence fails, Session is
+    /// the only remaining owner of the retained exact envelope, so mark it
+    /// for reconciliation before the next authoritative write.
+    fn record_agent_result_before_handle_loss(
+        &mut self,
+        spawned: &mut SpawnedAgent,
+        result: AgentResult,
+    ) -> Result<String, SessionError> {
+        let spawn_event_id = spawned.spawn_event_id().to_owned();
+        let recorded = self.record_agent_result(spawned, result);
+        if recorded.is_err() {
+            self.mark_pending_agent_result_orphaned(&spawn_event_id);
+        }
+        recorded
     }
 
     pub fn switch_model(
@@ -2163,15 +3038,7 @@ impl<D: PermissionDecider> Session<D> {
         }
         // The target and any required effort downgrade are one control-plane
         // transition: persist the complete batch before accepting either.
-        if let Some(writer) = &self.provenance {
-            writer.append(&events)?;
-        }
-        for event in events {
-            self.bus.push(event);
-        }
-        if self.provenance.is_some() {
-            self.persisted_events = self.bus.events().len();
-        }
+        self.accept_ordered_batch(&mut events)?;
         self.active_target = next;
         self.config.reasoning_effort = next_effort;
         // Compaction/hard-stop windows track the active model, not the launch
@@ -2208,11 +3075,7 @@ impl<D: PermissionDecider> Session<D> {
                 ("reason", reason.to_owned().into()),
             ]),
         );
-        self.append_before_accept(&event)?;
-        self.bus.push(event);
-        if self.provenance.is_some() {
-            self.persisted_events = self.bus.events().len();
-        }
+        self.accept_control_event(event)?;
         self.config.reasoning_effort = effort;
         Ok(true)
     }
@@ -2307,23 +3170,216 @@ impl<D: PermissionDecider> Session<D> {
         self.run_turn_with_sink(user_message, Arc::new(AtomicBool::new(false)), |_| {})
     }
 
+    /// Reserve, canonicalize, and admit the front follow-up through one core
+    /// operation. The caller never supplies prompt bytes separately from the
+    /// durable queue row, so a stale UI snapshot cannot dispatch different
+    /// content under the reserved queue identity.
+    pub fn run_next_queued_follow_up(
+        &mut self,
+        queue: Arc<SteeringQueue>,
+    ) -> Result<Option<Vec<EventEnvelope>>, SessionError> {
+        self.run_next_queued_follow_up_with_sink(queue, Arc::new(AtomicBool::new(false)), |_| {})
+    }
+
+    pub fn run_next_queued_follow_up_with_sink<F>(
+        &mut self,
+        queue: Arc<SteeringQueue>,
+        cancel_flag: Arc<AtomicBool>,
+        on_event: F,
+    ) -> Result<Option<Vec<EventEnvelope>>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let Some(reserved) = queue.reserve_front_for_dispatch() else {
+            return Ok(None);
+        };
+        let canonical =
+            match self.set_steering_queue_for_queued_input(Arc::clone(&queue), &reserved) {
+                Ok(canonical) => canonical,
+                Err(error) => {
+                    queue.release_dispatch(&reserved);
+                    return Err(error);
+                }
+            };
+        let prompt = canonical.content().to_owned();
+        self.run_turn_with_sink(&prompt, cancel_flag, on_event)
+            .map(Some)
+    }
+
     pub fn run_turn_with_sink<F>(
         &mut self,
         user_message: &str,
         cancel_flag: Arc<AtomicBool>,
-        on_event: F,
+        mut on_event: F,
     ) -> Result<Vec<EventEnvelope>, SessionError>
     where
         F: FnMut(&EventEnvelope),
     {
         let cancellation = CancellationSource::from_shared_flag(cancel_flag).token();
-        let result = self.run_turn_with_sink_open(user_message, cancellation, on_event);
-        self.release_queued_dispatch();
-        // Error, cancellation, and an early context latch do not cross the
-        // named no-tool terminal seam. Close them before returning the worker
-        // session; normal completion already closed and this is idempotent.
-        self.close_steering_turn();
+        let result = self.run_turn_with_sink_open(user_message, cancellation, &mut on_event);
+        let terminal_start = self.bus.events().len();
+        let result = self.finish_run_result(result);
+        for event in &self.bus.events()[terminal_start..] {
+            on_event(event);
+        }
         result
+    }
+
+    /// Continue the active run after an ambiguous mid-turn steering append.
+    /// The exact retained `queue.delivered + user.message` batch is retried;
+    /// no new run or user-message identity is allocated.
+    pub fn retry_unresolved_active_run(&mut self) -> Result<Vec<EventEnvelope>, SessionError> {
+        if !self
+            .pending_admission
+            .as_ref()
+            .is_some_and(|pending| pending.kind == UserAdmissionKind::Steering)
+        {
+            return Err(SessionError::InvalidQueuedInput);
+        }
+        let cancellation =
+            CancellationSource::from_shared_flag(Arc::new(AtomicBool::new(false))).token();
+        let result = self.retry_unresolved_active_run_open(cancellation, |_| {});
+        self.finish_run_result(result)
+    }
+
+    /// Reconcile the exact run-terminal batch retained after an ambiguous
+    /// append, then apply its queue cleanup to the live session.
+    pub fn retry_unresolved_run_terminal(&mut self) -> Result<EventEnvelope, SessionError> {
+        if self.pending_run_terminal.is_none() && self.deferred_run_terminal.is_none() {
+            return Err(SessionError::InvalidQueuedInput);
+        }
+        let queue = self.steering.clone();
+        if self.pending_run_terminal.is_some() {
+            return if let Some(queue) = queue {
+                queue.with_terminal_retry(|| self.retry_unresolved_run_terminal_unfenced())
+            } else {
+                self.retry_unresolved_run_terminal_unfenced()
+            };
+        }
+        let terminal = if let Some(queue) = queue {
+            if queue.has_unresolved_terminalization() {
+                queue.with_terminal_retry(|| self.terminalize_deferred_run())
+            } else {
+                queue.with_terminal_boundary(|| self.terminalize_deferred_run())
+            }
+        } else {
+            self.terminalize_deferred_run()
+        }?;
+        terminal.ok_or(SessionError::InvalidQueuedInput)
+    }
+
+    fn retry_unresolved_run_terminal_unfenced(&mut self) -> Result<EventEnvelope, SessionError> {
+        self.ensure_terminalization_intact()?;
+        let mut events = self
+            .pending_run_terminal
+            .as_ref()
+            .expect("retry precondition")
+            .events
+            .clone();
+        let writer = self
+            .provenance
+            .clone()
+            .ok_or(SessionError::InvalidQueuedInput)?;
+        let result = writer.append_ordered(&mut events);
+        self.pending_run_terminal
+            .as_mut()
+            .expect("terminal remains pending during append")
+            .events = events;
+        if let Err(error) = result {
+            self.reconcile_accepted_events()?;
+            return Err(error.into());
+        }
+        self.reconcile_accepted_events()?;
+        self.finish_pending_run_terminal()
+    }
+
+    fn finish_run_result(
+        &mut self,
+        result: Result<Vec<EventEnvelope>, SessionError>,
+    ) -> Result<Vec<EventEnvelope>, SessionError> {
+        self.release_queued_dispatch();
+        let terminal_start = self.bus.events().len();
+        let status = match &result {
+            Ok(_) => RunTerminalStatus::Completed,
+            Err(SessionError::Cancelled) => RunTerminalStatus::Cancelled,
+            Err(_) => RunTerminalStatus::Failed,
+        };
+        if let Err(error) = self.retry_orphaned_agent_results() {
+            // The local companion/reviewer handle has already been consumed,
+            // so the retained exact result must settle before a different
+            // terminal batch can own the writer. Preserve terminal intent for
+            // the explicit retry path, including sessions without a queue.
+            self.deferred_run_terminal = self.active_run.as_ref().map(|_| status);
+            return Err(error);
+        }
+        let terminal = if self.pending_admission.is_some() {
+            // The provenance writer fences every non-identical batch after
+            // an ambiguous admission. Preserve that exact admission as the
+            // sole repair owner; run termination follows only after retry.
+            Ok(None)
+        } else if let Some(queue) = self.steering.clone() {
+            self.deferred_run_terminal = self.active_run.as_ref().map(|_| status);
+            queue.with_terminal_boundary(|| self.terminalize_deferred_run())
+        } else {
+            self.terminalize_active_run_unfenced(status)
+        };
+        match (result, terminal) {
+            (Ok(mut events), Ok(_)) => {
+                events.extend_from_slice(&self.bus.events()[terminal_start..]);
+                Ok(events)
+            }
+            (Err(error), Ok(_)) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    fn terminalize_deferred_run(&mut self) -> Result<Option<EventEnvelope>, SessionError> {
+        self.retry_orphaned_agent_results()?;
+        let Some(status) = self.deferred_run_terminal.take() else {
+            return Ok(None);
+        };
+        let result = self.terminalize_active_run_unfenced(status);
+        if result.is_err() && self.pending_run_terminal.is_none() {
+            self.deferred_run_terminal = Some(status);
+        }
+        result
+    }
+
+    fn retry_unresolved_active_run_open<F>(
+        &mut self,
+        cancellation: CancellationToken,
+        mut on_event: F,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let pending = self
+            .pending_admission
+            .as_ref()
+            .filter(|pending| pending.kind == UserAdmissionKind::Steering)
+            .ok_or(SessionError::InvalidQueuedInput)?;
+        if self.active_run.as_deref() != Some(pending.run_id.as_str()) {
+            return Err(SessionError::InvalidQueuedInput);
+        }
+        let queue = self
+            .steering
+            .clone()
+            .ok_or(SessionError::InvalidQueuedInput)?;
+        let start = self.bus.events().len();
+        let mut sink = EventSink::new(start, &mut on_event);
+        let action = queue.persist_next_for_round(
+            steering::RoundBoundary::Intermediate,
+            || cancellation.is_cancelled(),
+            |input| {
+                self.admit_user_message(input.content(), Some(input), false)
+                    .map(drop)
+            },
+        )?;
+        if action != steering::BoundaryAction::Persisted {
+            return Err(SessionError::InvalidQueuedInput);
+        }
+        sink.flush(self.bus.events());
+        self.run_model_rounds(start, cancellation, &mut sink)
     }
 
     fn run_turn_with_sink_open<F>(
@@ -2344,9 +3400,19 @@ impl<D: PermissionDecider> Session<D> {
         let start = self.bus.events().len();
         crate::diagnostics::turn_start(&self.config.session_id);
         let mut sink = EventSink::new(start, &mut on_event);
-        let queue_id = self.queued_dispatch.as_ref().map(steering::QueuedInput::id);
-        self.admit_user_message(user_message, queue_id)?;
+        let queued_dispatch = self.canonical_queued_dispatch()?;
+        let admitted_content = queued_dispatch
+            .as_ref()
+            .map_or(user_message, steering::QueuedInput::content);
+        self.admit_user_message(admitted_content, queued_dispatch.as_ref(), true)?;
         self.acknowledge_queued_dispatch();
+        if let Some(queue) = &self.steering {
+            queue.activate_turn(
+                self.active_run
+                    .as_deref()
+                    .expect("successful initial admission opens a run"),
+            );
+        }
         sink.flush(self.bus.events());
         let settled = self.settle_shadow_at_context_limit(&cancellation);
         sink.flush(self.bus.events());
@@ -2370,6 +3436,19 @@ impl<D: PermissionDecider> Session<D> {
         self.run_model_rounds(start, cancellation, &mut sink)
     }
 
+    fn canonical_queued_dispatch(&mut self) -> Result<Option<steering::QueuedInput>, SessionError> {
+        let Some(reserved) = self.queued_dispatch.as_ref() else {
+            return Ok(None);
+        };
+        let canonical = self
+            .steering
+            .as_ref()
+            .and_then(|queue| queue.canonical_dispatch(reserved.id()))
+            .ok_or(SessionError::InvalidQueuedInput)?;
+        self.queued_dispatch = Some(canonical.clone());
+        Ok(Some(canonical))
+    }
+
     fn acknowledge_queued_dispatch(&mut self) {
         let Some(input) = self.queued_dispatch.take() else {
             return;
@@ -2388,10 +3467,121 @@ impl<D: PermissionDecider> Session<D> {
         }
     }
 
-    fn close_steering_turn(&self) {
-        if let Some(queue) = &self.steering {
-            queue.close_turn();
+    fn terminalize_active_run_unfenced(
+        &mut self,
+        status: RunTerminalStatus,
+    ) -> Result<Option<EventEnvelope>, SessionError> {
+        if self.pending_run_terminal.is_some() {
+            return Err(QueueError::UnresolvedTerminal.into());
         }
+        let Some(run_id) = self.active_run.clone() else {
+            return Ok(None);
+        };
+        self.reconcile_accepted_events()?;
+        if !self.run_lifecycle.is_open(&run_id) {
+            self.active_run = None;
+            if let Some(queue) = &self.steering {
+                queue.settle_terminal_steering(&run_id, &[]);
+            }
+            return Ok(None);
+        }
+        self.ensure_no_pending_admission()?;
+        if self.provenance.is_some() && self.persisted_events < self.bus.events().len() {
+            self.persist_new_events()?;
+        }
+        self.reconcile_accepted_events()?;
+        let steering = self.run_lifecycle.pending_steering(&run_id);
+        let queue_ids = steering
+            .iter()
+            .map(|item| item.queue_id().to_owned())
+            .collect::<Vec<_>>();
+        let mut events = steering
+            .iter()
+            .map(|item| {
+                EventEnvelope::new(
+                    self.config.session_id.clone(),
+                    self.config.agent_id.clone(),
+                    None,
+                    EventKind::QUEUE_CANCELLED,
+                    object([
+                        ("queue_id", item.queue_id().to_owned().into()),
+                        (
+                            "reason",
+                            run_lifecycle::QueueCancellationReason::for_terminal(status)
+                                .as_str()
+                                .into(),
+                        ),
+                    ]),
+                )
+                .with_run(run_id.clone())
+            })
+            .collect::<Vec<_>>();
+        events.push(
+            EventEnvelope::new(
+                self.config.session_id.clone(),
+                self.config.agent_id.clone(),
+                None,
+                EventKind::RUN_TERMINAL,
+                object([("status", status.as_str().into())]),
+            )
+            .with_run(run_id.clone()),
+        );
+        let terminal_id = events.last().expect("terminal batch").id.clone();
+        self.pending_run_terminal = Some(PendingRunTerminal {
+            events: events.clone(),
+            run_id: run_id.clone(),
+            queue_ids,
+            terminal_id: terminal_id.clone(),
+        });
+        let result = self.accept_terminal_batch(&mut events);
+        self.pending_run_terminal
+            .as_mut()
+            .expect("terminal remains owned until acceptance")
+            .events = events;
+        result?;
+        self.finish_pending_run_terminal().map(Some)
+    }
+
+    fn finish_pending_run_terminal(&mut self) -> Result<EventEnvelope, SessionError> {
+        let pending = self
+            .pending_run_terminal
+            .take()
+            .ok_or(SessionError::InvalidQueuedInput)?;
+        let event = self
+            .bus
+            .events()
+            .iter()
+            .find(|event| event.id == pending.terminal_id)
+            .cloned()
+            .expect("accepted run terminal is on the live bus");
+        self.active_run = None;
+        if let Some(queue) = &self.steering {
+            queue.settle_terminal_steering(&pending.run_id, &pending.queue_ids);
+        }
+        Ok(event)
+    }
+
+    fn accept_terminal_batch(&mut self, events: &mut [EventEnvelope]) -> Result<(), SessionError> {
+        let Some(writer) = self.provenance.clone() else {
+            let mut parent = self.previous_persisted_event_id();
+            for event in events.iter_mut() {
+                event.parent = parent;
+                parent = Some(event.id.clone());
+            }
+            let mut candidate = self.bus.events().to_vec();
+            candidate.extend(events.iter().cloned());
+            let lifecycle = run_lifecycle::fold_run_lifecycle(&candidate)?;
+            for event in events.iter().cloned() {
+                self.bus.push(event);
+            }
+            self.run_lifecycle = lifecycle;
+            return Ok(());
+        };
+        if let Err(error) = writer.append_ordered(events) {
+            self.reconcile_accepted_events()?;
+            return Err(error.into());
+        }
+        self.reconcile_accepted_events()
     }
 
     fn run_model_rounds<F>(
@@ -2973,6 +4163,7 @@ impl<D: PermissionDecider> Session<D> {
         ) else {
             return Ok(CompactionStatus::Unchanged);
         };
+        let origin_run = self.active_run.clone();
         let project_context = crate::project_context::fold_project_context(self.bus.events())
             .map_err(|error| SessionError::ProjectContextInvalid(error.to_string()))?;
         let policy = self.effective_stub_policy();
@@ -3033,6 +4224,7 @@ impl<D: PermissionDecider> Session<D> {
             model_call_id,
             worker,
             started_at: Instant::now(),
+            origin_run,
         });
         Ok(CompactionStatus::InProgress)
     }
@@ -3227,7 +4419,7 @@ impl<D: PermissionDecider> Session<D> {
         shadow: ShadowCompaction,
         reason: &'static str,
     ) -> Result<CompactionStatus, SessionError> {
-        self.emit_with_parent(
+        self.emit_with_parent_for_captured_run(
             EventKind::ERROR,
             object([
                 ("source", "session".into()),
@@ -3239,8 +4431,9 @@ impl<D: PermissionDecider> Session<D> {
                 ("cancelled", true.into()),
             ]),
             Some(shadow.model_call_id),
+            shadow.origin_run.clone(),
         )?;
-        self.discard_shadow_candidate("shadow compaction cancelled")?;
+        self.discard_shadow_candidate("shadow compaction cancelled", shadow.origin_run.clone())?;
         Ok(CompactionStatus::Cancelled)
     }
 
@@ -3267,8 +4460,16 @@ impl<D: PermissionDecider> Session<D> {
                     ("message", self.redactor.redact(error.message()).into()),
                 ]);
                 add_provider_error_metadata(&mut payload, &error);
-                self.emit_with_parent(EventKind::ERROR, payload, Some(shadow.model_call_id))?;
-                self.discard_shadow_candidate("compaction provider failed")?;
+                self.emit_with_parent_for_captured_run(
+                    EventKind::ERROR,
+                    payload,
+                    Some(shadow.model_call_id.clone()),
+                    shadow.origin_run.clone(),
+                )?;
+                self.discard_shadow_candidate(
+                    "compaction provider failed",
+                    shadow.origin_run.clone(),
+                )?;
                 return Ok(CompactionStatus::Failed);
             }
         };
@@ -3278,22 +4479,32 @@ impl<D: PermissionDecider> Session<D> {
             .as_ref()
             .expect("compaction worker validates finished event");
         if !data.tool_calls.is_empty() || *stop_reason != StopReason::Completed {
-            self.discard_shadow_candidate("compaction model did not return a completed summary")?;
+            self.discard_shadow_candidate(
+                "compaction model did not return a completed summary",
+                shadow.origin_run.clone(),
+            )?;
             return Ok(CompactionStatus::Failed);
         }
         let Some(projection) = projection_from_model_content(&data.content) else {
-            self.discard_shadow_candidate("compaction model returned an invalid projection")?;
+            self.discard_shadow_candidate(
+                "compaction model returned an invalid projection",
+                shadow.origin_run.clone(),
+            )?;
             return Ok(CompactionStatus::Failed);
         };
         shadow.candidate.projection = projection;
         if disposition == CompactionCloseDisposition::DiscardReady {
-            self.discard_shadow_candidate("shadow compaction interrupted before apply")?;
+            self.discard_shadow_candidate(
+                "shadow compaction interrupted before apply",
+                shadow.origin_run.clone(),
+            )?;
             return Ok(CompactionStatus::Cancelled);
         }
         let applied = self.commit_compaction_candidate(
             shadow.candidate,
             Some((&shadow.target, shadow.started_at.elapsed())),
             tool_catalog,
+            &CompactionEventOrigin::Captured(shadow.origin_run),
         );
         Ok(if applied {
             CompactionStatus::Applied
@@ -3318,10 +4529,11 @@ impl<D: PermissionDecider> Session<D> {
             if let Some(artifact) = &reasoning.artifact {
                 payload.insert("artifact".to_owned(), artifact.clone().into());
             }
-            self.emit_with_parent(
+            self.emit_with_parent_for_captured_run(
                 EventKind::MODEL_REASONING,
                 payload,
                 Some(shadow.model_call_id.clone()),
+                shadow.origin_run.clone(),
             )?;
         }
         let stop_reason = data
@@ -3340,16 +4552,21 @@ impl<D: PermissionDecider> Session<D> {
             &self.providers,
         );
         result_payload.insert("purpose".to_owned(), COMPACTION_PURPOSE.into());
-        self.emit_with_parent(
+        self.emit_with_parent_for_captured_run(
             EventKind::MODEL_RESULT,
             result_payload,
             Some(shadow.model_call_id.clone()),
+            shadow.origin_run.clone(),
         )?;
         Ok(())
     }
 
-    fn discard_shadow_candidate(&mut self, reason: &str) -> Result<(), SessionError> {
-        self.emit_control_event_required(
+    fn discard_shadow_candidate(
+        &mut self,
+        reason: &str,
+        origin_run: Option<String>,
+    ) -> Result<(), SessionError> {
+        self.emit_control_event_required_with_captured_run(
             EventKind::CANVAS_CANDIDATE_DISCARDED,
             object([
                 ("reason", reason.into()),
@@ -3358,6 +4575,7 @@ impl<D: PermissionDecider> Session<D> {
                     crate::compaction::COMPACTION_POLICY_VERSION.into(),
                 ),
             ]),
+            origin_run,
         )
     }
 
@@ -3571,31 +4789,132 @@ impl<D: PermissionDecider> Session<D> {
         // surface, so late output cannot reintroduce scrubbed bytes.
         self.cancel_compaction("secret scrub")?;
         let secrets = crate::scrub::prepare_secrets(secrets);
-        let report = writer.scrub_and_audit(
-            &secrets,
-            Some(self.config.root.as_path()),
-            &self.config.session_id,
-            &self.config.agent_id,
-        )?;
-        let durable = match crate::resume::read_resume_prefix(writer.log_path()) {
-            Ok(events) => events,
-            Err(crate::resume::ResumeError::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound =>
-            {
-                Vec::new()
-            }
-            Err(error) => return Err(crate::scrub::ScrubError::Reconcile(error.to_string()).into()),
+        let result = if let Some(queue) = self.steering.clone() {
+            queue.with_scrub_boundary(&secrets, |mark_durable_scrub| {
+                // Drain every queue append that linearized before the scrub
+                // fence. The feed carries pre-rewrite logical envelopes, so
+                // leaving one queued would resurrect its original payload
+                // after the durable log had been scrubbed.
+                self.reconcile_accepted_events()?;
+                let report = writer
+                    .scrub_and_audit(
+                        &secrets,
+                        Some(self.config.root.as_path()),
+                        &self.config.session_id,
+                        &self.config.agent_id,
+                    )
+                    .map_err(SessionError::from)?;
+                // From here onward a failure must leave the queue masked and
+                // fail-closed: durable bytes have already been rewritten.
+                mark_durable_scrub();
+                self.reconcile_live_scrub(&writer, &secrets, report.audit_event_id.as_deref())?;
+                Ok::<crate::scrub::ScrubReport, SessionError>(report)
+            })
+        } else {
+            self.reconcile_accepted_events()?;
+            (|| {
+                let report = writer.scrub_and_audit(
+                    &secrets,
+                    Some(self.config.root.as_path()),
+                    &self.config.session_id,
+                    &self.config.agent_id,
+                )?;
+                self.reconcile_live_scrub(&writer, &secrets, report.audit_event_id.as_deref())?;
+                Ok(report)
+            })()
         };
-        self.bus.reconcile_scrubbed_log(&durable, &secrets);
-        self.persisted_events = self.bus.events().len();
+        match result {
+            Ok(report) => {
+                self.remove_scrubbed_candidates(&secrets);
+                Ok(report)
+            }
+            Err(error) => {
+                // `scrub_and_audit` can fail after atomically replacing the
+                // log but before its audit append becomes durable. Its error
+                // does not expose that boundary, so conservatively mask every
+                // live surface and make this Session reopen-only.
+                self.mask_live_scrub_failure(&secrets);
+                Err(error)
+            }
+        }
+    }
+
+    fn remove_scrubbed_candidates(&mut self, secrets: &[String]) {
         self.scrub_candidates
-            .retain(|candidate| !secrets.contains(candidate));
-        Ok(report)
+            .retain(|candidate| crate::redaction::scrub_secrets_in_text(candidate, secrets).1 == 0);
+    }
+
+    fn mask_live_scrub_failure(&mut self, secrets: &[String]) {
+        self.bus.scrub_payloads(secrets);
+        self.remove_scrubbed_candidates(secrets);
+        self.mark_accepted_state_invalid();
+    }
+
+    fn reconcile_live_scrub(
+        &mut self,
+        writer: &ProvenanceWriter,
+        secrets: &[String],
+        audit_event_id: Option<&str>,
+    ) -> Result<(), SessionError> {
+        // Everything already in the Session bus predates this scrub cutoff;
+        // mask it before any fallible reread or projection work. Concurrent
+        // writer clients remain in the accepted feed and are reconciled as
+        // future data below.
+        self.bus.scrub_payloads(secrets);
+        let result = (|| {
+            if let Some(audit_event_id) = audit_event_id {
+                // The audit's writer generation is the exact scrub cutoff.
+                // Drain only through it; later background/extension/companion
+                // events are future data and must not be rewritten in memory
+                // when their durable copies were appended after the scrub.
+                self.reconcile_accepted_events_through(audit_event_id)?;
+                let durable = match crate::resume::read_resume_prefix(writer.log_path()) {
+                    Ok(events) => events,
+                    Err(crate::resume::ResumeError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        Vec::new()
+                    }
+                    Err(error) => {
+                        return Err(crate::scrub::ScrubError::Reconcile(error.to_string()).into());
+                    }
+                };
+                let audit_index = durable
+                    .iter()
+                    .position(|event| event.id == audit_event_id)
+                    .ok_or_else(|| {
+                        crate::scrub::ScrubError::Reconcile(format!(
+                            "scrub audit event {audit_event_id} is absent from the durable prefix"
+                        ))
+                    })?;
+                self.bus
+                    .reconcile_scrubbed_log(&durable[..=audit_index], secrets);
+            }
+            self.run_lifecycle = run_lifecycle::fold_run_lifecycle(
+                &self.bus.events()[..self.persisted_events.min(self.bus.events().len())],
+            )?;
+            // Events accepted after the audit are now safe to publish
+            // normally, byte-for-byte with their post-scrub durable
+            // representation.
+            self.reconcile_accepted_events()
+        })();
+        if result.is_err() {
+            self.mark_accepted_state_invalid();
+        }
+        result
     }
 
     fn emit(&mut self, kind: &'static str, payload: JsonObject) -> Result<String, SessionError> {
-        let parent = self.previous_persisted_event_id();
-        self.emit_with_parent(kind, payload, parent)
+        self.accept_new_event(
+            EventEnvelope::new(
+                self.config.session_id.clone(),
+                self.config.agent_id.clone(),
+                None,
+                kind,
+                payload,
+            ),
+            true,
+        )
     }
 
     fn emit_with_parent(
@@ -3604,25 +4923,91 @@ impl<D: PermissionDecider> Session<D> {
         payload: JsonObject,
         parent: Option<String>,
     ) -> Result<String, SessionError> {
-        self.ensure_no_pending_admission()?;
-        if self.provenance.is_some() && self.persisted_events < self.bus.events().len() {
-            self.persist_new_events()?;
-        }
-        self.bus.push(EventEnvelope::new(
+        self.accept_new_event(
+            EventEnvelope::new(
+                self.config.session_id.clone(),
+                self.config.agent_id.clone(),
+                parent,
+                kind,
+                payload,
+            ),
+            false,
+        )
+    }
+
+    fn emit_with_parent_for_captured_run(
+        &mut self,
+        kind: &'static str,
+        payload: JsonObject,
+        parent: Option<String>,
+        captured_run: Option<String>,
+    ) -> Result<String, SessionError> {
+        let mut event = EventEnvelope::new(
             self.config.session_id.clone(),
             self.config.agent_id.clone(),
             parent,
             kind,
             payload,
-        ));
-        let id = self
-            .bus
-            .events()
-            .last()
-            .expect("event just pushed")
-            .id
-            .clone();
-        self.persist_new_events()?;
+        );
+        event.run = captured_run;
+        self.accept_new_event_inner(event, false, false)
+    }
+
+    fn accept_new_event(
+        &mut self,
+        event: EventEnvelope,
+        writer_ordered_parent: bool,
+    ) -> Result<String, SessionError> {
+        self.accept_new_event_inner(event, writer_ordered_parent, true)
+    }
+
+    fn accept_new_event_inner(
+        &mut self,
+        mut event: EventEnvelope,
+        writer_ordered_parent: bool,
+        inherit_active_run: bool,
+    ) -> Result<String, SessionError> {
+        if inherit_active_run && event.run.is_none() {
+            event.run.clone_from(&self.active_run);
+        }
+        self.ensure_no_pending_admission()?;
+        if self.provenance.is_some() && self.persisted_events < self.bus.events().len() {
+            self.persist_new_events()?;
+        }
+        self.reconcile_accepted_events()?;
+        let id = event.id.clone();
+        let Some(writer) = self.provenance.clone() else {
+            if writer_ordered_parent {
+                event.parent = self.previous_persisted_event_id();
+            }
+            let mut candidate = self.bus.events().to_vec();
+            candidate.push(event.clone());
+            let lifecycle = run_lifecycle::fold_run_lifecycle(&candidate)?;
+            self.bus.push(event);
+            self.run_lifecycle = lifecycle;
+            return Ok(id);
+        };
+        let runtime_only = crate::provenance::event_is_runtime_only(event.kind.as_str());
+        let append = if writer_ordered_parent {
+            writer.append_ordered(std::slice::from_mut(&mut event))
+        } else {
+            writer.append(std::slice::from_ref(&event))
+        };
+        if let Err(error) = append {
+            // Preserve the exact candidate for the existing accepted-backlog
+            // retry path. Events another producer confirmed before this
+            // ambiguous append are published first.
+            self.reconcile_accepted_events()?;
+            self.bus.push(event);
+            return Err(error.into());
+        }
+        if runtime_only {
+            self.bus.push(event);
+            self.persisted_events = self.bus.events().len();
+            return Ok(id);
+        }
+        self.reconcile_accepted_events()?;
+        debug_assert!(self.bus.events().iter().any(|event| event.id == id));
         Ok(id)
     }
 }
@@ -3631,6 +5016,96 @@ fn pending_admission_error() -> SessionError {
     std::io::Error::new(
         std::io::ErrorKind::WouldBlock,
         "a prior authoritative event admission is unresolved; retry the same operation",
+    )
+    .into()
+}
+
+fn reconcile_accepted_feed(
+    feed: &AcceptedEventFeed,
+    bus: &mut EventBus,
+    persisted_events: &mut usize,
+    run_lifecycle: &mut run_lifecycle::RunLifecycleProjection,
+) -> Result<(), SessionError> {
+    reconcile_accepted_events(feed.drain(), bus, persisted_events, run_lifecycle)
+}
+
+fn reconcile_accepted_events(
+    events: Vec<EventEnvelope>,
+    bus: &mut EventBus,
+    persisted_events: &mut usize,
+    run_lifecycle: &mut run_lifecycle::RunLifecycleProjection,
+) -> Result<(), SessionError> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let split = (*persisted_events).min(bus.events.len());
+    let mut accepted = bus.events[..split].to_vec();
+    let mut pending = bus.events[split..].to_vec();
+    for event in events {
+        if accepted.iter().any(|candidate| candidate.id == event.id) {
+            return Err(accepted_event_duplicate(&event.id));
+        }
+        if let Some(index) = pending
+            .iter()
+            .position(|candidate| candidate.id == event.id)
+        {
+            // Runtime-only events have no accepted-feed row. Preserve their
+            // original position before the next matching durable event rather
+            // than moving them behind a later run terminal. Any unmatched
+            // durable row in that prefix would mean the feed overtook local
+            // writer order and must fail closed.
+            for runtime in pending.drain(..index) {
+                if !crate::provenance::event_is_runtime_only(runtime.kind.as_str()) {
+                    return Err(accepted_event_overtook_pending(&event.id, &runtime.id));
+                }
+                if accepted.iter().any(|candidate| candidate.id == runtime.id) {
+                    return Err(accepted_event_duplicate(&runtime.id));
+                }
+                accepted.push(runtime);
+            }
+            let local = pending.remove(0);
+            if local != event {
+                return Err(accepted_event_conflict(&event.id));
+            }
+        }
+        accepted.push(event);
+    }
+
+    let candidate_lifecycle = run_lifecycle::fold_run_lifecycle(&accepted)?;
+    let candidate_persisted_events = accepted.len();
+    accepted.append(&mut pending);
+
+    // Commit only after the complete candidate accepted prefix validates.
+    // The feed drain itself is intentionally not reversible; the owning
+    // Session marks this projection reopen-only if validation fails.
+    bus.events = accepted;
+    *persisted_events = candidate_persisted_events;
+    *run_lifecycle = candidate_lifecycle;
+    Ok(())
+}
+
+fn accepted_event_conflict(event_id: &str) -> SessionError {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("accepted event {event_id} conflicts with the live event of the same id"),
+    )
+    .into()
+}
+
+fn accepted_event_duplicate(event_id: &str) -> SessionError {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("accepted event {event_id} duplicates an event in the accepted prefix"),
+    )
+    .into()
+}
+
+fn accepted_event_overtook_pending(event_id: &str, pending_id: &str) -> SessionError {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "accepted event {event_id} overtook pending durable event {pending_id} in the live projection"
+        ),
     )
     .into()
 }

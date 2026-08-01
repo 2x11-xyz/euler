@@ -98,6 +98,7 @@ mod composer_tests {
             total: 1,
             text: full.to_owned(),
             selected: true,
+            saving: false,
         }]);
 
         let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 120, 2);
@@ -119,6 +120,7 @@ mod composer_tests {
             total: 1,
             text: "keep this\non one row".to_owned(),
             selected: false,
+            saving: false,
         }]);
 
         let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 120, 2);
@@ -137,6 +139,7 @@ mod composer_tests {
             total: 12,
             text: "界".repeat(80),
             selected: true,
+            saving: false,
         }]);
 
         for width in [12, 40, 120] {
@@ -155,6 +158,31 @@ mod composer_tests {
     }
 
     #[test]
+    fn saving_label_has_its_own_width_budget() {
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 1,
+            text: "abcdefghijklmnopqrstuvwxyz".to_owned(),
+            selected: false,
+            saving: true,
+        }]);
+
+        let width = 24;
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), width, 2);
+        let Some(ComposerLine::Queued(line)) = lines.first() else {
+            panic!("missing saving preview");
+        };
+        let prefix = queued_line_prefix(line.position, line.total);
+        let saving = queued_saving_prefix(line.saving);
+        assert_eq!(saving, "saving · ");
+        assert!(
+            display_width(&prefix) + display_width(saving) + display_width(&line.text)
+                <= usize::from(width)
+        );
+    }
+
+    #[test]
     fn queued_preview_hard_cuts_a_first_word_wider_than_the_budget() {
         let draft = ComposerDraft::new();
         // One unbroken word wider than the preview budget: there is no
@@ -165,6 +193,7 @@ mod composer_tests {
             total: 1,
             text: "supercalifragilisticexpialidocious".to_owned(),
             selected: false,
+            saving: false,
         }]);
 
         // width 16 → prefix `▌ 1/1 ` (6 cells) leaves a 10-cell budget.
@@ -184,6 +213,7 @@ mod composer_tests {
             total: 1,
             text: "hello world".to_owned(),
             selected: false,
+            saving: false,
         }]);
 
         // width 10 → prefix 6 leaves a 4-cell budget, at the ` ...` suffix
@@ -207,6 +237,7 @@ mod composer_tests {
             total: 1,
             text: text.clone(),
             selected: false,
+            saving: false,
         }]);
 
         // Reaching here at all proves the truncation did not panic on a

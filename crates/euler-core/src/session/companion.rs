@@ -61,8 +61,15 @@ struct CompanionLoop<'a, D> {
     providers: &'a euler_provider::ProviderSet,
     tools: &'a crate::tools::ToolRegistry,
     writer: Arc<crate::provenance::ProvenanceWriter>,
+    /// Run active when this companion was spawned. Later root transitions do
+    /// not reattribute already-started child work.
+    run_id: Option<String>,
+    accepted_events: crate::provenance::AcceptedEventFeed,
     bus: &'a mut crate::EventBus,
     persisted_events: &'a mut usize,
+    run_lifecycle: &'a mut super::run_lifecycle::RunLifecycleProjection,
+    pending_parented_append: &'a mut Option<EventEnvelope>,
+    parented_append_recovery_required: &'a mut bool,
     permissions: PermissionGate<&'a mut D>,
     turn_state: TurnState,
     /// Companion-lifetime re-teach streaks: a companion is its own model
@@ -92,10 +99,15 @@ type CompanionRecordedToolCall = (ToolCall, String);
 
 pub(super) struct ParentedAppender<'a> {
     pub(super) writer: &'a Arc<crate::provenance::ProvenanceWriter>,
+    pub(super) accepted_events: &'a crate::provenance::AcceptedEventFeed,
     pub(super) bus: &'a mut crate::EventBus,
     pub(super) persisted_events: &'a mut usize,
+    pub(super) run_lifecycle: &'a mut super::run_lifecycle::RunLifecycleProjection,
+    pub(super) pending_parented_append: &'a mut Option<EventEnvelope>,
+    pub(super) parented_append_recovery_required: &'a mut bool,
     pub(super) session_id: &'a str,
     pub(super) agent_id: &'a str,
+    pub(super) run_id: Option<&'a str>,
 }
 
 impl<D> Session<D> {
@@ -112,10 +124,18 @@ impl<D> Session<D> {
     ) -> ParentedAppender<'a> {
         ParentedAppender {
             writer,
+            accepted_events: self
+                .accepted_events
+                .as_ref()
+                .expect("provenance-backed companion has an accepted-event feed"),
             bus: &mut self.bus,
             persisted_events: &mut self.persisted_events,
+            run_lifecycle: &mut self.run_lifecycle,
+            pending_parented_append: &mut self.pending_parented_append,
+            parented_append_recovery_required: &mut self.parented_append_recovery_required,
             session_id: &self.config.session_id,
             agent_id,
+            run_id: self.active_run.as_deref(),
         }
     }
 }
@@ -175,7 +195,8 @@ impl<D: PermissionDecider> Session<D> {
             );
             loop_.run()
         };
-        let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
+        let result_event_id =
+            self.record_agent_result_before_handle_loss(&mut spawned, result.clone())?;
         if cancelled {
             return Err(SessionError::Cancelled);
         }
@@ -225,8 +246,14 @@ impl<D: PermissionDecider> Session<D> {
         let event =
             self.appender_as(writer, &agent_id)
                 .append(EventKind::AGENT_SPAWN, payload, None)?;
-        self.open_agent_spawns
-            .insert(event.id.clone(), child_agent_id.clone());
+        self.open_agent_spawns.insert(
+            event.id.clone(),
+            super::OpenAgentSpawn {
+                child_agent_id: child_agent_id.clone(),
+                run_id: self.active_run.clone(),
+                pending_result: None,
+            },
+        );
         Ok(SpawnedAgent::new(child_agent_id, event.id))
     }
 }
@@ -241,6 +268,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             agent_id,
             cancellation,
         } = init;
+        let run_id = session.active_run.clone();
         let mut permissions = PermissionGate::new_deny_all(session.permissions.decider_mut());
         for (capability, mode) in modes {
             permissions.set_mode(capability, mode);
@@ -263,8 +291,17 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             providers: &session.providers,
             tools: &session.tools,
             writer,
+            run_id,
+            accepted_events: session
+                .accepted_events
+                .as_ref()
+                .expect("provenance-backed companion has an accepted-event feed")
+                .clone(),
             bus: &mut session.bus,
             persisted_events: &mut session.persisted_events,
+            run_lifecycle: &mut session.run_lifecycle,
+            pending_parented_append: &mut session.pending_parented_append,
+            parented_append_recovery_required: &mut session.parented_append_recovery_required,
             permissions,
             turn_state: TurnState::default(),
             reteach: crate::tools::ReteachTracker::default(),
@@ -708,10 +745,15 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     ) -> Result<EventEnvelope, SessionError> {
         ParentedAppender {
             writer: &self.writer,
+            accepted_events: &self.accepted_events,
             bus: self.bus,
             persisted_events: self.persisted_events,
+            run_lifecycle: self.run_lifecycle,
+            pending_parented_append: self.pending_parented_append,
+            parented_append_recovery_required: self.parented_append_recovery_required,
             session_id: &self.session_id,
             agent_id: &self.agent_id,
+            run_id: self.run_id.as_deref(),
         }
         .append(kind, payload, parent)
     }
@@ -1135,18 +1177,56 @@ impl ParentedAppender<'_> {
         payload: JsonObject,
         parent: Option<String>,
     ) -> Result<EventEnvelope, SessionError> {
-        let event = EventEnvelope::new(
+        if *self.parented_append_recovery_required {
+            return Err(SessionError::ParentedAppendRecoveryRequired);
+        }
+        if self.pending_parented_append.is_some() {
+            return Err(SessionError::UnresolvedAuthoritativeAppend);
+        }
+        let mut event = EventEnvelope::new(
             self.session_id.to_owned(),
             self.agent_id.to_owned(),
             parent,
             kind,
             payload,
         );
-        let mut events = self.writer.append_parented(|_| vec![event])?;
-        let event = events.pop().expect("companion events are persisted");
-        self.bus.push(event.clone());
-        *self.persisted_events = self.bus.events().len();
-        Ok(event)
+        event.run = self.run_id.map(str::to_owned);
+        let event_id = event.id.clone();
+        *self.pending_parented_append = Some(event);
+        let append = self.writer.append_ordered(std::slice::from_mut(
+            self.pending_parented_append
+                .as_mut()
+                .expect("parented candidate was installed before append"),
+        ));
+        if let Err(error) = append {
+            *self.parented_append_recovery_required = true;
+            return Err(error.into());
+        }
+        if let Err(error) = super::reconcile_accepted_feed(
+            self.accepted_events,
+            self.bus,
+            self.persisted_events,
+            self.run_lifecycle,
+        ) {
+            *self.parented_append_recovery_required = true;
+            return Err(error);
+        }
+        let confirmed = self
+            .bus
+            .events()
+            .iter()
+            .find(|event| event.id == event_id)
+            .cloned();
+        if let Some(event) = confirmed {
+            *self.pending_parented_append = None;
+            return Ok(event);
+        }
+        *self.parented_append_recovery_required = true;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "confirmed companion event was absent from the accepted-event feed",
+        )
+        .into())
     }
 }
 

@@ -93,6 +93,7 @@ impl AgentReporter {
             spawn_event_id: self.spawn_event_id.clone(),
             queued_ts: now_rfc3339_millis(),
             payload,
+            prepared_event: None,
         };
         match self.report_tx.try_send(report) {
             Ok(()) => Ok(()),
@@ -109,6 +110,8 @@ struct QueuedAgentReport {
     spawn_event_id: String,
     queued_ts: String,
     payload: AgentReportPayload,
+    /// Exact writer-owned candidate retained across an ambiguous append.
+    prepared_event: Option<EventEnvelope>,
 }
 
 /// Current-process background child handle.
@@ -123,6 +126,9 @@ pub struct BackgroundAgent {
     recorded_result_event_id: Option<String>,
     session_id: String,
     parent_agent_id: String,
+    /// Run that owned the spawn. Reports arriving after the root advances
+    /// remain attributed to this origin.
+    run_id: Option<String>,
     report_rx: Option<Receiver<QueuedAgentReport>>,
     pending_report: Option<QueuedAgentReport>,
 }
@@ -133,6 +139,7 @@ impl BackgroundAgent {
         result_rx: Receiver<AgentResult>,
         session_id: String,
         parent_agent_id: String,
+        run_id: Option<String>,
     ) -> Self {
         Self {
             spawned,
@@ -141,6 +148,7 @@ impl BackgroundAgent {
             recorded_result_event_id: None,
             session_id,
             parent_agent_id,
+            run_id,
             report_rx: None,
             pending_report: None,
         }
@@ -151,6 +159,7 @@ impl BackgroundAgent {
         result_rx: Receiver<AgentResult>,
         session_id: String,
         parent_agent_id: String,
+        run_id: Option<String>,
         report_rx: Receiver<QueuedAgentReport>,
     ) -> Self {
         Self {
@@ -160,6 +169,7 @@ impl BackgroundAgent {
             recorded_result_event_id: None,
             session_id,
             parent_agent_id,
+            run_id,
             report_rx: Some(report_rx),
             pending_report: None,
         }
@@ -189,6 +199,7 @@ impl<D: PermissionDecider> Session<D> {
         F: FnOnce() -> AgentResult + Send + 'static,
     {
         install_background_agent_panic_hook();
+        let origin_run = self.active_run.clone();
         let (result_tx, result_rx) = mpsc::channel();
         let mut spawned = self.spawn_agent(task, parent_capabilities)?;
         let worker = thread::Builder::new()
@@ -206,10 +217,11 @@ impl<D: PermissionDecider> Session<D> {
                     result_rx,
                     self.config.session_id.clone(),
                     self.config.agent_id.clone(),
+                    origin_run,
                 ))
             }
             Err(error) => {
-                self.record_agent_result(
+                self.record_agent_result_before_handle_loss(
                     &mut spawned,
                     fixed_background_agent_failure(
                         BACKGROUND_AGENT_LAUNCH_SUMMARY,
@@ -231,6 +243,7 @@ impl<D: PermissionDecider> Session<D> {
         F: FnOnce(AgentReporter) -> AgentResult + Send + 'static,
     {
         install_background_agent_panic_hook();
+        let origin_run = self.active_run.clone();
         let (result_tx, result_rx) = mpsc::channel();
         let (report_tx, report_rx) = mpsc::sync_channel(REPORT_QUEUE_CAPACITY);
         let mut spawned = self.spawn_agent(task, parent_capabilities)?;
@@ -261,11 +274,12 @@ impl<D: PermissionDecider> Session<D> {
                     result_rx,
                     session_id,
                     parent_agent_id,
+                    origin_run,
                     report_rx,
                 ))
             }
             Err(error) => {
-                self.record_agent_result(
+                self.record_agent_result_before_handle_loss(
                     &mut spawned,
                     fixed_background_agent_failure(
                         BACKGROUND_AGENT_LAUNCH_SUMMARY,
@@ -333,9 +347,9 @@ impl<D: PermissionDecider> Session<D> {
     fn persist_background_agent_report(
         &mut self,
         background: &mut BackgroundAgent,
-        report: QueuedAgentReport,
+        mut report: QueuedAgentReport,
     ) -> Result<BackgroundAgentReportDrain, SessionError> {
-        match self.record_agent_message(&report) {
+        match self.record_agent_message(&mut report, background.run_id.as_deref()) {
             Ok(message_event_id) => Ok(BackgroundAgentReportDrain::Drained { message_event_id }),
             Err(error) => {
                 background.pending_report = Some(report);
@@ -357,23 +371,38 @@ impl<D: PermissionDecider> Session<D> {
         }
     }
 
-    fn record_agent_message(&mut self, report: &QueuedAgentReport) -> Result<String, SessionError> {
-        self.persist_new_events()?;
-        let event = EventEnvelope::new(
-            self.config.session_id.clone(),
-            self.config.agent_id.clone(),
-            self.previous_persisted_event_id(),
-            EventKind::AGENT_MESSAGE,
-            object([
-                ("from_agent_id", report.from_agent_id.clone().into()),
-                ("to_agent_id", report.to_agent_id.clone().into()),
-                ("spawn_event_id", report.spawn_event_id.clone().into()),
-                ("queued_ts", report.queued_ts.clone().into()),
-                ("payload", report.payload.value().clone()),
-            ]),
-        );
+    fn record_agent_message(
+        &mut self,
+        report: &mut QueuedAgentReport,
+        run_id: Option<&str>,
+    ) -> Result<String, SessionError> {
+        if report.prepared_event.is_none() {
+            self.persist_new_events()?;
+            let mut event = EventEnvelope::new(
+                self.config.session_id.clone(),
+                self.config.agent_id.clone(),
+                self.previous_persisted_event_id(),
+                EventKind::AGENT_MESSAGE,
+                object([
+                    ("from_agent_id", report.from_agent_id.clone().into()),
+                    ("to_agent_id", report.to_agent_id.clone().into()),
+                    ("spawn_event_id", report.spawn_event_id.clone().into()),
+                    ("queued_ts", report.queued_ts.clone().into()),
+                    ("payload", report.payload.value().clone()),
+                ]),
+            );
+            event.run = run_id.map(str::to_owned);
+            report.prepared_event = Some(event);
+        }
+        let event = report
+            .prepared_event
+            .as_mut()
+            .expect("prepared above when absent");
         let message_event_id = event.id.clone();
-        self.accept_control_event(event)?;
+        // `append_ordered` may assign a newer writer parent before failing.
+        // Keep that mutation on the retained envelope so only the exact
+        // reserved candidate can reconcile the writer on retry.
+        self.accept_prepared_agent_message(event)?;
         Ok(message_event_id)
     }
 }

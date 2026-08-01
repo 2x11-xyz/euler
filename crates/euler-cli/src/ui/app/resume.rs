@@ -21,9 +21,14 @@ impl AppCore {
     /// bottom-surface rebuild: listing reads each session's event log, which
     /// is far too slow for the submit hot path.
     pub(super) fn open_resume_picker(&mut self) -> CoreEffect {
-        if self.unresolved_admission_blocks_lifecycle() {
-            return self
-                .teach_notice("resume waits for the unresolved queued input admission".to_owned());
+        match self.unresolved_authoritative_write_blocks_lifecycle() {
+            Ok(true) => {
+                return self.teach_notice(
+                    "resume waits for an unresolved authoritative session write".to_owned(),
+                );
+            }
+            Err(error) => return self.error_item(format!("resume failed: {error}")),
+            Ok(false) => {}
         }
         let items = support::resume_items_from_home(self.status.session_id.as_deref());
         self.bottom
@@ -43,9 +48,14 @@ impl AppCore {
                 return self.teach_notice("resume needs an active session".to_owned())
             }
         };
-        if self.unresolved_admission_blocks_lifecycle() {
-            return self
-                .teach_notice("resume waits for the unresolved queued input admission".to_owned());
+        match self.unresolved_authoritative_write_blocks_lifecycle() {
+            Ok(true) => {
+                return self.teach_notice(
+                    "resume waits for an unresolved authoritative session write".to_owned(),
+                );
+            }
+            Err(error) => return self.error_item(format!("resume failed: {error}")),
+            Ok(false) => {}
         }
         if current_session_id == session_id {
             return self.teach_notice(format!("already using session {session_id}"));
@@ -106,6 +116,7 @@ impl AppCore {
             .session_store()?
             .find_session(session_id)?
             .ok_or_else(|| anyhow!("no session found with id {session_id}"))?;
+        let extension_home = self.session_store()?.home().clone();
         let prefix = read_resume_prefix(record.events_path())?;
         let root = std::env::current_dir().unwrap_or_else(|_| session_root_status_path());
         let mut seed_config = crate::session_lifecycle::session_config(
@@ -114,8 +125,11 @@ impl AppCore {
             self.status.model.clone(),
             session_id.to_owned(),
         );
-        seed_config.extensions_enabled =
-            resolve_session_extensions(&seed_config.root, &self.extensions)?;
+        seed_config.extensions_enabled = resolve_session_extensions_in_home(
+            &seed_config.root,
+            &self.extensions,
+            &extension_home,
+        )?;
         let observer = resolve_round_observer(&self.observe)?;
         if let Some((observer_config, _)) = &observer {
             seed_config.round_observer = Some(observer_config.clone());
@@ -179,11 +193,32 @@ impl AppCore {
     pub(super) fn accept_tui_resume(
         &mut self,
         session_id: String,
-        resume: TuiResume,
+        mut resume: TuiResume,
     ) -> CoreEffect {
-        if self.unresolved_admission_blocks_lifecycle() {
-            return self
-                .teach_notice("resume waits for the unresolved queued input admission".to_owned());
+        match self.unresolved_authoritative_write_blocks_lifecycle() {
+            Ok(true) => {
+                return self.teach_notice(
+                    "resume waits for an unresolved authoritative session write".to_owned(),
+                );
+            }
+            Err(error) => return self.error_item(format!("resume failed: {error}")),
+            Ok(false) => {}
+        }
+        let queued_inputs = Arc::clone(&self.queued_inputs);
+        let transition = match queued_inputs.begin_lifecycle_transition() {
+            Ok(transition) => transition,
+            Err(error) => return self.error_item(format!("resume failed: {error}")),
+        };
+        if let Err(error) = self.clear_queued_inputs(&transition) {
+            return self.error_item(format!("resume failed: {error}"));
+        }
+        if let Err(error) = resume
+            .session
+            .set_steering_queue_during_lifecycle_transition(Arc::clone(&queued_inputs), &transition)
+        {
+            return self.error_item(format!(
+                "resume failed while binding queued input ownership: {error}"
+            ));
         }
         let reasoning_effort = resume.session.reasoning_effort();
         let primary_agent_id = session_primary_agent_id(&resume.session);
@@ -223,7 +258,6 @@ impl AppCore {
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
-        self.clear_queued_inputs();
         self.notice = None;
         CoreEffect::ReplayHistoryWithScrollbackPurge
     }

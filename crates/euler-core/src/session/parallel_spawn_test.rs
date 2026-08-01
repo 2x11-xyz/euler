@@ -1,4 +1,5 @@
 use super::*;
+use crate::durability::fault::{arm_matching, Op};
 use crate::permissions::ScriptedDecider;
 use crate::{
     ProvenanceWriter, ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope,
@@ -10,6 +11,8 @@ use euler_provider::{
     ProviderError, ProviderSet, ProviderStream, ScriptedProvider, StopReason, Usage,
 };
 use serde_json::json;
+use std::fs::{self, OpenOptions};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -939,6 +942,414 @@ fn context_rejected_reviewer_never_opens_a_model_call_lifecycle() {
             .and_then(serde_json::Value::as_bool)
             != Some(true)
     }));
+}
+
+#[test]
+fn completed_reviewer_result_failure_is_orphaned_and_retried_once() {
+    let providers = scripted_set(&[("p1", FixtureResponse::Assistant("finding one".to_owned()))]);
+    let (_temp, log, mut session) = session_with_providers(providers);
+    session.persist_new_events().expect("persist session start");
+    let writer = Arc::clone(session.provenance.as_ref().expect("writer"));
+    let project_context =
+        crate::project_context::fold_project_context(session.events()).expect("context fold");
+    let prepared = session
+        .prepare_reviewer(
+            reviewer_task("p1", "m1", "code-swarm-correctness"),
+            &writer,
+            &[],
+            &project_context,
+        )
+        .expect("prepare reviewer");
+    let mut outcomes = run_workers(
+        &session.providers,
+        ReviewerProviderConfig {
+            session_id: session.session_id(),
+            round_loop: RoundLoopConfig {
+                max_rounds: Some(1),
+                provider_retries: 0,
+                provider_retry_backoff_ms: Vec::new(),
+            },
+            liveness: session.config.provider_liveness,
+            runtime_observer: session.provider_runtime_observer.clone(),
+        },
+        std::slice::from_ref(&prepared),
+        &CancellationToken::new(),
+    );
+    let outcome = outcomes.pop().expect("worker outcome");
+    let sync_count = Arc::new(AtomicUsize::new(0));
+    let fault_count = Arc::clone(&sync_count);
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| {
+        path == expected_log && fault_count.fetch_add(1, Ordering::SeqCst) == 2
+    });
+
+    assert!(matches!(
+        session.record_reviewer_outcome(&writer, prepared, outcome),
+        Err(SessionError::Io(_))
+    ));
+    assert!(guard.fired(), "third outcome append is agent.result");
+    assert!(session.open_agent_spawns.values().any(|open| {
+        open.pending_result
+            .as_ref()
+            .is_some_and(|pending| pending.orphaned)
+    }));
+    drop(guard);
+
+    session
+        .persist_new_events()
+        .expect("retry orphaned reviewer result");
+    assert_eq!(
+        crate::read_provenance(&log)
+            .expect("durable events")
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+            .count(),
+        1
+    );
+}
+
+fn resume_parallel_session(
+    root: &std::path::Path,
+    log: &std::path::Path,
+) -> crate::resume::ResumeOutcome<ScriptedDecider> {
+    let mut config = crate::SessionConfig::new(root);
+    config.session_id = "session-parallel".to_owned();
+    config.provider = "p1".to_owned();
+    config.model = "m1".to_owned();
+    crate::resume::resume_session_with_outcome(
+        config,
+        ProviderSet::single_named("p1".to_owned(), ScriptedProvider::new(vec![])),
+        ScriptedDecider::new(Vec::new()),
+        log,
+    )
+    .expect("resume interrupted reviewer")
+}
+
+fn truncate_last_event(log: &std::path::Path) {
+    let bytes = fs::read(log).expect("read physical prefix");
+    let previous_newline = bytes[..bytes.len().saturating_sub(1)]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .expect("log contains an earlier event");
+    OpenOptions::new()
+        .write(true)
+        .open(log)
+        .expect("open log for crash-tail simulation")
+        .set_len((previous_newline + 1) as u64)
+        .expect("remove ambiguous final event");
+}
+
+fn assert_reviewer_model_call_fault_recovery(physical_suffix_complete: bool) {
+    let providers = scripted_set(&[("p1", FixtureResponse::Assistant("must not run".to_owned()))]);
+    let (temp, log, mut session) = session_with_providers(providers);
+    session.persist_new_events().expect("persist session start");
+    let writer = Arc::clone(session.provenance.as_ref().expect("writer"));
+    let project_context =
+        crate::project_context::fold_project_context(session.events()).expect("context fold");
+    let sync_count = Arc::new(AtomicUsize::new(0));
+    let fault_count = Arc::clone(&sync_count);
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| {
+        path == expected_log && fault_count.fetch_add(1, Ordering::SeqCst) == 2
+    });
+
+    assert!(matches!(
+        session.prepare_reviewer(
+            reviewer_task("p1", "m1", "code-swarm-correctness"),
+            &writer,
+            &[],
+            &project_context,
+        ),
+        Err(SessionError::Io(_))
+    ));
+    assert!(
+        guard.fired(),
+        "third child preparation append is model.call"
+    );
+    assert_eq!(
+        session
+            .pending_parented_append
+            .as_ref()
+            .map(|event| event.kind.as_str()),
+        Some(EventKind::MODEL_CALL)
+    );
+    assert!(session.parented_append_recovery_required);
+    assert!(!session.can_accept_turn());
+    assert!(matches!(
+        session.persist_new_events(),
+        Err(SessionError::ParentedAppendRecoveryRequired)
+    ));
+    assert!(matches!(
+        session.emit(
+            EventKind::PLAN_UPDATE,
+            object([("content", "must remain fenced".into())]),
+        ),
+        Err(SessionError::ParentedAppendRecoveryRequired)
+    ));
+    drop(guard);
+    if !physical_suffix_complete {
+        truncate_last_event(&log);
+    }
+    drop(writer);
+    drop(session);
+
+    let outcome = resume_parallel_session(temp.path(), &log);
+    let events = outcome.session.events();
+    let expected_calls = usize::from(physical_suffix_complete);
+    assert_eq!(count_kind(events, EventKind::MODEL_CALL), expected_calls);
+    assert_eq!(count_kind(events, EventKind::AGENT_RESULT), 0);
+    let recovery_errors = events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && event
+                    .payload
+                    .get("recovery_closure")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+        })
+        .count();
+    assert_eq!(recovery_errors, expected_calls);
+    assert_eq!(outcome.recovery_closure_appended, physical_suffix_complete);
+    drop(outcome);
+
+    let second = resume_parallel_session(temp.path(), &log);
+    assert!(!second.recovery_closure_appended);
+    assert_eq!(
+        count_kind(second.session.events(), EventKind::MODEL_CALL),
+        expected_calls
+    );
+    assert_eq!(
+        second
+            .session
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::ERROR
+                    && event
+                        .payload
+                        .get("recovery_closure")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            })
+            .count(),
+        expected_calls
+    );
+}
+
+#[test]
+fn failed_child_model_call_is_fenced_until_complete_prefix_resume() {
+    assert_reviewer_model_call_fault_recovery(true);
+}
+
+#[test]
+fn failed_child_model_call_absent_prefix_invents_no_recovery_event() {
+    assert_reviewer_model_call_fault_recovery(false);
+}
+
+#[test]
+fn failed_child_reasoning_append_is_fenced_and_resume_closes_the_call_once() {
+    let providers = scripted_set(&[(
+        "p1",
+        FixtureResponse::ReasoningThenAssistant {
+            reasoning: "inspect invariant".to_owned(),
+            content: "finding".to_owned(),
+        },
+    )]);
+    let (temp, log, mut session) = session_with_providers(providers);
+    session.persist_new_events().expect("persist session start");
+    let writer = Arc::clone(session.provenance.as_ref().expect("writer"));
+    let project_context =
+        crate::project_context::fold_project_context(session.events()).expect("context fold");
+    let prepared = session
+        .prepare_reviewer(
+            reviewer_task("p1", "m1", "code-swarm-correctness"),
+            &writer,
+            &[],
+            &project_context,
+        )
+        .expect("prepare reviewer");
+    let mut outcomes = run_workers(
+        &session.providers,
+        ReviewerProviderConfig {
+            session_id: session.session_id(),
+            round_loop: RoundLoopConfig {
+                max_rounds: Some(1),
+                provider_retries: 0,
+                provider_retry_backoff_ms: Vec::new(),
+            },
+            liveness: session.config.provider_liveness,
+            runtime_observer: session.provider_runtime_observer.clone(),
+        },
+        std::slice::from_ref(&prepared),
+        &CancellationToken::new(),
+    );
+    let outcome = outcomes.pop().expect("worker outcome");
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+
+    assert!(matches!(
+        session.record_reviewer_outcome(&writer, prepared, outcome),
+        Err(SessionError::Io(_))
+    ));
+    assert!(guard.fired());
+    assert_eq!(
+        session
+            .pending_parented_append
+            .as_ref()
+            .map(|event| event.kind.as_str()),
+        Some(EventKind::MODEL_REASONING)
+    );
+    assert!(!session.can_accept_turn());
+    assert!(matches!(
+        session.persist_new_events(),
+        Err(SessionError::ParentedAppendRecoveryRequired)
+    ));
+    drop(guard);
+    drop(writer);
+    drop(session);
+
+    let resumed = resume_parallel_session(temp.path(), &log);
+    assert!(resumed.recovery_closure_appended);
+    assert_eq!(
+        count_kind(resumed.session.events(), EventKind::MODEL_CALL),
+        1
+    );
+    assert_eq!(
+        count_kind(resumed.session.events(), EventKind::MODEL_REASONING),
+        1
+    );
+    assert_eq!(
+        count_kind(resumed.session.events(), EventKind::MODEL_RESULT),
+        0
+    );
+    assert_eq!(
+        count_kind(resumed.session.events(), EventKind::AGENT_RESULT),
+        0
+    );
+    assert_eq!(
+        resumed
+            .session
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::ERROR
+                    && event
+                        .payload
+                        .get("recovery_closure")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn parented_append_retains_exact_event_after_accepted_projection_rejects_it() {
+    let providers = scripted_set(&[("p1", FixtureResponse::Assistant("unused".to_owned()))]);
+    let (_temp, log, mut session) = session_with_providers(providers);
+    session.persist_new_events().expect("persist session start");
+    let writer = Arc::clone(session.provenance.as_ref().expect("writer"));
+
+    let error = session
+        .appender_as(&writer, "reviewer-invalid")
+        .append(EventKind::RUN_TERMINAL, object([]), None)
+        .expect_err("run terminal without run identity must fail projection");
+    assert!(matches!(error, SessionError::RunLifecycle(_)));
+
+    let pending = session
+        .pending_parented_append
+        .as_ref()
+        .expect("exact writer-confirmed event remains owned by the session");
+    assert_eq!(pending.kind.as_str(), EventKind::RUN_TERMINAL);
+    assert_eq!(
+        crate::read_provenance(&log)
+            .expect("durable invalid prefix")
+            .last(),
+        Some(pending)
+    );
+    assert!(session.parented_append_recovery_required);
+    assert!(!session.can_accept_turn());
+}
+
+#[test]
+fn parented_append_retains_exact_event_when_feed_cannot_confirm_it() {
+    let providers = scripted_set(&[("p1", FixtureResponse::Assistant("unused".to_owned()))]);
+    let (_temp, log, mut session) = session_with_providers(providers);
+    session.persist_new_events().expect("persist session start");
+    let writer = Arc::clone(session.provenance.as_ref().expect("writer"));
+
+    let error = session
+        .appender_as(&writer, "reviewer-runtime")
+        .append(
+            EventKind::MODEL_DELTA,
+            object([("delta", "runtime-only control".into())]),
+            None,
+        )
+        .expect_err("runtime-only rows are absent from the accepted feed");
+    assert!(matches!(error, SessionError::Io(_)));
+
+    let pending = session
+        .pending_parented_append
+        .as_ref()
+        .expect("unconfirmed exact event remains owned by the session");
+    assert_eq!(pending.kind.as_str(), EventKind::MODEL_DELTA);
+    assert!(!crate::read_provenance(&log)
+        .expect("durable prefix")
+        .iter()
+        .any(|event| event.id == pending.id));
+    assert!(session.parented_append_recovery_required);
+    assert!(!session.can_accept_turn());
+}
+
+#[test]
+fn rejected_reviewer_result_failure_is_orphaned_and_retried_once() {
+    let providers = scripted_set(&[("p1", FixtureResponse::Assistant("must not run".to_owned()))]);
+    let (_temp, log, mut session) = session_with_providers(providers);
+    session.config.context_limit = Some(ContextLimitConfig::new(100, 1.0).expect("context limit"));
+    session.persist_new_events().expect("persist session start");
+    let writer = Arc::clone(session.provenance.as_ref().expect("writer"));
+    let project_context =
+        crate::project_context::fold_project_context(session.events()).expect("context fold");
+    let prepared = session
+        .prepare_reviewer(
+            reviewer_task("p1", "m1", "code-swarm-correctness"),
+            &writer,
+            &[],
+            &project_context,
+        )
+        .expect("prepare rejected reviewer");
+    assert!(matches!(
+        &prepared.preparation,
+        ReviewerPreparation::Rejected { .. }
+    ));
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+
+    assert!(matches!(
+        session.record_reviewer_outcome(&writer, prepared, WorkerOutcome::Rejected),
+        Err(SessionError::Io(_))
+    ));
+    assert!(guard.fired(), "rejected reviewer agent.result must fault");
+    assert!(session.open_agent_spawns.values().any(|open| {
+        open.pending_result
+            .as_ref()
+            .is_some_and(|pending| pending.orphaned)
+    }));
+    drop(guard);
+
+    session
+        .persist_new_events()
+        .expect("retry orphaned rejected result");
+    assert_eq!(
+        crate::read_provenance(&log)
+            .expect("durable events")
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+            .count(),
+        1
+    );
 }
 
 #[test]

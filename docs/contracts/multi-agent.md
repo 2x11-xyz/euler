@@ -33,7 +33,9 @@ letting them re-enter the live session. A stream with `agent.spawn` and no
 `agent.result` is a valid incomplete
 historical record after resume; core does not reconstruct live child state in
 v0, and that historical incomplete spawn cannot be completed through
-`record_agent_result` after resume.
+`record_agent_result` after resume. Resume may recovery-close accepted model
+and tool phases authored by that child, but it never synthesizes the missing
+parent-authored result.
 
 Current v0 invariants:
 
@@ -55,6 +57,22 @@ Current v0 invariants:
 - result recording requires a current-process `SpawnedAgent` handle that
   matches an in-memory open spawn entry. The handle is not an authority token or
   durable resume capability in v0.
+- before result recording performs any fallible persistence, the parent
+  Session retains one exact `agent.result` envelope for that open spawn,
+  including its id, timestamp, parent, originating run, and payload. An append
+  failure keeps that envelope as the only admissible retry; a different result
+  returns a typed mismatch, and unrelated authoritative Session writes and
+  lifecycle replacement remain fenced until the exact result reconciles. A
+  failed background poll keeps the result and its `SpawnedAgent` handle for
+  this retry.
+- before a companion or reviewer appends child-authored work, the Session
+  retains the exact envelope including its writer-assigned parent. Any
+  ambiguous append or post-append acceptance failure makes the live Session
+  restart-only: it fences all later authoritative writes, queue auto-dispatch,
+  `/new`, and `/resume`. The user must stop and restart Euler and reopen the
+  session. Resume closes each accepted unmatched child tool call by exact
+  semantic event parent and every accepted open child model call exactly once,
+  but leaves the incomplete `agent.spawn` without `agent.result`.
 - background execution uses a single-owner current-process handle. The worker
   closure is `Send + 'static`, receives no `Session`, provider, permission, or
   extension-host handle from core, and returns one bounded `AgentResult`.
@@ -69,7 +87,11 @@ Current v0 invariants:
 - parent `Session::drain_background_agent_report` persists at most one
   `agent.message` per call. It retries a parent-side pending report after
   ordinary append failure before reading later queued reports, preserving FIFO
-  for accepted reports from one background child.
+  for accepted reports from one background child. Once its event envelope has
+  been prepared, an append retry reuses that exact envelope rather than
+  assigning a new id, timestamp, parent, run, or payload. Results and reports
+  retain the run captured at spawn, including an explicitly runless origin,
+  even if a different run is active when the parent drains them.
 - `agent.message` is control-plane provenance and is excluded from
   transcript/model-canvas projection. It may appear after `agent.result` when a
   report was accepted before completion but drained later.
@@ -77,9 +99,14 @@ Current v0 invariants:
   the parent session before polling completion, may permanently leave an
   incomplete `agent.spawn` and may discard queued-but-undrained reports.
   Background handles are not joined, cancelled, or recovered on drop in v0.
+  After a result append has failed, dropping its handle does not release the
+  Session's exact pending-result fence; recovery then requires reopening the
+  durable session rather than allowing a competing write.
 - if a background worker cannot be launched after `agent.spawn` is recorded,
   core records a fixed sanitized failure `agent.result` before returning the
-  launch error when recording that failure succeeds.
+  launch error when recording that failure succeeds. If persistence of that
+  fixed result fails after its exact envelope is installed, the Session owns
+  the orphaned retry and attempts it before its next authoritative write.
 - background worker panics are degraded to a fixed sanitized failure
   `agent.result`; panic payloads are not stringified or persisted by core. The
   first background worker installs a process-global delegating panic hook;
@@ -208,7 +235,11 @@ the batch sibling of `spawn_agent`, built for reviewer fan-out (issue #32);
   spawn path publishes before each spawn.
 - Failure honesty is per child: a provider failure or budget exhaustion
   yields that child's failure `agent.result`; other children are
-  unaffected, and the batch call still returns all outcomes.
+  unaffected, and the batch call still returns all outcomes. The restart-only
+  exception is an ambiguous child-event persistence failure: live execution
+  stops before it can honestly construct the remainder of that child block,
+  and durable resume recovery-closes accepted phases without inventing a
+  result.
 
 Providers must be shareable across worker threads (`ModelProvider` is
 `Send + Sync`); each worker owns only its provider stream and buffers its

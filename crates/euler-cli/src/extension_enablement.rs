@@ -29,15 +29,20 @@ pub(crate) fn resolve_session_extensions(
     root: &Path,
     selection: &ExtensionSelection,
 ) -> Result<BTreeSet<String>> {
-    if let Some(value) = selection.cli_value.as_deref() {
-        let valid = valid_registry_ids()?;
-        return parse_cli_extensions(value, &valid);
-    }
-    resolve_registry_project_extensions(root)
+    let home = EulerHome::resolve()?;
+    resolve_session_extensions_in_home(root, selection, &home)
 }
 
-pub(crate) fn resolve_registry_project_extensions(root: &Path) -> Result<BTreeSet<String>> {
-    let mut resolution = RegistryResolution::load()?;
+pub(crate) fn resolve_session_extensions_in_home(
+    root: &Path,
+    selection: &ExtensionSelection,
+    home: &EulerHome,
+) -> Result<BTreeSet<String>> {
+    if let Some(value) = selection.cli_value.as_deref() {
+        let valid = valid_registry_ids_in_home(home)?;
+        return parse_cli_extensions(value, &valid);
+    }
+    let mut resolution = RegistryResolution::load_from_home(home)?;
     resolution.apply_project(root)?;
     Ok(resolution.enabled)
 }
@@ -51,9 +56,9 @@ pub(crate) struct RegistryResolution {
 }
 
 impl RegistryResolution {
-    pub(crate) fn load() -> Result<Self> {
-        let valid = valid_registry_ids()?;
-        let registry = ExtensionRegistry::open_read_only(EulerHome::resolve()?);
+    fn load_from_home(home: &EulerHome) -> Result<Self> {
+        let valid = valid_registry_ids_in_home(home)?;
+        let registry = ExtensionRegistry::open_read_only(home.clone());
         let enabled = registry_enabled_set(&registry, &valid)?;
         Ok(Self { valid, enabled })
     }
@@ -143,8 +148,8 @@ fn apply_project_overlay(
     Ok(())
 }
 
-fn valid_registry_ids() -> Result<Vec<String>> {
-    let registry = ExtensionRegistry::open_read_only(EulerHome::resolve()?);
+fn valid_registry_ids_in_home(home: &EulerHome) -> Result<Vec<String>> {
+    let registry = ExtensionRegistry::open_read_only(home.clone());
     Ok(registry
         .linked_extensions()?
         .into_iter()

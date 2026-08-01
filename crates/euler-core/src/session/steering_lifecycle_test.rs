@@ -2,7 +2,7 @@
 //! failures must never discard queued input, and cancellation must win over
 //! absorption.
 
-use super::SteeringQueue;
+use super::{BoundaryAction, SteeringQueue};
 use crate::durability::fault::{arm_matching, FaultGuard, Op};
 use crate::permissions::ScriptedDecider;
 use crate::provenance::ProvenanceWriter;
@@ -10,7 +10,7 @@ use crate::session::{
     event_terminalizes_model_call, CompactionStatus, RoundObserverConfig, Session, SessionError,
 };
 use crate::SessionConfig;
-use euler_event::{EventEnvelope, EventKind};
+use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
     FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ProviderSet,
     ProviderStream, ScriptedProvider, StopReason, ToolCall,
@@ -56,8 +56,12 @@ impl ExtensionCommand for SabotageBrief {
         if self.fired.swap(true, Ordering::SeqCst) {
             return Ok(json!({"status": "idle"}));
         }
-        self.queue.push_steering_back("steer one".to_owned());
-        self.queue.push_steering_back("steer two".to_owned());
+        self.queue
+            .push_steering_back("steer one".to_owned())
+            .expect("queue input");
+        self.queue
+            .push_steering_back("steer two".to_owned())
+            .expect("queue input");
         std::fs::rename(&self.log_path, &self.backup_path).expect("back up log");
         std::fs::create_dir(&self.log_path).expect("block log path");
         Ok(json!({}))
@@ -127,8 +131,12 @@ impl ExtensionCommand for QueueOnceBrief {
         _host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         if !self.fired.swap(true, Ordering::SeqCst) {
-            self.queue.push_steering_back("steer one".to_owned());
-            self.queue.push_steering_back("steer two".to_owned());
+            self.queue
+                .push_steering_back("steer one".to_owned())
+                .expect("queue input");
+            self.queue
+                .push_steering_back("steer two".to_owned())
+                .expect("queue input");
             let guard = arm_log_sync_fault(self.sync_fault.op, &self.sync_fault.log_path);
             *self.sync_fault.guard.lock().expect("fault guard slot") = Some(guard);
         }
@@ -196,7 +204,9 @@ fn mid_turn_steering_fail_once_repair_retry_is_exactly_once() {
     )
     .with_provenance(writer);
     let queue = Arc::new(SteeringQueue::default());
-    session.set_steering_queue(Arc::clone(&queue));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
     session.set_observer_extension(Arc::new(SabotageObserver {
         log_path: log_path.clone(),
         backup_path: backup_path.clone(),
@@ -219,15 +229,8 @@ fn mid_turn_steering_fail_once_repair_retry_is_exactly_once() {
 
     std::fs::remove_dir(&log_path).expect("remove blocking directory");
     std::fs::rename(&backup_path, &log_path).expect("restore log");
-    let input = queue
-        .reserve_front_for_dispatch()
-        .expect("retry reservation");
     session
-        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
-        .expect("wire queued dispatch");
-
-    session
-        .run_turn(input.content())
+        .retry_unresolved_active_run()
         .expect("repaired retry completes");
 
     assert!(
@@ -266,19 +269,52 @@ fn backlog_sync_failure_keeps_the_exact_queue_owner_until_reconciliation() {
     )
     .with_provenance(writer);
 
-    // Leave session.start accepted but unpersisted. The admission transaction
-    // must install its owner before attempting to flush this older backlog.
+    // Bind the queue against a confirmed bootstrap, then leave a later live
+    // event unpersisted. The admission transaction must install its owner
+    // before attempting to flush this older backlog.
     let queue_a = Arc::new(SteeringQueue::default());
-    queue_a.push_follow_up_back("original".to_owned());
-    queue_a.push_follow_up_back("later".to_owned());
+    session
+        .set_steering_queue(Arc::clone(&queue_a))
+        .expect("bind queue A");
+    queue_a
+        .push_follow_up_back("original".to_owned())
+        .expect("queue input");
+    queue_a
+        .push_follow_up_back("later".to_owned())
+        .expect("queue input");
+    session.bus.push(EventEnvelope::new(
+        "backlog-sync",
+        "root",
+        None,
+        EventKind::ERROR,
+        object([
+            ("source", "test".into()),
+            ("message", "accepted backlog".into()),
+        ]),
+    ));
     let input_a = queue_a.reserve_front_for_dispatch().expect("queue A row");
     session
         .set_steering_queue_for_queued_input(Arc::clone(&queue_a), &input_a)
         .expect("wire queue A");
 
     let queue_b = Arc::new(SteeringQueue::default());
-    queue_b.push_follow_up_back("original".to_owned());
+    let foreign_root = temp.path().join("foreign-session");
+    std::fs::create_dir(&foreign_root).expect("foreign session directory");
+    let foreign_log = foreign_root.join("events.jsonl");
+    queue_b
+        .bind_durable(
+            Arc::new(ProvenanceWriter::new(&foreign_log).expect("foreign writer")),
+            "foreign-session".to_owned(),
+            "root".to_owned(),
+            None,
+            &[],
+        )
+        .expect("bind canonical foreign queue");
+    queue_b
+        .push_follow_up_back("original".to_owned())
+        .expect("queue input");
     let input_b = queue_b.reserve_front_for_dispatch().expect("queue B row");
+    let foreign_before = std::fs::read(&foreign_log).expect("foreign durable row");
     let guard = arm_log_sync_fault(Op::FileSync, &log_path);
 
     let failure = session
@@ -297,11 +333,10 @@ fn backlog_sync_failure_keeps_the_exact_queue_owner_until_reconciliation() {
     );
     assert!(session.has_unresolved_admission());
     assert!(queue_a.has_unresolved_admission());
-    assert_eq!(
+    assert!(matches!(
         queue_a.remove(0),
-        None,
-        "the ambiguous owner cannot be edited away"
-    );
+        Err(super::QueueError::UnresolvedAdmission)
+    ));
     assert_eq!(
         user_message_count(
             &crate::resume::read_resume_prefix(&log_path).expect("read failed prefix"),
@@ -318,8 +353,24 @@ fn backlog_sync_failure_keeps_the_exact_queue_owner_until_reconciliation() {
         foreign,
         SessionError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
     ));
-    assert!(queue_b.is_current_dispatch(&input_b));
+    assert_eq!(
+        queue_b.canonical_dispatch(input_b.id),
+        Some(input_b.clone())
+    );
     assert_eq!(queue_b.snapshot(), ["original"]);
+    assert_eq!(
+        queue_b
+            .state()
+            .durable
+            .as_ref()
+            .map(|durable| durable.session_id.as_str()),
+        Some("foreign-session")
+    );
+    assert_eq!(
+        std::fs::read(&foreign_log).expect("unchanged foreign log"),
+        foreign_before,
+        "rejected pending-owner claim cannot rebind or mutate the foreign queue"
+    );
 
     let rename = session
         .rename_session("must-not-append")
@@ -359,7 +410,7 @@ fn backlog_sync_failure_keeps_the_exact_queue_owner_until_reconciliation() {
     session = *recovered;
     assert!(matches!(
         transition_error,
-        SessionError::UnresolvedAdmissionTransition
+        SessionError::UnresolvedAuthoritativeWriteTransition
     ));
 
     drop(guard);
@@ -408,9 +459,18 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
     .with_provenance(writer);
     session.persist_new_events().expect("persist bootstrap");
     let queue = Arc::new(SteeringQueue::default());
-    queue.push_follow_up_back("queued once".to_owned());
-    queue.push_follow_up_back("queued once".to_owned());
-    queue.push_follow_up_back("after duplicate".to_owned());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind durable queue");
+    queue
+        .push_follow_up_back("queued once".to_owned())
+        .expect("queue input");
+    queue
+        .push_follow_up_back("queued once".to_owned())
+        .expect("queue input");
+    queue
+        .push_follow_up_back("after duplicate".to_owned())
+        .expect("queue input");
     let input = queue.reserve_front_for_dispatch().expect("reservation");
     let duplicate_input = {
         let state = queue.state();
@@ -435,7 +495,7 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
         session
             .pending_admission
             .as_ref()
-            .map(|pending| &pending.event.id),
+            .and_then(|pending| pending.events.last().map(|event| &event.id)),
         Some(&physical.id),
         "session must retain the exact rejected envelope"
     );
@@ -453,7 +513,8 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
         .expect_err("an unreserved same-text row must be rejected at wiring");
     assert!(matches!(
         same_text_wrong_row,
-        crate::session::SessionError::InvalidQueuedInput
+        crate::session::SessionError::Io(ref error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
     ));
     let unrelated = session
         .run_turn("different input")
@@ -476,33 +537,31 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
         bytes_after_failure,
         "fenced operations must append nothing"
     );
-    assert_eq!(
-        queue.remove(0),
-        None,
-        "the unresolved physical admission cannot be edited or removed"
-    );
-    assert_eq!(
-        queue.remove(1).as_deref(),
-        Some("queued once"),
-        "the duplicate row remains independently editable"
-    );
-    queue.push_follow_up_back("edited duplicate".to_owned());
-    queue.push_follow_up_front("urgent after failure".to_owned());
+    for result in [queue.remove(0), queue.remove(1)] {
+        assert!(matches!(
+            result,
+            Err(super::QueueError::UnresolvedAdmission)
+        ));
+    }
+    assert!(matches!(
+        queue.push_follow_up_back("edited duplicate".to_owned()),
+        Err(super::QueueError::UnresolvedAdmission)
+    ));
+    assert!(matches!(
+        queue.push_follow_up_front("urgent after failure".to_owned()),
+        Err(super::QueueError::UnresolvedAdmission)
+    ));
     assert_eq!(
         queue.snapshot(),
-        [
-            "urgent after failure",
-            "queued once",
-            "after duplicate",
-            "edited duplicate",
-        ]
+        ["queued once", "queued once", "after duplicate"],
+        "one ambiguous writer append fences every queue mutation"
     );
     drop(guard);
 
     let retry = queue.reserve_front_for_dispatch().expect("retry");
     assert_eq!(
         retry.id, input.id,
-        "the unresolved row must outrank a later urgent insertion"
+        "the unresolved row retains its dispatch identity"
     );
     session
         .set_steering_queue_for_queued_input(Arc::clone(&queue), &retry)
@@ -513,11 +572,7 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
 
     assert_eq!(
         queue.snapshot(),
-        [
-            "urgent after failure",
-            "after duplicate",
-            "edited duplicate"
-        ],
+        ["queued once", "after duplicate"],
         "only the exact reconciled row is removed; remaining order is stable"
     );
     let accepted = only_user_message(session.events(), "queued once");
@@ -527,7 +582,7 @@ fn assert_queued_dispatch_sync_failure(op: Op) {
 }
 
 #[test]
-fn clear_preserves_only_the_unresolved_duplicate_row() {
+fn clear_is_fenced_until_an_unresolved_admission_reconciles() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log_path = temp.path().join("clear-unresolved.jsonl");
     let writer = sync_test_writer(temp.path(), log_path.clone());
@@ -541,9 +596,18 @@ fn clear_preserves_only_the_unresolved_duplicate_row() {
     .with_provenance(writer);
     session.persist_new_events().expect("persist bootstrap");
     let queue = Arc::new(SteeringQueue::default());
-    queue.push_follow_up_back("duplicate".to_owned());
-    queue.push_follow_up_back("duplicate".to_owned());
-    queue.push_follow_up_back("after".to_owned());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind durable queue");
+    queue
+        .push_follow_up_back("duplicate".to_owned())
+        .expect("queue input");
+    queue
+        .push_follow_up_back("duplicate".to_owned())
+        .expect("queue input");
+    queue
+        .push_follow_up_back("after".to_owned())
+        .expect("queue input");
     let input = queue.reserve_front_for_dispatch().expect("reservation");
     session
         .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
@@ -555,16 +619,14 @@ fn clear_preserves_only_the_unresolved_duplicate_row() {
     assert!(matches!(result, Err(SessionError::Io(_))));
     assert!(guard.fired());
     drop(guard);
-    queue.clear();
+    assert!(matches!(
+        queue.clear(),
+        Err(super::QueueError::UnresolvedAdmission)
+    ));
     assert_eq!(
         queue.snapshot(),
-        ["duplicate"],
-        "clear removes every mutable row but retains the unresolved one"
-    );
-    assert_eq!(
-        queue.remove(0),
-        None,
-        "the surviving unresolved row remains protected"
+        ["duplicate", "duplicate", "after"],
+        "an ambiguous admission fences the complete queue"
     );
 
     let retry = queue.reserve_front_for_dispatch().expect("exact retry");
@@ -576,7 +638,12 @@ fn clear_preserves_only_the_unresolved_duplicate_row() {
         .run_turn(retry.content())
         .expect("reconcile exact row");
 
+    assert_eq!(queue.snapshot(), ["duplicate", "after"]);
+    queue.clear().expect("clear after reconciliation");
     assert!(queue.is_empty());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("reconcile queue cancellations");
     assert_eq!(user_message_count(session.events(), "duplicate"), 1);
     assert_durable_bus_equivalence(&session, &log_path);
 }
@@ -618,7 +685,9 @@ fn assert_mid_turn_sync_failure(op: Op) {
     .with_provenance(writer);
     let fault_guard = Arc::new(Mutex::new(None));
     let queue = Arc::new(SteeringQueue::default());
-    session.set_steering_queue(Arc::clone(&queue));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
     session.set_observer_extension(Arc::new(QueueOnceObserver {
         queue: Arc::clone(&queue),
         fired: Arc::new(AtomicBool::new(false)),
@@ -645,31 +714,26 @@ fn assert_mid_turn_sync_failure(op: Op) {
         session
             .pending_admission
             .as_ref()
-            .map(|pending| &pending.event.id),
+            .and_then(|pending| pending.events.last().map(|event| &event.id)),
         Some(&physical.id),
         "session must retain the exact rejected steering envelope"
     );
-    assert_eq!(
-        queue.remove(0),
-        None,
-        "failed absorption must convert its row into protected unresolved state"
+    assert!(
+        matches!(queue.remove(0), Err(super::QueueError::UnresolvedAdmission)),
+        "failed absorption must fence edits behind its exact retained admission"
     );
     drop(guard);
 
-    let retry = queue.reserve_front_for_dispatch().expect("retry");
     assert_eq!(
         session
             .pending_admission
             .as_ref()
             .and_then(|pending| pending.queue_id),
-        Some(retry.id),
+        queue.state().unresolved_admission,
         "the pending event and absorption retry must identify the same row"
     );
     session
-        .set_steering_queue_for_queued_input(Arc::clone(&queue), &retry)
-        .expect("wire queued retry");
-    session
-        .run_turn(retry.content())
+        .retry_unresolved_active_run()
         .expect("matching retry reconciles");
 
     assert!(queue.is_empty());
@@ -823,10 +887,20 @@ fn assert_sync_overlap_cancel_resume(op: Op) {
         "the ambiguous append is not accepted into the live bus"
     );
     let physical = only_logged_user_message(&log_path, "physically complete pending input");
+    let durable_prefix = crate::resume::read_resume_prefix(&log_path).expect("read failed prefix");
+    let run_start = durable_prefix
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::RUN_STARTED && event.run == physical.run)
+        .expect("physical run start");
+    assert_eq!(
+        run_start.parent.as_deref(),
+        Some(shadow_call_id.as_str()),
+        "the atomic admission batch starts directly after the outstanding shadow call"
+    );
     assert_eq!(
         physical.parent.as_deref(),
-        Some(shadow_call_id.as_str()),
-        "the complete suffix sits directly after the outstanding shadow call"
+        Some(run_start.id.as_str()),
+        "the user message follows its run start inside the atomic batch"
     );
     drop(guard);
 
@@ -908,12 +982,9 @@ fn assert_sync_overlap_cancel_resume(op: Op) {
     assert_model_calls_are_terminal(&durable);
 }
 
-fn session_with_broken_log(temp: &tempfile::TempDir, session_id: &str) -> Session<ScriptedDecider> {
+fn session_with_log(temp: &tempfile::TempDir, session_id: &str) -> Session<ScriptedDecider> {
     let log_path = temp.path().join(format!("{session_id}.jsonl"));
     let writer = ProvenanceWriter::new(log_path.clone()).expect("writer");
-    std::fs::write(&log_path, "").expect("materialize log");
-    std::fs::remove_file(&log_path).expect("remove log");
-    std::fs::create_dir(&log_path).expect("replace log with directory");
     let mut config = SessionConfig::new(temp.path());
     config.session_id = session_id.to_owned();
     Session::new(
@@ -928,15 +999,23 @@ fn session_with_broken_log(temp: &tempfile::TempDir, session_id: &str) -> Sessio
 fn queued_dispatch_fail_once_repair_retry_is_exactly_once() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log_path = temp.path().join("ordinary-dispatch-failure.jsonl");
+    let backup_path = temp.path().join("ordinary-dispatch-failure.backup.jsonl");
     let queue = Arc::new(SteeringQueue::default());
+    let mut session = session_with_log(&temp, "ordinary-dispatch-failure");
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind durable queue");
     for content in ["ordinary one", "ordinary two", "ordinary three"] {
-        queue.push_follow_up_back(content.to_owned());
+        queue
+            .push_follow_up_back(content.to_owned())
+            .expect("queue input");
     }
     let input = queue.reserve_front_for_dispatch().expect("reservation");
-    let mut session = session_with_broken_log(&temp, "ordinary-dispatch-failure");
     session
         .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
         .expect("wire queued dispatch");
+    std::fs::rename(&log_path, &backup_path).expect("move log aside");
+    std::fs::create_dir(&log_path).expect("replace log with directory");
 
     let result = session.run_turn(input.content());
 
@@ -953,6 +1032,7 @@ fn queued_dispatch_fail_once_repair_retry_is_exactly_once() {
     );
 
     std::fs::remove_dir(&log_path).expect("remove blocking directory");
+    std::fs::rename(&backup_path, &log_path).expect("restore log");
     let retry = queue
         .reserve_front_for_dispatch()
         .expect("retry reservation");
@@ -975,26 +1055,25 @@ fn queued_dispatch_fail_once_repair_retry_is_exactly_once() {
 }
 
 #[test]
-fn interrupted_steering_dispatch_append_failure_keeps_the_group() {
-    let temp = tempfile::tempdir().expect("temp dir");
+fn interrupted_steering_is_not_reinterpreted_as_a_follow_up() {
     let queue = Arc::new(SteeringQueue::default());
-    queue.begin_turn(None);
-    queue.push_steering_back("steer one".to_owned());
-    queue.push_steering_back("steer two".to_owned());
-    queue.close_turn();
-    let input = queue.reserve_front_for_dispatch().expect("reservation");
-    let mut session = session_with_broken_log(&temp, "steering-dispatch-failure");
-    session
-        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
-        .expect("wire queued dispatch");
-
-    let result = session.run_turn(input.content());
-
-    assert!(result.is_err(), "the durable append must fail");
+    let run_id = ulid::Ulid::new().to_string();
+    queue.activate_turn(&run_id);
+    queue
+        .push_steering_back("steer one".to_owned())
+        .expect("queue input");
+    queue
+        .push_steering_back("steer two".to_owned())
+        .expect("queue input");
+    assert_eq!(
+        queue.defer_terminal_boundary(|| true),
+        BoundaryAction::Closed { cancelled: true }
+    );
+    assert!(queue.reserve_front_for_dispatch().is_none());
     assert_eq!(
         queue.snapshot(),
         ["steer one", "steer two"],
-        "reserved head and rebound siblings must survive together"
+        "stale steering remains explicit until terminal settlement"
     );
 }
 

@@ -190,7 +190,9 @@ fn completed_stacked_steer_turn_resume_equivalence() {
 
 fn run_completed_stacked_steer<D: PermissionDecider>(session: &mut Session<D>) {
     let queue = Arc::new(SteeringQueue::default());
-    session.set_steering_queue(Arc::clone(&queue));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
     let queued = Cell::new(false);
     session
         .run_turn_with_sink(
@@ -199,7 +201,9 @@ fn run_completed_stacked_steer<D: PermissionDecider>(session: &mut Session<D>) {
             |event| {
                 if event.kind.as_str() == EventKind::MODEL_DELTA && !queued.replace(true) {
                     for content in ["steer one", "steer two", "steer three"] {
-                        queue.push_steering_back(content.to_owned());
+                        queue
+                            .push_steering_back(content.to_owned())
+                            .expect("queue input");
                     }
                 }
             },
@@ -697,10 +701,11 @@ fn interrupted_tool_tail_resume_equivalence_uses_canonical_closure() {
         &baseline_events[cut],
         "execution and/or result persistence was interrupted, and side effects may have occurred",
     );
+    assert_run_recovery_terminal(&resumed_events[cut + 2], closure, &baseline_events[cut]);
     assert_eq!(
-        recovery_closure_count(&resumed_events),
+        non_lifecycle_recovery_closure_count(&resumed_events),
         1,
-        "interrupted_tool_tail closure count"
+        "interrupted_tool_tail non-lifecycle closure count"
     );
     assert_tail_canonical_projection_equivalent(
         "interrupted_tool_tail canonical continuation",
@@ -757,20 +762,26 @@ fn interrupted_model_tail_resume_idle_equivalence() {
     let resumed_events = read_resume_prefix(&resumed_log).expect("resumed read");
     let closure = &resumed_events[cut + 1];
     assert_model_recovery_closure(closure, &baseline_events[cut]);
+    assert_run_recovery_terminal(&resumed_events[cut + 2], closure, &baseline_events[cut]);
     assert_eq!(
-        resumed_events[cut + 2].kind.as_str(),
+        resumed_events[cut + 3].kind.as_str(),
         EventKind::SESSION_RESUMED,
         "interrupted_model_tail records a resume marker at the boundary"
     );
     assert_eq!(
-        resumed_events[cut + 3].kind.as_str(),
-        EventKind::USER_MESSAGE,
-        "interrupted_model_tail frontier turn follows the resume marker"
+        resumed_events[cut + 4].kind.as_str(),
+        EventKind::RUN_STARTED,
+        "interrupted_model_tail starts a fresh run after the resume boundary"
     );
     assert_eq!(
-        recovery_closure_count(&resumed_events),
+        resumed_events[cut + 5].kind.as_str(),
+        EventKind::USER_MESSAGE,
+        "interrupted_model_tail frontier message follows its fresh run boundary"
+    );
+    assert_eq!(
+        non_lifecycle_recovery_closure_count(&resumed_events),
         1,
-        "interrupted_model_tail closure count"
+        "interrupted_model_tail non-lifecycle closure count"
     );
     assert_tail_canonical_projection_equivalent(
         "interrupted_model_tail canonical continuation",
@@ -871,10 +882,11 @@ fn pending_permission_prompt_tail_reprompts_on_frontier_retry_equivalence() {
         &baseline_events[cut - 1],
         "interrupted before execution (permission undecided); the tool did not run",
     );
+    assert_run_recovery_terminal(&resumed_events[cut + 2], closure, &baseline_events[cut - 1]);
     assert_eq!(
-        recovery_closure_count(&resumed_events),
+        non_lifecycle_recovery_closure_count(&resumed_events),
         1,
-        "pending_permission_prompt_tail closure count"
+        "pending_permission_prompt_tail non-lifecycle closure count"
     );
     assert_eq!(
         resumed_events
@@ -1142,6 +1154,7 @@ fn normalize_events(
     driver_snapshot_links: &BTreeMap<String, String>,
 ) -> Result<Value, String> {
     let id_map = event_id_map(&events);
+    let (run_id_map, queue_id_map) = lifecycle_id_maps(&events);
     let values = events
         .into_iter()
         .map(|event| {
@@ -1155,6 +1168,14 @@ fn normalize_events(
                 Value::String(mapped_id(&id_map, object["id"].as_str().expect("id"))),
             );
             replace_allowed(object, allowlist, "ts", Value::String("<ts>".to_owned()));
+            if let Some(run_id) = object.get("run").and_then(Value::as_str) {
+                replace_allowed(
+                    object,
+                    allowlist,
+                    "run",
+                    Value::String(mapped_lifecycle_id(&run_id_map, run_id, "run")),
+                );
+            }
             if object.get("parent").is_some_and(Value::is_null) {
                 require_allowed(allowlist, "parent");
             } else if let Some(parent) = object.get("parent").and_then(Value::as_str) {
@@ -1178,6 +1199,20 @@ fn normalize_events(
                 }
             }
             if let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) {
+                normalize_lifecycle_payload_id(
+                    payload,
+                    allowlist,
+                    "source_run_id",
+                    &run_id_map,
+                    "run",
+                );
+                normalize_lifecycle_payload_id(
+                    payload,
+                    allowlist,
+                    "queue_id",
+                    &queue_id_map,
+                    "queue",
+                );
                 if payload.contains_key("canvas_snapshot_id") {
                     let canvas_snapshot_id =
                         driver_snapshot_links.get(&event_id).ok_or_else(|| {
@@ -1434,6 +1469,55 @@ fn event_id_map(events: &[EventEnvelope]) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn lifecycle_id_maps(
+    events: &[EventEnvelope],
+) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut run_ids = BTreeMap::new();
+    let mut queue_ids = BTreeMap::new();
+    for event in events {
+        if let Some(run_id) = event.run.as_deref() {
+            insert_lifecycle_id(&mut run_ids, run_id, "run");
+        }
+        if let Some(run_id) = payload_str(event, "source_run_id") {
+            insert_lifecycle_id(&mut run_ids, run_id, "run");
+        }
+        if let Some(queue_id) = payload_str(event, "queue_id") {
+            insert_lifecycle_id(&mut queue_ids, queue_id, "queue");
+        }
+    }
+    (run_ids, queue_ids)
+}
+
+fn insert_lifecycle_id(ids: &mut BTreeMap<String, String>, raw: &str, label: &str) {
+    if !ids.contains_key(raw) {
+        ids.insert(raw.to_owned(), format!("<{label}-{}>", ids.len()));
+    }
+}
+
+fn normalize_lifecycle_payload_id(
+    payload: &mut serde_json::Map<String, Value>,
+    allowlist: &BTreeSet<&'static str>,
+    field: &'static str,
+    ids: &BTreeMap<String, String>,
+    label: &str,
+) {
+    let Some(raw) = payload.get(field).and_then(Value::as_str) else {
+        return;
+    };
+    replace_allowed(
+        payload,
+        allowlist,
+        field,
+        Value::String(mapped_lifecycle_id(ids, raw, label)),
+    );
+}
+
+fn mapped_lifecycle_id(ids: &BTreeMap<String, String>, raw: &str, label: &str) -> String {
+    ids.get(raw)
+        .cloned()
+        .unwrap_or_else(|| format!("<unknown-{label}>"))
+}
+
 fn mapped_id(id_map: &BTreeMap<String, String>, raw: &str) -> String {
     id_map
         .get(raw)
@@ -1471,6 +1555,9 @@ fn nondeterministic_fields() -> BTreeSet<&'static str> {
         "root",
         "attached_roots",
         "session_start_projection_sha256",
+        "run",
+        "source_run_id",
+        "queue_id",
     ])
 }
 
@@ -1632,11 +1719,14 @@ fn write_fixture_file(root: &Path, path: &str, content: &str) {
     fs::write(root.join(path), content).expect("fixture file");
 }
 
-fn recovery_closure_count(events: &[EventEnvelope]) -> usize {
+fn non_lifecycle_recovery_closure_count(events: &[EventEnvelope]) -> usize {
     events
         .iter()
         .filter(|event| {
-            event
+            matches!(
+                event.kind.as_str(),
+                EventKind::ERROR | EventKind::TOOL_RESULT
+            ) && event
                 .payload
                 .get("recovery_closure")
                 .and_then(Value::as_bool)
@@ -1719,6 +1809,27 @@ fn assert_model_recovery_closure(closure: &EventEnvelope, call: &EventEnvelope) 
     );
     assert_eq!(
         closure
+            .payload
+            .get("recovery_closure")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+fn assert_run_recovery_terminal(
+    terminal: &EventEnvelope,
+    prior_closure: &EventEnvelope,
+    interrupted_event: &EventEnvelope,
+) {
+    assert_eq!(terminal.kind.as_str(), EventKind::RUN_TERMINAL);
+    assert_eq!(terminal.parent.as_deref(), Some(prior_closure.id.as_str()));
+    assert_eq!(terminal.run, interrupted_event.run);
+    assert_eq!(
+        terminal.payload.get("status").and_then(Value::as_str),
+        Some("interrupted")
+    );
+    assert_eq!(
+        terminal
             .payload
             .get("recovery_closure")
             .and_then(Value::as_bool),

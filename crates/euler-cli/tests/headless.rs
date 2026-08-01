@@ -50,25 +50,27 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
 
     let jsonl = fs::read_to_string(&log).expect("read jsonl");
     let lines: Vec<&str> = jsonl.lines().collect();
-    assert_eq!(lines.len(), 8);
+    assert_eq!(lines.len(), 10);
     assert!(lines[0].contains("\"kind\":\"session.start\""));
     // Dormant project-context bootstrap (ADR 0017): one disabled snapshot,
     // no diagnostics in an empty temp workspace, and no source bodies.
     assert!(lines[1].contains("\"kind\":\"project.context.snapshot\""));
     assert!(lines[1].contains("\"status\":\"disabled\""));
-    assert!(lines[2].contains("\"kind\":\"user.message\""));
-    assert!(lines[3].contains("\"kind\":\"canvas.snapshot\""));
-    assert!(lines[4].contains("\"kind\":\"model.call\""));
-    assert!(lines[5].contains("\"kind\":\"assistant.response.chunk\""));
-    assert!(lines[6].contains("\"kind\":\"model.result\""));
-    assert!(lines[7].contains("\"kind\":\"assistant.message\""));
+    assert!(lines[2].contains("\"kind\":\"run.started\""));
+    assert!(lines[3].contains("\"kind\":\"user.message\""));
+    assert!(lines[4].contains("\"kind\":\"canvas.snapshot\""));
+    assert!(lines[5].contains("\"kind\":\"model.call\""));
+    assert!(lines[6].contains("\"kind\":\"assistant.response.chunk\""));
+    assert!(lines[7].contains("\"kind\":\"model.result\""));
+    assert!(lines[8].contains("\"kind\":\"assistant.message\""));
+    assert!(lines[9].contains("\"kind\":\"run.terminal\""));
 
-    assert!(lines[2].contains("\"content\":\"hello skeleton\""));
-    assert!(lines[4].contains("\"provider\":\"fixture\""));
-    assert!(lines[4].contains("\"model\":\"echo\""));
-    assert!(lines[5].contains("\"content\":\"user: hello skeleton\""));
+    assert!(lines[3].contains("\"content\":\"hello skeleton\""));
+    assert!(lines[5].contains("\"provider\":\"fixture\""));
+    assert!(lines[5].contains("\"model\":\"echo\""));
     assert!(lines[6].contains("\"content\":\"user: hello skeleton\""));
     assert!(lines[7].contains("\"content\":\"user: hello skeleton\""));
+    assert!(lines[8].contains("\"content\":\"user: hello skeleton\""));
 }
 
 #[test]
@@ -1028,7 +1030,7 @@ fn fixture_loop_without_provenance_writes_home_session_store() {
 
     let log = sessions.join(session_id).join("events.jsonl");
     let events = read_jsonl(&log);
-    assert_eq!(events.len(), 8);
+    assert_eq!(events.len(), 10);
     assert!(events.iter().all(|event| event.session == session_id));
     assert_eq!(events[0].kind.as_str(), EventKind::SESSION_START);
     assert!(sessions.join(session_id).join("session.json").is_file());
@@ -4252,7 +4254,7 @@ fn resume_then_next_turn_matches_uninterrupted_transcript_projection() {
     assert!(resumed.status.success());
     let stderr = String::from_utf8_lossy(&resumed.stderr);
     assert!(stderr.contains("resumed session headless-session"));
-    assert!(stderr.contains("folded 8 events"));
+    assert!(stderr.contains("folded 10 events"));
     assert!(stderr.contains("target fixture/echo"));
     assert!(stderr.contains("recovery closure not appended"));
 
@@ -4288,7 +4290,11 @@ fn resume_with_session_start_differing_target_warns_and_uses_original() {
         "",
     );
 
-    assert!(output.status.success());
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(
         "warning: resume invocation target fixture/other differs from original session target fixture/echo; using original target"
@@ -5189,11 +5195,14 @@ fn tui_pty_stacked_steering_during_final_stream_hydrates_the_next_request() {
     );
     assert!(tui.wait_for_screen("/ commands"));
     // Wait until the first response is visibly streaming before submitting
-    // the stack. The fixture then holds the stream open for 4s, making these
-    // entries unambiguously steering for an already-dispatched model round.
+    // the stack. Use the glimpse wait because the active spinner prevents the
+    // quiet interval required by `wait_for_screen`; waiting for quiet would
+    // observe this text only after the run terminalized. The fixture then
+    // holds the stream open for 4s, making these entries unambiguously
+    // steering for an already-dispatched model round.
     tui.write("start the task\r");
     assert!(
-        tui.wait_for_screen("phase one final stream"),
+        tui.wait_for_screen_glimpse("phase one final stream"),
         "round 1 did not start:\n{}",
         tui.screen_text()
     );
@@ -5224,7 +5233,23 @@ fn tui_pty_stacked_steering_during_final_stream_hydrates_the_next_request() {
         .collect();
     assert_eq!(
         steering.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
-        ["steer one", "steer two", "steer three"]
+        ["steer one", "steer two", "steer three"],
+        "event trace: {:#?}",
+        events
+            .iter()
+            .map(|event| (
+                event.kind.as_str(),
+                event.run.as_deref(),
+                event
+                    .payload
+                    .get("mode")
+                    .and_then(serde_json::Value::as_str),
+                event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+            ))
+            .collect::<Vec<_>>()
     );
     let model_call_indexes: Vec<usize> = events
         .iter()
@@ -6594,7 +6619,7 @@ fn tui_pty_without_provenance_writes_home_session_store() {
 
     let session_id = only_home_session_id(home.path());
     let events = read_jsonl(&home_session_log(home.path(), &session_id));
-    assert_eq!(events.len(), 8);
+    assert_eq!(events.len(), 10);
     assert!(events.iter().all(|event| event.session == session_id));
 }
 
@@ -7905,7 +7930,7 @@ fn tool_call(id: &str, name: &str) -> EventEnvelope {
 fn session_start(provider: &str, model: &str) -> EventEnvelope {
     EventEnvelope::new(
         "s",
-        "a",
+        "root",
         None,
         EventKind::SESSION_START,
         object([

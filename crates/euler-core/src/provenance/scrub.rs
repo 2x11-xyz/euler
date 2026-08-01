@@ -30,7 +30,7 @@ impl ProvenanceWriter {
         agent: &str,
     ) -> io::Result<ScrubReport> {
         let mut append_state = recover_mutex(&self.append_lock);
-        if append_state.unresolved_append.is_some() {
+        if append_state.pending_append.is_some() {
             return Err(unresolved_append_fence());
         }
         let raw_len = match fs::metadata(&self.log_path) {
@@ -99,12 +99,14 @@ impl ProvenanceWriter {
         let audit = EventEnvelope::new(
             session_id,
             agent,
-            append_state.durable_tail.clone(),
+            append_state.parent_frontier.clone(),
             EventKind::new(EventKind::SECRET_SCRUBBED),
             scrub_audit_payload(secrets.len(), &pass.report),
         );
         pass.report.audit_event_id = Some(audit.id.clone());
-        self.append_locked(&mut append_state, std::slice::from_ref(&audit))?;
+        let generation = self.append_locked(&mut append_state, std::slice::from_ref(&audit))?;
+        self.publish_accepted(generation, vec![audit]);
+        drop(append_state);
         Ok(pass.report)
     }
 

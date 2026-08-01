@@ -415,7 +415,8 @@ impl<D: PermissionDecider> Session<D> {
                 companion_failure(self.redactor.redact(&error.to_string()))
             }
         };
-        let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
+        let result_event_id =
+            self.record_agent_result_before_handle_loss(&mut spawned, result.clone())?;
         Ok(AgentResultSummary {
             child_agent_id,
             spawn_event_id: spawned.spawn_event_id().to_owned(),
@@ -503,7 +504,8 @@ impl<D: PermissionDecider> Session<D> {
     ) -> Result<AgentResultSummary, SessionError> {
         let child_agent_id = spawned.child_agent_id().to_owned();
         let result = companion_failure(message);
-        let result_event_id = self.record_agent_result(&mut spawned, result.clone())?;
+        let result_event_id =
+            self.record_agent_result_before_handle_loss(&mut spawned, result.clone())?;
         Ok(AgentResultSummary {
             child_agent_id,
             spawn_event_id: spawned.spawn_event_id().to_owned(),

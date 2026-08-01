@@ -3,22 +3,25 @@
 use euler_core::permissions::{DeciderVerdict, PermissionDecider, PermissionRequest};
 use euler_core::{
     assemble_canvas, fold_session, project_assistant_response_terminals, read_resume_prefix,
-    resume_session, resume_session_from_prefix, resume_session_with_outcome,
-    AssistantResponseStatus, AutoCompactionPolicy, CanvasItem, CompactionStatus, CompactionTier,
-    ContextLimitConfig, ModelTarget, ProvenanceWriter, ReasoningEffort, ResumeError, Session,
-    SessionConfig, WorkingStateProjection,
+    resume_session, resume_session_from_folded_prefix, resume_session_from_prefix,
+    resume_session_with_outcome, ApprovalMode, AssistantResponseStatus, AutoCompactionPolicy,
+    CanvasItem, CompactionStatus, CompactionTier, ContextLimitConfig, ModelTarget,
+    ProvenanceWriter, QueueCancellationReason, ReasoningEffort, ResumeError, ResumeWarning,
+    Session, SessionConfig, WorkingStateProjection,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
     FixtureResponse, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ProviderSet,
     ProviderStream, ScriptedProvider, StopReason, ToolCall, Usage,
 };
+use euler_sdk::Capability;
 use serde_json::json;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::fs;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use ulid::Ulid;
 
 #[test]
 fn fold_reproduces_live_target_usage_and_context_limit_fields() {
@@ -52,7 +55,7 @@ fn fold_reproduces_live_target_usage_and_context_limit_fields() {
             }),
         ]],
     ));
-    let mut config = SessionConfig::new(temp.path());
+    let mut config = fixture_config(temp.path());
     config.provider = "a".to_owned();
     config.model = "model-a".to_owned();
     config.context_limit = Some(ContextLimitConfig::new(100, 0.9).expect("limit"));
@@ -90,7 +93,7 @@ fn fold_reproduces_live_target_usage_and_context_limit_fields() {
 #[test]
 fn fold_treats_canvas_swap_as_a_new_unknown_usage_window() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut config = SessionConfig::new(temp.path());
+    let mut config = fixture_config(temp.path());
     config.context_limit = Some(ContextLimitConfig::new(50_000, 1.0).expect("limit"));
     config.compaction_reserve_tokens = 1_000;
     config.auto_compaction.automatic = false;
@@ -167,7 +170,7 @@ fn snapshot_only_crash_keeps_extension_contribution_until_a_replacement_request(
         ],
         Arc::clone(&requests),
     );
-    let mut config = SessionConfig::new(temp.path());
+    let mut config = fixture_config(temp.path());
     config.agent_id = "agent".to_owned();
     let mut session = resume_session(
         config,
@@ -259,7 +262,7 @@ fn recovery_closure_keeps_an_accepted_request_consumption_terminal() {
     );
     write_events(&log, &[start, contribution.clone(), snapshot, call.clone()]);
 
-    let mut config = SessionConfig::new(temp.path());
+    let mut config = fixture_config(temp.path());
     config.agent_id = "agent".to_owned();
     let session = resume_session(
         config,
@@ -328,7 +331,7 @@ fn resumed_full_swap_keeps_pending_extension_input_in_order_until_root_selection
     let frontier = EventEnvelope::new(
         "session",
         "root",
-        Some(resumed.id.clone()),
+        Some(contribution.id.clone()),
         EventKind::USER_MESSAGE,
         object([("content", "post-swap frontier".into())]),
     );
@@ -343,7 +346,7 @@ fn resumed_full_swap_keeps_pending_extension_input_in_order_until_root_selection
         EventKind::CANVAS_SWAP,
         object([
             ("snapshot_start_id", old.id.clone().into()),
-            ("snapshot_end_id", resumed.id.clone().into()),
+            ("snapshot_end_id", contribution.id.clone().into()),
             ("frontier_start_id", frontier.id.clone().into()),
             ("policy_version", "1".into()),
             ("projection_schema_version", "1".into()),
@@ -525,7 +528,7 @@ fn resumed_shadow_compactor_cannot_capture_pending_extension_input() {
 #[test]
 fn fold_populates_original_target_from_session_start() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let mut config = SessionConfig::new(temp.path());
+    let mut config = fixture_config(temp.path());
     config.provider = "cli".to_owned();
     config.model = "override".to_owned();
 
@@ -541,11 +544,8 @@ fn fold_populates_original_target_from_session_start() {
 #[test]
 fn fold_leaves_original_target_empty_for_legacy_logs() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let folded = fold_session(
-        &SessionConfig::new(temp.path()),
-        vec![user_message("legacy")],
-    )
-    .expect("fold");
+    let folded =
+        fold_session(&fixture_config(temp.path()), vec![user_message("legacy")]).expect("fold");
 
     assert_eq!(folded.original_target, None);
     assert_eq!(
@@ -557,7 +557,7 @@ fn fold_leaves_original_target_empty_for_legacy_logs() {
 #[test]
 fn fold_replays_compaction_policy_changes_and_legacy_tier_off() {
     let temp = tempfile::tempdir().expect("temp dir");
-    let config = SessionConfig::new(temp.path());
+    let config = fixture_config(temp.path());
     let mut session = Session::new(
         config.clone(),
         ScriptedProvider::new(vec![]),
@@ -612,7 +612,7 @@ fn resume_constructor_and_fold_do_not_call_permission_decider() {
     };
 
     let session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         decider,
         &log,
@@ -632,7 +632,7 @@ fn resumed_legacy_session_records_current_system_instructions_on_first_call() {
     let log = temp.path().join("events.jsonl");
     write_events(&log, &[session_start("fixture", "fixture")]);
     let mut session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![FixtureResponse::Assistant(
             "done".to_owned(),
         )])),
@@ -666,7 +666,7 @@ fn interrupted_tool_tail_appends_one_side_effect_recovery_closure() {
     let call = tool_call(None, "call-read", "read_file");
     write_events(&log, std::slice::from_ref(&call));
 
-    let config = SessionConfig::new(temp.path());
+    let config = fixture_config(temp.path());
     let outcome = resume_session_with_outcome(
         config.clone(),
         ProviderSet::single(ScriptedProvider::new(vec![])),
@@ -728,7 +728,7 @@ fn resume_closes_an_unterminated_shadow_model_call_behind_later_events() {
     );
 
     let first = resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -754,7 +754,7 @@ fn resume_closes_an_unterminated_shadow_model_call_behind_later_events() {
 
     drop(first.session);
     let second = resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -787,7 +787,7 @@ fn nonterminal_error_child_does_not_hide_an_open_model_call_on_resume() {
     write_events(&log, &[start, call.clone(), extension_error]);
 
     let session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -821,7 +821,7 @@ fn writer_linear_terminal_closes_only_the_matching_agent_call() {
     write_events(&log, &[first_call.clone(), second_call.clone(), terminal]);
 
     let outcome = resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -860,7 +860,7 @@ fn unmatched_terminal_does_not_settle_open_calls_from_other_agents() {
     write_events(&log, &[first_call.clone(), second_call.clone(), terminal]);
 
     let outcome = resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -898,7 +898,7 @@ fn ambiguous_same_agent_terminal_fails_before_mutating_the_log() {
     let before = fs::read(&log).expect("read original log");
 
     let error = match resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -928,7 +928,7 @@ fn direct_duplicate_model_terminal_fails_before_mutating_the_log() {
     let before = fs::read(&log).expect("read original log");
 
     let error = match resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -959,7 +959,7 @@ fn unambiguous_writer_linear_duplicate_model_terminal_fails_closed() {
     let before = fs::read(&log).expect("read original log");
 
     let error = match resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -997,7 +997,7 @@ fn permission_gated_tail_closure_says_tool_never_executed() {
     write_events(&log, &[call, prompt]);
 
     let session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1090,7 +1090,7 @@ fn guardian_interleaved_tail_still_appends_recovery_closure() {
     );
 
     let outcome = resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1130,7 +1130,7 @@ fn extension_permission_decisions_do_not_satisfy_tool_prompts_or_tail_matching()
     write_events(&log, &[call, prompt, extension_decision]);
 
     let outcome = resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1180,7 +1180,7 @@ fn partially_decided_permission_batch_stays_interrupted_on_resume() {
     let decider = CountingDecider::default();
     let decider_calls = Rc::clone(&decider.calls);
     let mut outcome = resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         decider,
         &log,
@@ -1216,7 +1216,7 @@ fn extension_permission_decisions_alone_leave_resume_state_unaffected() {
         extension_permission_decision(None, "network", false, Some("net.check")),
     ];
 
-    let folded = fold_session(&SessionConfig::new(temp.path()), events).expect("fold");
+    let folded = fold_session(&fixture_config(temp.path()), events).expect("fold");
 
     assert!(folded.warnings.is_empty());
     assert_eq!(folded.active_target, ModelTarget::new("fixture", "echo"));
@@ -1233,7 +1233,7 @@ fn double_resume_does_not_append_second_recovery_closure() {
     write_events(&log, &[tool_call(None, "call-read", "read_file")]);
 
     let first = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1241,7 +1241,7 @@ fn double_resume_does_not_append_second_recovery_closure() {
     .expect("first resume");
     drop(first);
     let second = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1283,7 +1283,7 @@ fn closure_append_failure_leaves_log_at_accepted_prefix() {
     fs::set_permissions(&log, permissions).expect("readonly");
 
     let error = match resume_session_from_prefix(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         writer,
@@ -1306,7 +1306,7 @@ fn model_call_tail_appends_a_recovery_closure() {
     write_events(&log, &[start, call.clone()]);
 
     let session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1357,7 +1357,7 @@ fn response_checkpoint_tail_resumes_as_the_same_interrupted_partial() {
     write_events(&log, &[start, snapshot, call.clone(), chunk]);
 
     let session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1401,7 +1401,7 @@ fn resume_marker_is_a_log_leaf_emitted_with_the_first_continued_turn() {
     write_events(&log, &[start, seed]);
 
     let mut session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![FixtureResponse::Assistant(
             "done".to_owned(),
         )])),
@@ -1431,8 +1431,10 @@ fn resume_marker_is_a_log_leaf_emitted_with_the_first_continued_turn() {
         "marker records the tail it continued from"
     );
     assert_eq!(marker.parent.as_deref(), Some(seed_id.as_str()));
-    // The continued turn parents off the SAME real tail — the marker is a
-    // sibling leaf, never the parent of the conversation.
+    // The continued run starts from the SAME real tail — the marker is a
+    // sibling leaf, never the parent of the conversation. The user message
+    // then follows the durable run boundary introduced by the run-lifecycle
+    // contract.
     let user_message = logged
         .iter()
         .find(|event| {
@@ -1440,7 +1442,17 @@ fn resume_marker_is_a_log_leaf_emitted_with_the_first_continued_turn() {
                 && payload_str(event, "content") == Some("continue")
         })
         .expect("continued user message");
-    assert_eq!(user_message.parent.as_deref(), Some(seed_id.as_str()));
+    let run_started = logged
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::RUN_STARTED && event.run == user_message.run
+        })
+        .expect("continued run boundary");
+    assert_eq!(run_started.parent.as_deref(), Some(seed_id.as_str()));
+    assert_eq!(
+        user_message.parent.as_deref(),
+        Some(run_started.id.as_str())
+    );
     assert!(marker
         .payload
         .get("provider")
@@ -1461,6 +1473,19 @@ fn resume_marker_is_a_log_leaf_emitted_with_the_first_continued_turn() {
             .count(),
         1
     );
+
+    drop(session);
+    let resumed_again = resume_session(
+        fixture_config(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(Vec::new())),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume marker-bearing history");
+    assert!(resumed_again
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::SESSION_RESUMED));
 }
 
 #[test]
@@ -1474,7 +1499,7 @@ fn resume_marker_precedes_non_turn_control_activity() {
     write_events(&log, &[start, seed]);
 
     let mut session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(Vec::new())),
         CountingDecider::default(),
         &log,
@@ -1516,7 +1541,7 @@ fn model_call_then_reasoning_tail_appends_a_recovery_closure() {
     write_events(&log, &[start, call.clone(), reasoning]);
 
     let session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1540,7 +1565,7 @@ fn user_message_tail_appends_nothing() {
     write_events(&log, &[user_message("not yet acted on")]);
 
     let session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1557,7 +1582,7 @@ fn unknown_kind_is_resume_incompatibility_naming_kind() {
     let event = EventEnvelope::new("session", "agent", None, "future.kind", object([]));
     assert!(!EventKind::ALL.contains(&"future.kind"));
 
-    let error = fold_session(&SessionConfig::new(temp.path()), vec![event]).expect_err("unknown");
+    let error = fold_session(&fixture_config(temp.path()), vec![event]).expect_err("unknown");
 
     assert!(matches!(error, ResumeError::UnknownKind { kind } if kind == "future.kind"));
 }
@@ -1569,8 +1594,8 @@ fn fold_rejects_duplicate_event_ids_with_a_bounded_incompatibility() {
     let mut duplicate = user_message("conflicting duplicate");
     duplicate.id.clone_from(&first.id);
 
-    let error = fold_session(&SessionConfig::new(temp.path()), vec![first, duplicate])
-        .expect_err("duplicate");
+    let error =
+        fold_session(&fixture_config(temp.path()), vec![first, duplicate]).expect_err("duplicate");
 
     assert!(matches!(error, ResumeError::DuplicateEventId));
     assert_eq!(
@@ -1591,7 +1616,7 @@ fn resume_rejects_duplicate_event_ids_before_appending_any_recovery() {
     let before = fs::read(&log).expect("read original log");
 
     let error = match resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1609,11 +1634,336 @@ fn resume_rejects_duplicate_event_ids_before_appending_any_recovery() {
 }
 
 #[test]
+fn resume_rejects_session_or_root_agent_identity_mismatch_before_mutation() {
+    for (configured_session, configured_agent) in
+        [("other-session", "agent"), ("session", "other-agent")]
+    {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log = temp.path().join("events.jsonl");
+        let start = session_start("fixture", "fixture");
+        let call = model_call(Some(start.id.clone()));
+        write_events(&log, &[start, call]);
+        let before = fs::read(&log).expect("read original log");
+        let mut config = fixture_config(temp.path());
+        config.session_id = configured_session.to_owned();
+        config.agent_id = configured_agent.to_owned();
+
+        let error = match resume_session(
+            config,
+            ProviderSet::single(ScriptedProvider::new(vec![])),
+            CountingDecider::default(),
+            &log,
+        ) {
+            Ok(_) => panic!("identity mismatch must reject resume"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ResumeError::IdentityMismatch { .. }));
+        assert_eq!(
+            fs::read(&log).expect("read rejected log"),
+            before,
+            "identity rejection precedes recovery writes and resume-marker arming"
+        );
+    }
+}
+
+#[test]
+fn resume_closes_an_unmatched_model_call_after_its_run_terminal_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let prefix = terminated_run_with_unmatched_call(model_call(None));
+    let call_id = prefix[3].id.clone();
+    write_events(&log, &prefix);
+
+    let first = resume_session_with_outcome(
+        fixture_config(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("historical model recovery is not new work in a terminal run");
+    assert!(first.recovery_closure_appended);
+    let closures = model_recovery_closures(first.session.events());
+    assert_eq!(closures.len(), 1);
+    assert_eq!(closures[0].parent.as_deref(), Some(call_id.as_str()));
+    drop(first.session);
+    let after_first = fs::read(&log).expect("read recovered log");
+
+    let second = resume_session_with_outcome(
+        fixture_config(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("recovered model call is resumable");
+    assert!(!second.recovery_closure_appended);
+    assert_eq!(model_recovery_closures(second.session.events()).len(), 1);
+    drop(second.session);
+    assert_eq!(
+        fs::read(&log).expect("read twice-resumed log"),
+        after_first,
+        "historical model recovery is idempotent"
+    );
+}
+
+#[test]
+fn resume_leaves_a_non_tail_tool_call_before_run_terminal_unchanged() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    write_events(
+        &log,
+        &terminated_run_with_unmatched_call(tool_call(None, "call-edit", "edit_file")),
+    );
+    let before = fs::read(&log).expect("read original log");
+
+    let outcome = resume_session_with_outcome(
+        fixture_config(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("a run terminal makes the earlier tool call non-tail");
+
+    assert!(!outcome.recovery_closure_appended);
+    assert!(recovery_closures(outcome.session.events()).is_empty());
+    drop(outcome.session);
+    assert_eq!(
+        fs::read(&log).expect("read resumed log"),
+        before,
+        "non-tail tool recovery does not mutate durable evidence"
+    );
+}
+
+#[test]
+fn folded_resume_refolds_a_new_terminal_before_writing_recovery() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let run_id = Ulid::new().to_string();
+    let run_start = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::RUN_STARTED,
+        object([("trigger", "direct".into())]),
+    )
+    .with_run(run_id.clone());
+    let message = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(run_start.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "work".into())]),
+    )
+    .with_run(run_id.clone());
+    write_events(&log, &[start, run_start, message.clone()]);
+
+    let mut config = fixture_config(temp.path());
+    config.session_id = "session".to_owned();
+    config.agent_id = "agent".to_owned();
+    let mut folded = fold_session(&config, read_resume_prefix(&log).expect("read open run"))
+        .expect("fold open run");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut terminal = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(message.id),
+        EventKind::RUN_TERMINAL,
+        object([("status", "completed".into())]),
+    )
+    .with_run(run_id);
+    writer
+        .append(std::slice::from_mut(&mut terminal))
+        .expect("append accepted newer terminal");
+    folded.events.push(terminal);
+    let before = fs::read(&log).expect("read terminal prefix");
+
+    let outcome = resume_session_from_folded_prefix(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        writer,
+        folded,
+    )
+    .expect("resume uses current lifecycle projection");
+
+    assert!(!outcome.recovery_closure_appended);
+    drop(outcome.session);
+    assert_eq!(
+        fs::read(&log).expect("read resumed log"),
+        before,
+        "a stale cached open-run projection must not append recovery"
+    );
+}
+
+#[test]
+fn folded_resume_rejects_a_different_writer_tail_before_recovery() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let start = session_start("fixture", "fixture");
+    let run_id = Ulid::new().to_string();
+    let run_start = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::RUN_STARTED,
+        object([("trigger", "direct".into())]),
+    )
+    .with_run(run_id.clone());
+    let message = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(run_start.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "open work".into())]),
+    )
+    .with_run(run_id);
+    let mut config = fixture_config(temp.path());
+    config.agent_id = "agent".to_owned();
+    let folded = fold_session(&config, vec![start, run_start, message]).expect("fold open run");
+
+    let other_log = temp.path().join("other-events.jsonl");
+    write_events(&other_log, &[session_start("fixture", "fixture")]);
+    let before = fs::read(&other_log).expect("read other log");
+    let writer = ProvenanceWriter::new(&other_log).expect("other writer");
+    let error = match resume_session_from_folded_prefix(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        writer,
+        folded,
+    ) {
+        Ok(_) => panic!("writer-tail mismatch must reject resume"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, ResumeError::FoldedPrefixMismatch));
+    assert_eq!(
+        fs::read(&other_log).expect("read rejected writer"),
+        before,
+        "recovery cannot append a closure derived from another prefix"
+    );
+}
+
+#[test]
+fn folded_resume_recomputes_every_public_projection_from_durable_events() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    write_events(&log, std::slice::from_ref(&start));
+    let config = fixture_config(temp.path());
+    let mut folded = fold_session(&config, vec![start]).expect("canonical fold");
+    let forged_target = ModelTarget::new("forged-provider", "forged-model");
+    folded.original_target = Some(forged_target.clone());
+    folded.active_target = forged_target.clone();
+    folded.reasoning_effort = ReasoningEffort::XLarge;
+    folded.latest_model_usage_used_tokens = Some(999_999);
+    folded.context_limit_emitted = Some(forged_target);
+    folded.auto_compaction = AutoCompactionPolicy {
+        automatic: false,
+        tier: CompactionTier::Off,
+        budget_bytes: 1,
+    };
+    folded.session_allowed_capabilities = vec![Capability::ShellExec];
+    folded.warnings = vec![ResumeWarning {
+        message: "forged warning".to_owned(),
+    }];
+
+    let outcome = resume_session_from_folded_prefix(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        ProvenanceWriter::new(&log).expect("writer"),
+        folded,
+    )
+    .expect("resume canonical projections");
+
+    assert_eq!(
+        outcome.active_target,
+        ModelTarget::new("fixture", "fixture")
+    );
+    assert_eq!(
+        outcome.session.active_target(),
+        &ModelTarget::new("fixture", "fixture")
+    );
+    assert_eq!(outcome.session.reasoning_effort(), ReasoningEffort::Medium);
+    assert_eq!(
+        outcome.session.auto_compaction_policy(),
+        AutoCompactionPolicy::default()
+    );
+    assert_eq!(outcome.session.latest_model_usage_used_tokens(), None);
+    assert_eq!(outcome.session.context_limit_emitted(), None);
+    assert_ne!(
+        outcome.session.configured_mode(Capability::ShellExec),
+        Some(ApprovalMode::SessionAllow)
+    );
+    assert!(outcome.warnings.is_empty());
+}
+
+#[test]
+fn folded_resume_rejects_payload_mutation_even_when_the_tail_id_matches() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let denied = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::PERMISSION_DECISION,
+        object([
+            ("scope", "session".into()),
+            ("decision", "denied".into()),
+            ("capability", "shell-exec".into()),
+        ]),
+    );
+    write_events(&log, &[start, denied]);
+    let before = fs::read(&log).expect("read durable prefix");
+    let config = fixture_config(temp.path());
+    let mut folded = fold_session(
+        &config,
+        read_resume_prefix(&log).expect("read durable events"),
+    )
+    .expect("fold denied decision");
+    folded
+        .events
+        .last_mut()
+        .expect("decision")
+        .payload
+        .insert("decision".to_owned(), "allowed".into());
+    let forged_tail = folded.events.last().expect("tail").id.clone();
+
+    let error = match resume_session_from_folded_prefix(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        ProvenanceWriter::new(&log).expect("writer"),
+        folded,
+    ) {
+        Ok(_) => panic!("caller-modified permission payload must not resume"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, ResumeError::FoldedPrefixMismatch));
+    assert_eq!(
+        fs::read(&log).expect("read rejected log"),
+        before,
+        "same-id payload forgery cannot grant authority or mutate provenance"
+    );
+    assert_eq!(
+        read_resume_prefix(&log)
+            .expect("read unchanged durable prefix")
+            .last()
+            .expect("durable tail")
+            .id,
+        forged_tail
+    );
+}
+
+#[test]
 fn fold_accepts_known_canvas_swap_event() {
     let temp = tempfile::tempdir().expect("temp dir");
     let event = EventEnvelope::new("session", "agent", None, EventKind::CANVAS_SWAP, object([]));
 
-    fold_session(&SessionConfig::new(temp.path()), vec![event]).expect("fold");
+    fold_session(&fixture_config(temp.path()), vec![event]).expect("fold");
 }
 
 #[test]
@@ -1643,7 +1993,7 @@ fn malformed_canvas_swap_does_not_reset_folded_usage_or_context_latch() {
     );
 
     let folded = fold_session(
-        &SessionConfig::new(temp.path()),
+        &fixture_config(temp.path()),
         vec![start, result, limit, malformed],
     )
     .expect("fold");
@@ -1677,7 +2027,7 @@ fn fold_accepts_known_file_change_event() {
         ]),
     );
 
-    fold_session(&SessionConfig::new(temp.path()), vec![event]).expect("fold");
+    fold_session(&fixture_config(temp.path()), vec![event]).expect("fold");
 }
 
 #[test]
@@ -1702,7 +2052,7 @@ fn fold_accepts_known_file_diff_event() {
         ]),
     );
 
-    fold_session(&SessionConfig::new(temp.path()), vec![event]).expect("fold");
+    fold_session(&fixture_config(temp.path()), vec![event]).expect("fold");
 }
 
 #[test]
@@ -1711,7 +2061,7 @@ fn too_high_envelope_version_is_resume_incompatibility() {
     let mut event = user_message("hello");
     event.v = 2;
 
-    let error = fold_session(&SessionConfig::new(temp.path()), vec![event]).expect_err("version");
+    let error = fold_session(&fixture_config(temp.path()), vec![event]).expect_err("version");
 
     assert!(matches!(
         error,
@@ -1764,7 +2114,7 @@ fn resume_ignores_missing_extension_artifact_file() {
 
     let prefix = read_resume_prefix(&log).expect("read prefix");
     let outcome = resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1797,7 +2147,7 @@ fn resume_ignores_corrupt_extension_artifact_file() {
     write_events(&log, &[start, artifact.clone()]);
 
     let outcome = resume_session_with_outcome(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1832,7 +2182,7 @@ fn mid_stream_unmatched_prompt_warns_and_restores_no_permission_state() {
     let later = user_message("later event");
 
     let folded =
-        fold_session(&SessionConfig::new(temp.path()), vec![call, prompt, later]).expect("fold");
+        fold_session(&fixture_config(temp.path()), vec![call, prompt, later]).expect("fold");
 
     assert_eq!(folded.warnings.len(), 1);
     assert_eq!(folded.latest_model_usage_used_tokens, None);
@@ -1855,7 +2205,7 @@ fn tail_unmatched_prompt_warns_and_is_not_synthesized() {
     );
 
     let folded = fold_session(
-        &SessionConfig::new(temp.path()),
+        &fixture_config(temp.path()),
         vec![user_message("before"), prompt.clone()],
     )
     .expect("fold");
@@ -1864,7 +2214,7 @@ fn tail_unmatched_prompt_warns_and_is_not_synthesized() {
     write_events(&log, &[user_message("before"), prompt]);
 
     let session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -1899,7 +2249,7 @@ fn pending_prompt_history_does_not_grant_frontier_permission() {
     };
 
     let mut session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![
             FixtureResponse::ToolCalls(vec![ToolCall {
                 id: "call-edit-new".to_owned(),
@@ -1940,7 +2290,7 @@ fn mid_stream_unmatched_tool_call_is_not_synthesized() {
     );
 
     let session = resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -2035,7 +2385,7 @@ fn resume_attempt_on_corrupt_log_reports_plain_language_error() {
     .expect("write log");
 
     let error = match resume_session(
-        SessionConfig::new(temp.path()),
+        fixture_config(temp.path()),
         ProviderSet::single(ScriptedProvider::new(vec![])),
         CountingDecider::default(),
         &log,
@@ -2068,6 +2418,527 @@ fn resume_read_classifies_nul_run_inside_line_as_corruption() {
         error,
         ResumeError::CorruptedLog { line: 1, offset } if offset == head.len()
     ));
+}
+
+#[test]
+fn resume_retains_interrupted_steering_as_non_deliverable_recovery_input() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let run_id = Ulid::new().to_string();
+    let queue_id = Ulid::new().to_string();
+    let run_start = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::RUN_STARTED,
+        object([("trigger", "direct".into())]),
+    )
+    .with_run(run_id.clone());
+    let message = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(run_start.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "start".into())]),
+    )
+    .with_run(run_id.clone());
+    let queued = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(message.id.clone()),
+        EventKind::QUEUE_ENQUEUED,
+        object([
+            ("queue_id", queue_id.clone().into()),
+            ("mode", "steering".into()),
+            ("position", "back".into()),
+            ("content", "recover this private steering".into()),
+            ("source_run_id", run_id.clone().into()),
+        ]),
+    )
+    .with_run(run_id.clone());
+    write_events(&log, &[start, run_start, message, queued]);
+
+    let mut config = fixture_config(temp.path());
+    config.session_id = "session".to_owned();
+    config.agent_id = "agent".to_owned();
+    let mut first = resume_session_with_outcome(
+        config.clone(),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("first resume");
+    assert!(first.recovery_closure_appended);
+    assert!(first
+        .session
+        .pending_queue_inputs()
+        .expect("reconcile pending projection")
+        .is_empty());
+    let recoverable = first
+        .session
+        .recoverable_queue_inputs()
+        .expect("reconcile recovery projection");
+    assert_eq!(recoverable.len(), 1);
+    assert_eq!(recoverable[0].queue_id(), queue_id);
+    assert_eq!(recoverable[0].run_id(), run_id);
+    assert_eq!(recoverable[0].source_run_id(), Some(run_id.as_str()));
+    assert_eq!(recoverable[0].content(), "recover this private steering");
+    assert_eq!(
+        recoverable[0].reason(),
+        QueueCancellationReason::RunInterrupted
+    );
+    drop(first.session);
+
+    let mut second = resume_session_with_outcome(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("second resume");
+    assert!(!second.recovery_closure_appended);
+    assert!(second
+        .session
+        .pending_queue_inputs()
+        .expect("reconcile resumed pending projection")
+        .is_empty());
+    assert_eq!(
+        second
+            .session
+            .recoverable_queue_inputs()
+            .expect("reconcile resumed recovery projection"),
+        recoverable,
+        "restart reconstructs the same private recovery record without making it deliverable"
+    );
+}
+
+#[test]
+fn resume_keeps_partial_requeue_inert_until_a_fresh_atomic_pair_arrives() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let source_run = Ulid::new().to_string();
+    let queue_id = Ulid::new().to_string();
+    let abandoned_replacement = Ulid::new().to_string();
+    let run_start = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::RUN_STARTED,
+        object([("trigger", "direct".into())]),
+    )
+    .with_run(source_run.clone());
+    let message = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(run_start.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "start".into())]),
+    )
+    .with_run(source_run.clone());
+    let queued = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(message.id.clone()),
+        EventKind::QUEUE_ENQUEUED,
+        object([
+            ("queue_id", queue_id.clone().into()),
+            ("mode", "steering".into()),
+            ("position", "back".into()),
+            ("content", "private steer".into()),
+        ]),
+    )
+    .with_run(source_run.clone());
+    let cancelled = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(queued.id.clone()),
+        EventKind::QUEUE_CANCELLED,
+        object([
+            ("queue_id", queue_id.clone().into()),
+            ("reason", "run_interrupted".into()),
+        ]),
+    )
+    .with_run(source_run.clone());
+    let terminal = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(cancelled.id.clone()),
+        EventKind::RUN_TERMINAL,
+        object([("status", "interrupted".into())]),
+    )
+    .with_run(source_run.clone());
+    let partial_marker = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(terminal.id.clone()),
+        EventKind::QUEUE_RECOVERED,
+        object([
+            ("queue_id", queue_id.clone().into()),
+            ("action", "requeued".into()),
+            ("replacement_queue_id", abandoned_replacement.clone().into()),
+        ]),
+    )
+    .with_run(source_run.clone());
+    write_events(
+        &log,
+        &[
+            start,
+            run_start,
+            message,
+            queued,
+            cancelled,
+            terminal,
+            partial_marker.clone(),
+        ],
+    );
+
+    let mut config = fixture_config(temp.path());
+    config.session_id = "session".to_owned();
+    config.agent_id = "agent".to_owned();
+    let mut first = resume_session_with_outcome(
+        config.clone(),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume partial marker");
+    assert!(!first.recovery_closure_appended);
+    assert!(first
+        .session
+        .pending_queue_inputs()
+        .expect("pending projection")
+        .is_empty());
+    assert_eq!(
+        first
+            .session
+            .recoverable_queue_inputs()
+            .expect("recoverable projection")
+            .len(),
+        1
+    );
+    drop(first.session);
+
+    let replacement_run = Ulid::new().to_string();
+    let replacement_id = Ulid::new().to_string();
+    let fresh_marker = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(partial_marker.id.clone()),
+        EventKind::QUEUE_RECOVERED,
+        object([
+            ("queue_id", queue_id.into()),
+            ("action", "requeued".into()),
+            ("replacement_queue_id", replacement_id.clone().into()),
+        ]),
+    )
+    .with_run(source_run);
+    let replacement = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(fresh_marker.id.clone()),
+        EventKind::QUEUE_ENQUEUED,
+        object([
+            ("queue_id", replacement_id.clone().into()),
+            ("mode", "follow_up".into()),
+            ("position", "back".into()),
+            ("content", "edited follow-up".into()),
+        ]),
+    )
+    .with_run(replacement_run);
+    let writer = ProvenanceWriter::new(&log).expect("reopen writer");
+    writer
+        .append(&[fresh_marker, replacement])
+        .expect("append complete recovery pair");
+    drop(writer);
+
+    let mut second = resume_session_with_outcome(
+        config.clone(),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume complete recovery pair");
+    assert!(!second.recovery_closure_appended);
+    let pending = second
+        .session
+        .pending_queue_inputs()
+        .expect("replacement projection");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].queue_id(), replacement_id);
+    assert!(second
+        .session
+        .recoverable_queue_inputs()
+        .expect("resolved recovery projection")
+        .is_empty());
+    drop(second.session);
+
+    let mut third = resume_session_with_outcome(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("idempotent complete recovery resume");
+    assert!(!third.recovery_closure_appended);
+    assert_eq!(
+        third
+            .session
+            .pending_queue_inputs()
+            .expect("stable replacement projection")[0]
+            .queue_id(),
+        replacement_id
+    );
+}
+
+#[test]
+fn resume_recovers_after_a_crash_partial_terminal_batch() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let run_id = Ulid::new().to_string();
+    let first_id = Ulid::new().to_string();
+    let second_id = Ulid::new().to_string();
+    let run_start = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::RUN_STARTED,
+        object([("trigger", "direct".into())]),
+    )
+    .with_run(run_id.clone());
+    let message = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(run_start.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "start".into())]),
+    )
+    .with_run(run_id.clone());
+    let first = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(message.id.clone()),
+        EventKind::QUEUE_ENQUEUED,
+        object([
+            ("queue_id", first_id.clone().into()),
+            ("mode", "steering".into()),
+            ("position", "back".into()),
+            ("content", "first private steer".into()),
+            ("source_run_id", run_id.clone().into()),
+        ]),
+    )
+    .with_run(run_id.clone());
+    let second = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(first.id.clone()),
+        EventKind::QUEUE_ENQUEUED,
+        object([
+            ("queue_id", second_id.clone().into()),
+            ("mode", "steering".into()),
+            ("position", "back".into()),
+            ("content", "second private steer".into()),
+            ("source_run_id", run_id.clone().into()),
+        ]),
+    )
+    .with_run(run_id.clone());
+    let partial_cancellation = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(second.id.clone()),
+        EventKind::QUEUE_CANCELLED,
+        object([
+            ("queue_id", first_id.clone().into()),
+            ("reason", "run_failed".into()),
+        ]),
+    )
+    .with_run(run_id.clone());
+    write_events(
+        &log,
+        &[
+            start,
+            run_start,
+            message,
+            first,
+            second,
+            partial_cancellation,
+        ],
+    );
+
+    let mut config = fixture_config(temp.path());
+    config.session_id = "session".to_owned();
+    config.agent_id = "agent".to_owned();
+    let mut first_resume = resume_session_with_outcome(
+        config.clone(),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume completes a replacement terminal batch");
+
+    assert!(first_resume.recovery_closure_appended);
+    assert!(first_resume
+        .session
+        .pending_queue_inputs()
+        .expect("reconcile recovered pending state")
+        .is_empty());
+    let recoverable = first_resume
+        .session
+        .recoverable_queue_inputs()
+        .expect("reconcile recovered inputs");
+    assert_eq!(recoverable.len(), 2);
+    assert_eq!(recoverable[0].queue_id(), first_id);
+    assert_eq!(recoverable[1].queue_id(), second_id);
+    assert!(recoverable
+        .iter()
+        .all(|item| item.reason() == QueueCancellationReason::RunInterrupted));
+    assert_eq!(
+        first_resume
+            .session
+            .run_terminal_status(&run_id)
+            .expect("reconcile terminal status"),
+        Some(euler_core::RunTerminalStatus::Interrupted)
+    );
+    drop(first_resume.session);
+
+    let second_resume = resume_session_with_outcome(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("completed recovery is resumable");
+    assert!(!second_resume.recovery_closure_appended);
+}
+
+#[test]
+fn resume_keeps_a_crash_partial_follow_up_pending_until_complete_retry() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("partial-follow-up.jsonl");
+    let start = session_start("fixture", "fixture");
+    let run_id = Ulid::new().to_string();
+    let queue_id = Ulid::new().to_string();
+    let queued = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::QUEUE_ENQUEUED,
+        object([
+            ("queue_id", queue_id.clone().into()),
+            ("mode", "follow_up".into()),
+            ("position", "back".into()),
+            ("content", "continue after crash".into()),
+        ]),
+    )
+    .with_run(run_id.clone());
+    let run_start = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(queued.id.clone()),
+        EventKind::RUN_STARTED,
+        object([
+            ("trigger", "follow_up".into()),
+            ("queue_id", queue_id.clone().into()),
+        ]),
+    )
+    .with_run(run_id.clone());
+    let delivered = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(run_start.id.clone()),
+        EventKind::QUEUE_DELIVERED,
+        object([("queue_id", queue_id.clone().into())]),
+    )
+    .with_run(run_id);
+    write_events(&log, &[start, queued, run_start, delivered]);
+
+    let mut config = fixture_config(temp.path());
+    config.session_id = "session".to_owned();
+    config.agent_id = "agent".to_owned();
+    let mut session = resume_session(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "done".to_owned(),
+        )])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume crash prefix");
+    let pending = session
+        .pending_queue_inputs()
+        .expect("reconcile crash-prefix projection");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].queue_id(), queue_id);
+
+    let queue = Arc::new(euler_core::SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("rehydrate durable queue");
+    let input = queue
+        .reserve_front_for_dispatch()
+        .expect("pending follow-up");
+    session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &input)
+        .expect("wire exact retry");
+    session
+        .run_turn(input.content())
+        .expect("complete admission retry");
+
+    assert!(session
+        .pending_queue_inputs()
+        .expect("reconcile completed retry")
+        .is_empty());
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::USER_MESSAGE
+                    && event.payload.get("content") == Some(&json!("continue after crash"))
+            })
+            .count(),
+        1
+    );
+}
+
+fn fixture_config(root: &std::path::Path) -> SessionConfig {
+    let mut config = SessionConfig::new(root);
+    config.agent_id = "agent".to_owned();
+    config
+}
+
+fn terminated_run_with_unmatched_call(mut call: EventEnvelope) -> Vec<EventEnvelope> {
+    let start = session_start("fixture", "fixture");
+    let run_id = Ulid::new().to_string();
+    let run_start = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::RUN_STARTED,
+        object([("trigger", "direct".into())]),
+    )
+    .with_run(run_id.clone());
+    let message = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(run_start.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([("content", "work".into())]),
+    )
+    .with_run(run_id.clone());
+    call.parent = Some(message.id.clone());
+    call.run = Some(run_id.clone());
+    let terminal = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::RUN_TERMINAL,
+        object([("status", "completed".into())]),
+    )
+    .with_run(run_id);
+    vec![start, run_start, message, call, terminal]
 }
 
 fn write_events(path: &std::path::Path, events: &[EventEnvelope]) {

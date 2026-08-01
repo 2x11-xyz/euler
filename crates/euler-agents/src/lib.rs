@@ -48,6 +48,8 @@ pub enum AgentError {
     FailedResultMissingError,
     #[error("agent result has already been recorded for spawn {spawn_event_id}")]
     ResultAlreadyRecorded { spawn_event_id: String },
+    #[error("agent result retry does not match the reserved result for spawn {spawn_event_id}")]
+    ResultRetryMismatch { spawn_event_id: String },
     #[error("agent result references unknown spawn {spawn_event_id}")]
     UnknownSpawn { spawn_event_id: String },
     #[error("agent result child id mismatch for spawn {spawn_event_id}")]

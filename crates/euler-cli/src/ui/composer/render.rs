@@ -18,6 +18,14 @@ pub(crate) fn queued_line_prefix(position: usize, total: usize) -> String {
     format!("▌ {position}/{total} ")
 }
 
+pub(crate) fn queued_saving_prefix(saving: bool) -> &'static str {
+    if saving {
+        "saving · "
+    } else {
+        ""
+    }
+}
+
 pub struct ComposerSnapshot<'a> {
     pub draft: &'a ComposerDraft,
     pub queued: Vec<QueuedComposerLine>,
@@ -43,6 +51,7 @@ pub struct QueuedComposerLine {
     pub total: usize,
     pub text: String,
     pub selected: bool,
+    pub saving: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -173,7 +182,10 @@ pub fn render_lines(
         .map(|line| {
             let mut line = line.clone();
             let prefix = queued_line_prefix(line.position, line.total);
-            let available = usize::from(width).saturating_sub(display_width(&prefix));
+            let state = queued_saving_prefix(line.saving);
+            let available = usize::from(width)
+                .saturating_sub(display_width(&prefix))
+                .saturating_sub(display_width(state));
             line.text = queued_preview(&line.text, available.min(QUEUED_PREVIEW_MAX_WIDTH));
             ComposerLine::Queued(line)
         })
@@ -671,10 +683,18 @@ fn queued_spans(line: QueuedComposerLine, width: u16, theme: &Theme) -> Vec<Span
     // by one cell, turning ` ...` into ` ..` at tight widths (commit 4424869).
     let prefix = queued_line_prefix(line.position, line.total);
     let prefix_width = display_width(&prefix);
+    let state = queued_saving_prefix(line.saving);
+    let state_width = display_width(state);
     vec![
         Span::styled(prefix, theme.composer.token_bar),
+        Span::styled(state.to_owned(), theme.composer.overflow),
         Span::styled(
-            truncate_display(&line.text, usize::from(width).saturating_sub(prefix_width)),
+            truncate_display(
+                &line.text,
+                usize::from(width)
+                    .saturating_sub(prefix_width)
+                    .saturating_sub(state_width),
+            ),
             theme.composer.text,
         ),
     ]

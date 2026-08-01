@@ -137,12 +137,12 @@ pub fn scrub_secrets_in_object(object: &mut euler_event::JsonObject, secrets: &[
     count
 }
 
-/// Scrub one event payload while preserving response-protocol routing fields.
+/// Scrub one event payload while preserving closed protocol grammar.
 ///
 /// Durable and live scrub paths share this owner so a value that happens to
-/// equal a response id or closed status cannot corrupt replay identity. Blob
-/// pointer text is structural until the durable blob rewrite updates it;
-/// rehydrated/live chunk content has no blob entry and remains scrub-visible.
+/// equal a response id, run/queue id, or closed enum cannot corrupt replay.
+/// Blob pointer text is structural until the durable blob rewrite updates it;
+/// rehydrated response and queue content remains scrub-visible.
 pub(crate) fn scrub_event_payload(
     event: &mut euler_event::EventEnvelope,
     secrets: &[String],
@@ -153,17 +153,19 @@ pub(crate) fn scrub_event_payload(
     } else {
         Vec::new()
     };
+    protected.extend(take_lifecycle_protocol_fields(event));
+
     let mut replacements = scrub_secrets_in_object(&mut event.payload, secrets);
     for field in &mut protected {
         if field.scrub_value {
             replacements += scrub_secrets_in_value(&mut field.value, secrets);
         }
     }
-    restore_response_protocol_fields(event, protected);
+    restore_protocol_fields(event, protected);
     replacements
 }
 
-struct ProtectedResponseField {
+struct ProtectedProtocolField {
     name: &'static str,
     value: serde_json::Value,
     scrub_value: bool,
@@ -171,7 +173,7 @@ struct ProtectedResponseField {
 
 fn take_response_protocol_fields(
     event: &mut euler_event::EventEnvelope,
-) -> Vec<ProtectedResponseField> {
+) -> Vec<ProtectedProtocolField> {
     let is_chunk = event.kind.as_str() == euler_event::EventKind::ASSISTANT_RESPONSE_CHUNK;
     let is_terminal = matches!(
         event.kind.as_str(),
@@ -199,13 +201,59 @@ fn take_response_protocol_fields(
             ("recovery_closure", false),
         ]);
     }
+    take_protocol_fields(event, fields)
+}
+
+fn take_lifecycle_protocol_fields(
+    event: &mut euler_event::EventEnvelope,
+) -> Vec<ProtectedProtocolField> {
+    use euler_event::EventKind;
+
+    let scrub_queue_content = !event.blobs.contains_key("content");
+    let fields = match event.kind.as_str() {
+        EventKind::RUN_STARTED => vec![("trigger", false), ("queue_id", false)],
+        EventKind::RUN_TERMINAL => vec![("status", false), ("recovery_closure", false)],
+        EventKind::QUEUE_ENQUEUED => vec![
+            ("queue_id", false),
+            ("mode", false),
+            ("position", false),
+            ("content", scrub_queue_content),
+            ("source_run_id", false),
+        ],
+        EventKind::QUEUE_REPLACED => vec![
+            ("queue_id", false),
+            ("replacement_queue_id", false),
+            ("mode", false),
+            ("content", scrub_queue_content),
+            ("source_run_id", false),
+        ],
+        EventKind::QUEUE_CANCELLED => vec![
+            ("queue_id", false),
+            ("reason", false),
+            ("recovery_closure", false),
+        ],
+        EventKind::QUEUE_DELIVERED => vec![("queue_id", false)],
+        EventKind::QUEUE_RECOVERED => vec![
+            ("queue_id", false),
+            ("action", false),
+            ("replacement_queue_id", false),
+        ],
+        _ => Vec::new(),
+    };
+    take_protocol_fields(event, fields)
+}
+
+fn take_protocol_fields(
+    event: &mut euler_event::EventEnvelope,
+    fields: Vec<(&'static str, bool)>,
+) -> Vec<ProtectedProtocolField> {
     fields
         .into_iter()
         .filter_map(|(name, scrub_value)| {
             event
                 .payload
                 .remove(name)
-                .map(|value| ProtectedResponseField {
+                .map(|value| ProtectedProtocolField {
                     name,
                     value,
                     scrub_value,
@@ -214,12 +262,19 @@ fn take_response_protocol_fields(
         .collect()
 }
 
-fn restore_response_protocol_fields(
+fn restore_protocol_fields(
     event: &mut euler_event::EventEnvelope,
-    fields: Vec<ProtectedResponseField>,
+    fields: Vec<ProtectedProtocolField>,
 ) {
+    let remaining = std::mem::take(&mut event.payload);
     for field in fields {
         event.payload.insert(field.name.to_owned(), field.value);
+    }
+    // Install protocol keys first. If a scrubbed non-protocol key collides,
+    // retain it under a deterministic suffix instead of overwriting authority.
+    for (key, value) in remaining {
+        let key = unique_json_key(&event.payload, key);
+        event.payload.insert(key, value);
     }
 }
 
@@ -771,6 +826,114 @@ mod tests {
 
         assert_eq!(replacements, 1);
         assert_eq!(object.get(SCRUBBED), Some(&serde_json::json!("value")));
+    }
+
+    #[test]
+    fn lifecycle_scrub_preserves_protocol_keys_and_values_but_scrubs_content() {
+        use euler_event::{object, EventKind};
+
+        let queue_id = "01KY0000000000000000000001";
+        let replacement_id = "01KY0000000000000000000002";
+        let source_run_id = "01KY0000000000000000000003";
+        let private = "private lifecycle payload";
+        let secrets = [
+            "trigger",
+            "direct",
+            "queue_id",
+            queue_id,
+            "replacement_queue_id",
+            replacement_id,
+            "status",
+            "failed",
+            "mode",
+            "steering",
+            "position",
+            "back",
+            "source_run_id",
+            source_run_id,
+            "reason",
+            "run_failed",
+            "recovery_closure",
+            "content",
+            private,
+        ]
+        .map(str::to_owned);
+        let fixtures = [
+            (
+                EventKind::RUN_STARTED,
+                object([("trigger", "direct".into()), ("queue_id", queue_id.into())]),
+            ),
+            (
+                EventKind::RUN_TERMINAL,
+                object([
+                    ("status", "failed".into()),
+                    ("recovery_closure", true.into()),
+                ]),
+            ),
+            (
+                EventKind::QUEUE_ENQUEUED,
+                object([
+                    ("queue_id", queue_id.into()),
+                    ("mode", "steering".into()),
+                    ("position", "back".into()),
+                    ("source_run_id", source_run_id.into()),
+                    ("content", private.into()),
+                ]),
+            ),
+            (
+                EventKind::QUEUE_REPLACED,
+                object([
+                    ("queue_id", queue_id.into()),
+                    ("replacement_queue_id", replacement_id.into()),
+                    ("mode", "steering".into()),
+                    ("source_run_id", source_run_id.into()),
+                    ("content", private.into()),
+                ]),
+            ),
+            (
+                EventKind::QUEUE_CANCELLED,
+                object([
+                    ("queue_id", queue_id.into()),
+                    ("reason", "run_failed".into()),
+                    ("recovery_closure", true.into()),
+                ]),
+            ),
+            (
+                EventKind::QUEUE_DELIVERED,
+                object([("queue_id", queue_id.into())]),
+            ),
+            (
+                EventKind::QUEUE_RECOVERED,
+                object([
+                    ("queue_id", queue_id.into()),
+                    ("action", "requeued".into()),
+                    ("replacement_queue_id", replacement_id.into()),
+                ]),
+            ),
+        ];
+        let mut fixtures = fixtures.map(|(kind, payload)| {
+            euler_event::EventEnvelope::new("session", "agent", None, kind, payload)
+        });
+
+        let originals = fixtures
+            .iter()
+            .map(|event| event.payload.clone())
+            .collect::<Vec<_>>();
+        let replacements = fixtures
+            .iter_mut()
+            .map(|event| scrub_event_payload(event, &secrets, false))
+            .sum::<usize>();
+
+        assert_eq!(replacements, 2, "only the two private content fields scrub");
+        for (event, original) in fixtures.iter().zip(originals) {
+            for (field, value) in original {
+                if field == "content" {
+                    assert_eq!(event.payload[&field], SCRUBBED);
+                } else {
+                    assert_eq!(event.payload[&field], value, "protocol field {field}");
+                }
+            }
+        }
     }
 
     #[test]

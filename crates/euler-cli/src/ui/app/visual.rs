@@ -1,5 +1,5 @@
 use super::*;
-use crate::ui::composer::queued_line_prefix;
+use crate::ui::composer::{queued_line_prefix, queued_saving_prefix};
 use crate::ui::transcript;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -572,6 +572,7 @@ fn composer_line_to_canvas(line: ComposerLine) -> CanvasLine {
                     queued_line_prefix(line.position, line.total),
                     TextRole::Status,
                 ),
+                CanvasSpan::new_lossy(queued_saving_prefix(line.saving), TextRole::Status),
                 CanvasSpan::new_lossy(line.text, TextRole::Plain),
             ],
         },

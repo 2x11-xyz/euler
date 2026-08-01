@@ -1151,6 +1151,45 @@ fn name_session_appends_canonical_rename_event() {
 }
 
 #[test]
+fn name_session_after_stranded_resume_marker_uses_logical_frontier() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let start = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_START,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    let marker = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        Some(start.id.clone()),
+        EventKind::SESSION_RESUMED,
+        object([
+            ("resumed_from_event_id", start.id.clone().into()),
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+        ]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer
+        .append(&[start.clone(), marker.clone()])
+        .expect("seed");
+    drop(writer);
+
+    store
+        .name_session(record.id(), "continued name")
+        .expect("name session");
+
+    let events = read_resume_prefix(record.events_path()).expect("events");
+    let rename = events.last().expect("rename event");
+    assert_eq!(rename.kind.as_str(), EventKind::SESSION_RENAMED);
+    assert_eq!(rename.parent.as_deref(), Some(start.id.as_str()));
+    assert_ne!(rename.parent.as_deref(), Some(marker.id.as_str()));
+}
+
+#[test]
 fn multiple_rename_events_use_latest_name_for_listing_and_metadata() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");

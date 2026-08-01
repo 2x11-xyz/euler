@@ -20,6 +20,14 @@ substrates. If a removable workflow such as Causal DAG projection is hard to
 build without workflow-specific core APIs, improve the product-neutral SDK or
 host boundary before adding DAG-specific core behavior.
 
+Host-authored extension control provenance is part of command truth, not
+best-effort telemetry. Registration cannot succeed until its static capability
+decisions are durable. A returned command error or panic cannot be reported as
+normally recorded until its fixed sanitized `error` event is durable. If
+either append fails, the host returns an infrastructure failure, retains the
+writer's exact-append fence, and never substitutes the extension's ordinary
+result for the missing provenance.
+
 ## Bounded Event Feed v0
 
 `HostApi::query_provenance` is the v0 pull-based event feed for extensions.

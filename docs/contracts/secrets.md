@@ -91,7 +91,10 @@ echoes it, or a credential sits in a tool-call argument), euler does not
 silently rewrite the record. It **detects and warns** the user, and offers
 an explicit **scrub** operation that removes the value from every surface
 (provenance, blobs, checkpoints, sidecars, projections) on demand. Default
-is faithful; scrub is opt-in.
+is faithful; scrub is opt-in. If an interactive queue mutation still owns a
+pre-reconciliation display snapshot, scrub waits for that bounded mutation to
+settle before beginning; a stale UI-owned snapshot must never survive or
+re-expose the scrubbed value.
 
 Redaction is implemented in two layers:
 
@@ -211,9 +214,10 @@ One surface-sweeping engine (`euler_core::scrub`), two entry points:
 Both exhaustively remove every occurrence of each requested value from **every
 persistent content surface**. Content includes every user-, model-, tool-, and
 extension-authored value plus every nonstructural event payload key or value.
-Generated identities and the closed response-routing grammar enumerated below
-are protocol metadata, not authored content; preserving them is the sole
-structural exception needed to keep the scrubbed log replayable.
+Generated identities and the closed response-routing and run/queue lifecycle
+grammars enumerated below are protocol metadata, not authored content;
+preserving them is the sole structural exception needed to keep the scrubbed
+log replayable.
 
 - `events.jsonl` payloads, including the inline `projection_blob` compaction
   state (recursive JSON string/key walk);
@@ -262,6 +266,15 @@ replay cannot reconstruct the requested value across events. Both literal and
 distinct JSON-escaped spellings use the same bounded seam detector as the blob
 scrubber. Collapsed externalized chunks move every shared reference to a
 durable scrub-marker blob, then sanitize and retire the old hashes.
+
+Run/queue lifecycle grammar is structural authority, not a content scrub
+surface. Scrub preserves the envelope `run` and the protocol keys and values
+that identify starts, terminals, queue rows, modes, positions, source runs,
+cancellation reasons, and recovery markers. It still recursively scrubs the
+private `content` field of `queue.enqueued` and `queue.replaced`. Thus a scrub
+request equal to a run/queue id or enum spelling is a no-op for that protocol
+occurrence and can never make the durable stream or live projection
+unfoldable.
 
 ## Non-Goals
 
