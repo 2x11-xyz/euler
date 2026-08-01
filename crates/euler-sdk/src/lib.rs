@@ -271,6 +271,12 @@ pub struct IdleContributionDescriptor {
     pub command: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestTickDescriptor {
+    pub command: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArgSpec {
     pub flag: String,
@@ -303,6 +309,10 @@ pub enum ArgValueKind {
 #[serde(deny_unknown_fields)]
 pub struct ProvenanceQuery {
     pub after_event_id: Option<String>,
+    /// Inclusive upper bound within the accepted durable event stream.
+    /// Keeping the same bound across pages gives one stable historical view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_event_id: Option<String>,
     pub kinds: Vec<String>,
     pub limit: usize,
     pub scan_limit: usize,
@@ -314,6 +324,7 @@ impl ProvenanceQuery {
     pub fn new(limit: usize) -> Self {
         Self {
             after_event_id: None,
+            through_event_id: None,
             kinds: Vec::new(),
             limit,
             scan_limit: 1024,
@@ -606,6 +617,9 @@ pub trait Extension: Send + Sync {
     fn manifest(&self) -> ExtensionManifest;
     fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError>;
     fn idle_contribution(&self) -> Option<IdleContributionDescriptor> {
+        None
+    }
+    fn request_tick(&self) -> Option<RequestTickDescriptor> {
         None
     }
 }

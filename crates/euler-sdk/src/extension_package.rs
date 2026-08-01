@@ -1,5 +1,6 @@
 use crate::{
     validate_model_tool_descriptor, Capability, IdleContributionDescriptor, ModelToolDescriptor,
+    RequestTickDescriptor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -43,6 +44,8 @@ pub struct StaticExtensionDescriptor {
     pub observer: Option<StaticObserverDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_contribution: Option<IdleContributionDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_tick: Option<RequestTickDescriptor>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -301,6 +304,7 @@ pub fn parse_extension_manifest_bytes(
             "commands",
             "observer",
             "idle_contribution",
+            "request_tick",
         ],
         "manifest",
     )?;
@@ -332,6 +336,7 @@ pub fn parse_extension_manifest_bytes(
     let commands = parse_commands(root)?;
     let observer = parse_observer(root, &commands)?;
     let idle_contribution = parse_idle_contribution(root, &commands)?;
+    let request_tick = parse_request_tick(root, &commands)?;
     let envelope = capabilities.iter().cloned().collect::<BTreeSet<_>>();
     for command in &commands {
         for capability in &command.required_capabilities {
@@ -353,6 +358,7 @@ pub fn parse_extension_manifest_bytes(
         commands,
         observer,
         idle_contribution,
+        request_tick,
     })
 }
 
@@ -605,6 +611,34 @@ fn parse_idle_contribution(
         )));
     }
     Ok(Some(IdleContributionDescriptor { command }))
+}
+
+fn parse_request_tick(
+    root: &Map<String, Value>,
+    commands: &[StaticCommandDescriptor],
+) -> Result<Option<RequestTickDescriptor>, ExtensionPackageError> {
+    let Some(value) = root.get("request_tick") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| invalid("manifest request_tick must be an object"))?;
+    validate_fields(object, &["command"], "manifest request_tick")?;
+    let command = required_identifier(object, "command", "manifest request_tick command")?;
+    let descriptor = commands
+        .iter()
+        .find(|descriptor| descriptor.name == command)
+        .ok_or_else(|| {
+            invalid(format!(
+                "manifest request_tick command `{command}` is not registered"
+            ))
+        })?;
+    if !descriptor.invocation.is_agent_only() {
+        return Err(invalid(format!(
+            "manifest request_tick command `{command}` must be agent-only"
+        )));
+    }
+    Ok(Some(RequestTickDescriptor { command }))
 }
 
 fn parse_commands(

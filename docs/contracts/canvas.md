@@ -98,11 +98,26 @@ content line indented, so extension text cannot spoof canvas section markers.
 Live request assembly projects only slots whose owning extension id is
 currently enabled. Disabling/removing an extension hides its slots on the next
 snapshot without deleting durable state; re-enabling restores the latest slot.
-Raw provenance must not be dumped into the canvas.
+Slots are folded independently over the full accepted log and therefore stay
+out of shadow-compaction snapshots and shadow provider input: a compactor
+cannot bake a superseded slot value into its durable projection. Raw
+provenance must not be dumped into the canvas.
 
 Structured `plan.update` is a transcript/provenance presentation event and
 never enters the model canvas directly. Workflow state reaches the model only
 through an independently capability-gated, bounded context slot.
+
+Root request ticks (ADR 0019) run after the request's final compaction decision
+and before final canvas assembly and the purpose-free `canvas.snapshot`.
+Their command results and provenance queries are never canvas items. Only
+ordinary already-admitted substrates such as bounded context slots can affect
+the freshly assembled request. A tick cannot start a second compaction cycle;
+if its admitted slot update makes the final request exceed the normal context
+budget, request assembly fails honestly before provider invocation. The exact
+pre-tick request is the compatibility baseline: a no-op or failed optional
+tick does not replace an otherwise unchanged legacy admission decision.
+Shadow compaction and every child/companion/reviewer canvas omit the tick
+boundary.
 
 Run and queue lifecycle events are control/provenance state, never model
 content. In particular, private pending `queue.enqueued` or `queue.replaced`

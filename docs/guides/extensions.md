@@ -31,6 +31,22 @@ The fingerprint covers `Euler.extension.json`, not every source file in a
 linked development directory. Linked source remains mutable by design; use a
 future immutable installed-package runtime when source-byte pinning is needed.
 
+A package that maintains a bounded projection for root requests may nominate
+an existing `agent-only` command:
+
+```json
+"request_tick": {"command": "refresh-projection"}
+```
+
+Euler runs enabled request ticks in extension-id order after compaction and
+before each root request snapshot. The input is exactly
+`{"through_event_id":"..."}`; provenance queries during that command are
+pinned to the same inclusive cutoff. The command returns a JSON object that
+Euler ignores. Publish model-facing state through a bounded context slot, not
+through the result or raw provenance. Ticks never prompt, so all declared
+capabilities need standing authority; see the extension SDK contract for
+failure isolation and cancellation details.
+
 Linking inventories a local package without starting it. `validate`, `link`,
 and `info` show a managed package's exact argv; `enable` echoes that argv as it
 records the explicit local decision to launch it. Reloading or disabling

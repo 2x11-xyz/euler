@@ -493,6 +493,10 @@ extension error does not consume the later result.
   root-driver `model.call` binds the exact purpose-free `canvas.snapshot` that
   selected it, then becomes provenance-only. A prepared snapshot with no
   accepted call consumes nothing. It is never reclassified as `user.message`.
+  Request ticks (ADR 0019) do not add a sibling lifecycle or heartbeat event.
+  Their capability decisions, command failures, context slots, plans, and
+  artifacts retain the ordinary canonical event shapes above and below; the
+  ignored command result is never transcript or canvas content.
 - `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
   `modify`-style edits, `old` and `new` are the requested replacement or patch
   hunk text, not guaranteed whole-file before/after content. Whole-file

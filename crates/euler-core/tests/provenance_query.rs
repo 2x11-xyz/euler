@@ -250,6 +250,241 @@ fn provenance_query_cursor_starts_strictly_after_event_id() {
 }
 
 #[test]
+fn provenance_query_through_event_is_inclusive_and_excludes_later_events() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let events = [
+        content_event(EventKind::USER_MESSAGE, "first"),
+        content_event(EventKind::ASSISTANT_MESSAGE, "through"),
+        content_event(EventKind::USER_MESSAGE, "later"),
+    ];
+    write_events(&log, &events);
+    let mut query = ProvenanceQuery::new(10);
+    query.through_event_id = Some(events[1].id.clone());
+
+    let page = query_provenance(&log, query).expect("bounded query");
+
+    assert_eq!(
+        event_ids(&page.events),
+        vec![events[0].id.as_str(), events[1].id.as_str()]
+    );
+    assert_eq!(page.watermark_event_id, Some(events[1].id.clone()));
+    assert!(!page.truncated);
+}
+
+#[test]
+fn provenance_query_pages_against_one_stable_through_event() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let events = [
+        content_event(EventKind::USER_MESSAGE, "first"),
+        content_event(EventKind::USER_MESSAGE, "second"),
+        content_event(EventKind::USER_MESSAGE, "through"),
+        content_event(EventKind::USER_MESSAGE, "later"),
+    ];
+    write_events(&log, &events);
+    let through = events[2].id.clone();
+    let mut cursor = None;
+    let mut found = Vec::new();
+    loop {
+        let mut query = ProvenanceQuery::new(1);
+        query.after_event_id.clone_from(&cursor);
+        query.through_event_id = Some(through.clone());
+        let page = query_provenance(&log, query).expect("bounded page");
+        found.extend(page.events.iter().map(|event| event.id.clone()));
+        if !page.truncated {
+            assert_eq!(page.watermark_event_id, Some(through.clone()));
+            break;
+        }
+        cursor = page.next_after_event_id;
+    }
+    assert_eq!(
+        found,
+        events[..=2]
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn provenance_query_equal_cursor_and_through_returns_empty_page() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let events = [
+        content_event(EventKind::USER_MESSAGE, "cursor"),
+        content_event(EventKind::USER_MESSAGE, "later"),
+    ];
+    write_events(&log, &events);
+    let mut query = ProvenanceQuery::new(10);
+    query.after_event_id = Some(events[0].id.clone());
+    query.through_event_id = Some(events[0].id.clone());
+
+    let page = query_provenance(&log, query).expect("empty bounded page");
+
+    assert!(page.events.is_empty());
+    assert_eq!(page.scanned_events, 0);
+    assert_eq!(page.watermark_event_id, Some(events[0].id.clone()));
+    assert!(!page.truncated);
+}
+
+#[test]
+fn provenance_query_missing_through_event_returns_typed_error() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    write_events(&log, &[content_event(EventKind::USER_MESSAGE, "only")]);
+    let mut query = ProvenanceQuery::new(10);
+    query.through_event_id = Some("missing-through".to_owned());
+
+    let error = query_provenance(&log, query).expect_err("missing through event");
+
+    assert!(matches!(
+        error,
+        ProvenanceQueryError::ThroughEventNotFound { event_id } if event_id == "missing-through"
+    ));
+}
+
+#[test]
+fn provenance_query_missing_cursor_stops_at_valid_bound_before_corrupt_suffix() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let event = content_event(EventKind::USER_MESSAGE, "through");
+    fs::write(
+        &log,
+        format!(
+            "{}\n{{not valid event json}}\n",
+            event.to_json_line().expect("serialize through")
+        ),
+    )
+    .expect("write bounded corrupt fixture");
+    let mut query = ProvenanceQuery::new(10);
+    query.after_event_id = Some("missing-cursor".to_owned());
+    query.through_event_id = Some(event.id.clone());
+
+    let error = query_provenance(&log, query).expect_err("invalid bounded range");
+
+    assert!(matches!(
+        error,
+        ProvenanceQueryError::InvalidRange { after_event_id, through_event_id }
+            if after_event_id == "missing-cursor" && through_event_id == event.id
+    ));
+}
+
+#[test]
+fn provenance_query_reversed_cursor_stops_at_bound_before_corrupt_suffix() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let events = [
+        content_event(EventKind::USER_MESSAGE, "through"),
+        content_event(EventKind::USER_MESSAGE, "cursor"),
+    ];
+    fs::write(
+        &log,
+        format!(
+            "{}\n{{not valid event json}}\n{}\n",
+            events[0].to_json_line().expect("serialize through"),
+            events[1].to_json_line().expect("serialize cursor")
+        ),
+    )
+    .expect("write reversed corrupt fixture");
+    let mut query = ProvenanceQuery::new(10);
+    query.after_event_id = Some(events[1].id.clone());
+    query.through_event_id = Some(events[0].id.clone());
+
+    let error = query_provenance(&log, query).expect_err("invalid bounded range");
+
+    assert!(matches!(
+        error,
+        ProvenanceQueryError::InvalidRange { after_event_id, through_event_id }
+            if after_event_id == events[1].id && through_event_id == events[0].id
+    ));
+}
+
+#[test]
+fn provenance_query_nonmatching_through_event_still_owns_watermark() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let events = [
+        content_event(EventKind::USER_MESSAGE, "kept"),
+        content_event(EventKind::ASSISTANT_MESSAGE, "through"),
+        content_event(EventKind::USER_MESSAGE, "later"),
+    ];
+    write_events(&log, &events);
+    let mut query = ProvenanceQuery::new(10);
+    query.kinds = vec![EventKind::USER_MESSAGE.to_owned()];
+    query.through_event_id = Some(events[1].id.clone());
+
+    let page = query_provenance(&log, query).expect("filtered bounded query");
+
+    assert_eq!(event_ids(&page.events), vec![events[0].id.as_str()]);
+    assert_eq!(page.watermark_event_id, Some(events[1].id.clone()));
+    assert_eq!(page.scanned_events, 2);
+}
+
+#[test]
+fn provenance_query_scan_truncation_before_bound_keeps_bound_for_next_page() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let events = [
+        content_event(EventKind::USER_MESSAGE, "skip one"),
+        content_event(EventKind::ASSISTANT_MESSAGE, "skip two"),
+        content_event(EventKind::MODEL_RESULT, "match"),
+        content_event(EventKind::USER_MESSAGE, "through"),
+        content_event(EventKind::MODEL_RESULT, "later"),
+    ];
+    write_events(&log, &events);
+    let through = events[3].id.clone();
+    let mut first = ProvenanceQuery::new(10);
+    first.kinds = vec![EventKind::MODEL_RESULT.to_owned()];
+    first.scan_limit = 2;
+    first.through_event_id = Some(through.clone());
+
+    let first = query_provenance(&log, first).expect("first bounded scan page");
+    assert!(first.truncated);
+    assert_eq!(first.watermark_event_id, Some(events[1].id.clone()));
+
+    let mut second = ProvenanceQuery::new(10);
+    second.kinds = vec![EventKind::MODEL_RESULT.to_owned()];
+    second.scan_limit = 2;
+    second.after_event_id = first.next_after_event_id;
+    second.through_event_id = Some(through.clone());
+    let second = query_provenance(&log, second).expect("second bounded scan page");
+
+    assert_eq!(event_ids(&second.events), vec![events[2].id.as_str()]);
+    assert_eq!(second.watermark_event_id, Some(through));
+    assert!(!second.truncated);
+}
+
+#[test]
+fn provenance_query_missing_bound_is_reported_after_earlier_scan_truncation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let events = [
+        content_event(EventKind::USER_MESSAGE, "first"),
+        content_event(EventKind::ASSISTANT_MESSAGE, "second"),
+    ];
+    write_events(&log, &events);
+    let mut first = ProvenanceQuery::new(10);
+    first.scan_limit = 1;
+    first.through_event_id = Some("missing-through".to_owned());
+
+    let first = query_provenance(&log, first).expect("truncated before missing bound is known");
+    assert!(first.truncated);
+
+    let mut second = ProvenanceQuery::new(10);
+    second.scan_limit = 1;
+    second.after_event_id = first.next_after_event_id;
+    second.through_event_id = Some("missing-through".to_owned());
+    let error = query_provenance(&log, second).expect_err("missing bound at durable end");
+
+    assert!(matches!(
+        error,
+        ProvenanceQueryError::ThroughEventNotFound { event_id }
+            if event_id == "missing-through"
+    ));
+}
+
+#[test]
 fn provenance_query_cursor_can_point_to_non_matching_event_and_still_page_correctly() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");

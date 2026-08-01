@@ -12,7 +12,7 @@ use euler_sdk::{
     DiagnosticsPage, EventFeedCheckpoint, Extension, ExtensionCommand, ExtensionError,
     ExtensionManifest, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
     IdleContributionDescriptor, LoadedExtensionPackage, ManagedProcessEntrypoint, PlanPresentation,
-    ProvenancePage, SpawnAgentTask, StaticExtensionDescriptor,
+    ProvenancePage, RequestTickDescriptor, SpawnAgentTask, StaticExtensionDescriptor,
 };
 use io::{finish_io_thread, spawn_stderr_drain, spawn_stdin_writer, spawn_stdout_reader, IoThread};
 use serde::Deserialize;
@@ -119,6 +119,7 @@ pub struct ManagedProcessExtension {
     entrypoint: ManagedProcessEntrypoint,
     commands: Vec<CommandDescriptor>,
     idle_contribution: Option<IdleContributionDescriptor>,
+    request_tick: Option<RequestTickDescriptor>,
     limits: ManagedProcessLimits,
 }
 
@@ -185,6 +186,7 @@ impl ManagedProcessExtension {
             entrypoint,
             commands,
             idle_contribution: descriptor.idle_contribution.clone(),
+            request_tick: descriptor.request_tick.clone(),
             limits: ManagedProcessLimits::default(),
         })
     }
@@ -224,6 +226,10 @@ impl Extension for ManagedProcessExtension {
 
     fn idle_contribution(&self) -> Option<IdleContributionDescriptor> {
         self.idle_contribution.clone()
+    }
+
+    fn request_tick(&self) -> Option<RequestTickDescriptor> {
+        self.request_tick.clone()
     }
 }
 

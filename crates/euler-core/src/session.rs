@@ -430,6 +430,10 @@ pub enum ExtensionExecutionError {
     /// live-session surface.
     #[error("extension registration failed")]
     RegistrationFailed,
+    /// The extension panicked while the host revalidated its registration.
+    /// Panic payloads remain isolated and are never surfaced.
+    #[error("extension registration panicked")]
+    RegistrationPanicked,
     /// The selected command attempted a capability not granted for this call.
     #[error("extension capability denied")]
     CapabilityDenied { capability: Capability },
@@ -453,6 +457,11 @@ pub enum ExtensionExecutionError {
     /// publishing already-durable queued extension events into the live bus.
     #[error(transparent)]
     Session(#[from] SessionError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequestTickFailureLatch {
+    registration_fault: bool,
 }
 
 pub struct Session<D> {
@@ -509,6 +518,9 @@ pub struct Session<D> {
     /// request. Dispatch consults this map so an unadvertised or stale name
     /// cannot enter the extension path.
     active_extension_tools: BTreeMap<String, extension_contributions::ActiveExtensionTool>,
+    /// Process-local fail-open latch for request-tick contributors. Resume
+    /// deliberately retries them against the newly opened durable session.
+    request_tick_failures: BTreeMap<String, RequestTickFailureLatch>,
     /// Shared mid-turn steering queue (issue #146); drained at round
     /// boundaries into canonical `user.message` events. `None` (headless,
     /// companions) means no steering.
@@ -1266,6 +1278,7 @@ impl<D> Session<D> {
             provider_runtime_observer: ProviderRuntimeObserver::default(),
             extensions: BTreeMap::new(),
             active_extension_tools: BTreeMap::new(),
+            request_tick_failures: BTreeMap::new(),
             steering: None,
             queued_dispatch: None,
             pending_admission: None,
@@ -2839,6 +2852,7 @@ impl<D> Session<D> {
             provider_runtime_observer: ProviderRuntimeObserver::default(),
             extensions: BTreeMap::new(),
             active_extension_tools: BTreeMap::new(),
+            request_tick_failures: BTreeMap::new(),
             steering: None,
             queued_dispatch: None,
             pending_admission: None,
@@ -3678,17 +3692,32 @@ impl<D: PermissionDecider> Session<D> {
         // Admission can settle or cancel a shadow call. Publish those
         // canonical events before propagating its terminal result.
         sink.flush(self.bus.events());
-        let (canvas, pinned) = admitted?;
-        let request = self.driver_model_request(target, &canvas, &tool_catalog);
-        if let Some(pinned) = &pinned {
-            if let Some(error) = self.pinned_context_budget_error(pinned, &request, policy) {
+        // Admission above owns every compaction decision. Request ticks run
+        // only after that frontier is final. Preserve the already-admitted
+        // selection on the dominant no-contributor path; a real tick boundary
+        // can append ordinary context-slot/plan side effects and therefore
+        // requires one fresh pure assembly and budget check.
+        let (mut canvas, mut pinned) = admitted?;
+        let pre_tick_request = self.driver_model_request(target, &canvas, &tool_catalog);
+        let tick_boundary_ran = self.run_request_ticks(cancellation, sink)?;
+        sink.flush(self.bus.events());
+        if tick_boundary_ran {
+            (canvas, pinned) = self.assemble_driver_canvas(policy)?;
+            if let Some(error) = context_budget_exhausted(policy, &canvas) {
                 self.emit_session_error(&error)?;
                 sink.flush(self.bus.events());
                 return Err(error);
             }
-        } else if let Some(error) =
-            self.extension_tool_context_budget_error(&request, &tool_catalog)
-        {
+        }
+        let request = self.driver_model_request(target, &canvas, &tool_catalog);
+        let tick_baseline = tick_boundary_ran.then_some(&pre_tick_request);
+        if let Some(error) = self.driver_request_budget_error(
+            pinned.as_ref(),
+            &request,
+            policy,
+            tick_baseline,
+            &tool_catalog,
+        ) {
             self.emit_session_error(&error)?;
             sink.flush(self.bus.events());
             return Err(error);
@@ -3842,26 +3871,33 @@ impl<D: PermissionDecider> Session<D> {
         Ok(())
     }
 
+    fn driver_request_budget_error(
+        &self,
+        pinned: Option<&crate::project_context::PinnedProjectContext>,
+        request: &ModelRequest,
+        policy: AutoCompactionPolicy,
+        tick_baseline: Option<&ModelRequest>,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Option<SessionError> {
+        if let Some(pinned) = pinned {
+            return self.pinned_context_budget_error(pinned, request, policy);
+        }
+        if let Some(error) = self.extension_tool_context_budget_error(request, tool_catalog) {
+            return Some(error);
+        }
+        // Preserve the legacy admission decision for a request already above
+        // the exact proxy before an optional tick. A tick still may not grow
+        // an otherwise fitting request past the known context window.
+        tick_baseline
+            .and_then(|baseline| self.request_context_growth_budget_error(baseline, request))
+    }
+
     fn extension_tool_context_budget_error(
         &self,
         request: &ModelRequest,
         tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
     ) -> Option<SessionError> {
         if tool_catalog.definitions().is_empty() {
-            return None;
-        }
-        let limit_tokens = self
-            .config
-            .context_limit
-            .map(|limit| limit.limit_tokens())?;
-        let output_reserve = self
-            .config
-            .max_output_tokens
-            .unwrap_or(self.config.compaction_reserve_tokens as u64);
-        let required_tokens =
-            crate::project_context::request_required_tokens(request, output_reserve)
-                .unwrap_or(u64::MAX);
-        if crate::project_context::fits_context_limit(required_tokens, limit_tokens) {
             return None;
         }
         // Preserve the existing usage-driven hard-margin behavior for a
@@ -3878,12 +3914,54 @@ impl<D: PermissionDecider> Session<D> {
         without_extension_tools
             .tools
             .retain(|tool| !extension_names.contains(tool.name.as_str()));
-        let baseline_required = crate::project_context::request_required_tokens(
-            &without_extension_tools,
-            output_reserve,
-        )
-        .unwrap_or(u64::MAX);
-        crate::project_context::fits_context_limit(baseline_required, limit_tokens).then_some(
+        self.request_context_growth_budget_error(&without_extension_tools, request)
+    }
+
+    /// Reject only when the exact baseline request fits and the exact final
+    /// request does not. This preserves preexisting compatibility admission
+    /// for a baseline already above the proxy while preventing an optional
+    /// request-time contribution from crossing the known context window.
+    fn request_context_growth_budget_error(
+        &self,
+        baseline: &ModelRequest,
+        request: &ModelRequest,
+    ) -> Option<SessionError> {
+        let error = self.request_context_budget_error(request)?;
+        let SessionError::RequestOverTokenBudget {
+            required_tokens: _,
+            limit_tokens,
+        } = &error
+        else {
+            unreachable!("request budget owner returns request token errors")
+        };
+        let output_reserve = self
+            .config
+            .max_output_tokens
+            .unwrap_or(self.config.compaction_reserve_tokens as u64);
+        let baseline_required =
+            crate::project_context::request_required_tokens(baseline, output_reserve)
+                .unwrap_or(u64::MAX);
+        crate::project_context::fits_context_limit(baseline_required, *limit_tokens)
+            .then_some(error)
+    }
+
+    /// Exact provider-neutral request admission for a known model context
+    /// window. This is the single owner for the checked byte-to-token proxy;
+    /// callers decide whether their boundary requires strict admission or a
+    /// compatibility comparison against a baseline request.
+    fn request_context_budget_error(&self, request: &ModelRequest) -> Option<SessionError> {
+        let limit_tokens = self
+            .config
+            .context_limit
+            .map(|limit| limit.limit_tokens())?;
+        let output_reserve = self
+            .config
+            .max_output_tokens
+            .unwrap_or(self.config.compaction_reserve_tokens as u64);
+        let required_tokens =
+            crate::project_context::request_required_tokens(request, output_reserve)
+                .unwrap_or(u64::MAX);
+        (!crate::project_context::fits_context_limit(required_tokens, limit_tokens)).then_some(
             SessionError::RequestOverTokenBudget {
                 required_tokens,
                 limit_tokens,
@@ -5745,7 +5823,12 @@ fn shadow_model_request(
 fn shadow_compaction_canvas(canvas: Vec<CanvasItem>) -> Vec<CanvasItem> {
     canvas
         .into_iter()
-        .filter(|item| !matches!(item, CanvasItem::ExtensionContribution { .. }))
+        .filter(|item| {
+            !matches!(
+                item,
+                CanvasItem::ExtensionContribution { .. } | CanvasItem::Slot { .. }
+            )
+        })
         .collect()
 }
 

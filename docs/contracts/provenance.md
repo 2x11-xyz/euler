@@ -8,6 +8,25 @@ Provenance is complete but cheap. Large payloads should be stored as blobs refer
 
 Derived research structures, such as causal DAGs, are projections or extension artifacts. They do not mutate primary provenance events.
 
+Bounded provenance queries may name an inclusive `through_event_id`. The bound
+is a physical position in the accepted durable prefix, independent of filters;
+pages may stop earlier because of match or scan limits but no page may scan,
+return, or watermark an event after the bound. The same bound is retained
+across pages. Missing bounds and ranges whose bound precedes their cursor fail
+with typed errors rather than widening to the live tail. The reader physically
+stops as soon as it decodes the bound. If a requested cursor has not appeared
+by then, the bounded range is invalid; the reader does not inspect the suffix
+to distinguish a later cursor from one absent from the whole log. Unbounded
+missing-cursor queries retain the typed cursor-not-found error.
+
+At the root request-tick boundary (ADR 0019), core first settles compaction and
+persists current live events, then samples one writer-confirmed durable tail
+for all contributors. Tick-phase capability decisions and side effects occur
+after that cutoff and cannot enter any contributor's bounded read, including a
+later contributor's read. Tick execution adds no parallel provenance stream:
+commands, permission decisions, context slots, plans, artifacts, and fixed
+errors keep their existing canonical event shapes and writer fence.
+
 Provenance uses the canonical session event envelope in `docs/contracts/events.md`. Persistence policy, durability semantics (emitted/appended/durable), and schema versioning are defined in `docs/contracts/persistence.md`.
 
 Every fresh `session.start` records the exact compile-time runtime identity

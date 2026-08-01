@@ -43,7 +43,7 @@ impl AppCore {
                 self.rebuild_bottom_surface();
                 let notice = if enable {
                     format!(
-                        "extension enabled: {id} · restart/resume may be required for model tools or idle hooks"
+                        "extension enabled: {id} · restart/resume may be required for model tools, idle hooks, or request ticks"
                     )
                 } else {
                     format!("extension disabled: {id}")
@@ -88,7 +88,7 @@ impl AppCore {
                 }
                 self.rebuild_bottom_surface();
                 self.teach_notice(format!(
-                    "extension installed · {} · enabled · restart/resume for model tools or idle hooks",
+                    "extension installed · {} · enabled · restart/resume for model tools, idle hooks, or request ticks",
                     report.id
                 ));
                 self.teach_notice(report.steps_text());

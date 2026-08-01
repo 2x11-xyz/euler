@@ -4,17 +4,18 @@ use crate::compaction::WorkingStateProjection;
 use crate::permissions::{ApprovalMode, DeciderVerdict, ScriptedDecider};
 use crate::provenance::ProvenanceWriter;
 use crate::RoundObserverConfig;
+use euler_agents::AgentTask;
 use euler_provider::{
     FixtureResponse, ModelInputItem, ModelProvider, ModelRequest, ModelRole, ProviderError,
-    ProviderStream, ScriptedProvider, ToolCall,
+    ProviderSet, ProviderStream, ScriptedProvider, ToolCall,
 };
 use euler_sdk::{
     CommandContext, CommandRegistrar, ExtensionCommand, ExtensionError, ExtensionManifest, HostApi,
-    IdleContributionDescriptor, Invocation,
+    IdleContributionDescriptor, Invocation, ProvenanceQuery, RequestTickDescriptor,
 };
 use serde_json::json;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 #[derive(Clone)]
@@ -145,6 +146,324 @@ impl Extension for TestExtension {
         self.has_idle.then(|| IdleContributionDescriptor {
             command: "idle".to_owned(),
         })
+    }
+}
+
+#[derive(Clone)]
+struct RequestTickFixture {
+    id: String,
+    trace: Arc<Mutex<RequestTickTrace>>,
+    discovery_calls: Option<Arc<AtomicUsize>>,
+    required_capabilities: Vec<Capability>,
+    result: Value,
+    fail: bool,
+    query_provenance: bool,
+    explicit_query_cutoff: Option<String>,
+    update_slot: bool,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+#[derive(Default)]
+struct RequestTickTrace {
+    order: Vec<String>,
+    cutoffs: Vec<(String, String)>,
+    observed_ids: BTreeMap<String, Vec<String>>,
+    calls: BTreeMap<String, usize>,
+}
+
+impl RequestTickFixture {
+    fn new(id: &str, trace: Arc<Mutex<RequestTickTrace>>) -> Self {
+        Self {
+            id: id.to_owned(),
+            trace,
+            discovery_calls: None,
+            required_capabilities: Vec::new(),
+            result: json!({}),
+            fail: false,
+            query_provenance: false,
+            explicit_query_cutoff: None,
+            update_slot: false,
+            cancel: None,
+        }
+    }
+
+    fn with_capabilities(mut self, capabilities: Vec<Capability>) -> Self {
+        self.required_capabilities = capabilities;
+        self
+    }
+
+    fn with_discovery_counter(mut self, calls: Arc<AtomicUsize>) -> Self {
+        self.discovery_calls = Some(calls);
+        self
+    }
+}
+
+impl Extension for RequestTickFixture {
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            id: self.id.clone(),
+            version: "0.1.0".to_owned(),
+            display_name: "Request tick fixture".to_owned(),
+            capabilities: self.required_capabilities.clone(),
+        }
+    }
+
+    fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        registrar.register_command(
+            "request-tick",
+            Box::new(RequestTickCommand {
+                id: self.id.clone(),
+                trace: Arc::clone(&self.trace),
+                required_capabilities: self.required_capabilities.clone(),
+                result: self.result.clone(),
+                fail: self.fail,
+                query_provenance: self.query_provenance,
+                explicit_query_cutoff: self.explicit_query_cutoff.clone(),
+                update_slot: self.update_slot,
+                cancel: self.cancel.clone(),
+            }),
+        );
+        Ok(())
+    }
+
+    fn request_tick(&self) -> Option<RequestTickDescriptor> {
+        if let Some(calls) = &self.discovery_calls {
+            calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Some(RequestTickDescriptor {
+            command: "request-tick".to_owned(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct FailingTickWorkflowExtension {
+    trace: Arc<Mutex<RequestTickTrace>>,
+    state: Arc<Mutex<TestExtensionState>>,
+}
+
+impl FailingTickWorkflowExtension {
+    fn new(trace: Arc<Mutex<RequestTickTrace>>) -> Self {
+        Self {
+            trace,
+            state: Arc::new(Mutex::new(TestExtensionState {
+                idle_outputs: [json!({"action": "stop"}), json!({"action": "stop"})]
+                    .into_iter()
+                    .collect(),
+                model_tool_calls: 0,
+                idle_calls: 0,
+                cancel_after_idle: None,
+                steer_after_idle: None,
+            })),
+        }
+    }
+}
+
+impl Extension for FailingTickWorkflowExtension {
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            id: "failing-tick-workflow".to_owned(),
+            version: "0.1.0".to_owned(),
+            display_name: "Failing tick workflow fixture".to_owned(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        registrar.register_command(
+            "request-tick",
+            Box::new(RequestTickCommand {
+                id: "failing-tick-workflow".to_owned(),
+                trace: Arc::clone(&self.trace),
+                required_capabilities: Vec::new(),
+                result: json!({}),
+                fail: true,
+                query_provenance: false,
+                explicit_query_cutoff: None,
+                update_slot: false,
+                cancel: None,
+            }),
+        );
+        registrar.register_command(
+            "update",
+            Box::new(TestCommand {
+                kind: TestCommandKind::ModelTool,
+                state: Arc::clone(&self.state),
+                capabilities: Vec::new(),
+                model_tool: Some(standard_model_tool_descriptor()),
+            }),
+        );
+        registrar.register_command(
+            "idle",
+            Box::new(TestCommand {
+                kind: TestCommandKind::Idle,
+                state: Arc::clone(&self.state),
+                capabilities: Vec::new(),
+                model_tool: None,
+            }),
+        );
+        Ok(())
+    }
+
+    fn request_tick(&self) -> Option<RequestTickDescriptor> {
+        Some(RequestTickDescriptor {
+            command: "request-tick".to_owned(),
+        })
+    }
+
+    fn idle_contribution(&self) -> Option<IdleContributionDescriptor> {
+        Some(IdleContributionDescriptor {
+            command: "idle".to_owned(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct ManifestReentryPanicTick {
+    manifest_calls: Arc<AtomicUsize>,
+    reentry: Arc<Mutex<ManifestReentryState>>,
+    trace: Arc<Mutex<RequestTickTrace>>,
+}
+
+#[derive(Default)]
+struct ManifestReentryState {
+    manifest_in_declaration: bool,
+    standalone_tick_hint_seen: bool,
+    panic_on_manifest: bool,
+}
+
+impl Extension for ManifestReentryPanicTick {
+    fn manifest(&self) -> ExtensionManifest {
+        self.manifest_calls.fetch_add(1, Ordering::SeqCst);
+        let mut reentry = self.reentry.lock().unwrap_or_else(PoisonError::into_inner);
+        if reentry.panic_on_manifest {
+            panic!("manifest reentry payload must stay private");
+        }
+        reentry.manifest_in_declaration = true;
+        ExtensionManifest {
+            id: "a-manifest-panic".to_owned(),
+            version: "0.1.0".to_owned(),
+            display_name: "Manifest reentry panic fixture".to_owned(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        registrar.register_command(
+            "request-tick",
+            Box::new(RequestTickCommand {
+                id: "a-manifest-panic".to_owned(),
+                trace: Arc::clone(&self.trace),
+                required_capabilities: Vec::new(),
+                result: json!({}),
+                fail: false,
+                query_provenance: false,
+                explicit_query_cutoff: None,
+                update_slot: false,
+                cancel: None,
+            }),
+        );
+        Ok(())
+    }
+
+    fn request_tick(&self) -> Option<RequestTickDescriptor> {
+        let mut reentry = self.reentry.lock().unwrap_or_else(PoisonError::into_inner);
+        if reentry.manifest_in_declaration {
+            reentry.manifest_in_declaration = false;
+            if reentry.standalone_tick_hint_seen {
+                reentry.panic_on_manifest = true;
+            }
+        } else {
+            // request_tick_entries reads the cheap nomination immediately
+            // before full declaration discovery. Arm only after that full
+            // declaration completes, so its next manifest call is exactly
+            // command registration reentry.
+            reentry.standalone_tick_hint_seen = true;
+        }
+        Some(RequestTickDescriptor {
+            command: "request-tick".to_owned(),
+        })
+    }
+}
+
+struct RequestTickCommand {
+    id: String,
+    trace: Arc<Mutex<RequestTickTrace>>,
+    required_capabilities: Vec<Capability>,
+    result: Value,
+    fail: bool,
+    query_provenance: bool,
+    explicit_query_cutoff: Option<String>,
+    update_slot: bool,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl ExtensionCommand for RequestTickCommand {
+    fn descriptor(&self) -> euler_sdk::CommandDescriptor {
+        euler_sdk::CommandDescriptor {
+            name: "request-tick".to_owned(),
+            display_name: "Request tick".to_owned(),
+            summary: "Contribute at a root request boundary.".to_owned(),
+            required_capabilities: self.required_capabilities.clone(),
+            args: Vec::new(),
+            accepts_session_id: false,
+            invocation: Invocation::AgentOnly,
+            model_tool: None,
+        }
+    }
+
+    fn execute(
+        &self,
+        context: CommandContext,
+        host: &dyn HostApi,
+    ) -> Result<Value, ExtensionError> {
+        let cutoff = context
+            .input
+            .get("through_event_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ExtensionError::Message("missing request cutoff".to_owned()))?
+            .to_owned();
+        {
+            let mut trace = self.trace.lock().unwrap_or_else(PoisonError::into_inner);
+            trace.order.push(self.id.clone());
+            trace.cutoffs.push((self.id.clone(), cutoff.clone()));
+            *trace.calls.entry(self.id.clone()).or_default() += 1;
+        }
+        if self.query_provenance {
+            let mut after = None;
+            let mut ids = Vec::new();
+            loop {
+                let mut query = ProvenanceQuery::new(2);
+                query.after_event_id.clone_from(&after);
+                query
+                    .through_event_id
+                    .clone_from(&self.explicit_query_cutoff);
+                // The request boundary injects the shared cutoff when the
+                // extension omits it from an otherwise ordinary SDK query.
+                let page = host.query_provenance(query)?;
+                ids.extend(page.events.into_iter().map(|event| event.id));
+                if !page.truncated {
+                    assert_eq!(page.watermark_event_id.as_deref(), Some(cutoff.as_str()));
+                    break;
+                }
+                after = page.next_after_event_id;
+            }
+            self.trace
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .observed_ids
+                .insert(self.id.clone(), ids);
+        }
+        if self.update_slot {
+            host.update_context_slot(&self.id, &format!("{} at {cutoff}", self.id))?;
+        }
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        if self.fail {
+            return Err(ExtensionError::Message("fixture failure".to_owned()));
+        }
+        Ok(self.result.clone())
     }
 }
 
@@ -391,6 +710,708 @@ fn session_with_extension(
         .wire_extension(Arc::new(extension))
         .expect("wire extension");
     (session, requests)
+}
+
+fn session_with_request_ticks(
+    temp: &tempfile::TempDir,
+    extensions: Vec<RequestTickFixture>,
+    responses: Vec<FixtureResponse>,
+) -> (Session<ScriptedDecider>, Arc<Mutex<Vec<ModelRequest>>>) {
+    let (provider, requests) = CapturingProvider::new(responses);
+    let mut config = super::super::SessionConfig::new(temp.path());
+    for extension in &extensions {
+        config.extensions_enabled.insert(extension.id.clone());
+    }
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    for extension in extensions {
+        session
+            .wire_extension(Arc::new(extension))
+            .expect("wire request tick extension");
+    }
+    (session, requests)
+}
+
+#[test]
+fn request_tick_boundary_is_unchanged_without_contributors() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (provider, _) = CapturingProvider::new(Vec::new());
+    let config = super::super::SessionConfig::new(temp.path());
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    let event_count = session.events().len();
+    let mut flushed = 0;
+    let boundary_ran = {
+        let mut on_event = |_: &EventEnvelope| flushed += 1;
+        let mut sink = EventSink::new(event_count, &mut on_event);
+        session
+            .run_request_ticks(&CancellationToken::new(), &mut sink)
+            .expect("empty request-tick boundary")
+    };
+
+    assert!(!boundary_ran);
+    assert_eq!(session.events().len(), event_count);
+    assert_eq!(flushed, 0);
+}
+
+#[test]
+fn request_tick_boundary_without_provenance_skips_discovery_and_execution() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let discovery_calls = Arc::new(AtomicUsize::new(0));
+    let extension = RequestTickFixture::new("tick", Arc::clone(&trace))
+        .with_discovery_counter(Arc::clone(&discovery_calls));
+    let (provider, _) = CapturingProvider::new(Vec::new());
+    let mut config = super::super::SessionConfig::new(temp.path());
+    config.extensions_enabled.insert(extension.id.clone());
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
+    session
+        .wire_extension(Arc::new(extension))
+        .expect("wire request tick extension");
+    let discovery_before_boundary = discovery_calls.load(Ordering::SeqCst);
+    let event_count = session.events().len();
+    let mut flushed = 0;
+
+    let boundary_ran = {
+        let mut on_event = |_: &EventEnvelope| flushed += 1;
+        let mut sink = EventSink::new(event_count, &mut on_event);
+        session
+            .run_request_ticks(&CancellationToken::new(), &mut sink)
+            .expect("provenance-free request-tick boundary")
+    };
+
+    assert!(!boundary_ran);
+    assert_eq!(
+        discovery_calls.load(Ordering::SeqCst),
+        discovery_before_boundary,
+        "a missing writer must be detected before extension discovery"
+    );
+    assert!(trace
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .order
+        .is_empty());
+    assert_eq!(session.events().len(), event_count);
+    assert_eq!(flushed, 0);
+}
+
+#[test]
+fn request_tick_final_request_respects_tight_context_window_without_tools_or_pinned_context() {
+    let baseline_temp = tempfile::tempdir().expect("baseline temp");
+    let (baseline_provider, baseline_requests) =
+        CapturingProvider::new(vec![FixtureResponse::Assistant("baseline".to_owned())]);
+    let baseline_config = super::super::SessionConfig::new(baseline_temp.path());
+    let baseline_reserve = baseline_config.compaction_reserve_tokens as u64;
+    let mut baseline = Session::new(
+        baseline_config,
+        baseline_provider,
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(
+        ProvenanceWriter::new(baseline_temp.path().join("events.jsonl")).expect("baseline writer"),
+    );
+    baseline.run_turn("inspect").expect("baseline turn");
+    let baseline_request = baseline_requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .first()
+        .cloned()
+        .expect("baseline request");
+    let tight_limit =
+        crate::project_context::request_required_tokens(&baseline_request, baseline_reserve)
+            .expect("baseline token accounting");
+
+    let temp = tempfile::tempdir().expect("tick temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let mut tick = RequestTickFixture::new("slot-tick", Arc::clone(&trace))
+        .with_capabilities(vec![Capability::ContextSlot]);
+    tick.update_slot = true;
+    let (mut session, requests) = session_with_request_ticks(
+        &temp,
+        vec![tick],
+        vec![FixtureResponse::Assistant("must not run".to_owned())],
+    );
+    session.set_permission_mode(Capability::ContextSlot, ApprovalMode::SessionAllow);
+    session.config.context_limit = super::super::ContextLimitConfig::new(tight_limit, 1.0);
+
+    let error = session
+        .run_turn("inspect")
+        .expect_err("post-tick request must exceed tight window");
+
+    assert!(matches!(
+        error,
+        SessionError::RequestOverTokenBudget {
+            required_tokens,
+            limit_tokens,
+        } if required_tokens > limit_tokens && limit_tokens == tight_limit
+    ));
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .get("slot-tick"),
+        Some(&1)
+    );
+    assert!(requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty());
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::CANVAS_SNAPSHOT));
+}
+
+#[test]
+fn no_op_or_failed_request_tick_preserves_legacy_admission_for_oversized_baseline() {
+    let baseline_temp = tempfile::tempdir().expect("baseline temp");
+    let (baseline_provider, baseline_requests) =
+        CapturingProvider::new(vec![FixtureResponse::Assistant("baseline".to_owned())]);
+    let baseline_config = super::super::SessionConfig::new(baseline_temp.path());
+    let baseline_reserve = baseline_config.compaction_reserve_tokens as u64;
+    let mut baseline = Session::new(
+        baseline_config,
+        baseline_provider,
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(
+        ProvenanceWriter::new(baseline_temp.path().join("events.jsonl")).expect("baseline writer"),
+    );
+    baseline.run_turn("inspect").expect("baseline turn");
+    let baseline_request = baseline_requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .first()
+        .cloned()
+        .expect("baseline request");
+    let baseline_required =
+        crate::project_context::request_required_tokens(&baseline_request, baseline_reserve)
+            .expect("baseline token accounting");
+    let legacy_limit = baseline_required
+        .checked_sub(1)
+        .expect("baseline request uses at least one token");
+
+    for (id, fail) in [("no-op-tick", false), ("failed-tick", true)] {
+        let temp = tempfile::tempdir().expect("tick temp");
+        let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+        let mut tick = RequestTickFixture::new(id, Arc::clone(&trace));
+        tick.fail = fail;
+        let (mut session, requests) = session_with_request_ticks(
+            &temp,
+            vec![tick],
+            vec![FixtureResponse::Assistant("done".to_owned())],
+        );
+        session.config.context_limit = super::super::ContextLimitConfig::new(legacy_limit, 1.0);
+
+        session
+            .run_turn("inspect")
+            .expect("optional tick preserves baseline admission");
+
+        assert_eq!(
+            trace
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .calls
+                .get(id),
+            Some(&1)
+        );
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+            1,
+            "{id} must not block the legacy-admitted root request"
+        );
+    }
+}
+
+#[test]
+fn request_ticks_share_one_cutoff_run_in_id_order_and_compose_before_snapshot() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let mut later = RequestTickFixture::new("z-tick", Arc::clone(&trace))
+        .with_capabilities(vec![Capability::ProvenanceRead, Capability::ContextSlot]);
+    later.query_provenance = true;
+    later.update_slot = true;
+    let mut earlier = RequestTickFixture::new("a-tick", Arc::clone(&trace))
+        .with_capabilities(vec![Capability::ProvenanceRead, Capability::ContextSlot]);
+    earlier.query_provenance = true;
+    earlier.update_slot = true;
+    // Wire in reverse order. Session storage and execution remain canonical
+    // by extension id, not launch-time insertion order.
+    let (mut session, requests) = session_with_request_ticks(
+        &temp,
+        vec![later, earlier],
+        vec![FixtureResponse::Assistant("done".to_owned())],
+    );
+    session.set_permission_mode(Capability::ProvenanceRead, ApprovalMode::SessionAllow);
+    session.set_permission_mode(Capability::ContextSlot, ApprovalMode::SessionAllow);
+
+    session.run_turn("inspect").expect("root turn");
+
+    let trace = trace.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(trace.order, ["a-tick", "z-tick"]);
+    assert_eq!(trace.cutoffs.len(), 2);
+    assert_eq!(trace.cutoffs[0].1, trace.cutoffs[1].1);
+    let a_slot_id = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::CONTEXT_SLOT_UPDATED
+                && event.payload.get("extension_id").and_then(Value::as_str) == Some("a-tick")
+        })
+        .expect("earlier tick slot")
+        .id
+        .clone();
+    assert!(!trace
+        .observed_ids
+        .get("z-tick")
+        .expect("later query")
+        .contains(&a_slot_id));
+    drop(trace);
+
+    let slot_indices = session
+        .events()
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.kind.as_str() == EventKind::CONTEXT_SLOT_UPDATED)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let snapshot_index = session
+        .events()
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::CANVAS_SNAPSHOT)
+        .expect("driver snapshot");
+    assert_eq!(slot_indices.len(), 2);
+    assert!(slot_indices.iter().all(|index| *index < snapshot_index));
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(requests.len(), 1);
+    for id in ["a-tick", "z-tick"] {
+        assert!(requests[0].input.iter().any(|item| matches!(
+            item,
+            ModelInputItem::Message { content, .. } if content.contains(id)
+        )));
+    }
+}
+
+#[test]
+fn request_tick_failures_isolate_latch_and_do_not_prompt_or_block_root() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let mut command_failure = RequestTickFixture::new("a-command", Arc::clone(&trace));
+    command_failure.fail = true;
+    let mut parse_failure = RequestTickFixture::new("b-parse", Arc::clone(&trace));
+    parse_failure.result = json!(["not", "an", "object"]);
+    let authority_failure = RequestTickFixture::new("c-authority", Arc::clone(&trace))
+        .with_capabilities(vec![Capability::Network]);
+    let good = RequestTickFixture::new("z-good", Arc::clone(&trace));
+    let (mut session, requests) = session_with_request_ticks(
+        &temp,
+        vec![good, authority_failure, parse_failure, command_failure],
+        vec![
+            FixtureResponse::Assistant("first".to_owned()),
+            FixtureResponse::Assistant("second".to_owned()),
+        ],
+    );
+
+    session.run_turn("first").expect("first root request");
+    session.run_turn("second").expect("second root request");
+
+    let trace = trace.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(trace.calls.get("a-command"), Some(&1));
+    assert_eq!(trace.calls.get("b-parse"), Some(&1));
+    assert_eq!(trace.calls.get("c-authority"), None);
+    assert_eq!(trace.calls.get("z-good"), Some(&2));
+    assert_eq!(trace.order, ["a-command", "b-parse", "z-good", "z-good"]);
+    drop(trace);
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        2
+    );
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::PERMISSION_PROMPT));
+    let failures = session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && event.payload.get("source").and_then(Value::as_str) == Some("extension")
+                && matches!(
+                    event.payload.get("extension_id").and_then(Value::as_str),
+                    Some("a-command" | "b-parse" | "c-authority")
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(failures.len(), 3, "one canonical error per failed tick");
+    assert!(failures.iter().all(|event| {
+        event.payload.get("failure").and_then(Value::as_str) == Some("command_error")
+    }));
+}
+
+#[test]
+fn failed_request_tick_does_not_disable_model_tools_or_idle_work() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let extension = FailingTickWorkflowExtension::new(Arc::clone(&trace));
+    let state = Arc::clone(&extension.state);
+    let (provider, requests) = CapturingProvider::new(vec![
+        FixtureResponse::Assistant("first".to_owned()),
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-update".to_owned(),
+            name: "update_workflow".to_owned(),
+            input: json!({"items": ["still available"]}),
+        }]),
+        FixtureResponse::Assistant("second".to_owned()),
+    ]);
+    let mut config = super::super::SessionConfig::new(temp.path());
+    config
+        .extensions_enabled
+        .insert("failing-tick-workflow".to_owned());
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    session
+        .wire_extension(Arc::new(extension))
+        .expect("wire combined extension");
+
+    session.run_turn("first").expect("first turn");
+    session.run_turn("second").expect("second turn");
+
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .get("failing-tick-workflow"),
+        Some(&1),
+        "only the failed request-tick contribution is latched"
+    );
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1]
+        .tools
+        .iter()
+        .any(|tool| tool.name == "update_workflow"));
+    drop(requests);
+    let state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(state.model_tool_calls, 1);
+    assert_eq!(state.idle_calls, 2);
+    drop(state);
+    let tick_failures = session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && event.payload.get("extension_id").and_then(Value::as_str)
+                    == Some("failing-tick-workflow")
+                && event.payload.get("command").and_then(Value::as_str) == Some("request-tick")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tick_failures.len(), 1);
+    assert_eq!(tick_failures[0].payload["failure"], json!("command_error"));
+}
+
+#[test]
+fn request_tick_manifest_reentry_panic_isolated_once_and_later_work_continues() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let manifest_calls = Arc::new(AtomicUsize::new(0));
+    let reentry = Arc::new(Mutex::new(ManifestReentryState::default()));
+    let bad = ManifestReentryPanicTick {
+        manifest_calls: Arc::clone(&manifest_calls),
+        reentry: Arc::clone(&reentry),
+        trace: Arc::clone(&trace),
+    };
+    let good = RequestTickFixture::new("z-good", Arc::clone(&trace));
+    let (provider, requests) =
+        CapturingProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]);
+    let mut config = super::super::SessionConfig::new(temp.path());
+    config
+        .extensions_enabled
+        .insert("a-manifest-panic".to_owned());
+    config.extensions_enabled.insert("z-good".to_owned());
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    // Wire the good contributor first so validating the second extension does
+    // not re-enter the bad manifest. The fixture arms only after the cheap
+    // tick hint and its following full declaration both succeed, so the panic
+    // is necessarily execution-time manifest reentry.
+    session
+        .wire_extension(Arc::new(good))
+        .expect("wire good tick");
+    session
+        .wire_extension(Arc::new(bad))
+        .expect("wire panic tick");
+
+    session.run_turn("inspect").expect("root continues");
+
+    assert!(manifest_calls.load(Ordering::SeqCst) >= 4);
+    assert_eq!(
+        trace.lock().unwrap_or_else(PoisonError::into_inner).order,
+        ["z-good"]
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1
+    );
+    let diagnostics = session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && event.payload.get("extension_id").and_then(Value::as_str)
+                    == Some("a-manifest-panic")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 1, "diagnostics: {diagnostics:#?}");
+    assert_eq!(diagnostics[0].payload["command"], json!("request-tick"));
+    assert_eq!(diagnostics[0].payload["failure"], json!("panic"));
+    assert_eq!(
+        diagnostics[0].payload["message"],
+        json!("extension command panicked")
+    );
+}
+
+#[test]
+fn request_tick_rejects_a_different_explicit_provenance_cutoff() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let mut mismatched = RequestTickFixture::new("a-mismatch", Arc::clone(&trace))
+        .with_capabilities(vec![Capability::ProvenanceRead]);
+    mismatched.query_provenance = true;
+    mismatched.explicit_query_cutoff = Some("different-cutoff".to_owned());
+    let good = RequestTickFixture::new("z-good", Arc::clone(&trace));
+    let (mut session, requests) = session_with_request_ticks(
+        &temp,
+        vec![good, mismatched],
+        vec![FixtureResponse::Assistant("done".to_owned())],
+    );
+    session.set_permission_mode(Capability::ProvenanceRead, ApprovalMode::SessionAllow);
+
+    session.run_turn("inspect").expect("root continues");
+
+    assert_eq!(
+        trace.lock().unwrap_or_else(PoisonError::into_inner).order,
+        ["a-mismatch", "z-good"]
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1
+    );
+    assert!(session.events().iter().any(|event| {
+        event.kind.as_str() == EventKind::ERROR
+            && event.payload.get("extension_id").and_then(Value::as_str) == Some("a-mismatch")
+            && event.payload.get("failure").and_then(Value::as_str) == Some("command_error")
+    }));
+}
+
+#[test]
+fn request_tick_runs_once_before_each_logical_root_model_request() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let tick = RequestTickFixture::new("request-tick", Arc::clone(&trace));
+    let model_tool = TestExtension::model_tool_only();
+    let (provider, requests) = CapturingProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-update".to_owned(),
+            name: "update_workflow".to_owned(),
+            input: json!({"items": ["refresh"]}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut config = super::super::SessionConfig::new(temp.path());
+    config.extensions_enabled.insert(tick.id.clone());
+    config.extensions_enabled.insert(model_tool.id.clone());
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    session
+        .wire_extension(Arc::new(tick))
+        .expect("wire request tick");
+    session
+        .wire_extension(Arc::new(model_tool))
+        .expect("wire model tool");
+
+    session.run_turn("refresh").expect("two-round root turn");
+
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .get("request-tick"),
+        Some(&2)
+    );
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn request_tick_failure_latch_resets_on_durable_resume() {
+    let temp = tempfile::tempdir().expect("temp");
+    let log = temp.path().join("events.jsonl");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let mut extension = RequestTickFixture::new("bad-tick", Arc::clone(&trace));
+    extension.result = json!("invalid result");
+    let mut config = super::super::SessionConfig::new(temp.path());
+    config.extensions_enabled.insert(extension.id.clone());
+    let resume_config = config.clone();
+    let (first_provider, _) =
+        CapturingProvider::new(vec![FixtureResponse::Assistant("first".to_owned())]);
+    let mut session = Session::new(config, first_provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .wire_extension(Arc::new(extension.clone()))
+        .expect("wire first tick");
+    session.run_turn("first").expect("first turn");
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .get("bad-tick"),
+        Some(&1)
+    );
+    drop(session);
+
+    let (resumed_provider, resumed_requests) =
+        CapturingProvider::new(vec![FixtureResponse::Assistant("second".to_owned())]);
+    let mut resumed = crate::resume_session(
+        resume_config,
+        ProviderSet::single(resumed_provider),
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("resume session");
+    resumed
+        .wire_extension(Arc::new(extension))
+        .expect("rewire resumed tick");
+    resumed.run_turn("second").expect("resumed turn");
+
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .get("bad-tick"),
+        Some(&2),
+        "resume owns a fresh process-local failure latch"
+    );
+    assert_eq!(
+        resumed_requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn request_tick_cancellation_stops_later_contributors_and_root_request() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut first = RequestTickFixture::new("a-cancel", Arc::clone(&trace));
+    first.cancel = Some(Arc::clone(&cancel));
+    let later = RequestTickFixture::new("z-later", Arc::clone(&trace));
+    let (mut session, requests) = session_with_request_ticks(
+        &temp,
+        vec![later, first],
+        vec![FixtureResponse::Assistant("must not run".to_owned())],
+    );
+
+    let error = session
+        .run_turn_with_sink("cancel", Arc::clone(&cancel), |_| {})
+        .expect_err("tick cancellation");
+
+    assert!(matches!(error, SessionError::Cancelled));
+    assert_eq!(
+        trace.lock().unwrap_or_else(PoisonError::into_inner).order,
+        ["a-cancel"]
+    );
+    assert!(requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty());
+}
+
+#[test]
+fn request_tick_last_contributor_cancellation_prevents_root_snapshot() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut tick = RequestTickFixture::new("only-tick", Arc::clone(&trace));
+    tick.cancel = Some(Arc::clone(&cancel));
+    let (mut session, requests) = session_with_request_ticks(
+        &temp,
+        vec![tick],
+        vec![FixtureResponse::Assistant("must not run".to_owned())],
+    );
+
+    let error = session
+        .run_turn_with_sink("cancel", cancel, |_| {})
+        .expect_err("final tick cancellation");
+
+    assert!(matches!(error, SessionError::Cancelled));
+    assert_eq!(
+        trace.lock().unwrap_or_else(PoisonError::into_inner).order,
+        ["only-tick"]
+    );
+    assert!(requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty());
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::CANVAS_SNAPSHOT));
+}
+
+#[test]
+fn companion_model_requests_do_not_run_root_request_ticks() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let extension = RequestTickFixture::new("tick", Arc::clone(&trace));
+    let (mut session, requests) = session_with_request_ticks(
+        &temp,
+        vec![extension],
+        vec![FixtureResponse::Assistant("companion done".to_owned())],
+    );
+
+    session
+        .spawn_companion(
+            AgentTask::new_inheriting_target("inspect", "worker").expect("companion task"),
+        )
+        .expect("companion request");
+
+    assert!(trace
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .order
+        .is_empty());
+    assert_eq!(
+        requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -933,11 +1954,43 @@ fn shadow_compaction_is_tool_free_and_preserves_pending_driver_contribution() {
         ],
         Vec::new(),
     );
+    let tick_trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let mut request_tick = RequestTickFixture::new("request-tick", Arc::clone(&tick_trace))
+        .with_capabilities(vec![Capability::ContextSlot]);
+    request_tick.update_slot = true;
+    session.set_extension_enabled("request-tick", true);
+    session
+        .wire_extension(Arc::new(request_tick))
+        .expect("wire request tick");
+    session.set_permission_mode(Capability::ContextSlot, ApprovalMode::SessionAllow);
     session.config.compaction_keep_recent = 0;
 
     session
         .run_turn(&format!("seed {}", "x".repeat(20_000)))
         .expect("seed turn");
+    assert_eq!(
+        tick_trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .get("request-tick"),
+        Some(&1)
+    );
+    let stale_slot_content = {
+        let trace = tick_trace.lock().unwrap_or_else(PoisonError::into_inner);
+        format!("request-tick at {}", trace.cutoffs[0].1)
+    };
+    let stale_slot_event_id = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::CONTEXT_SLOT_UPDATED
+                && event.payload.get("extension_id").and_then(Value::as_str) == Some("request-tick")
+                && event.payload.get("content").and_then(Value::as_str)
+                    == Some(stale_slot_content.as_str())
+        })
+        .map(|event| event.id.clone())
+        .expect("pre-compaction request-tick slot");
     let pending_id = session
         .emit(
             EventKind::EXTENSION_CONTRIBUTION,
@@ -960,6 +2013,15 @@ fn shadow_compaction_is_tool_free_and_preserves_pending_driver_contribution() {
         session.compact_and_wait().expect("finish shadow"),
         super::super::CompactionStatus::Applied
     );
+    assert_eq!(
+        tick_trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .get("request-tick"),
+        Some(&1),
+        "shadow compaction must not run the root request tick"
+    );
 
     {
         let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
@@ -970,6 +2032,12 @@ fn shadow_compaction_is_tool_free_and_preserves_pending_driver_contribution() {
             item,
             ModelInputItem::Message { content, .. }
                 if content.contains("one-shot post-swap work")
+        )));
+        assert!(shadow.input.iter().all(|item| !matches!(
+            item,
+            ModelInputItem::Message { content, .. }
+                if content.contains(&stale_slot_content)
+                    || content.contains("[slot request-tick:request-tick]")
         )));
     }
     let shadow_snapshot = session
@@ -984,15 +2052,41 @@ fn shadow_compaction_is_tool_free_and_preserves_pending_driver_contribution() {
         .payload
         .get("selected_event_ids")
         .and_then(Value::as_array)
-        .is_some_and(|ids| ids.iter().all(|id| id.as_str() != Some(&pending_id))));
+        .is_some_and(|ids| ids.iter().all(|id| {
+            id.as_str() != Some(&pending_id) && id.as_str() != Some(&stale_slot_event_id)
+        })));
 
     session
         .run_turn("continue after swap")
         .expect("driver turn");
+    assert_eq!(
+        tick_trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .get("request-tick"),
+        Some(&2),
+        "the post-compaction logical root request runs exactly one tick"
+    );
 
     let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
     assert_eq!(requests.len(), 3);
     let driver = &requests[2];
+    let refreshed_slot_content = {
+        let trace = tick_trace.lock().unwrap_or_else(PoisonError::into_inner);
+        format!("request-tick at {}", trace.cutoffs[1].1)
+    };
+    assert_ne!(stale_slot_content, refreshed_slot_content);
+    assert!(driver.input.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message { content, .. }
+            if content.contains(&refreshed_slot_content)
+    )));
+    assert!(driver.input.iter().all(|item| !matches!(
+        item,
+        ModelInputItem::Message { content, .. }
+            if content.contains(&stale_slot_content)
+    )));
     assert!(driver.input.iter().any(|item| matches!(
         item,
         ModelInputItem::Message { content, .. }
