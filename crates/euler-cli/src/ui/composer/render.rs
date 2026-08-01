@@ -18,11 +18,27 @@ pub(crate) fn queued_line_prefix(position: usize, total: usize) -> String {
     format!("▌ {position}/{total} ")
 }
 
+pub(crate) fn queued_selection_prefix(selected: bool) -> &'static str {
+    if selected {
+        "› "
+    } else {
+        "  "
+    }
+}
+
 pub(crate) fn queued_saving_prefix(saving: bool) -> &'static str {
     if saving {
         "saving · "
     } else {
         ""
+    }
+}
+
+pub(crate) fn queued_context_prefix(context: &str) -> String {
+    if context.is_empty() {
+        String::new()
+    } else {
+        format!("{context} · ")
     }
 }
 
@@ -52,6 +68,7 @@ pub struct QueuedComposerLine {
     pub text: String,
     pub selected: bool,
     pub saving: bool,
+    pub context: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -182,9 +199,20 @@ pub fn render_lines(
         .map(|line| {
             let mut line = line.clone();
             let prefix = queued_line_prefix(line.position, line.total);
+            let selection = queued_selection_prefix(line.selected);
             let state = queued_saving_prefix(line.saving);
+            let fixed_width = display_width(&prefix)
+                .saturating_add(display_width(selection))
+                .saturating_add(display_width(state));
+            let context_budget = usize::from(width)
+                .saturating_sub(fixed_width)
+                .saturating_sub(12);
+            line.context = bounded_queue_context(&line.context, context_budget);
+            let context = queued_context_prefix(&line.context);
             let available = usize::from(width)
                 .saturating_sub(display_width(&prefix))
+                .saturating_sub(display_width(selection))
+                .saturating_sub(display_width(&context))
                 .saturating_sub(display_width(state));
             line.text = queued_preview(&line.text, available.min(QUEUED_PREVIEW_MAX_WIDTH));
             ComposerLine::Queued(line)
@@ -198,6 +226,14 @@ pub fn render_lines(
         true,
     ));
     lines
+}
+
+fn bounded_queue_context(context: &str, max_width: usize) -> String {
+    const SEPARATOR_WIDTH: usize = 3;
+    if context.is_empty() || max_width <= SEPARATOR_WIDTH {
+        return String::new();
+    }
+    truncate_display(context, max_width - SEPARATOR_WIDTH)
 }
 
 fn queued_preview(text: &str, max_width: usize) -> String {
@@ -683,16 +719,24 @@ fn queued_spans(line: QueuedComposerLine, width: u16, theme: &Theme) -> Vec<Span
     // by one cell, turning ` ...` into ` ..` at tight widths (commit 4424869).
     let prefix = queued_line_prefix(line.position, line.total);
     let prefix_width = display_width(&prefix);
+    let selection = queued_selection_prefix(line.selected);
+    let selection_width = display_width(selection);
+    let context = queued_context_prefix(&line.context);
+    let context_width = display_width(&context);
     let state = queued_saving_prefix(line.saving);
     let state_width = display_width(state);
     vec![
         Span::styled(prefix, theme.composer.token_bar),
+        Span::styled(selection.to_owned(), theme.composer.token_bar),
+        Span::styled(context, theme.composer.overflow),
         Span::styled(state.to_owned(), theme.composer.overflow),
         Span::styled(
             truncate_display(
                 &line.text,
                 usize::from(width)
                     .saturating_sub(prefix_width)
+                    .saturating_sub(selection_width)
+                    .saturating_sub(context_width)
                     .saturating_sub(state_width),
             ),
             theme.composer.text,

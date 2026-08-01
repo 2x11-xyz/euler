@@ -126,10 +126,10 @@ pub use session::{
     fold_model_target, fold_reasoning_effort, system_instruction_bytes, AgentReporter,
     AgentResultSummary, BackgroundAgent, BackgroundAgentPoll, BackgroundAgentReportDrain,
     CompactionStatus, ContextLimitConfig, ExtensionExecutionError, ModelTarget, PendingQueueInput,
-    QueueCancellationReason, QueueError, QueueLifecycleTransition, QueueMode, QueuePosition,
-    QueuedInput, QueuedInputMetadata, RecoverableQueueInput, RoundObserverConfig,
-    RunLifecycleError, RunTerminalStatus, Session, SessionConfig, SessionError, SteeringQueue,
-    SteeringQueueSnapshot, WorkspaceRestoreOutcome,
+    QueueCancellationReason, QueueChangeRetryOutcome, QueueError, QueueLifecycleTransition,
+    QueueMode, QueuePosition, QueuedInput, QueuedInputMetadata, RecoverableQueueInput,
+    RoundObserverConfig, RunLifecycleError, RunTerminalStatus, Session, SessionConfig,
+    SessionError, SteeringQueue, SteeringQueueSnapshot, WorkspaceRestoreOutcome,
 };
 pub use session_kind::SessionKind;
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};

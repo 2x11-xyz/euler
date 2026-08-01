@@ -116,6 +116,21 @@ impl BottomSurface {
         self.history.record_submission(text);
     }
 
+    /// Rewrite process-private composer history at the same boundary as a
+    /// live session scrub. Durable events are authoritative, but an old
+    /// history entry could otherwise recall the removed value back into a
+    /// future draft.
+    pub fn scrub_history(&mut self, secrets: &[String]) {
+        for entry in &mut self.history.entries {
+            *entry = euler_core::redaction::scrub_secrets_in_text(entry, secrets).0;
+        }
+        if let Some(saved) = &mut self.history.saved_draft {
+            let scrubbed =
+                euler_core::redaction::scrub_secrets_in_text(&saved.submit_text(), secrets).0;
+            replace_draft_text(saved, &scrubbed);
+        }
+    }
+
     pub fn move_up_or_recall_history(&mut self, width: u16) {
         if self.composer.can_move_up_visual(width) {
             self.composer.move_up_visual(width);

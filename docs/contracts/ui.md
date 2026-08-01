@@ -204,32 +204,58 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   rail and a dim cursor, nothing else — no ghost copy (startup declutter,
   #21; the deny-with-instruction ghost is separate and stays). While the
   agent works, the rail dims and shows
-  working/interrupt copy; typing remains accepted. Mid-turn submits steer:
-  they queue as one ordered steering group and the running model turn absorbs
-  them exactly once at its next round boundary as canonical `user.message`
-  events (the model sees them in-turn; docs/contracts/events.md). The surface
+  working/interrupt copy; typing remains accepted. After an active model run
+  is durably admitted, submitting composer input opens an explicit choice:
+  **Steer** delivers it within that run at the next safe round boundary, while
+  **Follow up** allocates a distinct queued run. Follow-up is the safe default;
+  the UI never infers one mode from timing. Selected steering rows form one
+  ordered group and the running model turn absorbs them exactly once as
+  canonical `user.message` events (the model sees them in-turn;
+  docs/contracts/events.md). The surface
   installs the worker as in-flight immediately, without waiting on provenance
   I/O. Until the worker reports that the initial `run.started + user.message`
   admission is durable and Core has atomically opened that exact run's queue
   identity and group, the surface is explicitly not steering-capable and a
   submit is refused with a clear notice while its text remains in the
   composer. Processing that worker report opens the steering affordance
-  asynchronously, after which the user can submit the retained text as
-  steering. Render, Escape, and composer editing must remain available while
+  asynchronously, after which the user can make that explicit choice for the
+  retained text. The choice freezes the run observed at submit time for both
+  modes. If that run terminalizes before the choice is persisted, Core returns
+  a typed stale-run failure and the UI restores the draft; it never strips the
+  source identity and reinterprets the input as an idle follow-up. Render,
+  Escape, and composer editing must remain available while
   admission waits on compaction or fsync; no queue mode is guessed in the
   startup window, and an explicitly selected steering enqueue is never
   reinterpreted by Core.
+  Deny-with-instruction is the one specialized input path: it is guidance for
+  the exact run currently blocked by the displayed permission request, not a
+  new composer message. The UI captures that run when the ask opens, queues
+  the instruction at the front as same-run steering, and sends the denial only
+  after the enqueue is durable. A missing, changed, or terminal run retains the
+  instruction and prompt; timing never converts it to a follow-up.
   A completed
   no-tool response is a boundary too: if steering arrived while its final
   text streamed, the worker stays active and dispatches the hydrated stack in
   the next model request. Escape pauses absorption while cancellation wins;
   terminal admission then cancels every undelivered steering row for that
   exact run before recording `run.terminal`. Cancelled steering is never
-  silently rebound as a follow-up or replacement run. An explicit empty-submit
+  silently rebound as a follow-up or replacement run. The UI exposes each
+  terminal-cancelled steering row through an explicit private recovery choice:
+  requeue the original as a follow-up, edit then requeue it, or dismiss it.
+  Escape keeps the recovery pending, and an empty submit reopens its decision.
+  The same recovery projection and FIFO order are restored on resume. A live
+  persistence failure leaves the recovery worker on the exact retained Core
+  batch, including its original target and replacement identity; the UI does
+  not restore or resubmit draft state while that outcome remains ambiguous.
+  An explicit empty-submit
   continue dispatches only a pending follow-up head. Dispatch reserves the
   head without removing it; only the durable
   initial `user.message` acknowledges the reservation. An append failure
-  leaves that exact reserved follow-up row intact. A latched context stop does
+  leaves that exact reserved follow-up row intact. The dispatch request carries
+  the snapshotted head `queue_id`; if the head moved, Core returns a typed
+  head-changed error and dispatches neither row. A matching head that is only
+  behind an active queue write is reported as temporarily unavailable, not as
+  a different head. A latched context stop does
   not auto-flush pending follow-ups; terminal admission still cancels the
   ended run's steering rows as described above. After provenance is repaired,
   retry reuses the retained event identity and accepts the head exactly once
@@ -276,14 +302,24 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   transaction closes the group without persisting steering the turn cannot
   observe: input linearized before the close stays deferred, and input after
   the close is a follow-up. Cancellation has precedence over a coincident
-  round-limit completion. Queued rows show one visual line: the message body is capped at
+  round-limit completion. A follow-up whose source run completed normally may
+  auto-dispatch. A follow-up whose source run failed, was cancelled, or was
+  interrupted remains queued behind an explicit confirmation; the same gate
+  applies to auto-dispatch and empty-submit continue. Queued rows show one
+  visual line with stable FIFO position, mode, and a bounded source/planned-run
+  identity before the message preview. The message body is capped at
   64 terminal display cells, truncates at a word boundary with an ASCII
   ` ...` suffix, and never alters the full queued input. Two fallbacks apply at
   tight widths: when the first word alone exceeds the budget there is no word
   boundary to keep, so the preview hard-cuts mid-word before appending the
   suffix; and when the budget is four cells or fewer (at or below the suffix
   width) the ` ...` suffix is dropped and the body is a bare hard cut. The
-  running footer hint reads `⏎ steer`.
+  currently targeted queue row carries an explicit `›` marker; Left/Right
+  moves that marker so recall, replace, and unqueue never rely on color alone.
+  The running footer hint reads `⏎ submit`, which describes the key action
+  without promising admission or a queue mode: submission may open the
+  steer-versus-follow-up chooser, default to a follow-up for non-model work,
+  or remain in the composer when pre-admission refuses it.
 - Skill commands: each accepted frozen skill contributes one dynamic
   `/skill:<name>` palette row using its catalog description. Selecting it with
   optional request text submits the canonical literal command through the same
@@ -492,20 +528,36 @@ order, leave the composer free for the next draft, and appear only as labelled
 `saving` rows until each append is reconciled. They are not acknowledged as
 durable queue rows. The visible queue applies staged positions to the last
 reconciled canonical snapshot, so a worker commit cannot duplicate a row or
-move a front insertion only after acknowledgment. A failed staged draft
-returns to its owning composer in request order; cancellation of an approval
-preserves an unaccepted denial draft, and a repeated cancellation of the same
-stable row is refused. Orderly shutdown waits within its cleanup bound for
-staged mutations. After a timeout it stays open; after a failed enqueue it
-keeps the typed error and refuses every shutdown attempt until the restored
-draft is resubmitted or explicitly cleared. It never discards process-private
-accepted input merely because quit was requested again.
+move a front insertion only after acknowledgment. If append or sync has an
+ambiguous outcome, the same worker retries Core's retained exact enqueue or
+change batch with bounded backoff. The row stays labelled `saving`; no new id,
+timestamp, parent, payload, or fresh fenced mutation is generated, and the UI
+never tells the user to resubmit it. Later staged commands remain behind that
+retry. A definitive non-ambiguous rejection or stopped worker returns an
+unaccepted draft to its owning composer in request order. Cancellation of an
+approval preserves an unaccepted denial draft, and a repeated cancellation of
+the same stable row is refused. Orderly shutdown waits within its cleanup bound
+for staged or exact-retry mutations and stays open after a timeout. It never
+discards process-private accepted input merely because quit was requested
+again.
 Session replacement waits for staged mutations as well as core queue writes,
 so an accepted worker command cannot cross into the replacement session.
 Unqueue, clear, and replace must persist their lifecycle events before changing
 the displayed queue. A persistence failure leaves the row and selection intact
 and surfaces the typed operation error; it must not create a hidden durable
 item or an optimistic edit that resume would reverse.
+
+Up-arrow recall selects the visible row by stable `queue_id` without removing
+it. Edited submit uses canonical `queue.replaced`, preserving FIFO position,
+mode, planned run, and source run while allocating the replacement id. Escape
+or explicitly clearing the recalled draft abandons edit mode and leaves the
+original row pending. Up within a recalled multiline or wrapped draft moves
+only the visual composer cursor and retains the edit identity; it never recalls
+history or abandons the row. Unqueue likewise selects the stable id; simultaneous replace/unqueue
+requests for the same id are refused instead of retargeting a successor. The
+dedicated queue surface rehydrates canonical pending FIFO rows and private
+recoverable rows on resume; it is a projection over Core state, not a second
+queue machine.
 
 Queued-turn dispatch canonicalizes the reserved row against the newly bound
 durable projection before using its text anywhere. Composer history, ledger
@@ -514,6 +566,16 @@ canonical row. Once that dispatch is installed, the Session core ignores any
 detached caller-supplied prompt and refreshes the reservation from queue
 authority again at admission. A scrub between binding and admission therefore
 cannot let a pre-scrub queue clone briefly reveal or submit stale content.
+The UI passes only the expected head id into this path; prompt bytes remain
+owned by the canonical Core row.
+After every live scrub outcome, including a fail-closed persistence error, the
+UI discards or refreshes all process-private content clones from the scrubbed
+Core projection: recoverable rows, an open recovery modal/edit, queue-mode
+content, stashed and failed drafts, composer history, clipboard cache, activity,
+transcript, and canvas. Escape from a recovery modal followed by `/scrub` and
+an empty submit must therefore reopen only the scrubbed canonical recovery;
+requeue can never restore the pre-scrub clone. Closed-session scrub has no live
+UI cache and continues to rebuild solely from rewritten durable surfaces.
 
 ## Activity and thinking
 

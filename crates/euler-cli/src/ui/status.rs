@@ -234,7 +234,7 @@ fn status_hints(turn: &TurnStatus, has_foldable: bool) -> String {
     match turn {
         TurnStatus::Idle if has_foldable => "/ commands · ctrl+o expand".to_owned(),
         TurnStatus::Idle => "/ commands".to_owned(),
-        TurnStatus::Running(_) => "⏎ steer · esc interrupt now".to_owned(),
+        TurnStatus::Running(_) => "⏎ submit · esc interrupt now".to_owned(),
     }
 }
 
@@ -665,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn statusline_shows_running_queue_and_interrupt_hints() {
+    fn statusline_shows_neutral_running_submit_and_interrupt_hints() {
         let snapshot = StatusSnapshot::new("fixture", "echo", PathBuf::from("/tmp/repo"));
         let tokens = TokenUsageSnapshot::default();
 
@@ -677,7 +677,8 @@ mod tests {
             120,
         );
 
-        assert!(rendered.contains("⏎ steer · esc interrupt now"));
+        assert!(rendered.contains("⏎ submit · esc interrupt now"));
+        assert!(!rendered.contains("⏎ steer"));
         assert!(!rendered.contains("running extension session-export.export"));
     }
 

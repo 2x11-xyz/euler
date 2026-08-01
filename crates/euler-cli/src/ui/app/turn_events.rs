@@ -58,8 +58,10 @@ impl AppCore {
         if matches!(
             event,
             TurnEvent::TurnDone { .. }
+                | TurnEvent::QueueDispatchUnavailable { .. }
                 | TurnEvent::ExtensionDone { .. }
                 | TurnEvent::CompanionDone { .. }
+                | TurnEvent::QueueRecoveryDone { .. }
         ) {
             // The worker's terminal event carries the live session back to
             // this thread; license exactly one replacement of the
@@ -75,19 +77,7 @@ impl AppCore {
                     }
                 }
             }
-            TurnEvent::Event(event) => {
-                let is_tool_call = event.kind.as_str() == EventKind::TOOL_CALL;
-                if self.activity.observe(&event) {
-                    self.stall_notified = false;
-                }
-                self.record_in_flight_error(&event);
-                self.update_token_usage_from_event(&event);
-                self.transcript.push_event(event);
-                self.queue_finalized_visual_output_for_latest_event();
-                if is_tool_call {
-                    self.refresh_patch_modal_preview();
-                }
-            }
+            TurnEvent::Event(event) => self.handle_streamed_turn_event(event),
             TurnEvent::ProviderRuntime(event) => {
                 self.activity.observe_provider_runtime(&event, Utc::now());
             }
@@ -98,6 +88,12 @@ impl AppCore {
                 self.handle_turn_outcome(outcome, elapsed);
                 self.status.git_branch = detect_git_branch(&self.status.cwd);
                 self.accept_worker_session_or_continue(session, auto_flush);
+            }
+            TurnEvent::QueueDispatchUnavailable { error, session } => {
+                self.queued_dispatch_history_pending = false;
+                self.last_working_elapsed_secs = None;
+                self.notice = Some(format!("follow-up not started: {error}"));
+                self.accept_worker_session_or_continue(session, false);
             }
             TurnEvent::ExtensionDone {
                 request,
@@ -133,7 +129,73 @@ impl AppCore {
                 self.handle_companion_outcome(&request, outcome, elapsed);
                 self.accept_worker_session_or_continue(session, auto_flush);
             }
+            TurnEvent::QueueRecoveryDone {
+                request,
+                result,
+                session,
+            } => self.finish_queue_recovery(request, result, session),
         }
+    }
+
+    fn handle_streamed_turn_event(&mut self, event: EventEnvelope) {
+        let is_tool_call = event.kind.as_str() == EventKind::TOOL_CALL;
+        if self.queued_dispatch_history_pending && event.kind.as_str() == EventKind::USER_MESSAGE {
+            if let Some(content) = event
+                .payload
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+            {
+                self.bottom.record_submission(content);
+            }
+            self.queued_dispatch_history_pending = false;
+        }
+        if self.activity.observe(&event) {
+            self.stall_notified = false;
+        }
+        self.record_in_flight_error(&event);
+        self.update_token_usage_from_event(&event);
+        self.transcript.push_event(event);
+        self.queue_finalized_visual_output_for_latest_event();
+        if is_tool_call {
+            self.refresh_patch_modal_preview();
+        }
+    }
+
+    fn finish_queue_recovery(
+        &mut self,
+        request: QueueRecoveryRequest,
+        result: Result<Option<String>, String>,
+        session: Box<Session<TuiDecider>>,
+    ) {
+        self.last_working_elapsed_secs = None;
+        self.install_state(AppState::Idle { session });
+        self.in_flight_label = None;
+        self.in_flight_companion_name = None;
+        self.in_flight_cancellable = false;
+        self.model_turn_steering_ready = false;
+        match result {
+            Ok(replacement) => {
+                self.recovery_edit = None;
+                if let Some(queue_id) = replacement {
+                    self.queued_selection = Some(queue_id);
+                    self.notice = Some("requeued as a follow-up".to_owned());
+                } else {
+                    self.notice = Some("recovery input dismissed".to_owned());
+                }
+            }
+            Err(error) => {
+                match request.action {
+                    QueueRecoveryAction::Requeue { content } => {
+                        self.recovery_edit = Some(request.recovered);
+                        self.bottom.replace_composer_text(&content);
+                    }
+                    QueueRecoveryAction::Dismiss => {}
+                }
+                self.notice = Some(format!("queue recovery failed: {error}"));
+            }
+        }
+        self.refresh_recoverable_queue_inputs();
+        self.offer_next_queue_recovery();
     }
 
     fn update_token_usage_from_event(&mut self, event: &EventEnvelope) {
@@ -180,9 +242,25 @@ impl AppCore {
                 return;
             }
         }
-        if auto_flush && !self.queued_inputs.paused() && session.can_accept_turn() {
-            if let Some(input) = self.pop_next_queued_input() {
-                self.spawn_queued_turn(input, session);
+        self.recoverable_queue_inputs = match session.recoverable_queue_inputs() {
+            Ok(recoverable) => recoverable,
+            Err(error) => {
+                self.notice = Some(format!("queue recovery projection failed: {error}"));
+                Vec::new()
+            }
+        };
+        let dispatch_policy = if session.can_accept_turn() {
+            follow_up_dispatch_policy(&mut session, &self.queued_inputs)
+        } else {
+            Ok(FollowUpDispatchPolicy::None)
+        };
+        if auto_flush
+            && self.modal.is_none()
+            && self.recoverable_queue_inputs.is_empty()
+            && !self.queued_inputs.paused()
+        {
+            if let Ok(FollowUpDispatchPolicy::Ready { queue_id }) = &dispatch_policy {
+                self.spawn_queued_turn(queue_id.clone(), session);
                 return;
             }
         }
@@ -197,6 +275,39 @@ impl AppCore {
         self.model_turn_steering_ready = false;
         self.spinner_frame = 0;
         self.spinner_last_tick = None;
+        self.surface_deferred_follow_up_policy(dispatch_policy);
+        self.offer_next_queue_recovery();
+    }
+
+    fn surface_deferred_follow_up_policy(
+        &mut self,
+        policy: Result<FollowUpDispatchPolicy, SessionError>,
+    ) {
+        if self.modal.is_some() || !self.recoverable_queue_inputs.is_empty() {
+            return;
+        }
+        match policy {
+            Ok(FollowUpDispatchPolicy::Confirm {
+                queue_id,
+                source_run_id,
+                status,
+            }) => {
+                self.modal = Some(Modal::FollowUpConfirmation(FollowUpConfirmationModal {
+                    queue_id,
+                    source_run_id,
+                    status,
+                    run_selected: false,
+                }));
+            }
+            Ok(FollowUpDispatchPolicy::Wait { source_run_id }) => {
+                self.notice = Some(format!(
+                    "follow-up waits for source run {} to finish",
+                    short_run_identity(&source_run_id)
+                ));
+            }
+            Err(error) => self.notice = Some(format!("follow-up unavailable: {error}")),
+            Ok(FollowUpDispatchPolicy::None | FollowUpDispatchPolicy::Ready { .. }) => {}
+        }
     }
 
     pub(super) fn drain_idle_compaction(&mut self) -> bool {

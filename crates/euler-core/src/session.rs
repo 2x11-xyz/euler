@@ -70,8 +70,8 @@ pub use run_lifecycle::{
     RunLifecycleError, RunTerminalStatus,
 };
 pub use steering::{
-    QueueError, QueueLifecycleTransition, QueuePosition, QueuedInput, QueuedInputMetadata,
-    SteeringQueue, SteeringQueueSnapshot,
+    QueueChangeRetryOutcome, QueueError, QueueLifecycleTransition, QueuePosition, QueuedInput,
+    QueuedInputMetadata, SteeringQueue, SteeringQueueSnapshot,
 };
 mod swarm_tool;
 mod tool_dispatch;
@@ -1724,6 +1724,30 @@ impl<D> Session<D> {
         Ok(replacement_id)
     }
 
+    /// Reconcile the exact recovery batch retained after an ambiguous append.
+    ///
+    /// The queue verifies that the unresolved owner is a recovery resolution
+    /// for `expected_queue_id` with the requested dismiss-versus-replacement
+    /// shape, retries its original envelopes and replacement identity, and
+    /// remains globally fenced until that exact write succeeds. No fresh
+    /// recovery operation is synthesized here.
+    pub fn retry_unresolved_recoverable_queue_operation(
+        &mut self,
+        queue: Arc<SteeringQueue>,
+        expected_queue_id: &str,
+        expected_replacement: bool,
+    ) -> Result<Option<String>, SessionError> {
+        self.ensure_steering_queue_identity(&queue)?;
+        let outcome = queue
+            .retry_unresolved_recovery_with_metadata(expected_queue_id, expected_replacement)?
+            .ok_or(QueueError::UnresolvedChange)?;
+        let replacement_id = outcome
+            .replacement()
+            .map(|replacement| replacement.queue_id().to_owned());
+        self.reconcile_accepted_events()?;
+        Ok(replacement_id)
+    }
+
     fn prepare_recoverable_queue_operation(
         &mut self,
         queue: &Arc<SteeringQueue>,
@@ -3256,7 +3280,43 @@ impl<D: PermissionDecider> Session<D> {
     where
         F: FnMut(&EventEnvelope),
     {
-        let Some(reserved) = queue.reserve_front_for_dispatch() else {
+        self.run_queued_follow_up_with_sink(queue, None, cancel_flag, on_event)
+    }
+
+    /// Dispatch the exact follow-up head selected by an interactive host.
+    ///
+    /// Prompt bytes come only from the canonical queue row after durable bind.
+    /// The expected id is a compare-before-reserve guard for a UI snapshot; a
+    /// moved head returns `QueueError::HeadChanged` rather than
+    /// silently running its successor.
+    pub fn run_expected_queued_follow_up_with_sink<F>(
+        &mut self,
+        queue: Arc<SteeringQueue>,
+        expected_queue_id: &str,
+        cancel_flag: Arc<AtomicBool>,
+        on_event: F,
+    ) -> Result<Option<Vec<EventEnvelope>>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        self.run_queued_follow_up_with_sink(queue, Some(expected_queue_id), cancel_flag, on_event)
+    }
+
+    fn run_queued_follow_up_with_sink<F>(
+        &mut self,
+        queue: Arc<SteeringQueue>,
+        expected_queue_id: Option<&str>,
+        cancel_flag: Arc<AtomicBool>,
+        on_event: F,
+    ) -> Result<Option<Vec<EventEnvelope>>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let reserved = match expected_queue_id {
+            Some(queue_id) => queue.reserve_expected_follow_up_for_dispatch(queue_id)?,
+            None => queue.reserve_front_for_dispatch(),
+        };
+        let Some(reserved) = reserved else {
             return Ok(None);
         };
         let canonical =

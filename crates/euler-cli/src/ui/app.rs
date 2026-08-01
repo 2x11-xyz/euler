@@ -3,8 +3,8 @@ use self::code_swarm::load_code_swarm_models_startup;
 use self::extension_runs::{list_extension_manager_items, ExtensionOutcome, ExtensionRunRequest};
 use self::notify::NotifyEvent;
 use self::queue_mutations::{
-    QueueMutation, QueueMutationBoundary, QueueMutationCompletion, QueueMutationFailure,
-    QueueMutationIntent, QueueMutationSuccess,
+    retry_retained_persistence, QueueMutation, QueueMutationBoundary, QueueMutationCompletion,
+    QueueMutationFailure, QueueMutationIntent, QueueMutationSuccess, QueueProjectionRow,
 };
 #[cfg(test)]
 use self::resume::TuiResume;
@@ -58,8 +58,8 @@ use euler_core::{
     EulerHome, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
     ProjectContextBootstrap, ProvenanceWriter, ProviderRuntimeEvent, ProviderRuntimeObserver,
     QueueError, QueueLifecycleTransition, QueueMode, QueuePosition, QueuedInput,
-    QueuedInputMetadata, ReasoningEffort, ScopePattern, Session, SessionError, SessionStore,
-    SkillCatalogEntry, SteeringQueueSnapshot,
+    QueuedInputMetadata, ReasoningEffort, RecoverableQueueInput, RunTerminalStatus, ScopePattern,
+    Session, SessionError, SessionStore, SkillCatalogEntry, SteeringQueueSnapshot,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -237,6 +237,10 @@ pub struct AppCore {
     /// Delayed deny-instruction completion may reply only to the generation
     /// that initiated its durable enqueue.
     permission_generation: u64,
+    /// Durable run that was active when the displayed permission ask blocked
+    /// it. A deny instruction is specialized same-run guidance and may never
+    /// be reclassified as an ordinary follow-up when this proof is absent.
+    permission_run_id: Option<String>,
     bottom: BottomSurface,
     status: StatusSnapshot,
     /// Last-known authenticated provider ids, refreshed whenever the session
@@ -316,6 +320,15 @@ pub struct AppCore {
     /// A failed accepted enqueue restored text that must be resubmitted or
     /// explicitly cleared before orderly shutdown may discard it.
     queue_failure_recovery_required: bool,
+    /// Exact pending row being edited after Up-arrow recall. Submit performs
+    /// one durable replace-in-place instead of cancel + re-enqueue.
+    recalled_queue_id: Option<String>,
+    /// Terminal-cancelled steering selected for edited requeue. The typed
+    /// core projection is the authority; the composer holds only new content.
+    recovery_edit: Option<RecoverableQueueInput>,
+    /// Last reconciled private recovery projection, refreshed whenever the
+    /// live Session is on the UI thread.
+    recoverable_queue_inputs: Vec<RecoverableQueueInput>,
     /// Edge-triggered `/compact` request shared with the root turn worker.
     /// The session consumes it at the next settled model-round boundary.
     compaction_request: Arc<AtomicBool>,
@@ -331,6 +344,9 @@ pub struct AppCore {
     /// worker reports this boundary, interactive input is an explicit
     /// follow-up and the event thread remains free to render or interrupt.
     model_turn_steering_ready: bool,
+    /// A queued dispatch records composer history only from its canonical
+    /// durable `user.message`, never from a stale display clone.
+    queued_dispatch_history_pending: bool,
     /// Braille spinner animation frame (issue #27) — advanced by a tick
     /// counter, never derived from `Instant::now()` at render time.
     spinner_frame: usize,
@@ -384,6 +400,10 @@ enum TurnEvent {
         outcome: TurnOutcome,
         session: Box<Session<TuiDecider>>,
     },
+    QueueDispatchUnavailable {
+        error: String,
+        session: Box<Session<TuiDecider>>,
+    },
     ExtensionDone {
         request: ExtensionRunRequest,
         outcome: ExtensionOutcome,
@@ -394,6 +414,11 @@ enum TurnEvent {
         request: CompanionRunRequest,
         outcome: CompanionOutcome,
         events: Vec<EventEnvelope>,
+        session: Box<Session<TuiDecider>>,
+    },
+    QueueRecoveryDone {
+        request: QueueRecoveryRequest,
+        result: Result<Option<String>, String>,
         session: Box<Session<TuiDecider>>,
     },
 }
@@ -418,15 +443,24 @@ enum SelectedQueueRow {
     Empty,
 }
 
+enum FollowUpDispatchPolicy {
+    None,
+    Ready {
+        queue_id: String,
+    },
+    Confirm {
+        queue_id: String,
+        source_run_id: String,
+        status: RunTerminalStatus,
+    },
+    Wait {
+        source_run_id: String,
+    },
+}
+
 struct FailedQueueDraft {
     content: Arc<str>,
     permission_generation: Option<u64>,
-}
-
-struct ProjectedQueueRow {
-    queue_id: Option<String>,
-    text: String,
-    saving: bool,
 }
 
 #[derive(Default)]
@@ -435,13 +469,72 @@ struct QueueMutationDrain {
     failed: bool,
 }
 
-impl ProjectedQueueRow {
-    fn durable(row: &QueuedInputMetadata) -> Self {
-        Self {
-            queue_id: Some(row.queue_id().to_owned()),
-            text: row.content().to_owned(),
-            saving: false,
-        }
+fn short_run_identity(run_id: &str) -> String {
+    let chars = run_id.chars().collect::<Vec<_>>();
+    if chars.len() <= 12 {
+        return run_id.to_owned();
+    }
+    format!(
+        "{}…{}",
+        chars[..6].iter().collect::<String>(),
+        chars[chars.len() - 4..].iter().collect::<String>()
+    )
+}
+
+fn queue_row_context(row: &QueueProjectionRow) -> String {
+    match row.mode {
+        QueueMode::Steering => row
+            .source_run_id
+            .as_deref()
+            .or(row.run_id.as_deref())
+            .map(short_run_identity)
+            .map_or_else(|| "steer".to_owned(), |run| format!("steer run {run}")),
+        QueueMode::FollowUp => row
+            .source_run_id
+            .as_deref()
+            .map(short_run_identity)
+            .map_or_else(
+                || {
+                    row.run_id.as_deref().map(short_run_identity).map_or_else(
+                        || "follow-up".to_owned(),
+                        |run| format!("follow-up run {run}"),
+                    )
+                },
+                |run| format!("follow-up after {run}"),
+            ),
+    }
+}
+
+fn follow_up_dispatch_policy(
+    session: &mut Session<TuiDecider>,
+    queue: &euler_core::SteeringQueue,
+) -> Result<FollowUpDispatchPolicy, SessionError> {
+    let snapshot = queue.metadata_snapshot();
+    let Some(row) = snapshot.rows().first() else {
+        return Ok(FollowUpDispatchPolicy::None);
+    };
+    if row.mode() != QueueMode::FollowUp {
+        return Ok(FollowUpDispatchPolicy::Wait {
+            source_run_id: row.run_id().to_owned(),
+        });
+    }
+    let Some(source_run_id) = row.source_run_id() else {
+        return Ok(FollowUpDispatchPolicy::Ready {
+            queue_id: row.queue_id().to_owned(),
+        });
+    };
+    match session.run_terminal_status(source_run_id)? {
+        Some(RunTerminalStatus::Completed) => Ok(FollowUpDispatchPolicy::Ready {
+            queue_id: row.queue_id().to_owned(),
+        }),
+        Some(status) => Ok(FollowUpDispatchPolicy::Confirm {
+            queue_id: row.queue_id().to_owned(),
+            source_run_id: source_run_id.to_owned(),
+            status,
+        }),
+        None => Ok(FollowUpDispatchPolicy::Wait {
+            source_run_id: source_run_id.to_owned(),
+        }),
     }
 }
 
@@ -465,7 +558,42 @@ enum Modal {
     /// phase 3). Its pending decision lives in `App::pending_new_ack`; this
     /// carries only the display state and which option is highlighted.
     ProjectContextAck(AckModalState),
+    QueueMode(QueueModeModal),
+    FollowUpConfirmation(FollowUpConfirmationModal),
+    QueueRecovery(QueueRecoveryModal),
     Help,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QueueModeModal {
+    content: Arc<str>,
+    expected_run_id: String,
+    selected: QueueMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FollowUpConfirmationModal {
+    queue_id: String,
+    source_run_id: String,
+    status: RunTerminalStatus,
+    run_selected: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct QueueRecoveryModal {
+    recovered: RecoverableQueueInput,
+}
+
+#[derive(Clone, Debug)]
+struct QueueRecoveryRequest {
+    recovered: RecoverableQueueInput,
+    action: QueueRecoveryAction,
+}
+
+#[derive(Clone, Debug)]
+enum QueueRecoveryAction {
+    Dismiss,
+    Requeue { content: String },
 }
 
 /// Display state for the in-app acknowledgment card. Default highlight is Skip
@@ -502,7 +630,7 @@ impl App {
         let mut terminal = terminal_session.ratatui_terminal()?;
         terminal.set_linefeed_history_insert_enabled(options.linefeed_history_insert);
         let event_loop = EventLoop::new(Instant::now());
-        let core = AppCore::new_with_options(session, channels, options);
+        let core = AppCore::new_with_options(session, channels, options)?;
         set_terminal_theme_colors(&mut terminal, &core)?;
         Ok(Self {
             terminal,
@@ -1011,20 +1139,53 @@ fn project_context_folder_label(root: &std::path::Path) -> String {
         .unwrap_or_else(|| root.to_string_lossy().into_owned())
 }
 
+struct InitialQueueProjection {
+    queue: Arc<euler_core::SteeringQueue>,
+    recoverable: Vec<RecoverableQueueInput>,
+    modal: Option<Modal>,
+    selected: Option<String>,
+}
+
+fn bind_initial_queue(session: &mut Session<TuiDecider>) -> Result<InitialQueueProjection> {
+    let queue = Arc::new(euler_core::SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .map_err(|error| anyhow!("startup failed while binding queued input ownership: {error}"))?;
+    let recoverable = session
+        .recoverable_queue_inputs()
+        .map_err(|error| anyhow!("startup failed while projecting queue recovery: {error}"))?;
+    let modal = recoverable
+        .first()
+        .cloned()
+        .map(|recovered| Modal::QueueRecovery(QueueRecoveryModal { recovered }));
+    let selected = queue
+        .metadata_snapshot()
+        .rows()
+        .last()
+        .map(|row| row.queue_id().to_owned());
+    Ok(InitialQueueProjection {
+        queue,
+        recoverable,
+        modal,
+        selected,
+    })
+}
+
 impl AppCore {
     #[cfg(test)]
-    pub fn new(session: Session<TuiDecider>, channels: PermissionChannels) -> Self {
+    pub fn new(session: Session<TuiDecider>, channels: PermissionChannels) -> Result<Self> {
         Self::new_with_options(session, channels, AppOptions::default())
     }
 
     pub fn new_with_options(
-        session: Session<TuiDecider>,
+        mut session: Session<TuiDecider>,
         channels: PermissionChannels,
         options: AppOptions,
-    ) -> Self {
+    ) -> Result<Self> {
         let boot = bootstrap_app_core(&session, options);
         let skill_commands = boot.initial_context.skill_commands.clone();
-        Self {
+        let initial_queue = bind_initial_queue(&mut session)?;
+        Ok(Self {
             state: AppState::Idle {
                 session: Box::new(session),
             },
@@ -1033,6 +1194,7 @@ impl AppCore {
             reply_tx: inactive_permission_reply_sender(),
             active_permission_cancellation: None,
             permission_generation: 0,
+            permission_run_id: None,
             bottom: BottomSurface::new(boot.initial_context),
             status: boot.status,
             authenticated_providers: boot.authenticated_providers,
@@ -1053,7 +1215,7 @@ impl AppCore {
             visual_scroll_offset: 0,
             composer_navigation_width: 80,
             last_working_elapsed_secs: None,
-            modal: None,
+            modal: initial_queue.modal,
             pending_new_ack: None,
             approval_selection: ApprovalOption::default(),
             modal_stashed_draft: None,
@@ -1072,16 +1234,20 @@ impl AppCore {
             clipboard: Box::<SystemClipboard>::default(),
             pending_runs: VecDeque::new(),
             code_swarm_models: load_code_swarm_models_startup(),
-            queued_inputs: Arc::new(euler_core::SteeringQueue::default()),
+            queued_inputs: initial_queue.queue,
             queue_mutations: QueueMutationBoundary::new(),
             failed_queue_drafts: VecDeque::new(),
             queue_failure_recovery_required: false,
+            recalled_queue_id: None,
+            recovery_edit: None,
+            recoverable_queue_inputs: initial_queue.recoverable,
             compaction_request: Arc::new(AtomicBool::new(false)),
-            queued_selection: None,
+            queued_selection: initial_queue.selected,
             in_flight_label: None,
             in_flight_companion_name: None,
             in_flight_cancellable: false,
             model_turn_steering_ready: false,
+            queued_dispatch_history_pending: false,
             spinner_frame: 0,
             spinner_last_tick: None,
             activity: RunActivityProjection::default(),
@@ -1094,7 +1260,7 @@ impl AppCore {
             notifications_enabled: boot.notifications_enabled,
             pending_notifications: VecDeque::new(),
             extension_registry_items: None,
-        }
+        })
     }
 
     fn rebuild_bottom_surface(&mut self) {
@@ -1231,18 +1397,7 @@ impl AppCore {
 
     fn queued_composer_lines(&self) -> Vec<QueuedComposerLine> {
         let snapshot = self.queued_inputs.metadata_snapshot();
-        let mut rows = self.durable_queue_projection(&snapshot);
-        for pending in self.queue_mutations.pending_enqueues() {
-            let row = ProjectedQueueRow {
-                queue_id: None,
-                text: pending.content,
-                saving: true,
-            };
-            match pending.position {
-                QueuePosition::Front => rows.insert(0, row),
-                QueuePosition::Back => rows.push(row),
-            }
-        }
+        let rows = self.queue_mutations.projected_rows(&snapshot);
         let total = rows.len();
         let selected = self
             .queued_selection
@@ -1258,38 +1413,10 @@ impl AppCore {
             .map(|(index, row)| QueuedComposerLine {
                 position: index + 1,
                 total,
-                text: row.text,
+                context: queue_row_context(&row),
+                text: row.content,
                 selected: row.queue_id == selected,
                 saving: row.saving,
-            })
-            .collect()
-    }
-
-    fn durable_queue_projection(&self, current: &SteeringQueueSnapshot) -> Vec<ProjectedQueueRow> {
-        let Some(baseline) = self.queue_mutations.projection_baseline() else {
-            return current
-                .rows()
-                .iter()
-                .map(ProjectedQueueRow::durable)
-                .collect();
-        };
-        baseline
-            .iter()
-            .filter_map(|baseline_row| {
-                current
-                    .rows()
-                    .iter()
-                    .find(|row| row.queue_id() == baseline_row.queue_id)
-                    .map(ProjectedQueueRow::durable)
-                    .or_else(|| {
-                        self.queue_mutations
-                            .cancellation_pending(&baseline_row.queue_id)
-                            .then(|| ProjectedQueueRow {
-                                queue_id: Some(baseline_row.queue_id.clone()),
-                                text: baseline_row.content.clone(),
-                                saving: false,
-                            })
-                    })
             })
             .collect()
     }
@@ -1509,9 +1636,9 @@ impl AppCore {
         match (completion.intent, completion.result) {
             (
                 QueueMutationIntent::ComposerSubmit { .. },
-                Ok(QueueMutationSuccess::Enqueued { queue_id }),
+                Ok(QueueMutationSuccess::Enqueued { row }),
             ) => {
-                self.queued_selection = Some(queue_id);
+                self.queued_selection = Some(row.queue_id().to_owned());
                 self.normalize_queue_selection();
                 self.clear_queue_mutation_notice();
                 false
@@ -1521,40 +1648,19 @@ impl AppCore {
                     original,
                     permission_generation,
                 },
-                Ok(QueueMutationSuccess::Enqueued { queue_id }),
+                Ok(QueueMutationSuccess::Enqueued { row }),
             ) => {
-                self.queued_selection = Some(queue_id);
-                if self.modal.is_none() || self.permission_generation != permission_generation {
-                    self.normalize_queue_selection();
-                    self.clear_queue_mutation_notice();
-                    return false;
-                }
-                let current = self.bottom.composer().submit_text();
-                let changed_while_saving = !current.is_empty();
-                self.bottom.replace_composer_text("");
-                self.reply_to_modal(PermissionReply::DenyWithInstruction(original.to_string()));
-                if changed_while_saving {
-                    self.append_preserved_composer(&current);
-                }
+                self.finish_deny_instruction_enqueue(&original, permission_generation, &row);
+                false
+            }
+            (QueueMutationIntent::Unqueue { queue_id: _ }, Ok(QueueMutationSuccess::Cancelled)) => {
                 self.normalize_queue_selection();
                 self.clear_queue_mutation_notice();
                 false
             }
-            (
-                QueueMutationIntent::Recall { queue_id: _ },
-                Ok(QueueMutationSuccess::Cancelled { content }),
-            ) => {
-                let current = self.bottom.composer().submit_text();
-                self.bottom.replace_composer_text(&content);
-                self.append_preserved_composer(&current);
-                self.normalize_queue_selection();
-                self.clear_queue_mutation_notice();
-                false
-            }
-            (
-                QueueMutationIntent::Unqueue { queue_id: _ },
-                Ok(QueueMutationSuccess::Cancelled { content: _ }),
-            ) => {
+            (QueueMutationIntent::Replace { .. }, Ok(QueueMutationSuccess::Replaced { row })) => {
+                self.queued_selection = Some(row.queue_id().to_owned());
+                self.recalled_queue_id = None;
                 self.normalize_queue_selection();
                 self.clear_queue_mutation_notice();
                 false
@@ -1571,6 +1677,52 @@ impl AppCore {
                 true
             }
         }
+    }
+
+    fn finish_deny_instruction_enqueue(
+        &mut self,
+        original: &str,
+        permission_generation: u64,
+        row: &euler_core::QueuedInputMetadata,
+    ) {
+        self.queued_selection = Some(row.queue_id().to_owned());
+        if self.modal.is_none() || self.permission_generation != permission_generation {
+            self.normalize_queue_selection();
+            self.clear_queue_mutation_notice();
+            return;
+        }
+        if self
+            .active_permission_cancellation
+            .as_ref()
+            .is_some_and(euler_sdk::CancellationToken::is_cancelled)
+        {
+            self.dismiss_cancelled_permission_modal();
+            self.normalize_queue_selection();
+            self.clear_queue_mutation_notice();
+            return;
+        }
+        let source_run = row.source_run_id();
+        let permission_run_matches = self.permission_run_id.as_deref() == source_run
+            && self.queued_inputs.metadata_snapshot().active_run() == source_run;
+        if !permission_run_matches {
+            let current = self.bottom.composer().submit_text();
+            self.bottom
+                .replace_composer_text(&join_drafts(original, &current));
+            self.notice = Some(
+                "deny instruction retained: the permission's run is no longer active".to_owned(),
+            );
+            self.normalize_queue_selection();
+            return;
+        }
+        let current = self.bottom.composer().submit_text();
+        let changed_while_saving = !current.is_empty();
+        self.bottom.replace_composer_text("");
+        self.reply_to_modal(PermissionReply::DenyWithInstruction(original.to_owned()));
+        if changed_while_saving {
+            self.append_preserved_composer(&current);
+        }
+        self.normalize_queue_selection();
+        self.clear_queue_mutation_notice();
     }
 
     fn finish_queue_mutation_failure(
@@ -1596,21 +1748,29 @@ impl AppCore {
                     permission_generation: Some(*permission_generation),
                 });
             }
-            QueueMutationIntent::Recall { .. } | QueueMutationIntent::Unqueue { .. } => {}
+            QueueMutationIntent::Replace { original, .. } => {
+                self.queue_failure_recovery_required = true;
+                self.recalled_queue_id = None;
+                self.failed_queue_drafts.push_back(FailedQueueDraft {
+                    content: Arc::clone(original),
+                    permission_generation: None,
+                });
+            }
+            QueueMutationIntent::Unqueue { .. } => {}
         }
         let operation = match intent {
             QueueMutationIntent::ComposerSubmit { .. }
             | QueueMutationIntent::DenyInstruction { .. } => "queue input failed",
-            QueueMutationIntent::Recall { .. } | QueueMutationIntent::Unqueue { .. } => {
-                "unqueue failed"
-            }
+            QueueMutationIntent::Replace { .. } => "queue edit failed",
+            QueueMutationIntent::Unqueue { .. } => "unqueue failed",
         };
         let recovery = match intent {
             QueueMutationIntent::ComposerSubmit { .. }
-            | QueueMutationIntent::DenyInstruction { .. } => {
+            | QueueMutationIntent::DenyInstruction { .. }
+            | QueueMutationIntent::Replace { .. } => {
                 " · draft restored; resubmit it or clear it before quitting"
             }
-            QueueMutationIntent::Recall { .. } | QueueMutationIntent::Unqueue { .. } => "",
+            QueueMutationIntent::Unqueue { .. } => "",
         };
         self.normalize_queue_selection();
         self.notice = Some(format!("{operation}: {error}{recovery}"));
@@ -1864,7 +2024,7 @@ impl AppCore {
             KeyCode::Enter if enter_key_intent(&key) == Some(EnterKeyIntent::InsertNewline) => {
                 self.edit_composer_text(|draft| draft.insert_newline())
             }
-            KeyCode::Enter => self.queue_composer_input(),
+            KeyCode::Enter => self.handle_submit(),
             _ if is_slash_command_key(&key) && self.bottom.composer().submit_text().is_empty() => {
                 self.bottom.open_palette();
                 CoreEffect::Render
@@ -2134,7 +2294,7 @@ impl AppCore {
             KeyCode::Right if self.can_move_queued_selection() => self.move_queued_selection(1),
             KeyCode::Left => self.move_composer_cursor(|draft| draft.move_left()),
             KeyCode::Right => self.move_composer_cursor(|draft| draft.move_right()),
-            KeyCode::Up => self.move_composer_up_or_history(),
+            KeyCode::Up => self.recall_selected_queued_input(),
             KeyCode::Down => self.move_composer_down_or_history(),
             KeyCode::Home => self.move_composer_cursor(|draft| draft.move_home()),
             KeyCode::End => self.move_composer_cursor(|draft| draft.move_end()),
@@ -2186,6 +2346,10 @@ impl AppCore {
             {
                 Some(self.open_transcript_search())
             }
+            KeyCode::Esc if self.recovery_edit.is_some() => Some(self.abandon_recovery_edit()),
+            KeyCode::Esc if self.recalled_queue_id.is_some() => {
+                Some(self.abandon_recalled_queue_edit())
+            }
             KeyCode::Esc => Some(self.handle_interrupt()),
             _ => None,
         }
@@ -2221,6 +2385,24 @@ impl AppCore {
     }
 
     fn handle_modal_input(&mut self, input: InputEvent) -> CoreEffect {
+        if matches!(self.modal, Some(Modal::QueueMode(_))) {
+            let InputEvent::Key(key) = input else {
+                return CoreEffect::None;
+            };
+            return self.handle_queue_mode_key(key);
+        }
+        if matches!(self.modal, Some(Modal::FollowUpConfirmation(_))) {
+            let InputEvent::Key(key) = input else {
+                return CoreEffect::None;
+            };
+            return self.handle_follow_up_confirmation_key(key);
+        }
+        if matches!(self.modal, Some(Modal::QueueRecovery(_))) {
+            let InputEvent::Key(key) = input else {
+                return CoreEffect::None;
+            };
+            return self.handle_queue_recovery_key(key);
+        }
         if matches!(self.modal, Some(Modal::ProjectContextAck(_))) {
             let InputEvent::Key(key) = input else {
                 return CoreEffect::None;
@@ -2234,6 +2416,220 @@ impl AppCore {
             return self.handle_patch_modal_key(key);
         }
         self.handle_approval_modal_key(key)
+    }
+
+    fn handle_queue_mode_key(&mut self, key: KeyEvent) -> CoreEffect {
+        match key.code {
+            KeyCode::Char('s') | KeyCode::Char('S') => self.resolve_queue_mode(QueueMode::Steering),
+            KeyCode::Char('f') | KeyCode::Char('F') => self.resolve_queue_mode(QueueMode::FollowUp),
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                if let Some(Modal::QueueMode(modal)) = &mut self.modal {
+                    modal.selected = match modal.selected {
+                        QueueMode::Steering => QueueMode::FollowUp,
+                        QueueMode::FollowUp => QueueMode::Steering,
+                    };
+                }
+                CoreEffect::Render
+            }
+            KeyCode::Enter => {
+                let selected = match &self.modal {
+                    Some(Modal::QueueMode(modal)) => modal.selected,
+                    _ => return CoreEffect::None,
+                };
+                self.resolve_queue_mode(selected)
+            }
+            KeyCode::Esc => {
+                self.modal = None;
+                CoreEffect::Render
+            }
+            _ => CoreEffect::None,
+        }
+    }
+
+    fn resolve_queue_mode(&mut self, mode: QueueMode) -> CoreEffect {
+        let Some(Modal::QueueMode(modal)) = self.modal.take() else {
+            return CoreEffect::None;
+        };
+        self.start_queue_enqueue(
+            mode,
+            Some(modal.expected_run_id),
+            QueuePosition::Back,
+            Arc::clone(&modal.content),
+            QueueMutationIntent::ComposerSubmit {
+                original: modal.content,
+            },
+        )
+    }
+
+    fn handle_follow_up_confirmation_key(&mut self, key: KeyEvent) -> CoreEffect {
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.confirm_follow_up_dispatch()
+            }
+            KeyCode::Char('k')
+            | KeyCode::Char('K')
+            | KeyCode::Char('n')
+            | KeyCode::Char('N')
+            | KeyCode::Esc => {
+                self.modal = None;
+                CoreEffect::Render
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
+                if let Some(Modal::FollowUpConfirmation(modal)) = &mut self.modal {
+                    modal.run_selected = !modal.run_selected;
+                }
+                CoreEffect::Render
+            }
+            KeyCode::Enter => {
+                let run_selected = matches!(
+                    &self.modal,
+                    Some(Modal::FollowUpConfirmation(modal)) if modal.run_selected
+                );
+                if run_selected {
+                    self.confirm_follow_up_dispatch()
+                } else {
+                    self.modal = None;
+                    CoreEffect::Render
+                }
+            }
+            _ => CoreEffect::None,
+        }
+    }
+
+    fn confirm_follow_up_dispatch(&mut self) -> CoreEffect {
+        let Some(Modal::FollowUpConfirmation(modal)) = self.modal.take() else {
+            return CoreEffect::None;
+        };
+        let policy = {
+            let AppState::Idle { session } = &mut self.state else {
+                self.notice = Some("follow-up waits for active work".to_owned());
+                return CoreEffect::Render;
+            };
+            follow_up_dispatch_policy(session, &self.queued_inputs)
+        };
+        match policy {
+            Ok(
+                FollowUpDispatchPolicy::Confirm { queue_id, .. }
+                | FollowUpDispatchPolicy::Ready { queue_id },
+            ) if queue_id == modal.queue_id => self.start_expected_queued_turn(queue_id),
+            Ok(_) => {
+                self.notice = Some("follow-up queue changed; review the current head".to_owned());
+                CoreEffect::Render
+            }
+            Err(error) => {
+                self.notice = Some(format!("follow-up unavailable: {error}"));
+                CoreEffect::Render
+            }
+        }
+    }
+
+    fn handle_queue_recovery_key(&mut self, key: KeyEvent) -> CoreEffect {
+        let recovered = match &self.modal {
+            Some(Modal::QueueRecovery(modal)) => modal.recovered.clone(),
+            _ => return CoreEffect::None,
+        };
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.modal = None;
+                self.start_queue_recovery(QueueRecoveryRequest {
+                    action: QueueRecoveryAction::Requeue {
+                        content: recovered.content().to_owned(),
+                    },
+                    recovered,
+                })
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                self.modal = None;
+                self.bottom.replace_composer_text(recovered.content());
+                self.recovery_edit = Some(recovered);
+                CoreEffect::Render
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.modal = None;
+                self.start_queue_recovery(QueueRecoveryRequest {
+                    recovered,
+                    action: QueueRecoveryAction::Dismiss,
+                })
+            }
+            KeyCode::Esc => {
+                self.modal = None;
+                CoreEffect::Render
+            }
+            _ => CoreEffect::None,
+        }
+    }
+
+    fn start_edited_recovery_requeue(&mut self, content: String) -> CoreEffect {
+        let Some(recovered) = self.recovery_edit.take() else {
+            return CoreEffect::None;
+        };
+        self.clear_composer_if_unchanged(&content);
+        self.start_queue_recovery(QueueRecoveryRequest {
+            recovered,
+            action: QueueRecoveryAction::Requeue { content },
+        })
+    }
+
+    fn start_queue_recovery(&mut self, request: QueueRecoveryRequest) -> CoreEffect {
+        let AppState::Idle { .. } = self.state else {
+            self.notice = Some("queue recovery waits for active work".to_owned());
+            return CoreEffect::Render;
+        };
+        let queued_inputs = Arc::clone(&self.queued_inputs);
+        let mut session = self.take_idle_session();
+        let worker_request = request.clone();
+        let (worker_tx, worker_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let expected_replacement =
+                matches!(&worker_request.action, QueueRecoveryAction::Requeue { .. });
+            let first_attempt = match &worker_request.action {
+                QueueRecoveryAction::Dismiss => session
+                    .dismiss_recoverable_queue_input(
+                        Arc::clone(&queued_inputs),
+                        worker_request.recovered.queue_id(),
+                    )
+                    .map(|()| None),
+                QueueRecoveryAction::Requeue { content } => session
+                    .requeue_recoverable_queue_input(
+                        Arc::clone(&queued_inputs),
+                        worker_request.recovered.queue_id(),
+                        None,
+                        QueuePosition::Back,
+                        content.clone(),
+                    )
+                    .map(Some),
+            };
+            let result = match first_attempt {
+                Err(SessionError::Queue(QueueError::Persistence(_))) => retry_retained_persistence(
+                    || {
+                        session.retry_unresolved_recoverable_queue_operation(
+                            Arc::clone(&queued_inputs),
+                            worker_request.recovered.queue_id(),
+                            expected_replacement,
+                        )
+                    },
+                    |error| matches!(error, SessionError::Queue(QueueError::Persistence(_))),
+                ),
+                result => result,
+            }
+            .map_err(|error| error.to_string());
+            let _ = worker_tx.send(TurnEvent::QueueRecoveryDone {
+                request: worker_request,
+                result,
+                session,
+            });
+        });
+        self.install_state(AppState::TurnInFlight {
+            worker_rx,
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        });
+        self.in_flight_label = Some("queue recovery".to_owned());
+        self.in_flight_companion_name = None;
+        self.in_flight_cancellable = false;
+        self.model_turn_steering_ready = false;
+        self.notice = Some("saving queue recovery".to_owned());
+        CoreEffect::Render
     }
 
     /// The in-app acknowledgment card (`/new`) is single-keypress: `y` loads,
@@ -2472,9 +2868,15 @@ impl AppCore {
         match &self.modal {
             Some(Modal::Permission(request)) => Some(request),
             Some(Modal::PatchApproval(modal)) => Some(&modal.request),
-            None | Some(Modal::PermissionBatch(_) | Modal::ProjectContextAck(_) | Modal::Help) => {
-                None
-            }
+            None
+            | Some(
+                Modal::PermissionBatch(_)
+                | Modal::ProjectContextAck(_)
+                | Modal::QueueMode(_)
+                | Modal::FollowUpConfirmation(_)
+                | Modal::QueueRecovery(_)
+                | Modal::Help,
+            ) => None,
         }
     }
 
@@ -2490,12 +2892,28 @@ impl AppCore {
             // carrier of that guidance (#57). No composer ghost text here.
             self.reply_to_modal(PermissionReply::Deny)
         } else {
-            // Front of queue. The decision event's `instruction` field is
-            // audit-only — this queue entry is how the guidance reaches the
-            // model: absorbed at the turn's next round boundary (steering),
-            // or flushed as the next turn if the denial ended the turn.
+            // The decision event's `instruction` field is audit-only. The
+            // queue entry is specialized guidance for the exact run blocked
+            // on this permission; it is never inferred as a follow-up from
+            // whatever lifecycle state happens to exist at keypress time.
+            let Some(expected_run_id) = self.permission_run_id.clone() else {
+                self.notice = Some(
+                    "deny instruction retained: the blocked run identity is unavailable".to_owned(),
+                );
+                return CoreEffect::Render;
+            };
+            if self.queued_inputs.metadata_snapshot().active_run() != Some(expected_run_id.as_str())
+            {
+                self.notice = Some(
+                    "deny instruction retained: the permission's run is no longer active"
+                        .to_owned(),
+                );
+                return CoreEffect::Render;
+            }
             let content: Arc<str> = Arc::from(draft);
             self.start_queue_enqueue(
+                QueueMode::Steering,
+                Some(expected_run_id),
                 QueuePosition::Front,
                 Arc::clone(&content),
                 QueueMutationIntent::DenyInstruction {
@@ -2544,7 +2962,27 @@ impl AppCore {
         // invent a parallel canvas channel here.
         let prompt = self.bottom.composer().submit_text();
         if prompt.trim().is_empty() {
+            if self.recovery_edit.is_some() {
+                return self.abandon_recovery_edit();
+            }
+            if let Some(queue_id) = self.recalled_queue_id.as_deref() {
+                if self.queue_mutations.target_pending(queue_id) {
+                    self.notice = Some("queue edit is still being saved".to_owned());
+                    return CoreEffect::Render;
+                }
+                return self.abandon_recalled_queue_edit();
+            }
+            if !self.recoverable_queue_inputs.is_empty() {
+                self.offer_next_queue_recovery();
+                return CoreEffect::Render;
+            }
             return self.continue_queued_input();
+        }
+        if let Some(queue_id) = self.recalled_queue_id.clone() {
+            return self.start_queue_replace(queue_id, Arc::from(prompt));
+        }
+        if self.recovery_edit.is_some() {
+            return self.start_edited_recovery_requeue(prompt);
         }
         let AppState::Idle { .. } = self.state else {
             return self.queue_composer_input();
@@ -2568,7 +3006,31 @@ impl AppCore {
             return CoreEffect::Render;
         }
         let content: Arc<str> = Arc::from(prompt);
+        if self.running_model_turn_accepts_steering() {
+            let Some(expected_run_id) = self
+                .queued_inputs
+                .metadata_snapshot()
+                .active_run()
+                .map(str::to_owned)
+            else {
+                self.notice = Some(TURN_STARTING_NOTICE.to_owned());
+                return CoreEffect::Render;
+            };
+            self.modal = Some(Modal::QueueMode(QueueModeModal {
+                content,
+                expected_run_id,
+                selected: QueueMode::FollowUp,
+            }));
+            return CoreEffect::Render;
+        }
+        let expected_run_id = self
+            .queued_inputs
+            .metadata_snapshot()
+            .active_run()
+            .map(str::to_owned);
         self.start_queue_enqueue(
+            QueueMode::FollowUp,
+            expected_run_id,
             QueuePosition::Back,
             Arc::clone(&content),
             QueueMutationIntent::ComposerSubmit { original: content },
@@ -2577,19 +3039,15 @@ impl AppCore {
 
     fn start_queue_enqueue(
         &mut self,
+        mode: QueueMode,
+        expected_run_id: Option<String>,
         position: QueuePosition,
         content: Arc<str>,
         intent: QueueMutationIntent,
     ) -> CoreEffect {
-        let snapshot = self.queued_inputs.metadata_snapshot();
-        let mode = if self.running_model_turn_accepts_steering() {
-            QueueMode::Steering
-        } else {
-            QueueMode::FollowUp
-        };
         let mutation = QueueMutation::Enqueue {
             mode,
-            expected_run_id: snapshot.active_run().map(str::to_owned),
+            expected_run_id,
             position,
             content: Arc::clone(&content),
         };
@@ -2602,6 +3060,28 @@ impl AppCore {
                 self.notice = Some(QUEUE_MUTATION_SAVING_NOTICE.to_owned());
             }
             Err(error) => self.notice = Some(format!("queue input failed: {error}")),
+        }
+        CoreEffect::Render
+    }
+
+    fn start_queue_replace(&mut self, queue_id: String, content: Arc<str>) -> CoreEffect {
+        let mutation = QueueMutation::Replace {
+            queue_id: queue_id.clone(),
+            content: Arc::clone(&content),
+        };
+        let intent = QueueMutationIntent::Replace {
+            queue_id,
+            original: Arc::clone(&content),
+        };
+        match self
+            .queue_mutations
+            .start(Arc::clone(&self.queued_inputs), mutation, intent)
+        {
+            Ok(()) => {
+                self.clear_composer_if_unchanged(&content);
+                self.notice = Some(QUEUE_MUTATION_SAVING_NOTICE.to_owned());
+            }
+            Err(error) => self.notice = Some(format!("queue edit failed: {error}")),
         }
         CoreEffect::Render
     }
@@ -2619,19 +3099,59 @@ impl AppCore {
     }
 
     fn continue_queued_input(&mut self) -> CoreEffect {
+        let policy = {
+            let AppState::Idle { session } = &mut self.state else {
+                return CoreEffect::None;
+            };
+            if !session.can_accept_turn() {
+                return CoreEffect::None;
+            }
+            follow_up_dispatch_policy(session, &self.queued_inputs)
+        };
+        let policy = match policy {
+            Ok(policy) => policy,
+            Err(error) => {
+                self.notice = Some(format!("follow-up unavailable: {error}"));
+                return CoreEffect::Render;
+            }
+        };
+        match policy {
+            FollowUpDispatchPolicy::Ready { queue_id } => self.start_expected_queued_turn(queue_id),
+            FollowUpDispatchPolicy::Confirm {
+                queue_id,
+                source_run_id,
+                status,
+            } => {
+                self.modal = Some(Modal::FollowUpConfirmation(FollowUpConfirmationModal {
+                    queue_id,
+                    source_run_id,
+                    status,
+                    run_selected: false,
+                }));
+                CoreEffect::Render
+            }
+            FollowUpDispatchPolicy::Wait { source_run_id } => {
+                self.notice = Some(format!(
+                    "follow-up waits for source run {} to finish",
+                    short_run_identity(&source_run_id)
+                ));
+                CoreEffect::Render
+            }
+            FollowUpDispatchPolicy::None => CoreEffect::None,
+        }
+    }
+
+    fn start_expected_queued_turn(&mut self, queue_id: String) -> CoreEffect {
         let AppState::Idle { session } = &self.state else {
             return CoreEffect::None;
         };
         if !session.can_accept_turn() {
             return CoreEffect::None;
         }
-        let Some(input) = self.pop_next_queued_input() else {
-            return CoreEffect::None;
-        };
         self.queued_inputs.set_paused(false);
         self.visual_scroll_offset = 0;
         let session = self.take_idle_session();
-        self.spawn_queued_turn(input, session);
+        self.spawn_queued_turn(queue_id, session);
         CoreEffect::Render
     }
 
@@ -2684,45 +3204,73 @@ impl AppCore {
     }
 
     fn spawn_turn(&mut self, prompt: String, session: Box<Session<TuiDecider>>) {
-        self.spawn_turn_inner(prompt, session, None);
+        self.spawn_turn_inner(prompt, session);
     }
 
-    fn spawn_queued_turn(&mut self, input: QueuedInput, session: Box<Session<TuiDecider>>) {
-        let prompt = input.content().to_owned();
-        self.spawn_turn_inner(prompt, session, Some(&input));
+    fn spawn_queued_turn(&mut self, queue_id: String, mut session: Box<Session<TuiDecider>>) {
+        self.snapshot_permission_envelope(&session);
+        session.set_compaction_request(Arc::clone(&self.compaction_request));
+        let (worker_tx, worker_rx) = mpsc::channel();
+        let runtime_tx = worker_tx.clone();
+        session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+            let _ = runtime_tx.send(TurnEvent::ProviderRuntime(event));
+        }));
+        let interrupt_flag = Arc::new(AtomicBool::new(false));
+        let worker_interrupt = Arc::clone(&interrupt_flag);
+        let queue = Arc::clone(&self.queued_inputs);
+        std::thread::spawn(move || {
+            let stream_tx = worker_tx.clone();
+            let mut admission_reported = false;
+            let result = session.run_expected_queued_follow_up_with_sink(
+                queue,
+                &queue_id,
+                Arc::clone(&worker_interrupt),
+                |event| {
+                    if !admission_reported {
+                        admission_reported = true;
+                        let _ = stream_tx.send(TurnEvent::RunAdmitted);
+                    }
+                    let _ = stream_tx.send(TurnEvent::Event(event.clone()));
+                },
+            );
+            let event = match result {
+                Ok(Some(_)) => TurnEvent::TurnDone {
+                    outcome: TurnOutcome::Complete,
+                    session,
+                },
+                Ok(None) => TurnEvent::QueueDispatchUnavailable {
+                    error: "follow-up is temporarily busy; it remains queued".to_owned(),
+                    session,
+                },
+                Err(error) if !admission_reported => TurnEvent::QueueDispatchUnavailable {
+                    error: error.to_string(),
+                    session,
+                },
+                Err(euler_core::SessionError::Cancelled) => TurnEvent::TurnDone {
+                    outcome: TurnOutcome::Cancelled,
+                    session,
+                },
+                Err(error) => TurnEvent::TurnDone {
+                    outcome: TurnOutcome::Failed(error.to_string()),
+                    session,
+                },
+            };
+            let _ = worker_tx.send(event);
+        });
+        self.install_turn_worker(worker_rx, interrupt_flag);
+        self.queued_dispatch_history_pending = true;
     }
 
-    fn spawn_turn_inner(
-        &mut self,
-        mut prompt: String,
-        mut session: Box<Session<TuiDecider>>,
-        queued_input: Option<&QueuedInput>,
-    ) {
+    fn spawn_turn_inner(&mut self, prompt: String, mut session: Box<Session<TuiDecider>>) {
         self.snapshot_permission_envelope(&session);
         // Mid-turn steering (issue #146): the worker drains this queue at
         // round boundaries; we keep pushing into our clone while the turn
         // is in flight. Re-wired every spawn so /new and /resume sessions
         // always steer the queue this AppCore renders.
-        if let Some(input) = queued_input {
-            match session
-                .set_steering_queue_for_queued_input(Arc::clone(&self.queued_inputs), input)
-            {
-                Ok(canonical) => {
-                    prompt = canonical.content().to_owned();
-                    self.bottom.record_submission(&prompt);
-                }
-                Err(error) => {
-                    self.install_state(AppState::Idle { session });
-                    self.push_error_item(format!("queued turn failed: {error}"));
-                    return;
-                }
-            }
-        } else {
-            if let Err(error) = session.set_steering_queue(Arc::clone(&self.queued_inputs)) {
-                self.install_state(AppState::Idle { session });
-                self.push_error_item(format!("turn setup failed: {error}"));
-                return;
-            }
+        if let Err(error) = session.set_steering_queue(Arc::clone(&self.queued_inputs)) {
+            self.install_state(AppState::Idle { session });
+            self.push_error_item(format!("turn setup failed: {error}"));
+            return;
         }
         session.set_compaction_request(Arc::clone(&self.compaction_request));
         let (worker_tx, worker_rx) = mpsc::channel();
@@ -2755,6 +3303,14 @@ impl AppCore {
         // input. `RunAdmitted` later opens the steering affordance on this
         // thread; until then submit retains the composer and asks the user to
         // retry instead of guessing a queue mode.
+        self.install_turn_worker(worker_rx, interrupt_flag);
+    }
+
+    fn install_turn_worker(
+        &mut self,
+        worker_rx: Receiver<TurnEvent>,
+        interrupt_flag: Arc<AtomicBool>,
+    ) {
         self.install_state(AppState::TurnInFlight {
             worker_rx,
             interrupt_flag,
@@ -3061,6 +3617,7 @@ impl AppCore {
         self.permission_rx = channels.request_rx;
         self.reply_tx = inactive_permission_reply_sender();
         self.active_permission_cancellation = None;
+        self.permission_run_id = None;
         self.primary_agent_id = session_primary_agent_id(&session);
         self.install_state(AppState::Idle {
             session: Box::new(session),
@@ -3077,6 +3634,10 @@ impl AppCore {
         self.token_usage.context_window_tokens = self.active_context_window_tokens();
         self.tool_output_expanded = false;
         self.modal = None;
+        self.recalled_queue_id = None;
+        self.recovery_edit = None;
+        self.recoverable_queue_inputs.clear();
+        self.queued_dispatch_history_pending = false;
         self.quit_armed = None;
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
@@ -3219,6 +3780,30 @@ impl AppCore {
         edit: impl FnOnce(&mut super::composer::ComposerDraft),
     ) -> CoreEffect {
         self.bottom.edit_composer(edit);
+        if self.bottom.composer().submit_text().is_empty()
+            && self
+                .recalled_queue_id
+                .as_deref()
+                .is_some_and(|queue_id| !self.queue_mutations.target_pending(queue_id))
+        {
+            self.recalled_queue_id = None;
+            self.notice = Some("queue edit abandoned; input remains queued".to_owned());
+        }
+        CoreEffect::Render
+    }
+
+    fn abandon_recalled_queue_edit(&mut self) -> CoreEffect {
+        self.recalled_queue_id = None;
+        self.bottom.replace_composer_text("");
+        self.notice = Some("queue edit abandoned; input remains queued".to_owned());
+        CoreEffect::Render
+    }
+
+    fn abandon_recovery_edit(&mut self) -> CoreEffect {
+        self.recovery_edit = None;
+        self.bottom.replace_composer_text("");
+        self.notice = Some("recovery edit abandoned; input still awaits a decision".to_owned());
+        self.offer_next_queue_recovery();
         CoreEffect::Render
     }
 
@@ -3243,6 +3828,10 @@ impl AppCore {
     }
 
     fn recall_selected_queued_input(&mut self) -> CoreEffect {
+        if self.recalled_queue_id.is_some() && !self.bottom.composer().submit_text().is_empty() {
+            let width = self.composer_navigation_width;
+            return self.move_composer_cursor(|draft| draft.move_up_visual(width));
+        }
         let queue_id = match self.selected_queue_id_for_mutation() {
             SelectedQueueRow::Selected(queue_id) => queue_id,
             SelectedQueueRow::Refreshed => return CoreEffect::Render,
@@ -3251,7 +3840,17 @@ impl AppCore {
         if !self.bottom.composer().submit_text().is_empty() {
             return self.move_composer_up_or_history();
         }
-        self.start_queue_cancel(queue_id.clone(), QueueMutationIntent::Recall { queue_id });
+        let snapshot = self.queued_inputs.metadata_snapshot();
+        let Some(row) = snapshot
+            .rows()
+            .iter()
+            .find(|row| row.queue_id() == queue_id)
+        else {
+            self.normalize_queue_selection();
+            return CoreEffect::Render;
+        };
+        self.recalled_queue_id = Some(queue_id);
+        self.bottom.replace_composer_text(row.content());
         CoreEffect::Render
     }
 
@@ -3316,14 +3915,16 @@ impl AppCore {
         CoreEffect::Render
     }
 
-    fn pop_next_queued_input(&mut self) -> Option<QueuedInput> {
-        let prompt = self.queued_inputs.reserve_front_for_dispatch();
-        self.normalize_queue_selection();
-        prompt
-    }
-
     fn normalize_queue_selection(&mut self) {
         let snapshot = self.queued_inputs.metadata_snapshot();
+        if self
+            .recalled_queue_id
+            .as_ref()
+            .is_some_and(|recalled| !snapshot.rows().iter().any(|row| row.queue_id() == recalled))
+        {
+            self.recalled_queue_id = None;
+            self.notice = Some("recalled queue input is no longer pending".to_owned());
+        }
         if self
             .queued_selection
             .as_ref()
@@ -3332,6 +3933,29 @@ impl AppCore {
             return;
         }
         self.queued_selection = snapshot.rows().last().map(|row| row.queue_id().to_owned());
+    }
+
+    fn refresh_recoverable_queue_inputs(&mut self) {
+        let result = match &mut self.state {
+            AppState::Idle { session } => session.recoverable_queue_inputs(),
+            AppState::Empty | AppState::TurnInFlight { .. } => return,
+        };
+        match result {
+            Ok(recoverable) => self.recoverable_queue_inputs = recoverable,
+            Err(error) => {
+                self.recoverable_queue_inputs.clear();
+                self.notice = Some(format!("queue recovery projection failed: {error}"));
+            }
+        }
+    }
+
+    fn offer_next_queue_recovery(&mut self) {
+        if self.modal.is_some() || self.recovery_edit.is_some() || self.turn_in_flight() {
+            return;
+        }
+        if let Some(recovered) = self.recoverable_queue_inputs.first().cloned() {
+            self.modal = Some(Modal::QueueRecovery(QueueRecoveryModal { recovered }));
+        }
     }
 
     fn clear_queued_inputs(
@@ -3393,7 +4017,13 @@ impl AppCore {
             EditorResult::Updated(contents) => {
                 self.bottom.replace_composer_text(&contents);
                 self.quit_armed = None;
-                self.notice = Some("draft updated from editor".to_owned());
+                if contents.is_empty() && self.recovery_edit.is_some() {
+                    return self.abandon_recovery_edit();
+                } else if contents.is_empty() && self.recalled_queue_id.take().is_some() {
+                    self.notice = Some("queue edit abandoned; input remains queued".to_owned());
+                } else {
+                    self.notice = Some("draft updated from editor".to_owned());
+                }
             }
             EditorResult::Unset => {
                 self.notice = Some("EDITOR is not set; draft unchanged".to_owned());
@@ -3479,6 +4109,11 @@ impl AppCore {
             .permission_generation
             .checked_add(1)
             .expect("permission prompt identity exhausted");
+        self.permission_run_id = self
+            .queued_inputs
+            .metadata_snapshot()
+            .active_run()
+            .map(str::to_owned);
         self.approval_selection = ApprovalOption::default();
         let draft = self.bottom.composer().submit_text();
         if !draft.is_empty() {
@@ -3563,6 +4198,7 @@ impl AppCore {
     fn reply_to_modal(&mut self, reply: PermissionReply) -> CoreEffect {
         self.modal = None;
         self.active_permission_cancellation = None;
+        self.permission_run_id = None;
         self.approval_selection = ApprovalOption::default();
         let _ = self.reply_tx.send(reply);
         self.restore_stashed_draft();
@@ -3582,6 +4218,7 @@ impl AppCore {
     fn deny_open_modal(&mut self) {
         if self.modal.take().is_some() {
             self.active_permission_cancellation = None;
+            self.permission_run_id = None;
             self.approval_selection = ApprovalOption::default();
             let _ = self.reply_tx.send(PermissionReply::Deny);
             self.restore_stashed_draft();
@@ -3603,6 +4240,7 @@ impl AppCore {
             String::new()
         };
         self.modal = None;
+        self.permission_run_id = None;
         self.approval_selection = ApprovalOption::default();
         // Cancellation is a distinct gate outcome, not a denial. The prompt's
         // one-shot receiver is already gone (or will be dropped immediately).
@@ -3745,6 +4383,7 @@ impl AppCore {
         } else {
             snapshot.verb()
         };
+        let detail = self.activity_detail_with_queue(snapshot.detail());
         Some(HudLine::Working {
             marker,
             stalled,
@@ -3753,8 +4392,29 @@ impl AppCore {
                 " · {} · esc to interrupt",
                 activity::format_age(snapshot.phase_age)
             ),
-            detail: snapshot.detail(),
+            detail,
         })
+    }
+
+    fn activity_detail_with_queue(&self, detail: Option<String>) -> Option<String> {
+        let queue = self.queued_inputs.metadata_snapshot();
+        let queue_context = queue.active_run().map(short_run_identity).map(|run| {
+            format!(
+                "run {run} · queue {}{}",
+                queue.rows().len(),
+                if self.queued_inputs.paused() {
+                    " paused"
+                } else {
+                    ""
+                }
+            )
+        });
+        match (detail, queue_context) {
+            (Some(detail), Some(queue)) => Some(format!("{detail} · {queue}")),
+            (Some(detail), None) => Some(detail),
+            (None, Some(queue)) => Some(queue),
+            (None, None) => None,
+        }
     }
 
     /// Plain-text flattening of `working_hud_line`, kept for the legacy
@@ -3821,7 +4481,14 @@ impl AppCore {
                 skill_count: state.skill_count,
                 load_selected: state.load_selected,
             }),
-            None | Some(Modal::PatchApproval(_)) | Some(Modal::Help) => None,
+            None
+            | Some(
+                Modal::PatchApproval(_)
+                | Modal::QueueMode(_)
+                | Modal::FollowUpConfirmation(_)
+                | Modal::QueueRecovery(_)
+                | Modal::Help,
+            ) => None,
         }
     }
 

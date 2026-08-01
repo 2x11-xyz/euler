@@ -96,6 +96,7 @@ mod composer_tests {
         let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
             position: 1,
             total: 1,
+            context: String::new(),
             text: full.to_owned(),
             selected: true,
             saving: false,
@@ -118,6 +119,7 @@ mod composer_tests {
         let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
             position: 1,
             total: 1,
+            context: String::new(),
             text: "keep this\non one row".to_owned(),
             selected: false,
             saving: false,
@@ -137,6 +139,7 @@ mod composer_tests {
         let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
             position: 12,
             total: 12,
+            context: String::new(),
             text: "界".repeat(80),
             selected: true,
             saving: false,
@@ -148,13 +151,45 @@ mod composer_tests {
                 panic!("missing queued preview at width {width}");
             };
             let prefix = queued_line_prefix(line.position, line.total);
+            let selection = queued_selection_prefix(line.selected);
             assert!(
-                display_width(&prefix) + display_width(&line.text) <= usize::from(width),
-                "width {width} rendered {prefix:?} + {:?}",
+                display_width(&prefix) + display_width(selection) + display_width(&line.text)
+                    <= usize::from(width),
+                "width {width} rendered {prefix:?} + {selection:?} + {:?}",
                 line.text
             );
             assert!(display_width(&line.text) <= 64);
         }
+    }
+
+    #[test]
+    fn queued_mode_and_run_context_leaves_a_bounded_preview() {
+        let draft = ComposerDraft::new();
+        let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
+            position: 1,
+            total: 2,
+            context: "follow-up after 01KYYVABCDEF…WXYZ".to_owned(),
+            text: "keep enough of this pending input visible".to_owned(),
+            selected: true,
+            saving: false,
+        }]);
+
+        let width = 40;
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), width, 2);
+        let Some(ComposerLine::Queued(line)) = lines.first() else {
+            panic!("missing queued preview");
+        };
+        let rendered = format!(
+            "{}{}{}{}{}",
+            queued_line_prefix(line.position, line.total),
+            queued_selection_prefix(line.selected),
+            queued_context_prefix(&line.context),
+            queued_saving_prefix(line.saving),
+            line.text
+        );
+        assert!(display_width(&rendered) <= usize::from(width));
+        assert!(line.context.starts_with("follow-up"));
+        assert!(!line.text.is_empty());
     }
 
     #[test]
@@ -163,6 +198,7 @@ mod composer_tests {
         let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
             position: 1,
             total: 1,
+            context: String::new(),
             text: "abcdefghijklmnopqrstuvwxyz".to_owned(),
             selected: false,
             saving: true,
@@ -174,10 +210,14 @@ mod composer_tests {
             panic!("missing saving preview");
         };
         let prefix = queued_line_prefix(line.position, line.total);
+        let selection = queued_selection_prefix(line.selected);
         let saving = queued_saving_prefix(line.saving);
         assert_eq!(saving, "saving · ");
         assert!(
-            display_width(&prefix) + display_width(saving) + display_width(&line.text)
+            display_width(&prefix)
+                + display_width(selection)
+                + display_width(saving)
+                + display_width(&line.text)
                 <= usize::from(width)
         );
     }
@@ -191,13 +231,15 @@ mod composer_tests {
         let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
             position: 1,
             total: 1,
+            context: String::new(),
             text: "supercalifragilisticexpialidocious".to_owned(),
             selected: false,
             saving: false,
         }]);
 
-        // width 16 → prefix `▌ 1/1 ` (6 cells) leaves a 10-cell budget.
-        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 16, 2);
+        // width 18 → prefix + selection column (8 cells) leaves a
+        // 10-cell budget.
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 18, 2);
         let Some(ComposerLine::Queued(line)) = lines.first() else {
             panic!("missing queued preview");
         };
@@ -211,14 +253,15 @@ mod composer_tests {
         let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
             position: 1,
             total: 1,
+            context: String::new(),
             text: "hello world".to_owned(),
             selected: false,
             saving: false,
         }]);
 
-        // width 10 → prefix 6 leaves a 4-cell budget, at the ` ...` suffix
-        // width, so the preview is a bare hard cut with no ellipsis.
-        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 10, 2);
+        // width 12 → prefix + selection column 8 leaves a 4-cell budget,
+        // at the ` ...` suffix width, so the preview is a bare hard cut.
+        let lines = render_lines(&snapshot, &ComposerRenderOptions::default(), 12, 2);
         let Some(ComposerLine::Queued(line)) = lines.first() else {
             panic!("missing queued preview");
         };
@@ -235,6 +278,7 @@ mod composer_tests {
         let snapshot = ComposerSnapshot::new(&draft).with_queued(vec![QueuedComposerLine {
             position: 1,
             total: 1,
+            context: String::new(),
             text: text.clone(),
             selected: false,
             saving: false,

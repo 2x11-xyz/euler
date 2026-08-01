@@ -1,8 +1,12 @@
-use euler_core::{QueueError, QueueMode, QueuePosition, SteeringQueue};
+use euler_core::{QueueError, QueueMode, QueuePosition, QueuedInputMetadata, SteeringQueue};
 use std::collections::VecDeque;
 use std::fmt;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::time::Duration;
+
+const EXACT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
+const EXACT_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
 
 /// One user action whose durable queue append runs off the terminal thread.
 pub(super) enum QueueMutation {
@@ -14,6 +18,10 @@ pub(super) enum QueueMutation {
     },
     Cancel {
         queue_id: String,
+    },
+    Replace {
+        queue_id: String,
+        content: Arc<str>,
     },
 }
 
@@ -29,18 +37,20 @@ pub(super) enum QueueMutationIntent {
         original: Arc<str>,
         permission_generation: u64,
     },
-    Recall {
-        queue_id: String,
-    },
     Unqueue {
         queue_id: String,
+    },
+    Replace {
+        queue_id: String,
+        original: Arc<str>,
     },
 }
 
 #[derive(Debug)]
 pub(super) enum QueueMutationSuccess {
-    Enqueued { queue_id: String },
-    Cancelled { content: String },
+    Enqueued { row: QueuedInputMetadata },
+    Cancelled,
+    Replaced { row: QueuedInputMetadata },
 }
 
 #[derive(Debug)]
@@ -101,22 +111,58 @@ struct PendingMutation {
 
 enum PendingMutationProjection {
     Enqueue {
+        mode: QueueMode,
+        expected_run_id: Option<String>,
         position: QueuePosition,
         content: Arc<str>,
     },
     Cancel {
         queue_id: String,
     },
+    Replace {
+        queue_id: String,
+        content: Arc<str>,
+    },
 }
 
-pub(super) struct PendingEnqueueProjection {
-    pub(super) position: QueuePosition,
-    pub(super) content: String,
+fn mutation_target(mutation: &QueueMutation) -> Option<&str> {
+    match mutation {
+        QueueMutation::Cancel { queue_id } | QueueMutation::Replace { queue_id, .. } => {
+            Some(queue_id)
+        }
+        QueueMutation::Enqueue { .. } => None,
+    }
 }
 
+fn pending_projection_target(projection: &PendingMutationProjection) -> Option<&str> {
+    match projection {
+        PendingMutationProjection::Cancel { queue_id }
+        | PendingMutationProjection::Replace { queue_id, .. } => Some(queue_id),
+        PendingMutationProjection::Enqueue { .. } => None,
+    }
+}
+
+#[derive(Clone)]
 pub(super) struct QueueProjectionRow {
-    pub(super) queue_id: String,
+    pub(super) queue_id: Option<String>,
+    pub(super) run_id: Option<String>,
+    pub(super) source_run_id: Option<String>,
+    pub(super) mode: QueueMode,
     pub(super) content: String,
+    pub(super) saving: bool,
+}
+
+impl QueueProjectionRow {
+    fn durable(row: &QueuedInputMetadata) -> Self {
+        Self {
+            queue_id: Some(row.queue_id().to_owned()),
+            run_id: Some(row.run_id().to_owned()),
+            source_run_id: row.source_run_id().map(str::to_owned),
+            mode: row.mode(),
+            content: row.content().to_owned(),
+            saving: false,
+        }
+    }
 }
 
 /// Single-owner asynchronous boundary for interactive queue mutations.
@@ -159,30 +205,31 @@ impl QueueMutationBoundary {
         mutation: QueueMutation,
         intent: QueueMutationIntent,
     ) -> Result<(), QueueMutationStartError> {
-        if let QueueMutation::Cancel { queue_id } = &mutation {
-            let duplicate = self.pending.iter().any(|pending| match &pending.intent {
-                QueueMutationIntent::Recall {
-                    queue_id: pending_id,
-                }
-                | QueueMutationIntent::Unqueue {
-                    queue_id: pending_id,
-                } => pending_id == queue_id,
-                QueueMutationIntent::ComposerSubmit { .. }
-                | QueueMutationIntent::DenyInstruction { .. } => false,
-            });
-            if duplicate {
-                return Err(QueueMutationStartError::Duplicate);
-            }
+        if mutation_target(&mutation).is_some_and(|target| {
+            self.pending
+                .iter()
+                .any(|pending| pending_projection_target(&pending.projection) == Some(target))
+        }) {
+            return Err(QueueMutationStartError::Duplicate);
         }
         let projection = match &mutation {
             QueueMutation::Enqueue {
-                position, content, ..
+                mode,
+                expected_run_id,
+                position,
+                content,
             } => PendingMutationProjection::Enqueue {
+                mode: *mode,
+                expected_run_id: expected_run_id.clone(),
                 position: *position,
                 content: Arc::clone(content),
             },
             QueueMutation::Cancel { queue_id } => PendingMutationProjection::Cancel {
                 queue_id: queue_id.clone(),
+            },
+            QueueMutation::Replace { queue_id, content } => PendingMutationProjection::Replace {
+                queue_id: queue_id.clone(),
+                content: Arc::clone(content),
             },
         };
         let baseline = self.pending.is_empty().then(|| {
@@ -190,10 +237,7 @@ impl QueueMutationBoundary {
                 .metadata_snapshot()
                 .rows()
                 .iter()
-                .map(|row| QueueProjectionRow {
-                    queue_id: row.queue_id().to_owned(),
-                    content: row.content().to_owned(),
-                })
+                .map(QueueProjectionRow::durable)
                 .collect()
         });
         let id = self.next_id;
@@ -266,13 +310,13 @@ impl QueueMutationBoundary {
         };
         match (pending, result) {
             (
-                PendingMutationProjection::Enqueue { position, content },
-                Ok(QueueMutationSuccess::Enqueued { queue_id }),
+                PendingMutationProjection::Enqueue {
+                    position, content, ..
+                },
+                Ok(QueueMutationSuccess::Enqueued { row }),
             ) => {
-                let row = QueueProjectionRow {
-                    queue_id: queue_id.clone(),
-                    content: content.to_string(),
-                };
+                debug_assert_eq!(row.content(), content.as_ref());
+                let row = QueueProjectionRow::durable(row);
                 match position {
                     QueuePosition::Front => rows.insert(0, row),
                     QueuePosition::Back => rows.push(row),
@@ -280,8 +324,20 @@ impl QueueMutationBoundary {
             }
             (
                 PendingMutationProjection::Cancel { queue_id },
-                Ok(QueueMutationSuccess::Cancelled { .. }),
-            ) => rows.retain(|row| row.queue_id != *queue_id),
+                Ok(QueueMutationSuccess::Cancelled),
+            ) => rows.retain(|row| row.queue_id.as_deref() != Some(queue_id)),
+            (
+                PendingMutationProjection::Replace { queue_id, content },
+                Ok(QueueMutationSuccess::Replaced { row }),
+            ) => {
+                debug_assert_eq!(row.content(), content.as_ref());
+                if let Some(existing) = rows
+                    .iter_mut()
+                    .find(|row| row.queue_id.as_deref() == Some(queue_id))
+                {
+                    *existing = QueueProjectionRow::durable(row);
+                }
+            }
             _ => {}
         }
     }
@@ -296,34 +352,85 @@ impl QueueMutationBoundary {
         !self.pending.is_empty()
     }
 
-    pub(super) fn pending_enqueues(&self) -> Vec<PendingEnqueueProjection> {
+    pub(super) fn target_pending(&self, queue_id: &str) -> bool {
         self.pending
             .iter()
-            .filter_map(|pending| match &pending.projection {
-                PendingMutationProjection::Enqueue { position, content } => {
-                    Some(PendingEnqueueProjection {
-                        position: *position,
+            .any(|pending| pending_projection_target(&pending.projection) == Some(queue_id))
+    }
+
+    pub(super) fn projected_rows(
+        &self,
+        current: &euler_core::SteeringQueueSnapshot,
+    ) -> Vec<QueueProjectionRow> {
+        let mut rows: Vec<QueueProjectionRow> = match &self.projection_baseline {
+            Some(baseline) => baseline
+                .iter()
+                .filter_map(|baseline_row| {
+                    let queue_id = baseline_row.queue_id.as_deref()?;
+                    current
+                        .rows()
+                        .iter()
+                        .find(|row| row.queue_id() == queue_id)
+                        .map(QueueProjectionRow::durable)
+                        .or_else(|| {
+                            self.pending
+                                .iter()
+                                .any(|pending| {
+                                    pending_projection_target(&pending.projection) == Some(queue_id)
+                                })
+                                .then(|| baseline_row.clone())
+                        })
+                })
+                .collect(),
+            None => current
+                .rows()
+                .iter()
+                .map(QueueProjectionRow::durable)
+                .collect(),
+        };
+        for pending in &self.pending {
+            match &pending.projection {
+                PendingMutationProjection::Enqueue {
+                    mode,
+                    expected_run_id,
+                    position,
+                    content,
+                } => {
+                    let row = QueueProjectionRow {
+                        queue_id: None,
+                        run_id: (*mode == QueueMode::Steering)
+                            .then(|| expected_run_id.clone())
+                            .flatten(),
+                        source_run_id: expected_run_id.clone(),
+                        mode: *mode,
                         content: content.to_string(),
-                    })
+                        saving: true,
+                    };
+                    match position {
+                        QueuePosition::Front => rows.insert(0, row),
+                        QueuePosition::Back => rows.push(row),
+                    }
                 }
-                PendingMutationProjection::Cancel { .. } => None,
-            })
-            .collect()
-    }
-
-    pub(super) fn cancellation_pending(&self, queue_id: &str) -> bool {
-        self.pending.iter().any(|pending| {
-            matches!(
-                &pending.projection,
-                PendingMutationProjection::Cancel {
-                    queue_id: pending_id
-                } if pending_id == queue_id
-            )
-        })
-    }
-
-    pub(super) fn projection_baseline(&self) -> Option<&[QueueProjectionRow]> {
-        self.projection_baseline.as_deref()
+                PendingMutationProjection::Cancel { queue_id } => {
+                    if let Some(row) = rows
+                        .iter_mut()
+                        .find(|row| row.queue_id.as_deref() == Some(queue_id))
+                    {
+                        row.saving = true;
+                    }
+                }
+                PendingMutationProjection::Replace { queue_id, content } => {
+                    if let Some(row) = rows
+                        .iter_mut()
+                        .find(|row| row.queue_id.as_deref() == Some(queue_id))
+                    {
+                        row.content = content.to_string();
+                        row.saving = true;
+                    }
+                }
+            }
+        }
+        rows
     }
 }
 
@@ -332,27 +439,8 @@ fn queue_mutation_worker(
     result_tx: Sender<QueueMutationResult>,
 ) {
     while let Ok(command) = command_rx.recv() {
-        let result = match command.mutation {
-            QueueMutation::Enqueue {
-                mode,
-                expected_run_id,
-                position,
-                content,
-            } => command
-                .queue
-                .enqueue(
-                    mode,
-                    expected_run_id.as_deref(),
-                    position,
-                    content.to_string(),
-                )
-                .map(|queue_id| QueueMutationSuccess::Enqueued { queue_id }),
-            QueueMutation::Cancel { queue_id } => command
-                .queue
-                .cancel(&queue_id)
-                .map(|content| QueueMutationSuccess::Cancelled { content }),
-        }
-        .map_err(QueueMutationFailure::Core);
+        let result = apply_queue_mutation(&command.queue, command.mutation)
+            .map_err(QueueMutationFailure::Core);
         if result_tx
             .send(QueueMutationResult {
                 id: command.id,
@@ -361,6 +449,103 @@ fn queue_mutation_worker(
             .is_err()
         {
             return;
+        }
+    }
+}
+
+fn apply_queue_mutation(
+    queue: &SteeringQueue,
+    mutation: QueueMutation,
+) -> Result<QueueMutationSuccess, QueueError> {
+    match mutation {
+        QueueMutation::Enqueue {
+            mode,
+            expected_run_id,
+            position,
+            content,
+        } => match queue.enqueue_with_metadata(
+            mode,
+            expected_run_id.as_deref(),
+            position,
+            content.to_string(),
+        ) {
+            Ok(row) => Ok(QueueMutationSuccess::Enqueued { row }),
+            Err(QueueError::Persistence(_)) => retry_exact_enqueue(queue),
+            Err(error) => Err(error),
+        },
+        QueueMutation::Cancel { queue_id } => match queue.cancel(&queue_id) {
+            Ok(_) => Ok(QueueMutationSuccess::Cancelled),
+            Err(QueueError::Persistence(_)) => retry_exact_cancel(queue),
+            Err(error) => Err(error),
+        },
+        QueueMutation::Replace { queue_id, content } => {
+            match queue.replace_pending_with_metadata(&queue_id, content.to_string()) {
+                Ok(row) => Ok(QueueMutationSuccess::Replaced { row }),
+                Err(QueueError::Persistence(_)) => retry_exact_replace(queue),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+fn retry_exact_enqueue(queue: &SteeringQueue) -> Result<QueueMutationSuccess, QueueError> {
+    retry_retained_persistence(
+        || {
+            queue
+                .retry_unresolved_enqueue_with_metadata()?
+                .map(|row| QueueMutationSuccess::Enqueued { row })
+                .ok_or(QueueError::UnresolvedEnqueue)
+        },
+        |error| matches!(error, QueueError::Persistence(_)),
+    )
+}
+
+fn retry_exact_cancel(queue: &SteeringQueue) -> Result<QueueMutationSuccess, QueueError> {
+    retry_retained_persistence(
+        || {
+            let outcome = queue
+                .retry_unresolved_change_with_metadata()?
+                .ok_or(QueueError::UnresolvedChange)?;
+            if outcome.replacement().is_some() {
+                return Err(QueueError::UnresolvedChange);
+            }
+            Ok(QueueMutationSuccess::Cancelled)
+        },
+        |error| matches!(error, QueueError::Persistence(_)),
+    )
+}
+
+fn retry_exact_replace(queue: &SteeringQueue) -> Result<QueueMutationSuccess, QueueError> {
+    retry_retained_persistence(
+        || {
+            let outcome = queue
+                .retry_unresolved_change_with_metadata()?
+                .ok_or(QueueError::UnresolvedChange)?;
+            let row = outcome
+                .replacement()
+                .cloned()
+                .ok_or(QueueError::UnresolvedChange)?;
+            Ok(QueueMutationSuccess::Replaced { row })
+        },
+        |error| matches!(error, QueueError::Persistence(_)),
+    )
+}
+
+/// Keep retrying only an exact retained operation while its durable outcome
+/// remains ambiguous. Callers own the retained envelope; this helper owns the
+/// shared bounded-backoff policy and must never receive a fresh mutation.
+pub(super) fn retry_retained_persistence<T, E>(
+    mut retry: impl FnMut() -> Result<T, E>,
+    is_persistence: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let mut backoff = EXACT_RETRY_BACKOFF;
+    loop {
+        std::thread::sleep(backoff);
+        match retry() {
+            Err(error) if is_persistence(&error) => {
+                backoff = backoff.saturating_mul(2).min(EXACT_RETRY_MAX_BACKOFF);
+            }
+            result => return result,
         }
     }
 }

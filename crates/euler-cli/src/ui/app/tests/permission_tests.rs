@@ -430,7 +430,7 @@ fn empty_deny_leaves_composer_empty_without_ghost_text() {
 
 #[test]
 fn typed_permission_instruction_does_not_fire_hotkeys() {
-    let mut core = core();
+    let (mut core, gate) = permission_core_with_active_run();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
     core.open_permission_modal(PermissionRequest::new(
@@ -459,6 +459,12 @@ fn typed_permission_instruction_does_not_fire_hotkeys() {
         reply_rx.recv().expect("reply"),
         PermissionReply::DenyWithInstruction("wait".into())
     );
+    assert_eq!(
+        core.queued_inputs.metadata_snapshot().rows()[0].mode(),
+        QueueMode::Steering
+    );
+    gate.open();
+    wait_for_idle(&mut core);
 }
 
 #[test]
@@ -508,7 +514,7 @@ fn preexisting_draft_keeps_hotkeys_live_and_survives_the_decision() {
 
 #[test]
 fn instruction_typed_inside_the_panel_denies_and_restores_the_stash() {
-    let mut core = core();
+    let (mut core, gate) = permission_core_with_active_run();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
     core.bottom.composer_mut().insert_text("pre-ask draft");
@@ -530,14 +536,19 @@ fn instruction_typed_inside_the_panel_denies_and_restores_the_stash() {
         reply_rx.recv().expect("reply"),
         PermissionReply::DenyWithInstruction("use ls".into())
     );
-    // The instruction queues at the front — absorbed by the running turn's
-    // next round boundary (steering), or flushed as the next turn if the
-    // denial ended the turn. The pre-ask draft returns to the composer.
+    // The instruction is specialized steering for the exact permission-
+    // blocked run. The pre-ask draft returns to the composer.
     assert_eq!(
         core.queued_inputs.snapshot().first().map(String::as_str),
         Some("use ls")
     );
+    assert_eq!(
+        core.queued_inputs.metadata_snapshot().rows()[0].mode(),
+        QueueMode::Steering
+    );
     assert_eq!(core.bottom.composer().submit_text(), "pre-ask draft");
+    gate.open();
+    wait_for_idle(&mut core);
 }
 
 #[test]
@@ -630,13 +641,13 @@ fn user_rule_option_absent_without_user_store() {
     // SessionConfig::new has no user_grant_dir, so the store is inert and
     // the panel must not offer a durable rule it cannot install.
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
-    let mut core = core();
+    let (mut core, gate) = permission_core_with_active_run();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.reply_tx = reply_tx;
-    core.modal = Some(Modal::Permission(
+    core.open_permission_modal(
         PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
             .with_command("cargo test -q"),
-    ));
+    );
 
     terminal.draw(|frame| core.render(frame)).expect("draw");
     let contents = terminal.backend().screen_contents();
@@ -663,6 +674,8 @@ fn user_rule_option_absent_without_user_store() {
         reply_rx.recv().expect("reply"),
         PermissionReply::DenyWithInstruction("u".into())
     );
+    gate.open();
+    wait_for_idle(&mut core);
 }
 
 #[test]

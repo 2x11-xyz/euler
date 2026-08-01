@@ -193,8 +193,11 @@ Recoverable requeue owns a two-row marker-first transaction:
 `queue.recovered` then the linked `queue.enqueued`. Replay validates every
 marker's original target and reserves its replacement id, but a marker prefix
 is projection-inert. Only the adjacent parent-linked matching enqueue commits
-the replacement and removes the recovery row; a later restart attempt uses
-fresh event, queue, and planned-run ids.
+the replacement and removes the recovery row. An ambiguous live append keeps
+the exact recovery target, dismiss-versus-replacement shape, envelopes, and
+replacement metadata globally fenced until the owning worker retries that
+same batch; a mismatched retry cannot write or release the fence. A later
+restart attempt uses fresh event, queue, and planned-run ids.
 
 Lifecycle replacement is a writer-ownership boundary, not merely an admission
 check. `/new` and `/resume` first reconcile accepted events and then refuse to
@@ -218,6 +221,13 @@ being inserted into new-owner state. A bind failure before the application
 state swap drops the transition and reopens the still-current, durably cleared
 old owner. Failure after the authority or application state swap becomes
 uncertain stays closed rather than allowing a row to reach a detached log.
+
+An interactive host may compare a displayed FIFO head by stable `queue_id`
+before reservation. A different head fails without reserving its successor;
+the same head behind an in-flight queue transaction remains unreserved and is
+reported as temporarily unavailable. After reservation, Session still binds
+and hydrates that id from canonical queue authority before admitting content;
+the host never supplies authoritative prompt bytes.
 
 Durable bind reconstructs row bytes and FIFO order from the current lifecycle
 projection, including after resume or scrub; matching in-memory ids do not

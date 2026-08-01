@@ -225,6 +225,7 @@ impl AppCore {
         self.permission_rx = resume.channels.request_rx;
         self.reply_tx = inactive_permission_reply_sender();
         self.active_permission_cancellation = None;
+        self.permission_run_id = None;
         self.primary_agent_id = primary_agent_id;
         self.install_state(AppState::Idle {
             session: Box::new(resume.session),
@@ -254,11 +255,16 @@ impl AppCore {
         });
         self.visual_scroll_offset = 0;
         self.modal = None;
+        self.notice = None;
+        self.recalled_queue_id = None;
+        self.recovery_edit = None;
+        self.normalize_queue_selection();
+        self.refresh_recoverable_queue_inputs();
+        self.offer_next_queue_recovery();
         self.quit_armed = None;
         self.last_working_elapsed_secs = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
-        self.notice = None;
         CoreEffect::ReplayHistoryWithScrollbackPurge
     }
 }
