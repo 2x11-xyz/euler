@@ -13,9 +13,8 @@ env:
 
 jobs:
   checks:
-    # Ubuntu 24.04 hosted runners restrict the unprivileged user namespaces
-    # Bubblewrap needs. Euler correctly fails closed there; this gate uses the
-    # still-supported image where it can exercise the real enforced profile.
+    # The enforced-profile gate below requires unprivileged user namespaces;
+    # GitHub's Ubuntu 24.04 image deliberately restricts that kernel feature.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
@@ -39,6 +38,8 @@ jobs:
         run: cargo clippy --workspace --all-targets
       - name: Test
         run: cargo nextest run --workspace
+      - name: Test enforced workspace sandbox
+        run: cargo test --locked -p euler-cli --test headless linux_host_enforces_agent_shell_isolation -- --ignored --exact
       - name: Doc tests
         run: cargo test --workspace --doc
 

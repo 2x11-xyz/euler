@@ -1260,7 +1260,6 @@ struct MountTable {
 #[derive(Debug)]
 struct MountEntry {
     mount_id: u64,
-    mount_root: PathBuf,
     mount_point: PathBuf,
     filesystem_type: String,
 }
@@ -1269,7 +1268,6 @@ struct MountEntry {
 impl MountEntry {
     fn has_valid_structure(&self) -> bool {
         self.mount_id != 0
-            && is_normalized_absolute_mount_path(&self.mount_root)
             && is_normalized_absolute_mount_path(&self.mount_point)
             && !self.filesystem_type.is_empty()
     }
@@ -1346,6 +1344,9 @@ fn parse_mount_entry(line: &str) -> Result<MountEntry, SandboxUnavailableReason>
     let mount_root = fields
         .get(3)
         .ok_or(SandboxUnavailableReason::AuthorityInspectionFailed)?;
+    if decode_mount_path(mount_root)?.as_os_str().is_empty() {
+        return Err(SandboxUnavailableReason::AuthorityInspectionFailed);
+    }
     let mount_point = fields
         .get(4)
         .ok_or(SandboxUnavailableReason::AuthorityInspectionFailed)?;
@@ -1369,7 +1370,6 @@ fn parse_mount_entry(line: &str) -> Result<MountEntry, SandboxUnavailableReason>
     )?;
     Ok(MountEntry {
         mount_id,
-        mount_root: decode_mount_path(mount_root)?,
         mount_point: decode_mount_path(mount_point)?,
         filesystem_type: (*filesystem_type).to_owned(),
     })
@@ -2793,6 +2793,22 @@ mod tests {
         assert_eq!(
             table.validate_root(Path::new("/workspace")),
             Err(SandboxUnavailableReason::UnsafeMountTopology)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_namespace_mount_root_does_not_poison_authority_table() {
+        let table = parse_mount_table(
+            "10 1 254:0 / / rw - ext4 /dev/root rw\n\
+             11 10 254:0 /work /work rw - ext4 /dev/root rw\n\
+             12 10 0:4 net:[4026532267] /run/docker/netns/example rw - nsfs nsfs rw\n",
+        )
+        .expect("namespace descriptors are valid mount roots");
+
+        assert_eq!(
+            table.validate_root(Path::new("/work")),
+            Ok((11, PathBuf::from("/work")))
         );
     }
 

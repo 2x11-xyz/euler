@@ -71,19 +71,34 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn agent_shell_uses_private_home_and_clears_parent_controls() {
+fn agent_shell_isolates_parent_controls_or_fails_closed() {
+    assert_agent_shell_isolation(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a Linux host with an enforceable Bubblewrap profile"]
+fn linux_host_enforces_agent_shell_isolation() {
+    assert_agent_shell_isolation(true);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_agent_shell_isolation(require_enforced: bool) {
     let exe = env!("CARGO_BIN_EXE_euler");
     let user_home = isolated_home();
     let outer_euler_home = tempfile::tempdir().expect("outer Euler home");
     let workspace = tempfile::tempdir().expect("workspace");
+    let command_marker = workspace.path().join("agent-command-ran");
     let host_home_marker = user_home.path().join(".euler/host-home-marker");
     std::fs::create_dir_all(host_home_marker.parent().expect("marker parent"))
         .expect("host Euler home");
     std::fs::write(&host_home_marker, "must stay hidden").expect("host marker");
 
     let nested_command = format!(
-        "printf 'rust-log=%s\\nhome=%s\\neuler-home=%s\\n' \"$RUST_LOG\" \"$HOME\" \"$EULER_HOME\"; \
+        "printf ran > {}; \
+         printf 'rust-log=%s\\nhome=%s\\neuler-home=%s\\n' \"$RUST_LOG\" \"$HOME\" \"$EULER_HOME\"; \
          if test -e {}; then printf 'host-home-visible\\n'; fi",
+        shell_quote(path_str(&command_marker)),
         shell_quote(path_str(&host_home_marker))
     );
     let script = write_fixture_script(
@@ -140,12 +155,63 @@ fn agent_shell_uses_private_home_and_clears_parent_controls() {
     );
 
     let events = read_jsonl(&log);
-    let tool_output = events
+    let tool_call = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .unwrap_or_else(|| panic!("run_shell tool call; events: {events:#?}"));
+    let enforcement = tool_call
+        .payload
+        .get("workspace_authority")
+        .and_then(|authority| authority.get("enforcement"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("workspace enforcement posture; event: {tool_call:#?}"));
+    let tool_result = events
         .iter()
         .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
-        .and_then(|event| event.payload.get("output"))
+        .unwrap_or_else(|| panic!("run_shell tool result; events: {events:#?}"));
+    if enforcement == "unavailable" {
+        assert_eq!(
+            tool_result.payload.get("ok"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(tool_result.payload.get("output").is_none());
+        let error = tool_result
+            .payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("concise sandbox error");
+        assert!(
+            [
+                euler_core::SandboxUnavailableReason::BubblewrapMissing,
+                euler_core::SandboxUnavailableReason::CannotEnforce,
+                euler_core::SandboxUnavailableReason::AuthorityInspectionFailed,
+                euler_core::SandboxUnavailableReason::UnsafeSpecialNode,
+                euler_core::SandboxUnavailableReason::UnsafeMountTopology,
+            ]
+            .iter()
+            .any(|reason| reason.message() == error),
+            "unexpected workspace sandbox error: {error}"
+        );
+        assert!(
+            !command_marker.exists(),
+            "unavailable authority must not fall back to host execution"
+        );
+        assert!(
+            !require_enforced,
+            "Linux enforcement fixture was unavailable: {error}"
+        );
+        return;
+    }
+    assert_eq!(enforcement, "available");
+    let tool_output = tool_result
+        .payload
+        .get("output")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| panic!("nested Euler tool output; events: {events:#?}"));
+    assert_eq!(
+        std::fs::read_to_string(&command_marker).expect("agent command marker"),
+        "ran"
+    );
     assert!(tool_output.contains("rust-log=\n"));
     assert!(tool_output.contains("euler-home=\n"));
     assert!(!tool_output.contains("host-home-visible"));
