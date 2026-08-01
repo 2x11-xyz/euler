@@ -1,4 +1,5 @@
 #![allow(clippy::too_many_lines)] // integration-test exemption for integration test modules
+#[cfg(target_os = "linux")]
 use euler_core::canvas::projected_tool_output;
 use euler_core::permissions::{
     ApprovalMode, DeciderVerdict, PermissionDecider, PermissionRequest, ScriptedDecider,
@@ -5900,6 +5901,7 @@ fn rename_session_persists_canonical_event_after_start() {
     assert_eq!(payload_str(&persisted[1], "name"), Some("live name"));
 }
 
+#[cfg(target_os = "linux")]
 fn run_shell_with_mode(
     mode: ApprovalMode,
     decisions: Vec<DeciderVerdict>,
@@ -5933,11 +5935,13 @@ fn run_shell_with_mode(
     session.events().to_vec()
 }
 
+#[cfg(target_os = "linux")]
 struct ObservingDecider {
     observed: Arc<Mutex<Vec<String>>>,
     verdict: DeciderVerdict,
 }
 
+#[cfg(target_os = "linux")]
 impl PermissionDecider for ObservingDecider {
     fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
         let observed = self.observed.lock().expect("observed sink lock");
@@ -5951,6 +5955,7 @@ impl PermissionDecider for ObservingDecider {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn event_position(events: &[EventEnvelope], kind: &'static str) -> usize {
     events
         .iter()
@@ -6693,6 +6698,7 @@ fn assert_patch_file_change_sequence(events: &[EventEnvelope], call_id: &str) {
     assert!(event_index(events, &file_change.id) < event_index(events, &tool_result.id));
 }
 
+#[cfg(target_os = "linux")]
 fn assert_shell_file_change_sequence<'a>(
     events: &'a [EventEnvelope],
     call_id: &str,
@@ -6762,6 +6768,7 @@ fn selected_ids(event: &EventEnvelope) -> Vec<String> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn assert_decision(events: &[EventEnvelope], mode: &str, allowed: bool) {
     let decision = events
         .iter()
@@ -6783,6 +6790,7 @@ fn assert_decision(events: &[EventEnvelope], mode: &str, allowed: bool) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn has_subsequence(actual: &[String], expected: &[&str]) -> bool {
     let mut index = 0;
     for kind in actual {

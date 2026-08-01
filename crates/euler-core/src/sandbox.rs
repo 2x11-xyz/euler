@@ -1457,6 +1457,24 @@ fn inspect_authority_root(
             for entry in entries {
                 let entry =
                     entry.map_err(|_| SandboxUnavailableReason::AuthorityInspectionFailed)?;
+                // `DirEntry::file_type` uses the directory entry's type when
+                // the filesystem supplies it and falls back to `fstatat`
+                // otherwise. It does not follow symlinks, so ordinary files
+                // need no second pathname lookup while special nodes are
+                // still rejected and every directory is walked.
+                let entry_type = entry
+                    .file_type()
+                    .map_err(|_| SandboxUnavailableReason::AuthorityInspectionFailed)?;
+                if entry_type.is_socket()
+                    || entry_type.is_fifo()
+                    || entry_type.is_block_device()
+                    || entry_type.is_char_device()
+                {
+                    return Err(SandboxUnavailableReason::UnsafeSpecialNode);
+                }
+                if !entry_type.is_file() && !entry_type.is_symlink() && !entry_type.is_dir() {
+                    return Err(SandboxUnavailableReason::UnsafeSpecialNode);
+                }
                 // Count discoveries before queueing them so a single broad
                 // directory cannot allocate an unbounded pending list before
                 // the scan notices its entry limit.
@@ -1464,7 +1482,9 @@ fn inspect_authority_root(
                     .checked_add(1)
                     .filter(|count| *count <= MAX_AUTHORITY_SCAN_ENTRIES)
                     .ok_or(SandboxUnavailableReason::AuthorityInspectionFailed)?;
-                pending.push(entry.path());
+                if entry_type.is_dir() {
+                    pending.push(entry.path());
+                }
             }
         } else if !file_type.is_file() && !file_type.is_symlink() {
             return Err(SandboxUnavailableReason::UnsafeSpecialNode);
