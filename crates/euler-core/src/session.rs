@@ -1,5 +1,6 @@
 //! Session state machine: turn loop, tool dispatch, compaction integration.
 //! Justification for >1000 lines: session.rs owns the main turn lifecycle while focused subsystems are extracted.
+use crate::assistant_response::{AssistantResponseStatus, ResponseCheckpoint, ResponseChunk};
 use crate::canvas::{
     active_layer1_compacted_result_ids, assemble_canvas_prefolded,
     assemble_canvas_with_compaction_for_extensions, canvas_bytes, retention_stats,
@@ -531,6 +532,7 @@ where
     turn_state: &'a mut TurnState,
     rounds: &'a mut u64,
     cancellation: CancellationToken,
+    response_checkpoint: Option<ResponseCheckpoint>,
 }
 
 type RecordedToolCall = (ToolCall, String);
@@ -615,6 +617,27 @@ pub(super) fn add_provider_error_metadata(payload: &mut JsonObject, error: &Prov
     }
 }
 
+fn add_response_terminal_metadata(
+    payload: &mut JsonObject,
+    response_id: &str,
+    observed_output_bytes: Option<u64>,
+    status: AssistantResponseStatus,
+) {
+    let Some(observed_output_bytes) = observed_output_bytes else {
+        return;
+    };
+    payload.insert("response_id".to_owned(), response_id.into());
+    payload.insert("response_status".to_owned(), status.as_str().into());
+    payload.insert(
+        "observed_output_bytes".to_owned(),
+        observed_output_bytes.into(),
+    );
+    payload.insert(
+        "retained_content_bytes".to_owned(),
+        observed_output_bytes.into(),
+    );
+}
+
 impl<F, D> RoundLoopIo for SessionRoundIo<'_, '_, F, D>
 where
     F: FnMut(&EventEnvelope),
@@ -643,8 +666,11 @@ where
         target: &ModelTarget,
     ) -> Result<(String, ModelRequest), SessionError> {
         let cancellation = self.cancellation.clone();
-        self.session
-            .prepare_model_request(target, self.sink, &cancellation)
+        let prepared = self
+            .session
+            .prepare_model_request(target, self.sink, &cancellation)?;
+        self.response_checkpoint = Some(ResponseCheckpoint::new(prepared.0.clone()));
+        Ok(prepared)
     }
 
     fn invoke_model(
@@ -672,16 +698,41 @@ where
         &mut self,
         error: &ProviderError,
         model_call_id: String,
+        observed_output_bytes: Option<u64>,
     ) -> Result<String, SessionError> {
-        self.session.emit_provider_error(error, model_call_id)
+        self.session
+            .emit_provider_error_with_response(error, model_call_id, observed_output_bytes)
     }
 
-    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError> {
-        self.session.emit_with_parent(
-            EventKind::ERROR,
-            round_loop::model_call_cancelled_payload(),
-            Some(model_call_id),
-        )
+    fn emit_model_call_cancelled(
+        &mut self,
+        model_call_id: String,
+        observed_output_bytes: Option<u64>,
+    ) -> Result<String, SessionError> {
+        let mut payload = round_loop::model_call_cancelled_payload();
+        add_response_terminal_metadata(
+            &mut payload,
+            &model_call_id,
+            observed_output_bytes,
+            AssistantResponseStatus::Cancelled,
+        );
+        self.session
+            .emit_with_parent(EventKind::ERROR, payload, Some(model_call_id))
+    }
+
+    fn flush_response_checkpoints(
+        &mut self,
+        model_call_id: &str,
+    ) -> Result<Option<u64>, SessionError> {
+        let Some(checkpoint) = self.response_checkpoint.as_mut() else {
+            return Ok(None);
+        };
+        debug_assert_eq!(checkpoint.response_id(), model_call_id);
+        let chunks = checkpoint
+            .flush(Instant::now())
+            .map_err(std::io::Error::other)?;
+        self.session.emit_response_chunks(model_call_id, chunks)?;
+        Ok(checkpoint.has_text().then(|| checkpoint.observed_bytes()))
     }
 
     fn after_stream_event(
@@ -689,6 +740,17 @@ where
         event: &ModelStreamEvent,
         model_call_id: &str,
     ) -> Result<(), SessionError> {
+        if let ModelStreamEvent::TextDelta(delta) = event {
+            if let Some(checkpoint) = self.response_checkpoint.as_mut() {
+                debug_assert_eq!(checkpoint.response_id(), model_call_id);
+                let chunks = checkpoint
+                    .observe_text(delta, Instant::now())
+                    .map_err(std::io::Error::other)?;
+                // Checkpoints become durable before the runtime delta reaches
+                // the sink, so the first visible prefix cannot be ephemeral.
+                self.session.emit_response_chunks(model_call_id, chunks)?;
+            }
+        }
         self.session
             .record_stream_event(event, model_call_id, self.sink)
     }
@@ -709,21 +771,27 @@ where
             .stop_reason
             .as_ref()
             .expect("validated finished stream");
+        // Flush every visible text byte before any other fallible
+        // finalization write. A reasoning/result append failure may fence the
+        // writer, but lifecycle reopen must still recover the exact response
+        // prefix the user already saw.
+        let observed_output_bytes = self.flush_response_checkpoints(&model_call_id)?;
         for item in &data.reasoning {
             self.session
                 .emit_model_reasoning(item, &target, model_call_id.clone())?;
             self.sink.flush(self.session.bus.events());
         }
-        let model_result_id = self
-            .session
-            .emit_model_result(companion::ModelResultRecord {
+        let model_result_id = self.session.emit_model_result(
+            companion::ModelResultRecord {
                 content: &data.content,
                 tool_calls: &data.tool_calls,
                 stop_reason,
                 usage: data.usage.as_ref(),
                 target: &target,
-                parent: model_call_id,
-            })?;
+                parent: model_call_id.clone(),
+            },
+            observed_output_bytes,
+        )?;
         self.sink.flush(self.session.bus.events());
         self.session.record_latest_usage(data.usage.as_ref());
         self.session.service_compaction_request()?;
@@ -2334,6 +2402,7 @@ impl<D: PermissionDecider> Session<D> {
             turn_state: &mut turn_state,
             rounds: &mut rounds,
             cancellation: cancellation.clone(),
+            response_checkpoint: None,
         };
         let result = RoundLoop::new(
             &mut io,
@@ -3325,9 +3394,39 @@ impl<D: PermissionDecider> Session<D> {
     fn emit_model_result(
         &mut self,
         record: companion::ModelResultRecord<'_>,
+        observed_output_bytes: Option<u64>,
     ) -> Result<String, SessionError> {
-        let payload = companion::model_result_payload(&record, &self.providers);
+        let mut payload = companion::model_result_payload(&record, &self.providers);
+        add_response_terminal_metadata(
+            &mut payload,
+            &record.parent,
+            observed_output_bytes,
+            AssistantResponseStatus::Completed,
+        );
         self.emit_with_parent(EventKind::MODEL_RESULT, payload, Some(record.parent))
+    }
+
+    fn emit_response_chunks(
+        &mut self,
+        response_id: &str,
+        chunks: Vec<ResponseChunk>,
+    ) -> Result<(), SessionError> {
+        for chunk in chunks {
+            self.emit(
+                EventKind::ASSISTANT_RESPONSE_CHUNK,
+                object([
+                    ("response_id", response_id.to_owned().into()),
+                    ("sequence", chunk.sequence.into()),
+                    ("content", chunk.content.into()),
+                    ("observed_output_bytes", chunk.observed_output_bytes.into()),
+                    (
+                        "retained_content_bytes",
+                        chunk.retained_content_bytes.into(),
+                    ),
+                ]),
+            )?;
+        }
+        Ok(())
     }
 
     fn emit_model_delta(
@@ -3366,6 +3465,15 @@ impl<D: PermissionDecider> Session<D> {
         error: &ProviderError,
         model_call_id: String,
     ) -> Result<String, SessionError> {
+        self.emit_provider_error_with_response(error, model_call_id, None)
+    }
+
+    fn emit_provider_error_with_response(
+        &mut self,
+        error: &ProviderError,
+        model_call_id: String,
+        observed_output_bytes: Option<u64>,
+    ) -> Result<String, SessionError> {
         // Provider error text can echo request fragments (HTTP error bodies
         // quote what was sent); redact before it reaches the ledger and the
         // canvas (secrets contract, "error messages").
@@ -3374,6 +3482,12 @@ impl<D: PermissionDecider> Session<D> {
             ("message", self.redactor.redact(&error.to_string()).into()),
         ]);
         add_provider_error_metadata(&mut payload, error);
+        add_response_terminal_metadata(
+            &mut payload,
+            &model_call_id,
+            observed_output_bytes,
+            AssistantResponseStatus::Failed,
+        );
         self.emit_with_parent(EventKind::ERROR, payload, Some(model_call_id))
     }
 

@@ -3560,6 +3560,20 @@ fn run_turn_with_sink_forwards_events_in_returned_order() {
             .collect::<Vec<_>>()
     );
     assert_eq!(count_kind(&events, EventKind::MODEL_DELTA), 2);
+    let chunks = events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::ASSISTANT_RESPONSE_CHUNK)
+        .collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(payload_str(chunks[0], "content"), Some("hel"));
+    assert_eq!(payload_str(chunks[1], "content"), Some("lo"));
+    assert_eq!(chunks[0].payload["sequence"], json!(0));
+    assert_eq!(chunks[1].payload["sequence"], json!(1));
+    assert_eq!(chunks[1].payload["observed_output_bytes"], json!(5));
+    let result = find_kind(&events, EventKind::MODEL_RESULT);
+    assert_eq!(payload_str(result, "response_status"), Some("completed"));
+    assert_eq!(result.payload["observed_output_bytes"], json!(5));
+    assert_eq!(count_kind(&events, EventKind::ASSISTANT_MESSAGE), 1);
 }
 
 #[test]
@@ -3577,6 +3591,60 @@ fn run_turn_batch_wrapper_still_returns_turn_events() {
     assert!(events
         .iter()
         .any(|event| event.kind.as_str() == EventKind::ASSISTANT_MESSAGE));
+}
+
+#[test]
+fn text_checkpoint_terminalizes_on_tool_use_without_becoming_assistant_message() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "hello\n").expect("fixture");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![
+            vec![
+                Ok(ModelStreamEvent::TextDelta("I will read it.".to_owned())),
+                Ok(ModelStreamEvent::ToolCall(ToolCall {
+                    id: "read-1".to_owned(),
+                    name: "read_file".to_owned(),
+                    input: json!({"path": "note.txt"}),
+                })),
+                finished(StopReason::ToolUse),
+            ],
+            text_stream("done"),
+        ],
+        requests,
+    );
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    );
+
+    session.run_turn("read note").expect("turn");
+
+    let results = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::MODEL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert_eq!(payload_str(results[0], "stop_reason"), Some("tool_use"));
+    assert_eq!(
+        payload_str(results[0], "response_status"),
+        Some("completed")
+    );
+    assert_eq!(results[0].payload["observed_output_bytes"], json!(15));
+    assert_eq!(
+        payload_str(results[1], "response_status"),
+        Some("completed")
+    );
+    let messages = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::ASSISTANT_MESSAGE)
+        .filter_map(|event| payload_str(event, "content"))
+        .collect::<Vec<_>>();
+    assert_eq!(messages, vec!["done"]);
 }
 
 #[test]
@@ -3636,6 +3704,56 @@ fn cancel_mid_stream_returns_cancelled_without_consuming_rest() {
 }
 
 #[test]
+fn cancellation_flushes_every_visible_text_byte_before_terminal() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let next_count = Arc::new(AtomicUsize::new(0));
+    let provider = CountingStreamProvider::new(
+        vec![
+            Ok(ModelStreamEvent::TextDelta("first".to_owned())),
+            Ok(ModelStreamEvent::TextDelta(" second".to_owned())),
+            finished(StopReason::Completed),
+        ],
+        Arc::clone(&next_count),
+    );
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let sink_cancel = Arc::clone(&cancel);
+    let mut visible_deltas = 0;
+
+    let error = session
+        .run_turn_with_sink("cancel", cancel, |event| {
+            if event.kind.as_str() == EventKind::MODEL_DELTA {
+                visible_deltas += 1;
+                if visible_deltas == 2 {
+                    sink_cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        })
+        .expect_err("cancelled");
+
+    assert!(matches!(error, SessionError::Cancelled));
+    assert_eq!(next_count.load(Ordering::Relaxed), 2);
+    let persisted = logged_events(&log);
+    let kept = persisted
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::ASSISTANT_RESPONSE_CHUNK)
+        .filter_map(|event| payload_str(event, "content"))
+        .collect::<String>();
+    assert_eq!(kept, "first second");
+    let terminal = find_kind(&persisted, EventKind::ERROR);
+    assert_eq!(payload_str(terminal, "response_status"), Some("cancelled"));
+    assert_eq!(terminal.payload["observed_output_bytes"], json!(12));
+    assert_eq!(count_kind(&persisted, EventKind::MODEL_RESULT), 0);
+    assert_eq!(count_kind(&persisted, EventKind::ASSISTANT_MESSAGE), 0);
+}
+
+#[test]
 fn cancel_between_tool_rounds_skips_second_provider_invoke() {
     let temp = tempfile::tempdir().expect("temp dir");
     fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
@@ -3667,7 +3785,10 @@ fn cancel_between_tool_rounds_skips_second_provider_invoke() {
 
 #[test]
 fn partial_stream_error_forwards_deltas_then_provider_error() {
+    // Minimized issue #209 / 4F1 regression: text becomes visible, then the
+    // provider stream fails before a successful model result exists.
     let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
     let provider = RawStreamProvider::new(vec![
         Ok(ModelStreamEvent::TextDelta("one".to_owned())),
         Ok(ModelStreamEvent::TextDelta("two".to_owned())),
@@ -3677,7 +3798,8 @@ fn partial_stream_error_forwards_deltas_then_provider_error() {
         SessionConfig::new(temp.path()),
         provider,
         ScriptedDecider::new(vec![]),
-    );
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
     let cancel = Arc::new(AtomicBool::new(false));
     let mut delta_values = Vec::new();
     let mut saw_error = false;
@@ -3693,6 +3815,21 @@ fn partial_stream_error_forwards_deltas_then_provider_error() {
     assert!(matches!(error, SessionError::Provider(_)));
     assert_eq!(delta_values, vec!["one", "two"]);
     assert!(saw_error);
+
+    let persisted = logged_events(&log);
+    let chunks = persisted
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::ASSISTANT_RESPONSE_CHUNK)
+        .collect::<Vec<_>>();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(payload_str(chunks[0], "content"), Some("one"));
+    assert_eq!(payload_str(chunks[1], "content"), Some("two"));
+    assert_eq!(chunks[1].payload["observed_output_bytes"], json!(6));
+    let terminal = find_kind(&persisted, EventKind::ERROR);
+    assert_eq!(payload_str(terminal, "response_status"), Some("failed"));
+    assert_eq!(terminal.payload["observed_output_bytes"], json!(6));
+    assert_eq!(count_kind(&persisted, EventKind::MODEL_RESULT), 0);
+    assert_eq!(count_kind(&persisted, EventKind::ASSISTANT_MESSAGE), 0);
 }
 
 #[test]
@@ -6309,6 +6446,105 @@ fn scrub_expansion_preserves_the_shell_result_preview_budget() {
     assert!(preview.contains(&after.id), "{preview}");
 }
 
+#[test]
+fn live_scrub_reconciles_partial_response_content_and_byte_accounting() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let secret = "partial-secret-value".to_owned();
+    let original = format!("before {secret} after");
+    let provider = RawStreamProvider::new(vec![
+        Ok(ModelStreamEvent::TextDelta("before partial-".to_owned())),
+        Ok(ModelStreamEvent::TextDelta("secret-value after".to_owned())),
+        Err(ProviderError::transport("network closed")),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("provenance writer"));
+
+    session.run_turn("stream").expect_err("provider failure");
+    session
+        .scrub_live(std::slice::from_ref(&secret))
+        .expect("live scrub");
+
+    let projected = euler_core::project_assistant_response_terminals(session.events())
+        .expect("live projection remains valid");
+    let response = projected.values().next().expect("failed partial response");
+    assert_eq!(response.content, "[scrubbed][scrubbed]");
+    assert_eq!(response.observed_output_bytes, original.len() as u64);
+    assert_eq!(
+        response.retained_content_bytes,
+        response.content.len() as u64
+    );
+
+    let durable = euler_core::read_resume_prefix(&log).expect("durable scrubbed log");
+    let durable_projected = euler_core::project_assistant_response_terminals(&durable)
+        .expect("durable projection remains valid");
+    assert_eq!(durable_projected.values().next(), Some(response));
+}
+
+#[test]
+fn no_op_live_scrub_preserves_response_identity_and_projection() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let provider = RawStreamProvider::new(vec![
+        Ok(ModelStreamEvent::TextDelta("recoverable text".to_owned())),
+        Err(ProviderError::transport("network closed")),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("provenance writer"));
+
+    session.run_turn("stream").expect_err("provider failure");
+    let before_ids = session
+        .events()
+        .iter()
+        .map(|event| event.id.clone())
+        .collect::<Vec<_>>();
+    let before = euler_core::project_assistant_response_terminals(session.events())
+        .expect("valid response before scrub");
+    let response = before.values().next().expect("failed partial response");
+    let response_id = response.response_id.clone();
+    let observed = response.observed_output_bytes;
+    let retained = response.retained_content_bytes;
+    let raw_before = fs::read(&log).expect("raw log before no-op scrub");
+
+    let report = session
+        .scrub_live(std::slice::from_ref(&response_id))
+        .expect("response-identity-only scrub");
+
+    assert!(!report.anything_scrubbed(), "{report:?}");
+    assert!(report.audit_event_id.is_none());
+    assert_eq!(fs::read(&log).expect("raw log after scrub"), raw_before);
+    assert_eq!(
+        session
+            .events()
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>(),
+        before_ids
+    );
+    let after = euler_core::project_assistant_response_terminals(session.events())
+        .expect("valid live response after scrub");
+    assert_eq!(after, before);
+    let response = after.values().next().expect("live response");
+    assert_eq!(response.response_id, response_id);
+    assert_eq!(response.status, euler_core::AssistantResponseStatus::Failed);
+    assert_eq!(response.source, "provider");
+    assert_eq!(response.observed_output_bytes, observed);
+    assert_eq!(response.retained_content_bytes, retained);
+
+    let durable = euler_core::read_resume_prefix(&log).expect("durable log");
+    let durable = euler_core::project_assistant_response_terminals(&durable)
+        .expect("valid durable response after scrub");
+    assert_eq!(durable, before);
+}
+
 fn logged_kinds(path: &std::path::Path) -> Vec<String> {
     logged_events(path)
         .into_iter()
@@ -7502,6 +7738,10 @@ fn tool_free_max_tokens_round_with_partial_text_still_completes() {
         count_kind(session.events(), EventKind::ASSISTANT_MESSAGE),
         1
     );
+    let result = find_kind(session.events(), EventKind::MODEL_RESULT);
+    assert_eq!(result.payload["usage"], serde_json::Value::Null);
+    assert_eq!(result.payload["observed_output_bytes"], json!(14));
+    assert_eq!(payload_str(result, "response_status"), Some("completed"));
 }
 
 #[test]

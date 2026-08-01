@@ -114,6 +114,8 @@ pub enum ResumeError {
     Writer(#[from] crate::provenance::ProvenanceWriterError),
     #[error(transparent)]
     RuntimeIdentity(#[from] RuntimeIdentityError),
+    #[error(transparent)]
+    AssistantResponse(#[from] crate::assistant_response::AssistantResponseProtocolError),
 }
 
 /// Fold persisted session events into live core session state.
@@ -733,6 +735,7 @@ fn preflight_events(events: &[EventEnvelope]) -> Result<(), ResumeError> {
             return Err(ResumeError::DuplicateEventId);
         }
     }
+    crate::assistant_response::validate_and_find_open_drafts(events)?;
     Ok(())
 }
 
@@ -814,6 +817,7 @@ fn recovery_closures(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, Res
         open: bool,
     }
 
+    let open_drafts = open_response_draft_bytes(events)?;
     let mut calls = Vec::<ModelCallState<'_>>::new();
     for event in events {
         if event.kind.as_str() == EventKind::MODEL_CALL {
@@ -889,12 +893,30 @@ fn recovery_closures(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, Res
     let mut closures = calls
         .into_iter()
         .filter(|state| state.open)
-        .map(|state| model_recovery_closure(state.call))
+        .map(|state| {
+            model_recovery_closure(state.call, open_drafts.get(state.call.id.as_str()).copied())
+        })
         .collect::<Vec<_>>();
     if let Some(closure) = tool_recovery_closure(events) {
         closures.push(closure);
     }
     Ok(closures)
+}
+
+fn open_response_draft_bytes(
+    events: &[EventEnvelope],
+) -> Result<std::collections::HashMap<String, (u64, u64)>, ResumeError> {
+    Ok(
+        crate::assistant_response::validate_and_find_open_drafts(events)?
+            .into_iter()
+            .map(|draft| {
+                (
+                    draft.response_id,
+                    (draft.observed_output_bytes, draft.retained_content_bytes),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn duplicate_model_terminal(terminal: &EventEnvelope, call: &EventEnvelope) -> ResumeError {
@@ -921,7 +943,10 @@ fn model_terminal_metadata_matches(call: &EventEnvelope, terminal: &EventEnvelop
     payload_str(call, "purpose") == payload_str(terminal, "purpose")
 }
 
-fn model_recovery_closure(call: &EventEnvelope) -> EventEnvelope {
+fn model_recovery_closure(
+    call: &EventEnvelope,
+    response_bytes: Option<(u64, u64)>,
+) -> EventEnvelope {
     let mut payload = object([
         ("source", "session".into()),
         (
@@ -934,6 +959,18 @@ fn model_recovery_closure(call: &EventEnvelope) -> EventEnvelope {
     ]);
     if let Some(purpose) = call.payload.get("purpose").and_then(Value::as_str) {
         payload.insert("purpose".to_owned(), purpose.to_owned().into());
+    }
+    if let Some((observed_output_bytes, retained_content_bytes)) = response_bytes {
+        payload.insert("response_id".to_owned(), call.id.clone().into());
+        payload.insert("response_status".to_owned(), "interrupted".into());
+        payload.insert(
+            "observed_output_bytes".to_owned(),
+            observed_output_bytes.into(),
+        );
+        payload.insert(
+            "retained_content_bytes".to_owned(),
+            retained_content_bytes.into(),
+        );
     }
     EventEnvelope::new(
         call.session.clone(),

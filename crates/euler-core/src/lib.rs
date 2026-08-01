@@ -4,6 +4,7 @@
 use euler_event::EventEnvelope;
 
 pub mod apply_patch;
+pub mod assistant_response;
 pub mod auth_storage;
 pub mod canvas;
 pub mod checkpoints;
@@ -37,6 +38,11 @@ pub mod tools;
 pub use apply_patch::{
     apply_patch_update_chunks, parse_single_file_apply_patch, ApplyPatchChunk, ApplyPatchDocument,
     ApplyPatchError,
+};
+pub use assistant_response::{
+    project_assistant_response_terminals, AssistantResponseProjection,
+    AssistantResponseProtocolError, AssistantResponseStatus, AssistantResponseTerminal,
+    MAX_RESPONSE_CHUNK_BYTES, RESPONSE_CHECKPOINT_INTERVAL,
 };
 pub use auth_storage::{
     AuthError, AuthSource, AuthState, AuthStatus, AuthStorage, Credential, SecretString,
@@ -154,17 +160,20 @@ impl EventBus {
     /// re-persisting a value already removed from the durable log. Event ids
     /// and order are untouched. Returns the total replacements made.
     pub fn scrub_payloads(&mut self, secrets: &[String]) -> usize {
+        let protect_response_protocol =
+            assistant_response::validate_and_find_open_drafts(&self.events).is_ok();
         let mut count = 0;
         for event in &mut self.events {
-            count += redaction::scrub_secrets_in_object(&mut event.payload, secrets);
+            count += redaction::scrub_event_payload(event, secrets, protect_response_protocol);
         }
         count
     }
 
     /// Align the live bus with a successful durable scrub. Full tool-result
     /// payloads stay in memory (the writer externalizes only its clone), while
-    /// content-addressed pointers are copied from the rewritten log and the
-    /// log-only resume marker remains excluded.
+    /// rewritten routing fields, response byte accounting, and
+    /// content-addressed pointers are copied from the log. The log-only resume
+    /// marker remains excluded.
     pub(crate) fn reconcile_scrubbed_log(&mut self, durable: &[EventEnvelope], secrets: &[String]) {
         self.scrub_payloads(secrets);
         let durable_by_id = durable
@@ -178,6 +187,14 @@ impl EventBus {
             event.blobs.clone_from(&rewritten.blobs);
             match event.kind.as_str() {
                 euler_event::EventKind::EXTENSION_ARTIFACT => {
+                    event.payload.clone_from(&rewritten.payload);
+                }
+                euler_event::EventKind::ASSISTANT_RESPONSE_CHUNK => {
+                    event.payload.clone_from(&rewritten.payload);
+                }
+                euler_event::EventKind::MODEL_RESULT | euler_event::EventKind::ERROR
+                    if rewritten.payload.contains_key("response_id") =>
+                {
                     event.payload.clone_from(&rewritten.payload);
                 }
                 euler_event::EventKind::FILE_CHANGE => {

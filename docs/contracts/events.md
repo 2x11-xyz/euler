@@ -35,6 +35,7 @@ authority.
 - `user.message`
 - `assistant.message`
 - `assistant.activity`
+- `assistant.response.chunk`
 - `plan.update`
 - `tool.call`
 - `tool.result`
@@ -145,6 +146,23 @@ envelope `v` per `docs/contracts/persistence.md`.
   round, the terminal transaction closes the steering group without persisting
   queued steering; rows submitted before that close remain deferred, and rows
   submitted after it are ordinary follow-ups.
+- `assistant.response.chunk`: a durable, append-only text checkpoint for one
+  root-driver response. `response_id` is the owning `model.call` envelope id;
+  `sequence` starts at zero and is contiguous; `content` is nonempty UTF-8 text
+  of at most 16 KiB; `observed_output_bytes` is the immutable cumulative UTF-8
+  byte count received from the provider through that chunk, while
+  `retained_content_bytes` is the checked cumulative byte count of the
+  reconstructable stored text. They are equal when emitted; an explicit
+  secret scrub may rewrite only the retained count along with content. Only
+  provider-neutral text deltas enter this event. Reasoning, tool calls,
+  provider-control signals, and transport bytes are forbidden. The first
+  nonempty text delta is durable before its
+  runtime-only `model.delta` can reach the UI. Later text is checkpointed at
+  the byte bound and opportunistically when another delta arrives after one
+  second; this is not a wall-clock guarantee while a stream is blocked inside
+  its reader. A handled result, failure, or cancellation synchronously flushes
+  the remaining observed suffix before its canonical terminal. Large content
+  may be content-addressed and is rehydrated at the session boundary.
 - `model.call`: `provider`, `model`, `canvas_items`,
   `requested_reasoning_effort`; optional resolved `reasoning_effort`,
   `max_output_tokens`, and `project_context_digest`. A root-driver call also
@@ -421,6 +439,15 @@ envelope `v` per `docs/contracts/persistence.md`.
   returned; the canonical execution truth is the subsequent `tool.call` /
   `tool.result` events, and replay request-building reads those, never
   `model.result.tool_calls`.
+  Every new result also records `observed_output_bytes`, derived locally from
+  its UTF-8 content even when provider usage is unavailable. A result that
+  terminalizes a checkpointed root response additionally carries the same
+  `response_id`, `response_status: "completed"`, immutable observed count, and
+  current `retained_content_bytes`.
+  A checkpointed provider failure, cancellation, or resume recovery closure
+  carries those fields on its canonical `error` with status `failed`,
+  `cancelled`, or `interrupted` respectively. These terminal fields must match
+  the direct root call parent, actor, session, and final chunk byte count.
 - `model.reasoning`: `provider`, `model`, `fidelity`
   (`raw` | `summary` | `opaque`), `content` (empty for opaque),
   optional provider-opaque `artifact` (signature/encrypted item,
@@ -777,6 +804,9 @@ envelope `v` per `docs/contracts/persistence.md`.
   writer-owned linear spine and may parent preceding reasoning or another
   reviewer's event. Model terminal identity is governed only by the
   authoritative association rule in the `model.call` schema above.
+- `assistant.response.chunk` follows the durable writer spine. Its
+  `response_id`, rather than its linear `parent`, associates it with the
+  same-session, same-agent root-driver `model.call`.
 - `assistant.message` parents its `model.result`.
 - `model.switched`, `model.effort.changed`, `context.limit`,
   `context.slot.updated`, `canvas.policy.changed`, `canvas.swap`, and
@@ -835,6 +865,21 @@ Cardinality and ordering invariants:
   resume rejects a second semantic terminal instead of normalizing it away;
 - zero or more `model.reasoning` events per `model.call`, emitted in
   provider order before its terminal event;
+- zero or more `assistant.response.chunk` events per eligible root-driver
+  `model.call`, with one contiguous sequence and monotonically exact retained
+  byte accounting plus a strictly increasing immutable observed count. Chunks
+  after a terminal, child/compaction chunks, crossed-actor
+  chunks, duplicate terminals, and terminal byte mismatches make the prefix
+  incompatible and resume fails before mutation. Eligibility is derived from
+  an exact reference to the call actor's latest preceding valid purpose-free
+  driver `canvas.snapshot`, in the same session and with matching
+  `canvas_items`. This request-backed authority deliberately does not anchor to
+  the actor on `session.start`: a legacy session may resume under the current
+  configured root actor, and the audit-only `session.resumed` marker is absent
+  from the live event bus. Canonical child, reviewer, shadow, and compaction
+  calls do not carry this root-driver link; a crossed-actor link, stale/future
+  snapshot, or duplicate envelope id cannot authorize checkpoint prose for
+  resume or transcript projection;
 - `assistant.message` is emitted after its `model.result`, and only for
   model rounds that finish without tool calls. It does not by itself prove
   that the user turn ended: pending steering or an accepted same-turn idle

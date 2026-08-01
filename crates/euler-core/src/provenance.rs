@@ -464,6 +464,7 @@ fn externalized_payload_fields(event: &EventEnvelope) -> &'static [&'static str]
         EventKind::USER_MESSAGE if event.payload.contains_key("skill_activation") => {
             &["model_content"]
         }
+        EventKind::ASSISTANT_RESPONSE_CHUNK => &["content"],
         EventKind::PATCH_PROPOSED | EventKind::PATCH_APPLIED => &["old", "new"],
         // The admitted manifest is one top-level payload string; above the
         // threshold that complete string becomes one content-addressed blob

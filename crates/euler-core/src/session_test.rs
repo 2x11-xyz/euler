@@ -1,4 +1,5 @@
 use super::*;
+use crate::durability::fault::{arm_matching, Op};
 use crate::extensions::ExtensionHostError;
 use crate::permissions::ScriptedDecider;
 
@@ -24,7 +25,7 @@ use crate::read_provenance;
 use crate::{probe_workspace_sandbox, SandboxProfile, SubprocessSandbox};
 use euler_provider::{
     FixtureResponse, ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent,
-    ProviderError, ProviderStream, ScriptedProvider, StopReason, Usage,
+    ProviderError, ProviderStream, ScriptedProvider, ScriptedStreamStep, StopReason, Usage,
 };
 use euler_sdk::{
     ArtifactWrite, CommandContext, CommandDescriptor, CommandRegistrar, Extension,
@@ -87,6 +88,125 @@ fn max_output_tokens_propagates_to_model_request_and_model_call() {
         .find(|event| event.kind.as_str() == EventKind::MODEL_CALL)
         .expect("model.call");
     assert_eq!(model_call.payload["max_output_tokens"], json!(42));
+}
+
+#[test]
+fn ambiguous_checkpoint_append_is_not_shown_or_reused_until_reopen() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "visible only if durable".to_owned(),
+        )]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("writer"));
+    let matched_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| {
+        path == matched_log
+            && std::fs::read_to_string(path).is_ok_and(|raw| {
+                raw.lines()
+                    .last()
+                    .is_some_and(|line| line.contains("assistant.response.chunk"))
+            })
+    });
+    let mut shown = Vec::new();
+
+    let error = session
+        .run_turn_with_sink("answer", Arc::new(AtomicBool::new(false)), |event| {
+            shown.push(event.kind.to_string());
+        })
+        .expect_err("checkpoint sync is ambiguous");
+
+    assert!(matches!(error, SessionError::Io(_)));
+    assert!(guard.fired(), "checkpoint log sync fault must fire");
+    assert!(!shown.iter().any(|kind| kind == EventKind::MODEL_DELTA));
+    assert!(!shown
+        .iter()
+        .any(|kind| kind == EventKind::ASSISTANT_RESPONSE_CHUNK));
+    drop(guard);
+    assert!(
+        session
+            .run_turn("cannot continue on fenced writer")
+            .is_err(),
+        "a new run must not reinterpret the unresolved checkpoint append"
+    );
+    drop(session);
+
+    let resumed = crate::resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("lifecycle reopen reconciles the physical checkpoint");
+    let closure = resumed
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && event
+                    .payload
+                    .get("response_status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("interrupted")
+        })
+        .expect("interrupted response closure");
+    assert_eq!(closure.payload["observed_output_bytes"], json!(23));
+}
+
+#[test]
+fn reasoning_append_failure_cannot_lose_a_visible_checkpoint_suffix() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::Stream(vec![
+        ScriptedStreamStep::Event(ModelStreamEvent::ReasoningDelta(ReasoningChunk::summary(
+            "final rationale",
+        ))),
+        ScriptedStreamStep::Event(ModelStreamEvent::TextDelta("durable".to_owned())),
+        ScriptedStreamStep::Event(ModelStreamEvent::TextDelta(" pending".to_owned())),
+        ScriptedStreamStep::Event(ModelStreamEvent::Finished {
+            stop_reason: StopReason::Completed,
+            usage: None,
+        }),
+    ])]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("writer"));
+    let matched_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| {
+        path == matched_log
+            && std::fs::read_to_string(path).is_ok_and(|raw| {
+                raw.lines()
+                    .last()
+                    .is_some_and(|line| line.contains("model.reasoning"))
+            })
+    });
+
+    let error = session
+        .run_turn("answer")
+        .expect_err("reasoning sync becomes ambiguous");
+    assert!(matches!(error, SessionError::Io(_)));
+    assert!(guard.fired(), "reasoning sync fault must fire");
+    drop(guard);
+    drop(session);
+
+    let resumed = crate::resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("reopen accepted response prefix");
+    let projected = crate::project_assistant_response_terminals(resumed.events())
+        .expect("recovered response protocol");
+    let response = projected.values().next().expect("interrupted response");
+    assert_eq!(response.status, AssistantResponseStatus::Interrupted);
+    assert_eq!(response.content, "durable pending");
 }
 
 #[test]

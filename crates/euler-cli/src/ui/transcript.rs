@@ -4,6 +4,10 @@ use super::theme::Theme;
 use crate::ui::markdown_stream::MarkdownStreamCollector;
 use chrono::{DateTime, Local};
 use euler_core::canvas::projected_tool_output;
+use euler_core::{
+    project_assistant_response_terminals, AssistantResponseProjection, AssistantResponseStatus,
+    AssistantResponseTerminal,
+};
 use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use euler_sdk::{
     validate_plan_presentation, PlanItemStatus, PlanPresentation, PlanPresentationItem,
@@ -66,6 +70,13 @@ pub enum TranscriptItem {
     TurnSeparator,
     UserMessage(String),
     AssistantMessage(String),
+    IncompleteAssistantResponse {
+        content: String,
+        status: String,
+        observed_output_bytes: u64,
+        source: String,
+        message: String,
+    },
     AssistantActivity(String),
     PlanUpdate(PlanUpdateView),
     ModelCall {
@@ -361,6 +372,41 @@ enum ToolCallProjection {
     Edit { path: String },
 }
 
+fn incomplete_response_item(terminal: &AssistantResponseTerminal) -> Option<TranscriptItem> {
+    if terminal.status == AssistantResponseStatus::Completed {
+        return None;
+    }
+    Some(TranscriptItem::IncompleteAssistantResponse {
+        content: terminal.content.clone(),
+        status: terminal.status.as_str().to_owned(),
+        observed_output_bytes: terminal.observed_output_bytes,
+        source: terminal.source.clone(),
+        message: terminal.message.clone(),
+    })
+}
+
+#[derive(Clone, Debug)]
+struct TranscriptResponseProjection(Option<AssistantResponseProjection>);
+
+impl Default for TranscriptResponseProjection {
+    fn default() -> Self {
+        Self(Some(AssistantResponseProjection::default()))
+    }
+}
+
+impl TranscriptResponseProjection {
+    fn ingest(&mut self, event: &EventEnvelope) -> Option<TranscriptItem> {
+        let result = self.0.as_mut()?.ingest(event);
+        match result {
+            Ok(terminal) => terminal.as_ref().and_then(incomplete_response_item),
+            Err(_) => {
+                self.0 = None;
+                None
+            }
+        }
+    }
+}
+
 /// Causally coalesces an extension model tool's successful result into the
 /// canonical plan cell emitted during that invocation. Provenance retains the
 /// full tool.call → plan.update → tool.result braid; this fold is presentation
@@ -459,23 +505,30 @@ pub fn project_events(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
     let checkpoint_ids = checkpoint_event_ids(events);
     let mut spawn_times: HashMap<String, String> = HashMap::new();
     let mut items = Vec::new();
+    let response_terminals = project_assistant_response_terminals(events).unwrap_or_default();
     for event in events {
+        if event.kind.as_str() == EventKind::ASSISTANT_RESPONSE_CHUNK {
+            continue;
+        }
         if event.kind.as_str() == EventKind::AGENT_SPAWN {
             spawn_times.insert(event.id.clone(), event.ts.clone());
         }
-        let item = match event.kind.as_str() {
-            EventKind::AGENT_MESSAGE => {
-                let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
-                project_agent_message(event, spawn_ts)
-                    .or_else(|| project_event_with_checkpoints(event, &checkpoint_ids))
-            }
-            EventKind::AGENT_RESULT => {
-                let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
-                project_agent_result(event, spawn_ts)
-                    .or_else(|| project_event_with_checkpoints(event, &checkpoint_ids))
-            }
-            _ => project_event_with_checkpoints(event, &checkpoint_ids),
-        };
+        let item = response_terminals
+            .get(&event.id)
+            .and_then(incomplete_response_item)
+            .or_else(|| match event.kind.as_str() {
+                EventKind::AGENT_MESSAGE => {
+                    let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
+                    project_agent_message(event, spawn_ts)
+                        .or_else(|| project_event_with_checkpoints(event, &checkpoint_ids))
+                }
+                EventKind::AGENT_RESULT => {
+                    let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
+                    project_agent_result(event, spawn_ts)
+                        .or_else(|| project_event_with_checkpoints(event, &checkpoint_ids))
+                }
+                _ => project_event_with_checkpoints(event, &checkpoint_ids),
+            });
         if let Some(item) = item {
             push_tui_item(&mut items, item);
         }
@@ -681,7 +734,8 @@ impl TranscriptState {
 
     pub fn last_visible_assistant_response(&self) -> Option<String> {
         self.items().into_iter().rev().find_map(|item| match item {
-            TranscriptItem::AssistantMessage(content) => Some(content),
+            TranscriptItem::AssistantMessage(content)
+            | TranscriptItem::IncompleteAssistantResponse { content, .. } => Some(content),
             _ => None,
         })
     }
@@ -1088,6 +1142,9 @@ struct StreamProjection {
     event_ts_by_id: HashMap<String, String>,
     /// Causal fold for extension plan-tool presentation coalescing.
     plan_tools: ExtensionPlanCoalescer,
+    /// Shared core-owned response grammar. `None` means the accepted prefix
+    /// was incompatible, so no response checkpoint text is projected.
+    response_projection: TranscriptResponseProjection,
     /// Projection of the most recently ingested event, computed exactly once
     /// at ingest — repeated reads can never re-project (or re-count) it.
     latest_item: Option<TranscriptItem>,
@@ -1098,8 +1155,9 @@ impl StreamProjection {
     /// everything ingested before it, then folds the event into that context
     /// for the events after it. Call exactly once per appended event.
     fn ingest(&mut self, event: &EventEnvelope) {
+        let response_item = self.response_projection.ingest(event);
         let hide_tool_result = self.plan_tools.ingest(event);
-        self.latest_item = self.project(event, hide_tool_result);
+        self.latest_item = response_item.or_else(|| self.project(event, hide_tool_result));
         if event.kind.as_str() == EventKind::AGENT_SPAWN {
             if let Some(child) = payload_string(event, "child_agent_id") {
                 self.child_agents.insert(child);
@@ -1172,6 +1230,9 @@ impl StreamProjection {
 #[cfg(test)]
 pub(crate) fn replay_latest_event_for_ui(events: &[EventEnvelope]) -> Option<TranscriptItem> {
     let (latest, earlier) = events.split_last()?;
+    let response_item = project_assistant_response_terminals(events)
+        .ok()
+        .and_then(|terminals| terminals.get(&latest.id).and_then(incomplete_response_item));
     if is_child_agent_event(latest, earlier) {
         return None;
     }
@@ -1180,6 +1241,9 @@ pub(crate) fn replay_latest_event_for_ui(events: &[EventEnvelope]) -> Option<Tra
     }
     if let Some(item) = model_result_fallback_item(latest) {
         return Some(item);
+    }
+    if response_item.is_some() {
+        return response_item;
     }
     let mut calls = HashMap::new();
     let mut plan_tools = ExtensionPlanCoalescer::default();
@@ -1353,8 +1417,12 @@ fn project_tui_entries_with_clock(events: &[EventEnvelope]) -> (Vec<ProjectedEnt
     let mut user_turns = 0usize;
     let mut child_agents: HashMap<String, String> = HashMap::new();
     let mut spawn_times: HashMap<String, String> = HashMap::new();
+    let response_terminals = project_assistant_response_terminals(events).unwrap_or_default();
     let mut clock = TimingClock::default();
     for (index, event) in events.iter().enumerate() {
+        if event.kind.as_str() == EventKind::ASSISTANT_RESPONSE_CHUNK {
+            continue;
+        }
         let hide_tool_result = plan_tools.ingest(event);
         if event.kind.as_str() == EventKind::AGENT_SPAWN {
             if let Some(child) = payload_string(event, "child_agent_id") {
@@ -1375,6 +1443,14 @@ fn project_tui_entries_with_clock(events: &[EventEnvelope]) -> (Vec<ProjectedEnt
                 let timing = clock.stamp_at(&event.ts);
                 push_tui_entry(&mut entries, item, timing);
             }
+            continue;
+        }
+        if let Some(item) = response_terminals
+            .get(&event.id)
+            .and_then(incomplete_response_item)
+        {
+            let timing = clock.stamp_at(&event.ts);
+            push_tui_entry(&mut entries, item, timing);
             continue;
         }
         let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);

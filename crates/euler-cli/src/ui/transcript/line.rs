@@ -5,6 +5,9 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         | super::TranscriptItem::ModelReasoningLive { .. } => String::new(),
         super::TranscriptItem::UserMessage(content) => format!("user: {content}\n"),
         super::TranscriptItem::AssistantMessage(content) => format!("assistant: {content}\n"),
+        super::TranscriptItem::IncompleteAssistantResponse { .. } => {
+            line_oriented_incomplete_response(item)
+        }
         super::TranscriptItem::AssistantActivity(content) => {
             format!("assistant.activity: {content}\n")
         }
@@ -77,6 +80,22 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::Error { source, message } => format!("error: {source}: {message}\n"),
         super::TranscriptItem::Notice(message) => format!("notice: {message}\n"),
     }
+}
+
+fn line_oriented_incomplete_response(item: &super::TranscriptItem) -> String {
+    let super::TranscriptItem::IncompleteAssistantResponse {
+        content,
+        status,
+        observed_output_bytes,
+        source,
+        message,
+    } = item
+    else {
+        unreachable!("caller selects incomplete responses")
+    };
+    format!(
+        "assistant.partial: {status} after {observed_output_bytes} bytes: {content}\nerror: {source}: {message}\n"
+    )
 }
 
 fn line_oriented_plan_update(update: &super::PlanUpdateView) -> String {

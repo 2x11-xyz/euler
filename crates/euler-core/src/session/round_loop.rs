@@ -130,8 +130,22 @@ pub(crate) trait RoundLoopIo {
         &mut self,
         error: &ProviderError,
         model_call_id: String,
+        observed_output_bytes: Option<u64>,
     ) -> Result<String, SessionError>;
-    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError>;
+    fn emit_model_call_cancelled(
+        &mut self,
+        model_call_id: String,
+        observed_output_bytes: Option<u64>,
+    ) -> Result<String, SessionError>;
+    /// Persist every text suffix observed so far before a handled failure or
+    /// cancellation becomes visible. Non-root loops have no user-visible
+    /// response draft and retain the default no-op.
+    fn flush_response_checkpoints(
+        &mut self,
+        _model_call_id: &str,
+    ) -> Result<Option<u64>, SessionError> {
+        Ok(None)
+    }
     fn after_stream_event(
         &mut self,
         event: &ModelStreamEvent,
@@ -236,32 +250,42 @@ where
         let target = self.io.target();
         let (model_call_id, request) = self.io.prepare_model_request(&target)?;
         let started = Instant::now();
-        let data = match self.collect_model_round(&target, &model_call_id, request, cancellation) {
+        let mut progress = ModelCallProgress::default();
+        let data = match self.collect_model_round(
+            &target,
+            &model_call_id,
+            request,
+            cancellation,
+            &mut progress,
+        ) {
             Ok(data) => data,
             Err(error) => {
-                crate::diagnostics::model_call_end(
-                    self.io.session_id(),
-                    &target.provider,
-                    &target.model,
-                    elapsed_ms(started),
-                    None,
-                    false,
-                );
+                crate::diagnostics::model_call_end(crate::diagnostics::ModelCallEnd {
+                    session_id: self.io.session_id(),
+                    provider: &target.provider,
+                    model: &target.model,
+                    duration_ms: elapsed_ms(started),
+                    usage: None,
+                    observed_output_bytes: progress.observed_output_bytes,
+                    ok: false,
+                });
                 if matches!(&error, SessionError::Cancelled) {
-                    self.io.emit_model_call_cancelled(model_call_id)?;
+                    let observed = self.io.flush_response_checkpoints(&model_call_id)?;
+                    self.io.emit_model_call_cancelled(model_call_id, observed)?;
                     self.io.flush_events();
                 }
                 return Err(error);
             }
         };
-        crate::diagnostics::model_call_end(
-            self.io.session_id(),
-            &target.provider,
-            &target.model,
-            elapsed_ms(started),
-            data.usage.as_ref(),
-            true,
-        );
+        crate::diagnostics::model_call_end(crate::diagnostics::ModelCallEnd {
+            session_id: self.io.session_id(),
+            provider: &target.provider,
+            model: &target.model,
+            duration_ms: elapsed_ms(started),
+            usage: data.usage.as_ref(),
+            observed_output_bytes: u64::try_from(data.content.len()).unwrap_or(u64::MAX),
+            ok: true,
+        });
         self.io.finish_round(
             target,
             model_call_id,
@@ -277,16 +301,17 @@ where
         model_call_id: &str,
         request: ModelRequest,
         cancellation: &CancellationToken,
+        progress: &mut ModelCallProgress,
     ) -> Result<ModelRoundData, SessionError> {
         let mut attempt = 0usize;
         loop {
-            let mut provider_neutral_progress = false;
+            progress.provider_neutral_progress = false;
             let error = match self.collect_model_round_attempt(
                 target,
                 model_call_id,
                 request.clone(),
                 cancellation,
-                &mut provider_neutral_progress,
+                progress,
             ) {
                 Ok(data) => return Ok(data),
                 Err(AttemptFailure::Session(error)) => return Err(error),
@@ -294,13 +319,20 @@ where
             };
             let retryable = provider_failure_is_retryable(
                 &error,
-                provider_neutral_progress,
+                progress.provider_neutral_progress,
                 attempt,
                 self.config.provider_retries,
             );
             if !retryable {
+                let observed = self
+                    .io
+                    .flush_response_checkpoints(model_call_id)?
+                    .or_else(|| {
+                        (progress.observed_output_bytes > 0)
+                            .then_some(progress.observed_output_bytes)
+                    });
                 self.io
-                    .emit_provider_error(&error, model_call_id.to_owned())?;
+                    .emit_provider_error(&error, model_call_id.to_owned(), observed)?;
                 self.io.flush_events();
                 return Err(error.into());
             }
@@ -339,7 +371,7 @@ where
         model_call_id: &str,
         request: ModelRequest,
         cancellation: &CancellationToken,
-        provider_neutral_progress: &mut bool,
+        progress: &mut ModelCallProgress,
     ) -> Result<ModelRoundData, AttemptFailure> {
         let mut stream = match self.io.invoke_model(target, request) {
             Ok(stream) => stream,
@@ -359,7 +391,12 @@ where
                 Ok(event) => event,
                 Err(error) => return Err(AttemptFailure::Provider(error)),
             };
-            *provider_neutral_progress |= event.is_provider_neutral_progress();
+            progress.provider_neutral_progress |= event.is_provider_neutral_progress();
+            if let ModelStreamEvent::TextDelta(delta) = &event {
+                progress.observed_output_bytes = progress
+                    .observed_output_bytes
+                    .saturating_add(u64::try_from(delta.len()).unwrap_or(u64::MAX));
+            }
             self.io
                 .after_stream_event(&event, model_call_id)
                 .map_err(AttemptFailure::Session)?;
@@ -376,6 +413,12 @@ where
         }
         Ok(data)
     }
+}
+
+#[derive(Default)]
+struct ModelCallProgress {
+    provider_neutral_progress: bool,
+    observed_output_bytes: u64,
 }
 
 pub(crate) fn model_call_cancelled_payload() -> JsonObject {
@@ -503,6 +546,8 @@ mod tests {
         provider_runtime_observer: ProviderRuntimeObserver,
         boundary_calls: usize,
         limit_calls: usize,
+        stream: Option<Vec<Result<ModelStreamEvent, ProviderError>>>,
+        observed_error_bytes: Option<u64>,
     }
 
     impl RoundLoopIo for CancelAfterCompletedRound {
@@ -546,6 +591,9 @@ mod tests {
             _target: &ModelTarget,
             _request: ModelRequest,
         ) -> Result<ProviderStream, ProviderError> {
+            if let Some(stream) = self.stream.take() {
+                return Ok(Box::new(stream.into_iter()));
+            }
             Ok(Box::new(
                 vec![
                     Ok(ModelStreamEvent::ToolCall(ToolCall {
@@ -566,13 +614,16 @@ mod tests {
             &mut self,
             _error: &ProviderError,
             _model_call_id: String,
+            observed_output_bytes: Option<u64>,
         ) -> Result<String, SessionError> {
-            unreachable!("the scripted stream succeeds")
+            self.observed_error_bytes = observed_output_bytes;
+            Ok("provider-error".to_owned())
         }
 
         fn emit_model_call_cancelled(
             &mut self,
             _model_call_id: String,
+            _observed_output_bytes: Option<u64>,
         ) -> Result<String, SessionError> {
             unreachable!("cancellation happens between rounds")
         }
@@ -626,6 +677,8 @@ mod tests {
             provider_runtime_observer: ProviderRuntimeObserver::default(),
             boundary_calls: 0,
             limit_calls: 0,
+            stream: None,
+            observed_error_bytes: None,
         };
 
         let result = RoundLoop::new(
@@ -641,5 +694,35 @@ mod tests {
         assert!(matches!(result, Err(SessionError::Cancelled)));
         assert_eq!(io.boundary_calls, 0);
         assert_eq!(io.limit_calls, 0);
+    }
+
+    #[test]
+    fn failed_loop_without_response_checkpoint_retains_observed_text_byte_count() {
+        let cancellation = CancellationSource::new();
+        let token = cancellation.token();
+        let mut io = CancelAfterCompletedRound {
+            cancellation,
+            provider_runtime_observer: ProviderRuntimeObserver::default(),
+            boundary_calls: 0,
+            limit_calls: 0,
+            stream: Some(vec![
+                Ok(ModelStreamEvent::TextDelta("partial text".to_owned())),
+                Err(ProviderError::transport("stream closed")),
+            ]),
+            observed_error_bytes: None,
+        };
+
+        let result = RoundLoop::new(
+            &mut io,
+            RoundLoopConfig {
+                max_rounds: Some(1),
+                provider_retries: 0,
+                provider_retry_backoff_ms: Vec::new(),
+            },
+        )
+        .run(&token);
+
+        assert!(matches!(result, Err(SessionError::Provider(_))));
+        assert_eq!(io.observed_error_bytes, Some(12));
     }
 }

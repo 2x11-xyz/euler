@@ -86,6 +86,26 @@ and blob directory have both synced. A matching content-addressed blob is
 re-synced together with its directory on every retry: matching bytes establish
 identity but cannot prove that an earlier rename survived a failed directory
 sync.
+
+Streamed root-assistant text uses ordinary durable
+`assistant.response.chunk` appends. If a checkpoint append becomes ambiguous,
+its text is not forwarded to the live UI and the writer fences unrelated
+activity; lifecycle reopen is the recovery boundary. A physically complete
+checkpoint is then accepted once and the open call receives an interrupted
+recovery terminal. Chunk content above the blob threshold is content-addressed
+and rehydrated for replay. Secret scrub rewrites chunk and terminal
+`retained_content_bytes` together so the scrubbed stream remains
+protocol-valid; immutable `observed_output_bytes` remains the original local
+observation. Chunks are one logical scrub surface: if an explicit secret spans
+a chunk boundary, or ordinary marker expansion would exceed the per-chunk byte
+bound, every chunk in that response is conservatively replaced by the scrub
+marker. Event ids, ordering, chunk count, and size bounds remain valid without
+retaining a reconstructable secret. Seam detection retains only a suffix
+bounded by the longest literal or JSON-escaped scrub value; it never copies an
+unbounded response into a second aggregate buffer. Externalized chunks in a
+collapsed response are staged through the ordinary content-addressed rewrite
+transaction: every reference moves to the durable scrub marker before each old
+hash is sanitized and retired.
 Opening a log with a readable final fragment may recover its newline-terminated
 prefix for inspection, but the raw-length mismatch fences every new append.
 

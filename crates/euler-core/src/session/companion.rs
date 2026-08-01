@@ -999,6 +999,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         &mut self,
         error: &ProviderError,
         model_call_id: String,
+        _observed_output_bytes: Option<u64>,
     ) -> Result<String, SessionError> {
         // Same chokepoint as the parent session: provider error text can
         // echo request fragments (secrets contract, "error messages").
@@ -1012,7 +1013,11 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
             .id)
     }
 
-    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError> {
+    fn emit_model_call_cancelled(
+        &mut self,
+        model_call_id: String,
+        _observed_output_bytes: Option<u64>,
+    ) -> Result<String, SessionError> {
         Ok(self
             .append(
                 EventKind::ERROR,
@@ -1235,6 +1240,12 @@ pub(super) fn model_result_payload(
         ("tool_calls", calls.into()),
         ("stop_reason", record.stop_reason.as_str().into()),
         ("usage", usage_payload(record.usage)),
+        (
+            "observed_output_bytes",
+            u64::try_from(record.content.len())
+                .unwrap_or(u64::MAX)
+                .into(),
+        ),
     ]);
     if let Some(cost) = model_cost_payload(providers, record.target, record.usage) {
         payload.insert("cost".to_owned(), cost);

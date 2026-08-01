@@ -194,6 +194,43 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             TranscriptItem::AssistantMessage(content) => {
                 lines.extend(render_assistant_prose(content, theme, width));
             }
+            TranscriptItem::IncompleteAssistantResponse {
+                content,
+                status,
+                observed_output_bytes,
+                source,
+                message,
+            } => {
+                lines.extend(render_assistant_prose(content, theme, width));
+                push_wrapped(
+                    &mut lines,
+                    blank_gutter(),
+                    &format!(
+                        "Incomplete response — {status} after {observed_output_bytes} observed bytes"
+                    ),
+                    theme.transcript.error,
+                    theme,
+                    width,
+                );
+                if !source.is_empty() || !message.is_empty() {
+                    push_wrapped(
+                        &mut lines,
+                        blank_gutter(),
+                        &format!("{source}: {message}"),
+                        theme.transcript.error,
+                        theme,
+                        width,
+                    );
+                }
+                push_wrapped(
+                    &mut lines,
+                    blank_gutter(),
+                    "Partial text kept · Ctrl+Shift+C or /copy copies it · send a new instruction to continue or retry",
+                    theme.transcript.muted,
+                    theme,
+                    width,
+                );
+            }
             TranscriptItem::AssistantActivity(content) => {
                 push_cell_parent(&mut lines, content, theme.transcript.control, theme, width);
             }
@@ -952,7 +989,9 @@ fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)>
             (glyphs::revert().to_owned(), theme.transcript.added)
         }
         TranscriptItem::Interrupted => (glyphs::interrupt().to_owned(), theme.transcript.warning),
-        TranscriptItem::Error { .. } => (glyphs::cross().to_owned(), theme.transcript.error),
+        TranscriptItem::Error { .. } | TranscriptItem::IncompleteAssistantResponse { .. } => {
+            (glyphs::cross().to_owned(), theme.transcript.error)
+        }
         _ => (glyphs::bullet().to_owned(), theme.transcript.gutter),
     };
     Some(anchor)
