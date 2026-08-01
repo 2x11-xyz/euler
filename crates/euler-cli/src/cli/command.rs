@@ -102,6 +102,8 @@ pub(crate) struct RunArgs {
     /// Fresh-session project-context policy (`auto|on|off`); `None` uses the
     /// default (`auto`). Resume never consults it.
     pub(crate) project_context: Option<euler_core::ProjectContextPolicy>,
+    pub(crate) writable_roots: Vec<PathBuf>,
+    pub(crate) runtime_roots: Vec<PathBuf>,
     /// Scripted acceptance of a resume workspace relocation (single-invocation).
     pub(crate) accept_relocation: bool,
 }
@@ -435,6 +437,8 @@ fn build_run_args(
         linefeed_history_insert: parsed.linefeed_history_insert.unwrap_or(parsed.tui),
         linefeed_history_insert_from_cli: parsed.linefeed_history_insert.is_some(),
         project_context: parsed.project_context,
+        writable_roots: parsed.writable_roots.clone(),
+        runtime_roots: parsed.runtime_roots.clone(),
         accept_relocation: parsed.accept_relocation,
     })
 }

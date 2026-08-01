@@ -3,6 +3,8 @@ use crate::provenance::{read_provenance, ProvenanceWriter};
 use euler_event::{object, EventEnvelope, EventKind};
 use sha2::{Digest, Sha256};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -227,6 +229,372 @@ fn rehashes_and_repoints_a_workspace_pre_image_checkpoint() {
 }
 
 #[test]
+fn rehashes_a_checkpoint_in_an_attached_writable_root() {
+    let dir = tempdir().expect("session");
+    let primary = tempdir().expect("primary workspace");
+    let attached = tempdir().expect("attached workspace");
+    let value = "attached-internal-hostname-42";
+    let content = format!("host = {value}\n");
+    let hash = crate::checkpoints::store_pre_image(attached.path(), "conf.toml", &content)
+        .expect("checkpoint stored");
+    let primary_root = primary.path().to_string_lossy().into_owned();
+    let attached_root = attached.path().to_string_lossy().into_owned();
+
+    write_events(
+        dir.path(),
+        &[
+            workspace_session_start(&primary_root, &[&attached_root]),
+            EventEnvelope::new(
+                "session-1",
+                "agent",
+                None,
+                EventKind::new(EventKind::FILE_CHANGE),
+                object([
+                    ("workspace_root", attached_root.clone().into()),
+                    ("path", "conf.toml".into()),
+                    ("action", "modify".into()),
+                    ("pre_image_blob", hash.clone().into()),
+                ]),
+            ),
+        ],
+    );
+
+    let report = scrub_closed_session(
+        dir.path(),
+        "session-1",
+        ScrubSurfaces {
+            workspace_root: Some(primary.path()),
+        },
+        &[value.to_owned()],
+    )
+    .expect("scrub attached checkpoint");
+
+    assert_eq!(report.checkpoints_rewritten, 1);
+    let events = read_provenance(dir.path().join("events.jsonl")).expect("events");
+    let change = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .expect("file change");
+    let new_hash = change.payload["pre_image_blob"]
+        .as_str()
+        .expect("rewritten hash");
+    assert_ne!(new_hash, hash);
+    let restored = crate::checkpoints::load_pre_image(attached.path(), new_hash)
+        .expect("attached checkpoint remains loadable");
+    assert!(!restored.contains(value));
+    assert!(restored.contains(crate::redaction::SCRUBBED));
+}
+
+#[test]
+fn rehashes_the_same_checkpoint_hash_in_each_writable_root() {
+    let dir = tempdir().expect("session");
+    let primary = tempdir().expect("primary workspace");
+    let attached = tempdir().expect("attached workspace");
+    let value = "shared-internal-hostname-42";
+    let content = format!("host = {value}\n");
+    let primary_hash = crate::checkpoints::store_pre_image(primary.path(), "conf.toml", &content)
+        .expect("primary checkpoint stored");
+    let attached_hash = crate::checkpoints::store_pre_image(attached.path(), "conf.toml", &content)
+        .expect("attached checkpoint stored");
+    assert_eq!(primary_hash, attached_hash);
+    let primary_root = primary.path().to_string_lossy().into_owned();
+    let attached_root = attached.path().to_string_lossy().into_owned();
+
+    write_events(
+        dir.path(),
+        &[
+            workspace_session_start(&primary_root, &[&attached_root]),
+            EventEnvelope::new(
+                "session-1",
+                "agent",
+                None,
+                EventKind::new(EventKind::FILE_CHANGE),
+                object([
+                    ("workspace_root", primary_root.clone().into()),
+                    ("path", "conf.toml".into()),
+                    ("action", "modify".into()),
+                    ("pre_image_blob", primary_hash.clone().into()),
+                ]),
+            ),
+            EventEnvelope::new(
+                "session-1",
+                "agent",
+                None,
+                EventKind::new(EventKind::FILE_CHANGE),
+                object([
+                    ("workspace_root", attached_root.clone().into()),
+                    ("path", "conf.toml".into()),
+                    ("action", "modify".into()),
+                    ("pre_image_blob", attached_hash.clone().into()),
+                ]),
+            ),
+        ],
+    );
+
+    let report = scrub_closed_session(
+        dir.path(),
+        "session-1",
+        ScrubSurfaces {
+            workspace_root: Some(primary.path()),
+        },
+        &[value.to_owned()],
+    )
+    .expect("scrub both checkpoint stores");
+
+    assert_eq!(report.checkpoints_rewritten, 2);
+    let events = read_provenance(dir.path().join("events.jsonl")).expect("events");
+    let hashes = events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .map(|event| {
+            event.payload["pre_image_blob"]
+                .as_str()
+                .expect("rewritten hash")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(hashes.len(), 2);
+    assert_eq!(hashes[0], hashes[1]);
+    for root in [primary.path(), attached.path()] {
+        let restored = crate::checkpoints::load_pre_image(root, hashes[0])
+            .expect("rewritten checkpoint in each store");
+        assert!(!restored.contains(value));
+        assert!(restored.contains(crate::redaction::SCRUBBED));
+        assert!(
+            !crate::checkpoints::checked_checkpoint_blob_path(root, &primary_hash)
+                .expect("old checkpoint path")
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn scrub_after_chained_relocation_reaches_every_historical_primary_checkpoint() {
+    let dir = tempdir().expect("session");
+    let old = tempdir().expect("original workspace");
+    let middle = tempdir().expect("intermediate workspace");
+    let current = tempdir().expect("current workspace");
+    let value = "relocated-internal-hostname-42";
+    let content = format!("host = {value}\n");
+    let old_hash = crate::checkpoints::store_pre_image(old.path(), "old.toml", &content)
+        .expect("original checkpoint");
+    let middle_hash = crate::checkpoints::store_pre_image(middle.path(), "middle.toml", &content)
+        .expect("intermediate checkpoint");
+    assert_eq!(old_hash, middle_hash);
+
+    let old_root = crate::session_root::session_root_for_event(old.path());
+    let middle_root = crate::session_root::session_root_for_event(middle.path());
+    let current_root = crate::session_root::session_root_for_event(current.path());
+    let old_identity = workspace_identity_value(old.path());
+    let middle_identity = workspace_identity_value(middle.path());
+    let start = workspace_session_start(&old_root, &[]);
+    let snapshot = EventEnvelope::new(
+        "session-1",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::new(EventKind::PROJECT_CONTEXT_SNAPSHOT),
+        object([("workspace_identity", old_identity.clone())]),
+    );
+    let old_change = checkpoint_change(&old_root, "old.toml", &old_hash, Some(&snapshot.id));
+    let first_relocation =
+        relocation_event(&old_change.id, &old_identity, middle.path(), &middle_root);
+    let middle_change = checkpoint_change(
+        &middle_root,
+        "middle.toml",
+        &middle_hash,
+        Some(&first_relocation.id),
+    );
+    let second_relocation = relocation_event(
+        &middle_change.id,
+        &middle_identity,
+        current.path(),
+        &current_root,
+    );
+    write_events(
+        dir.path(),
+        &[
+            start,
+            snapshot,
+            old_change,
+            first_relocation,
+            middle_change,
+            second_relocation,
+        ],
+    );
+
+    let report = scrub_closed_session(
+        dir.path(),
+        "session-1",
+        ScrubSurfaces {
+            workspace_root: Some(current.path()),
+        },
+        &[value.to_owned()],
+    )
+    .expect("scrub checkpoints across relocation history");
+
+    assert_eq!(report.checkpoints_rewritten, 2);
+    let events = read_provenance(dir.path().join("events.jsonl")).expect("events");
+    let rewritten = events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .map(|event| {
+            event.payload["pre_image_blob"]
+                .as_str()
+                .expect("rewritten hash")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rewritten.len(), 2);
+    assert_eq!(rewritten[0], rewritten[1]);
+    for root in [old.path(), middle.path()] {
+        let restored = crate::checkpoints::load_pre_image(root, rewritten[0])
+            .expect("historical checkpoint remains loadable");
+        assert!(!restored.contains(value));
+        assert!(restored.contains(crate::redaction::SCRUBBED));
+    }
+}
+
+#[test]
+fn rejects_a_checkpoint_root_not_declared_by_session_authority() {
+    let dir = tempdir().expect("session");
+    let primary = tempdir().expect("primary workspace");
+    let outside = tempdir().expect("outside workspace");
+    let value = "outside-internal-hostname-42";
+    let content = format!("host = {value}\n");
+    let hash = crate::checkpoints::store_pre_image(outside.path(), "conf.toml", &content)
+        .expect("checkpoint stored");
+    let primary_root = primary.path().to_string_lossy().into_owned();
+    let outside_root = outside.path().to_string_lossy().into_owned();
+
+    write_events(
+        dir.path(),
+        &[
+            workspace_session_start(&primary_root, &[]),
+            EventEnvelope::new(
+                "session-1",
+                "agent",
+                None,
+                EventKind::new(EventKind::FILE_CHANGE),
+                object([
+                    ("workspace_root", outside_root.into()),
+                    ("path", "conf.toml".into()),
+                    ("action", "modify".into()),
+                    ("pre_image_blob", hash.clone().into()),
+                ]),
+            ),
+        ],
+    );
+
+    let error = scrub_closed_session(
+        dir.path(),
+        "session-1",
+        ScrubSurfaces {
+            workspace_root: Some(primary.path()),
+        },
+        &[value.to_owned()],
+    )
+    .expect_err("event-local paths must not expand scrub authority");
+
+    assert!(error
+        .to_string()
+        .contains("outside durable workspace authority"));
+    assert_eq!(
+        crate::checkpoints::load_pre_image(outside.path(), &hash).expect("outside checkpoint"),
+        content
+    );
+    assert!(!raw_lines(dir.path()).contains(EventKind::SECRET_SCRUBBED));
+}
+
+#[test]
+fn rejects_a_non_hash_checkpoint_pointer_before_path_resolution() {
+    let dir = tempdir().expect("session");
+    let primary = tempdir().expect("primary workspace");
+    let primary_root = primary.path().to_string_lossy().into_owned();
+    write_events(
+        dir.path(),
+        &[
+            workspace_session_start(&primary_root, &[]),
+            EventEnvelope::new(
+                "session-1",
+                "agent",
+                None,
+                EventKind::new(EventKind::FILE_CHANGE),
+                object([
+                    ("workspace_root", primary_root.into()),
+                    ("path", "conf.toml".into()),
+                    ("action", "modify".into()),
+                    ("pre_image_blob", "../../outside".into()),
+                ]),
+            ),
+        ],
+    );
+
+    let error = scrub_closed_session(
+        dir.path(),
+        "session-1",
+        ScrubSurfaces {
+            workspace_root: Some(primary.path()),
+        },
+        &["explicit-value-to-scrub".to_owned()],
+    )
+    .expect_err("checkpoint pointer must be a content hash");
+
+    assert!(error.to_string().contains("invalid hash"));
+    assert!(!raw_lines(dir.path()).contains(EventKind::SECRET_SCRUBBED));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_checkpoint_directory_symlink_without_rewriting_its_target() {
+    let dir = tempdir().expect("session");
+    let primary = tempdir().expect("primary workspace");
+    let outside = tempdir().expect("outside directory");
+    let value = "outside-checkpoint-secret-42";
+    let content = format!("host = {value}\n");
+    let hash = sha256(content.as_bytes());
+    fs::create_dir(outside.path().join("checkpoints")).expect("outside checkpoints");
+    fs::write(outside.path().join("checkpoints").join(&hash), &content).expect("outside object");
+    symlink(outside.path(), primary.path().join(".euler")).expect("planted symlink");
+    let primary_root = primary.path().to_string_lossy().into_owned();
+    write_events(
+        dir.path(),
+        &[
+            workspace_session_start(&primary_root, &[]),
+            EventEnvelope::new(
+                "session-1",
+                "agent",
+                None,
+                EventKind::new(EventKind::FILE_CHANGE),
+                object([
+                    ("workspace_root", primary_root.into()),
+                    ("path", "conf.toml".into()),
+                    ("action", "modify".into()),
+                    ("pre_image_blob", hash.clone().into()),
+                ]),
+            ),
+        ],
+    );
+
+    let error = scrub_closed_session(
+        dir.path(),
+        "session-1",
+        ScrubSurfaces {
+            workspace_root: Some(primary.path()),
+        },
+        &[value.to_owned()],
+    )
+    .expect_err("checkpoint directory symlink must fail closed");
+
+    assert!(error
+        .to_string()
+        .contains("checkpoint directory is not a real directory"));
+    assert_eq!(
+        fs::read_to_string(outside.path().join("checkpoints").join(hash))
+            .expect("outside object remains"),
+        content
+    );
+    assert!(!raw_lines(dir.path()).contains(EventKind::SECRET_SCRUBBED));
+}
+
+#[test]
 fn scrubbing_a_value_with_json_metacharacters_keeps_the_sidecar_valid() {
     let dir = tempdir().expect("temp");
     write_events(dir.path(), &[tool_result("clean")]);
@@ -388,4 +756,73 @@ fn preserves_event_ids_and_order_across_a_scrub() {
 
 fn sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn workspace_session_start(primary: &str, attached: &[&str]) -> EventEnvelope {
+    EventEnvelope::new(
+        "session-1",
+        "agent",
+        None,
+        EventKind::new(EventKind::SESSION_START),
+        object([
+            ("root", primary.into()),
+            (
+                "workspace_authority",
+                serde_json::json!({
+                    "mode": "enforced",
+                    "profile": "workspace-no-network",
+                    "attached_writable_roots": attached,
+                    "read_only_runtime_roots": [],
+                }),
+            ),
+        ]),
+    )
+}
+
+fn workspace_identity_value(root: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "algorithm": crate::project_context::WORKSPACE_IDENTITY_ALGORITHM,
+        "version": crate::project_context::WORKSPACE_IDENTITY_VERSION,
+        "digest": crate::project_context::workspace_identity_digest_v1(root),
+    })
+}
+
+fn checkpoint_change(
+    workspace_root: &str,
+    path: &str,
+    hash: &str,
+    parent: Option<&str>,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        "session-1",
+        "agent",
+        parent.map(str::to_owned),
+        EventKind::new(EventKind::FILE_CHANGE),
+        object([
+            ("workspace_root", workspace_root.into()),
+            ("path", path.into()),
+            ("action", "modify".into()),
+            ("pre_image_blob", hash.into()),
+        ]),
+    )
+}
+
+fn relocation_event(
+    parent: &str,
+    prior_identity: &serde_json::Value,
+    new_root: &Path,
+    new_root_display: &str,
+) -> EventEnvelope {
+    EventEnvelope::new(
+        "session-1",
+        "agent",
+        Some(parent.to_owned()),
+        EventKind::new(EventKind::PROJECT_CONTEXT_RELOCATED),
+        crate::project_context::build_relocated_payload(
+            prior_identity,
+            new_root,
+            new_root_display.to_owned(),
+            "2026-08-01T00:00:00Z".to_owned(),
+        ),
+    )
 }

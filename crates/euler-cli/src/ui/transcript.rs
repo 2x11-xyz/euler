@@ -2,6 +2,7 @@ use super::patch_approval::ApprovalOption;
 use super::patch_diff;
 use super::theme::Theme;
 use crate::ui::markdown_stream::MarkdownStreamCollector;
+use crate::ui::workspace_path::{session_primary_root, workspace_path_display, workspace_path_key};
 use chrono::{DateTime, Local};
 use euler_core::canvas::projected_tool_output;
 use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
@@ -204,6 +205,8 @@ pub enum TranscriptItem {
     WorkspaceRestore {
         path: String,
         checkpoint_event_id: String,
+        restored: bool,
+        error: String,
     },
     CheckStarted {
         name: String,
@@ -454,6 +457,7 @@ fn nonempty_payload_string(event: &EventEnvelope, key: &str) -> Option<String> {
 
 pub fn project_events(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
     let checkpoint_ids = checkpoint_event_ids(events);
+    let legacy_primary_root = session_primary_root(events);
     let mut spawn_times: HashMap<String, String> = HashMap::new();
     let mut items = Vec::new();
     for event in events {
@@ -463,15 +467,17 @@ pub fn project_events(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
         let item = match event.kind.as_str() {
             EventKind::AGENT_MESSAGE => {
                 let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
-                project_agent_message(event, spawn_ts)
-                    .or_else(|| project_event_with_checkpoints(event, &checkpoint_ids))
+                project_agent_message(event, spawn_ts).or_else(|| {
+                    project_event_with_checkpoints(event, &checkpoint_ids, legacy_primary_root)
+                })
             }
             EventKind::AGENT_RESULT => {
                 let spawn_ts = companion_spawn_ts_lookup(event, &spawn_times);
-                project_agent_result(event, spawn_ts)
-                    .or_else(|| project_event_with_checkpoints(event, &checkpoint_ids))
+                project_agent_result(event, spawn_ts).or_else(|| {
+                    project_event_with_checkpoints(event, &checkpoint_ids, legacy_primary_root)
+                })
             }
-            _ => project_event_with_checkpoints(event, &checkpoint_ids),
+            _ => project_event_with_checkpoints(event, &checkpoint_ids, legacy_primary_root),
         };
         if let Some(item) = item {
             push_tui_item(&mut items, item);
@@ -788,14 +794,22 @@ pub(crate) fn transcript_items_widget<'a>(
     }
 }
 
-fn project_event(event: &EventEnvelope) -> Option<TranscriptItem> {
-    project_event_with_checkpoints(event, &std::collections::HashSet::new())
+fn project_event(
+    event: &EventEnvelope,
+    legacy_primary_root: Option<&str>,
+) -> Option<TranscriptItem> {
+    project_event_with_checkpoints(
+        event,
+        &std::collections::HashSet::new(),
+        legacy_primary_root,
+    )
 }
 
 #[allow(clippy::too_many_lines)] // ratchet: 82 lines, refactor target
 fn project_event_with_checkpoints(
     event: &EventEnvelope,
     checkpoint_ids: &std::collections::HashSet<String>,
+    legacy_primary_root: Option<&str>,
 ) -> Option<TranscriptItem> {
     if is_compaction_activity(event) {
         return None;
@@ -832,10 +846,7 @@ fn project_event_with_checkpoints(
             ok: tool_result_succeeded(&event.payload),
             error: payload_string(event, "error").unwrap_or_default(),
             output: projected_tool_output(event),
-            exit_code: event
-                .payload
-                .get("exit_code")
-                .and_then(serde_json::Value::as_i64),
+            exit_code: tool_result_display_exit_code(event),
             path: None,
         }),
         EventKind::PERMISSION_PROMPT => Some(TranscriptItem::PermissionPrompt {
@@ -867,13 +878,23 @@ fn project_event_with_checkpoints(
             decision_source: payload_string(event, "decision_source"),
             rationale: payload_string(event, "rationale"),
         }),
-        EventKind::PATCH_PROPOSED => Some(project_patch(event, true)),
-        EventKind::PATCH_APPLIED => Some(project_patch(event, false)),
-        EventKind::FILE_CHANGE => Some(project_file_change(event)),
-        EventKind::FILE_DIFF => Some(project_file_diff(event, checkpoint_ids)),
+        EventKind::PATCH_PROPOSED => Some(project_patch(event, true, legacy_primary_root)),
+        EventKind::PATCH_APPLIED => Some(project_patch(event, false, legacy_primary_root)),
+        EventKind::FILE_CHANGE => Some(project_file_change(event, legacy_primary_root)),
+        EventKind::FILE_DIFF => Some(project_file_diff(
+            event,
+            checkpoint_ids,
+            legacy_primary_root,
+        )),
         EventKind::WORKSPACE_RESTORE => Some(TranscriptItem::WorkspaceRestore {
-            path: payload_string(event, "path").unwrap_or_default(),
+            path: payload_workspace_path(event, legacy_primary_root),
             checkpoint_event_id: payload_string(event, "checkpoint_event_id").unwrap_or_default(),
+            restored: event
+                .payload
+                .get("restored")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true),
+            error: payload_string(event, "error").unwrap_or_default(),
         }),
         EventKind::CHECK_STARTED => Some(TranscriptItem::CheckStarted {
             name: payload_string(event, "name").unwrap_or_default(),
@@ -1083,6 +1104,9 @@ struct StreamProjection {
     /// earlier event (not just agent.spawn), so parity needs all ids; the
     /// map stays small next to the event vec the state already retains.
     event_ts_by_id: HashMap<String, String>,
+    /// First durable session root, used only to identify legacy file events
+    /// that predate event-local `workspace_root`.
+    legacy_primary_root: Option<String>,
     /// Causal fold for extension plan-tool presentation coalescing.
     plan_tools: ExtensionPlanCoalescer,
     /// Projection of the most recently ingested event, computed exactly once
@@ -1101,6 +1125,10 @@ impl StreamProjection {
             if let Some(child) = payload_string(event, "child_agent_id") {
                 self.child_agents.insert(child);
             }
+        }
+        if self.legacy_primary_root.is_none() && event.kind.as_str() == EventKind::SESSION_START {
+            self.legacy_primary_root =
+                payload_string(event, "root").filter(|root| !root.is_empty());
         }
         if matches!(
             event.kind.as_str(),
@@ -1123,7 +1151,12 @@ impl StreamProjection {
             // spawn/message/result only. The full replay still folded child
             // tool.calls into the call context — preserve that so a later
             // result can resolve them.
-            let _ = project_tui_event_with_context(event, &mut self.calls, hide_tool_result);
+            let _ = project_tui_event_with_context(
+                event,
+                &mut self.calls,
+                hide_tool_result,
+                self.legacy_primary_root.as_deref(),
+            );
             return None;
         }
         if self.assistant_duplicates_last_fallback(event) {
@@ -1137,10 +1170,17 @@ impl StreamProjection {
         let Self {
             calls,
             event_ts_by_id,
+            legacy_primary_root,
             ..
         } = self;
         let spawn_ts = companion_spawn_ts_lookup(event, event_ts_by_id);
-        project_tui_event_with_context_and_spawn_ts(event, calls, spawn_ts, hide_tool_result)
+        project_tui_event_with_context_and_spawn_ts(
+            event,
+            calls,
+            spawn_ts,
+            hide_tool_result,
+            legacy_primary_root.as_deref(),
+        )
     }
 
     fn is_child_agent_event(&self, event: &EventEnvelope) -> bool {
@@ -1180,13 +1220,25 @@ pub(crate) fn replay_latest_event_for_ui(events: &[EventEnvelope]) -> Option<Tra
     }
     let mut calls = HashMap::new();
     let mut plan_tools = ExtensionPlanCoalescer::default();
+    let legacy_primary_root = session_primary_root(events);
     for event in earlier {
         let hide_tool_result = plan_tools.ingest(event);
-        let _ = project_tui_event_with_context(event, &mut calls, hide_tool_result);
+        let _ = project_tui_event_with_context(
+            event,
+            &mut calls,
+            hide_tool_result,
+            legacy_primary_root,
+        );
     }
     let spawn_ts = companion_spawn_ts_for_event(latest, earlier);
     let hide_tool_result = plan_tools.ingest(latest);
-    project_tui_event_with_context_and_spawn_ts(latest, &mut calls, spawn_ts, hide_tool_result)
+    project_tui_event_with_context_and_spawn_ts(
+        latest,
+        &mut calls,
+        spawn_ts,
+        hide_tool_result,
+        legacy_primary_root,
+    )
 }
 
 pub(crate) fn render_items_for_history(
@@ -1317,13 +1369,6 @@ fn prior_permission_scope_matches(event: &EventEnvelope, scope_prefix: Option<&s
         .is_none_or(|pattern| pattern == prefix)
 }
 
-fn project_live_event(event: &EventEnvelope) -> Option<TranscriptItem> {
-    match event.kind.as_str() {
-        EventKind::MODEL_DELTA => None,
-        _ => project_tui_event(event),
-    }
-}
-
 fn project_tui_items(events: &[EventEnvelope]) -> Vec<TranscriptItem> {
     project_tui_entries(events)
         .into_iter()
@@ -1351,6 +1396,7 @@ fn project_tui_entries_with_clock(events: &[EventEnvelope]) -> (Vec<ProjectedEnt
     let mut child_agents: HashMap<String, String> = HashMap::new();
     let mut spawn_times: HashMap<String, String> = HashMap::new();
     let mut clock = TimingClock::default();
+    let legacy_primary_root = session_primary_root(events);
     for (index, event) in events.iter().enumerate() {
         let hide_tool_result = plan_tools.ingest(event);
         if event.kind.as_str() == EventKind::AGENT_SPAWN {
@@ -1380,6 +1426,7 @@ fn project_tui_entries_with_clock(events: &[EventEnvelope]) -> (Vec<ProjectedEnt
             &mut calls,
             spawn_ts,
             hide_tool_result,
+            legacy_primary_root,
         ) {
             let timing = clock.stamp_at(&event.ts);
             if matches!(item, TranscriptItem::UserMessage(_)) {
@@ -1401,8 +1448,15 @@ fn project_tui_event_with_context(
     event: &EventEnvelope,
     calls: &mut HashMap<String, ToolCallProjection>,
     hide_tool_result: bool,
+    legacy_primary_root: Option<&str>,
 ) -> Option<TranscriptItem> {
-    project_tui_event_with_context_and_spawn_ts(event, calls, None, hide_tool_result)
+    project_tui_event_with_context_and_spawn_ts(
+        event,
+        calls,
+        None,
+        hide_tool_result,
+        legacy_primary_root,
+    )
 }
 
 fn project_tui_event_with_context_and_spawn_ts(
@@ -1410,6 +1464,7 @@ fn project_tui_event_with_context_and_spawn_ts(
     calls: &mut HashMap<String, ToolCallProjection>,
     spawn_ts: Option<&str>,
     hide_tool_result: bool,
+    legacy_primary_root: Option<&str>,
 ) -> Option<TranscriptItem> {
     #[cfg(test)]
     note_projection_event_visit();
@@ -1428,7 +1483,10 @@ fn project_tui_event_with_context_and_spawn_ts(
         EventKind::AGENT_SPAWN => project_agent_spawn(event, None),
         EventKind::AGENT_MESSAGE => project_agent_message(event, spawn_ts),
         EventKind::AGENT_RESULT => project_agent_result(event, spawn_ts),
-        _ => project_live_event(event),
+        _ => match event.kind.as_str() {
+            EventKind::MODEL_DELTA => None,
+            _ => project_tui_event(event, legacy_primary_root),
+        },
     }
 }
 
@@ -1467,14 +1525,11 @@ fn project_tui_tool_result(
             ok: false,
             error: payload_string(event, "error").unwrap_or_default(),
             output: payload_string(event, "output").unwrap_or_default(),
-            exit_code: event
-                .payload
-                .get("exit_code")
-                .and_then(serde_json::Value::as_i64),
+            exit_code: tool_result_display_exit_code(event),
             path,
         });
     }
-    project_event(event)
+    project_event(event, None)
 }
 
 fn push_tui_item(items: &mut Vec<TranscriptItem>, item: TranscriptItem) {
@@ -1628,7 +1683,10 @@ fn assistant_duplicates_model_result_fallback(
     )
 }
 
-fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
+fn project_tui_event(
+    event: &EventEnvelope,
+    legacy_primary_root: Option<&str>,
+) -> Option<TranscriptItem> {
     match event.kind.as_str() {
         EventKind::ASSISTANT_ACTIVITY => {
             activity_text(event).map(TranscriptItem::AssistantActivity)
@@ -1654,7 +1712,7 @@ fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
             if suppress_allowed {
                 None
             } else {
-                project_event(event)
+                project_event(event, legacy_primary_root)
             }
         }
         EventKind::TOOL_RESULT => {
@@ -1663,10 +1721,10 @@ fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
             if ok && matches!(name.as_str(), "edit_file" | "write_file") {
                 None
             } else {
-                project_event(event)
+                project_event(event, legacy_primary_root)
             }
         }
-        _ => project_event(event),
+        _ => project_event(event, legacy_primary_root),
     }
 }
 
@@ -2007,8 +2065,12 @@ fn activity_text(event: &EventEnvelope) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-fn project_patch(event: &EventEnvelope, proposed: bool) -> TranscriptItem {
-    let path = payload_string(event, "path").unwrap_or_default();
+fn project_patch(
+    event: &EventEnvelope,
+    proposed: bool,
+    legacy_primary_root: Option<&str>,
+) -> TranscriptItem {
+    let path = payload_workspace_path(event, legacy_primary_root);
     let old = payload_string(event, "old");
     let new = payload_string(event, "new");
 
@@ -2019,7 +2081,7 @@ fn project_patch(event: &EventEnvelope, proposed: bool) -> TranscriptItem {
     }
 }
 
-fn project_file_change(event: &EventEnvelope) -> TranscriptItem {
+fn project_file_change(event: &EventEnvelope, legacy_primary_root: Option<&str>) -> TranscriptItem {
     let checkpoint_event_id = event
         .payload
         .get("pre_image_blob")
@@ -2027,7 +2089,7 @@ fn project_file_change(event: &EventEnvelope) -> TranscriptItem {
         .filter(|value| !value.is_empty())
         .map(|_| event.id.clone());
     TranscriptItem::FileChange {
-        path: payload_string(event, "path").unwrap_or_default(),
+        path: payload_workspace_path(event, legacy_primary_root),
         action: payload_string(event, "action").unwrap_or_default(),
         origin: payload_string(event, "origin").unwrap_or_default(),
         before_sha256: payload_string(event, "before_sha256"),
@@ -2042,11 +2104,12 @@ fn project_file_change(event: &EventEnvelope) -> TranscriptItem {
 fn project_file_diff(
     event: &EventEnvelope,
     checkpoint_ids: &std::collections::HashSet<String>,
+    legacy_primary_root: Option<&str>,
 ) -> TranscriptItem {
     let checkpoint_event_id =
         payload_string(event, "file_change_id").filter(|id| checkpoint_ids.contains(id));
     TranscriptItem::FileDiff {
-        path: payload_string(event, "path").unwrap_or_default(),
+        path: payload_workspace_path(event, legacy_primary_root),
         action: payload_string(event, "action").unwrap_or_default(),
         origin: payload_string(event, "origin").unwrap_or_default(),
         diff: payload_string(event, "diff"),
@@ -2055,6 +2118,24 @@ fn project_file_diff(
         omitted_reason: payload_string(event, "omitted_reason"),
         checkpoint_event_id,
     }
+}
+
+fn payload_workspace_path(event: &EventEnvelope, legacy_primary_root: Option<&str>) -> String {
+    workspace_path_key(event, legacy_primary_root)
+        .map(|path| workspace_path_display(&path))
+        .unwrap_or_default()
+}
+
+/// Non-normal process termination retains `exit_code: -1` in durable events
+/// for wire compatibility, but the transcript must not label that sentinel as
+/// a real process exit. Legacy results and explicit process-exit failures keep
+/// their historical exit rendering.
+fn tool_result_display_exit_code(event: &EventEnvelope) -> Option<i64> {
+    let failure_kind = event.payload.get("failure_kind").and_then(Value::as_str);
+    if failure_kind.is_some_and(|kind| kind != "process-exit") {
+        return None;
+    }
+    event.payload.get("exit_code").and_then(Value::as_i64)
 }
 
 fn tool_projection_from_call(event: &EventEnvelope) -> Option<ToolCallProjection> {
@@ -2104,10 +2185,7 @@ fn run_item_from_result(
         // so the collapsed and expanded views render the same stored
         // lines and agree on count/order by construction.
         output: normalize_tool_run_output(&projected_tool_output(event)),
-        exit_code: event
-            .payload
-            .get("exit_code")
-            .and_then(serde_json::Value::as_i64),
+        exit_code: tool_result_display_exit_code(event),
         grant_source: payload_string(event, "grant_source"),
         static_safe: event
             .payload

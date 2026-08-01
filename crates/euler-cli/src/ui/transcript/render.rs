@@ -572,17 +572,23 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             TranscriptItem::WorkspaceRestore {
                 path,
                 checkpoint_event_id,
+                restored,
+                error,
             } => {
-                push_wrapped(
-                    &mut lines,
-                    blank_gutter(),
-                    &format!(
-                        "reverted {path} → ckpt {checkpoint_event_id} · files restored, history intact"
-                    ),
-                    theme.transcript.muted,
-                    theme,
-                    width,
-                );
+                let (message, style) = if *restored {
+                    (
+                        format!(
+                            "reverted {path} → ckpt {checkpoint_event_id} · files restored, history intact"
+                        ),
+                        theme.transcript.muted,
+                    )
+                } else {
+                    (
+                        format!("restore failed for {path} → ckpt {checkpoint_event_id}: {error}"),
+                        theme.transcript.error,
+                    )
+                };
+                push_wrapped(&mut lines, blank_gutter(), &message, style, theme, width);
             }
             TranscriptItem::CheckStarted { name } => {
                 push_wrapped(
@@ -946,9 +952,12 @@ fn spine_anchor(item: &TranscriptItem, theme: &Theme) -> Option<(String, Style)>
             glyphs::companion_glyph().to_owned(),
             theme.transcript.companion,
         ),
-        TranscriptItem::WorkspaceRestore { .. } => {
+        TranscriptItem::WorkspaceRestore { restored: true, .. } => {
             (glyphs::revert().to_owned(), theme.transcript.added)
         }
+        TranscriptItem::WorkspaceRestore {
+            restored: false, ..
+        } => (glyphs::cross().to_owned(), theme.transcript.error),
         TranscriptItem::Interrupted => (glyphs::interrupt().to_owned(), theme.transcript.warning),
         TranscriptItem::Error { .. } => (glyphs::cross().to_owned(), theme.transcript.error),
         _ => (glyphs::bullet().to_owned(), theme.transcript.gutter),

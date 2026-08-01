@@ -69,40 +69,22 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
     assert!(lines[6].contains("\"content\":\"user: hello skeleton\""));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
+fn agent_shell_uses_private_home_and_clears_parent_controls() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let user_home = isolated_home();
     let outer_euler_home = tempfile::tempdir().expect("outer Euler home");
     let workspace = tempfile::tempdir().expect("workspace");
-    let extension_dir = tempfile::tempdir().expect("extension dir");
-    write_extension_manifest(extension_dir.path(), "default-only-extension", "0.1.0");
-
-    let linked = command_with_home(exe, &user_home)
-        .env_remove("EULER_HOME")
-        .args(["extension", "link", path_str(extension_dir.path())])
-        .output()
-        .expect("link extension in default home");
-    assert!(
-        linked.status.success(),
-        "link stderr: {}",
-        String::from_utf8_lossy(&linked.stderr)
-    );
-    let default_list = command_with_home(exe, &user_home)
-        .env_remove("EULER_HOME")
-        .args(["extension", "list"])
-        .output()
-        .expect("list default-home extensions");
-    assert!(
-        default_list.status.success(),
-        "default list stderr: {}",
-        String::from_utf8_lossy(&default_list.stderr)
-    );
-    assert!(String::from_utf8_lossy(&default_list.stdout).contains("default-only-extension"));
+    let host_home_marker = user_home.path().join(".euler/host-home-marker");
+    std::fs::create_dir_all(host_home_marker.parent().expect("marker parent"))
+        .expect("host Euler home");
+    std::fs::write(&host_home_marker, "must stay hidden").expect("host marker");
 
     let nested_command = format!(
-        "printf 'rust-log=%s\\nchild-home=%s\\n' \"$RUST_LOG\" \"$EULER_HOME\"; {} extension list",
-        shell_quote(exe)
+        "printf 'rust-log=%s\\nhome=%s\\neuler-home=%s\\n' \"$RUST_LOG\" \"$HOME\" \"$EULER_HOME\"; \
+         if test -e {}; then printf 'host-home-visible\\n'; fi",
+        shell_quote(path_str(&host_home_marker))
     );
     let script = write_fixture_script(
         workspace.path(),
@@ -164,20 +146,18 @@ fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
         .and_then(|event| event.payload.get("output"))
         .and_then(serde_json::Value::as_str)
         .expect("nested Euler tool output");
-    assert!(tool_output.contains("rust-log=project_under_test=trace"));
-    assert!(!tool_output.contains("default-only-extension"));
+    assert!(tool_output.contains("rust-log=\n"));
+    assert!(tool_output.contains("euler-home=\n"));
+    assert!(!tool_output.contains("host-home-visible"));
     let child_home = tool_output
         .lines()
-        .find_map(|line| line.strip_prefix("child-home="))
+        .find_map(|line| line.strip_prefix("home="))
         .map(PathBuf::from)
-        .expect("isolated child Euler home");
+        .expect("private child home");
     assert!(child_home.is_absolute());
+    assert_eq!(child_home, PathBuf::from("/tmp/home"));
     assert_ne!(child_home, outer_euler_home.path());
     assert_ne!(child_home, user_home.path().join(".euler"));
-    assert!(
-        !child_home.exists(),
-        "temporary child home should be removed"
-    );
 }
 
 #[test]
@@ -8324,6 +8304,82 @@ fn exec_resume_relocation_requires_accept_relocation_flag() {
             .any(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_RELOCATED),
         "an accepted relocation must record a durable project.context.relocated event"
     );
+}
+
+#[test]
+fn accepted_relocation_cannot_append_before_workspace_authority_preflight() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let temp = tempfile::tempdir().expect("temp");
+    let workspace_a = temp.path().join("a");
+    let workspace_b = temp.path().join("b");
+    let attached = temp.path().join("attached");
+    std::fs::create_dir_all(&workspace_a).expect("a");
+    std::fs::create_dir_all(&workspace_b).expect("b");
+    std::fs::create_dir_all(&attached).expect("attached");
+    let log = temp.path().join("session-authority.jsonl");
+    let script = write_fixture_script(
+        temp.path(),
+        "reloc-authority.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "ok"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let create = command_with_home(exe, &home)
+        .current_dir(&workspace_a)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--provenance",
+            path_str(&log),
+            "--writable-root",
+            path_str(&attached),
+            "--auto-approve",
+            "read-only",
+            "first prompt",
+        ])
+        .output()
+        .expect("create session");
+    assert!(
+        create.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let before = std::fs::read(&log).expect("accepted prefix bytes");
+
+    // Omitting the launch-owned attachment is an authority mismatch. Even an
+    // explicit relocation yes cannot append before that mismatch is rejected.
+    let resumed = command_with_home(exe, &home)
+        .current_dir(&workspace_b)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--resume",
+            path_str(&log),
+            "--accept-relocation",
+            "--auto-approve",
+            "read-only",
+            "second prompt",
+        ])
+        .output()
+        .expect("resume with mismatched authority");
+
+    assert!(!resumed.status.success());
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(stderr.contains("workspace authority changed"), "{stderr}");
+    assert_eq!(std::fs::read(&log).expect("unchanged prefix bytes"), before);
 }
 
 /// The relocation-consent card (ADR 0017 phase 3) is presented before a

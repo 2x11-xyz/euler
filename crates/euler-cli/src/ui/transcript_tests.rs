@@ -3742,6 +3742,8 @@ fn projects_checkpoint_suffix_and_workspace_restore() {
         TranscriptItem::WorkspaceRestore {
             path: "src/lib.rs".to_owned(),
             checkpoint_event_id: change_id.clone(),
+            restored: true,
+            error: String::new(),
         }
     );
 
@@ -3755,6 +3757,112 @@ fn projects_checkpoint_suffix_and_workspace_restore() {
         joined.contains("files restored, history intact"),
         "joined: {joined:?}"
     );
+}
+
+#[test]
+fn legacy_file_events_inherit_the_first_session_root_in_replay_and_streaming() {
+    let events = vec![
+        event(
+            EventKind::SESSION_START,
+            object([("root", "/work/primary".into())]),
+        ),
+        event(
+            EventKind::FILE_CHANGE,
+            object([("path", "src/lib.rs".into()), ("action", "modify".into())]),
+        ),
+        event(
+            EventKind::FILE_DIFF,
+            object([
+                ("path", "src/lib.rs".into()),
+                ("action", "modify".into()),
+                ("diff", "+new\n".into()),
+            ]),
+        ),
+    ];
+
+    let projected = project_events(&events);
+    assert!(matches!(
+        &projected[0],
+        TranscriptItem::FileChange { path, .. } if path == "/work/primary/src/lib.rs"
+    ));
+    assert!(matches!(
+        &projected[1],
+        TranscriptItem::FileDiff { path, .. } if path == "/work/primary/src/lib.rs"
+    ));
+    let screen = rendered_screen(&events, &Theme::default(), 100, 14);
+    assert!(screen.contains("/work/primary/src/lib.rs"), "{screen}");
+}
+
+#[test]
+fn malformed_absolute_event_path_cannot_discard_its_workspace_root() {
+    let events = vec![event(
+        EventKind::FILE_DIFF,
+        object([
+            ("workspace_root", "/work/attached".into()),
+            ("path", "/outside/file.rs".into()),
+            ("action", "modify".into()),
+            ("diff", "+new\n".into()),
+        ]),
+    )];
+
+    assert!(matches!(
+        &project_events(&events)[0],
+        TranscriptItem::FileDiff { path, .. }
+            if path == "/work/attached::/outside/file.rs"
+    ));
+}
+
+#[test]
+fn workspace_restore_displays_the_attached_root_identity() {
+    let events = vec![event(
+        EventKind::WORKSPACE_RESTORE,
+        object([
+            ("workspace_root", "/work/attached".into()),
+            ("path", "src/lib.rs".into()),
+            ("checkpoint_event_id", "checkpoint-1".into()),
+            ("restored", true.into()),
+        ]),
+    )];
+
+    assert_eq!(
+        project_events(&events),
+        vec![TranscriptItem::WorkspaceRestore {
+            path: "/work/attached/src/lib.rs".to_owned(),
+            checkpoint_event_id: "checkpoint-1".to_owned(),
+            restored: true,
+            error: String::new(),
+        }]
+    );
+}
+
+#[test]
+fn failed_workspace_restore_is_never_rendered_as_success() {
+    let events = vec![event(
+        EventKind::WORKSPACE_RESTORE,
+        object([
+            ("workspace_root", "/work/attached".into()),
+            ("path", "src/lib.rs".into()),
+            ("checkpoint_event_id", "checkpoint-1".into()),
+            ("restored", false.into()),
+            ("error", "write failed after truncation".into()),
+        ]),
+    )];
+
+    let projected = project_events(&events);
+    assert_eq!(
+        projected,
+        vec![TranscriptItem::WorkspaceRestore {
+            path: "/work/attached/src/lib.rs".to_owned(),
+            checkpoint_event_id: "checkpoint-1".to_owned(),
+            restored: false,
+            error: "write failed after truncation".to_owned(),
+        }]
+    );
+    let line = render_line_oriented(&events);
+    assert!(line.contains("workspace.restore failed"), "{line}");
+    let screen = rendered_screen(&events, &Theme::default(), 120, 8);
+    assert!(screen.contains("restore failed"), "{screen}");
+    assert!(!screen.contains("files restored"), "{screen}");
 }
 
 #[test]
@@ -4599,6 +4707,32 @@ fn vt100_legacy_ok_true_with_exit_101_renders_as_failure() {
     assert!(contents.contains("Ran"), "{contents}");
     assert!(contents.contains("✗ exit 101"), "{contents}");
     assert!(!contents.contains("exit 101\n"), "{contents}");
+}
+
+#[test]
+fn vt100_signal_failure_names_the_signal_without_a_fake_exit_status() {
+    let events = vec![event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("name", "run_shell".into()),
+            ("ok", false.into()),
+            ("failure_kind", "signal".into()),
+            ("error", "command terminated by signal 15".into()),
+            (
+                "output",
+                "exit -1 (command terminated by signal 15)\n".into(),
+            ),
+            ("exit_code", (-1).into()),
+        ]),
+    )];
+
+    let contents = rendered_screen(&events, &Theme::default(), 72, 5);
+
+    assert!(
+        contents.contains("✗ command terminated by signal 15"),
+        "{contents}"
+    );
+    assert!(!contents.contains("✗ exit -1"), "{contents}");
 }
 
 #[test]

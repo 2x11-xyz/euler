@@ -43,7 +43,6 @@ struct CompanionLoop<'a, D> {
     target: ModelTarget,
     task: AgentTask,
     redactor: crate::redaction::SecretRedactor,
-    workspace_root: std::path::PathBuf,
     auto_compaction: AutoCompactionPolicy,
     enabled_extension_ids: std::collections::BTreeSet<String>,
     reasoning_effort: ReasoningEffort,
@@ -247,7 +246,6 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             agent_id,
             target,
             task,
-            workspace_root: session.config.root.clone(),
             auto_compaction: session.config.auto_compaction,
             enabled_extension_ids: session.config.extensions_enabled.clone(),
             reasoning_effort: session.config.reasoning_effort,
@@ -309,17 +307,18 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     /// adapt to, exactly as in the parent session loop; it never terminates
     /// the companion. Budgets bound the loop.
     fn record_tool_call(&mut self, call: &ToolCall) -> Result<String, SessionError> {
-        let tool_call_event_id = self
-            .append(
-                EventKind::TOOL_CALL,
-                object([
-                    ("id", call.id.clone().into()),
-                    ("name", call.name.clone().into()),
-                    ("input", call.input.clone()),
-                ]),
-                None,
-            )?
-            .id;
+        let mut payload = object([
+            ("id", call.id.clone().into()),
+            ("name", call.name.clone().into()),
+            ("input", call.input.clone()),
+        ]);
+        if matches!(call.name.as_str(), "run_shell" | "git_status" | "git_diff") {
+            payload.insert(
+                "workspace_authority".to_owned(),
+                self.tools.workspace_authority_payload(),
+            );
+        }
+        let tool_call_event_id = self.append(EventKind::TOOL_CALL, payload, None)?.id;
         Ok(tool_call_event_id)
     }
 
@@ -471,7 +470,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                     );
                     return Ok(());
                 }
-                self.record_observed_file_changes(&call.id, &execution.file_changes)?;
+                self.record_execution_changes(&call.id, &execution, &tool_call_event_id)?;
                 let succeeded = self.emit_tool_result(call, execution, tool_call_event_id)?;
                 crate::diagnostics::tool_exec_end(
                     &self.session_id,
@@ -481,7 +480,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 );
             }
             Ok(crate::tools::ToolExecutionOutcome::Cancelled(execution)) => {
-                self.record_observed_file_changes(&call.id, &execution.file_changes)?;
+                self.record_execution_changes(&call.id, &execution, &tool_call_event_id)?;
                 self.emit_cancelled_tool_result(call, tool_call_event_id, Some(&execution))?;
                 crate::diagnostics::tool_exec_end(
                     &self.session_id,
@@ -532,6 +531,10 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             return Ok(false);
         };
         let mut payload = object([
+            (
+                "workspace_root",
+                patch.workspace_root.to_string_lossy().into_owned().into(),
+            ),
             ("path", patch.path.clone().into()),
             ("old", patch.before.clone().into()),
             ("new", patch.after.clone().into()),
@@ -539,11 +542,24 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         self.redactor
             .redact_payload_fields(&mut payload, &["old", "new"]);
         let patch_proposed_id = self
-            .append(EventKind::PATCH_PROPOSED, payload.clone(), None)?
+            .append(
+                EventKind::PATCH_PROPOSED,
+                payload.clone(),
+                Some(tool_call_event_id.to_owned()),
+            )?
             .id;
-        match self.tools.apply_patch_cancellable(patch, cancellation) {
+        match self
+            .tools
+            .apply_patch_cancellable_observed(patch, cancellation)
+        {
             Ok(()) => {}
-            Err(crate::ToolError::Cancelled) => {
+            Err(failure) if matches!(failure.error, crate::ToolError::Cancelled) => {
+                self.record_observed_file_changes(
+                    &call.id,
+                    patch.origin,
+                    &failure.file_changes,
+                    tool_call_event_id,
+                )?;
                 self.emit_cancelled_tool_result(
                     call.clone(),
                     tool_call_event_id.to_owned(),
@@ -551,11 +567,17 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 )?;
                 return Err(SessionError::Cancelled);
             }
-            Err(error) => {
+            Err(failure) => {
+                self.record_observed_file_changes(
+                    &call.id,
+                    patch.origin,
+                    &failure.file_changes,
+                    tool_call_event_id,
+                )?;
                 self.emit_tool_failure(
                     call.id.clone(),
                     execution.name.clone(),
-                    error.to_string(),
+                    failure.error.to_string(),
                     tool_call_event_id.to_owned(),
                 )?;
                 return Ok(true);
@@ -564,7 +586,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let patch_applied_id = self
             .append(EventKind::PATCH_APPLIED, payload, Some(patch_proposed_id))?
             .id;
-        let pre_image_blob = maybe_store_pre_image(self.workspace_root.as_path(), patch);
+        let pre_image_blob = maybe_store_pre_image(patch);
         let file_change_id = self
             .append(
                 EventKind::FILE_CHANGE,
@@ -582,27 +604,39 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
     fn record_observed_file_changes(
         &mut self,
         call_id: &str,
+        origin: &str,
         changes: &[crate::ObservedFileChange],
+        parent: &str,
     ) -> Result<(), SessionError> {
-        for change in changes {
-            let file_change_id = self
-                .append(
-                    EventKind::FILE_CHANGE,
-                    crate::file_diff::observed_file_change_payload(call_id, "run_shell", change),
-                    None,
-                )?
-                .id;
-            let mut observed_diff = crate::file_diff::observed_file_diff_payload(
-                call_id,
-                &file_change_id,
-                "run_shell",
-                change,
-            );
-            self.redactor
-                .redact_payload_fields(&mut observed_diff, &["diff"]);
-            self.append(EventKind::FILE_DIFF, observed_diff, None)?;
-        }
-        Ok(())
+        let mut appender = ParentedAppender {
+            writer: &self.writer,
+            bus: self.bus,
+            persisted_events: self.persisted_events,
+            session_id: &self.session_id,
+            agent_id: &self.agent_id,
+        };
+        append_companion_observed_file_changes(
+            &mut appender,
+            &self.redactor,
+            call_id,
+            origin,
+            changes,
+            parent,
+        )
+    }
+
+    fn record_execution_changes(
+        &mut self,
+        call_id: &str,
+        execution: &crate::tools::ToolExecution,
+        tool_call_event_id: &str,
+    ) -> Result<(), SessionError> {
+        self.record_observed_file_changes(
+            call_id,
+            &execution.name,
+            &execution.file_changes,
+            tool_call_event_id,
+        )
     }
 
     fn emit_tool_result(
@@ -1098,6 +1132,30 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
     ) -> Result<AgentResult, SessionError> {
         Ok(companion_failure("budget exhausted: max_turns"))
     }
+}
+
+fn append_companion_observed_file_changes(
+    appender: &mut ParentedAppender<'_>,
+    redactor: &crate::redaction::SecretRedactor,
+    call_id: &str,
+    origin: &str,
+    changes: &[crate::ObservedFileChange],
+    parent: &str,
+) -> Result<(), SessionError> {
+    for change in changes {
+        let file_change_id = appender
+            .append(
+                EventKind::FILE_CHANGE,
+                crate::file_diff::observed_file_change_payload(call_id, origin, change),
+                Some(parent.to_owned()),
+            )?
+            .id;
+        let mut observed_diff =
+            crate::file_diff::observed_file_diff_payload(call_id, &file_change_id, origin, change);
+        redactor.redact_payload_fields(&mut observed_diff, &["diff"]);
+        appender.append(EventKind::FILE_DIFF, observed_diff, Some(parent.to_owned()))?;
+    }
+    Ok(())
 }
 
 impl ParentedAppender<'_> {

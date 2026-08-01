@@ -810,8 +810,7 @@ fn permissions_picker_gives_no_radio_to_action_rows() {
         .join("\n");
 
     for row in rendered.lines() {
-        if row.contains("Advanced capability settings") || row.contains("Auto in workspace sandbox")
-        {
+        if row.contains("Advanced capability settings") || row.contains("Workspace sandbox") {
             assert!(
                 !row.contains('○') && !row.contains('●'),
                 "action row must not wear a posture marker: {row:?}"
@@ -912,7 +911,7 @@ fn permissions_picker_keeps_per_capability_controls_under_advanced() {
 }
 
 #[test]
-fn permissions_picker_marks_sandbox_posture_unavailable_instead_of_faking_it() {
+fn permissions_picker_marks_workspace_sandbox_as_launch_controlled() {
     let mut surface = BottomSurface::new(CommandContext::default());
     surface.open_picker(PickerSpec::Permissions(permission_choices()));
     for _ in 0..3 {

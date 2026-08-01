@@ -37,3 +37,4 @@ mod transcript_tests;
 pub mod tui_decider;
 pub mod visual_canvas;
 pub(crate) mod workspace_files;
+pub(crate) mod workspace_path;

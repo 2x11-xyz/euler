@@ -10,9 +10,10 @@ use super::terminal::{
 };
 use anyhow::{anyhow, Result};
 use euler_core::{
-    fold_session, read_resume_prefix, resume_session_from_folded_prefix, CompactionTier,
-    ModelTarget, PermissionDecider, ProvenanceWriter, ReasoningEffort, Session, SessionConfig,
-    SessionKind,
+    canonical_runtime_roots, canonical_writable_roots, fold_session, preflight_resume_authority,
+    read_resume_prefix, resume_session_from_folded_prefix, CompactionTier, ModelTarget,
+    PermissionDecider, ProvenanceWriter, ReasoningEffort, SandboxProfile, Session, SessionConfig,
+    SessionKind, SubprocessSandbox,
 };
 use euler_provider::ProviderSet;
 use std::io::{self, IsTerminal, Read, Write};
@@ -69,6 +70,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.session_kind = SessionKind::Interactive;
+    apply_workspace_authority(&mut live_session.config, &run)?;
     apply_permission_reviewer(&mut live_session.config, &run);
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
@@ -219,6 +221,7 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.session_kind = SessionKind::Interactive;
+    apply_workspace_authority(&mut live_session.config, &run)?;
     apply_permission_reviewer(&mut live_session.config, &run);
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
@@ -347,6 +350,7 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
         provenance,
     )?;
     live_session.config.session_kind = SessionKind::NonInteractive;
+    apply_workspace_authority(&mut live_session.config, &exec.run)?;
     apply_permission_reviewer(&mut live_session.config, &exec.run);
     apply_catalog_context_limit(&mut live_session.config, &exec.run.model_catalog);
     apply_exec_config(
@@ -450,6 +454,23 @@ fn apply_permission_reviewer(config: &mut SessionConfig, run: &RunArgs) {
     if let Some(reviewer) = run.permission_reviewer {
         config.permission_reviewer = reviewer;
     }
+}
+
+fn apply_workspace_authority(config: &mut SessionConfig, run: &RunArgs) -> Result<()> {
+    let roots = canonical_writable_roots(&config.root, &run.writable_roots)
+        .map_err(|error| anyhow!("invalid writable-root authority: {error}"))?;
+    let mut roots = roots.into_iter();
+    config.root = roots
+        .next()
+        .ok_or_else(|| anyhow!("workspace root could not be resolved"))?;
+    config.attached_writable_roots = roots.collect();
+    let writable_roots = std::iter::once(config.root.clone())
+        .chain(config.attached_writable_roots.iter().cloned())
+        .collect::<Vec<_>>();
+    config.subprocess_runtime_roots = canonical_runtime_roots(&writable_roots, &run.runtime_roots)
+        .map_err(|error| anyhow!("invalid runtime-root authority: {error}"))?;
+    config.subprocess_sandbox = SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork);
+    Ok(())
 }
 
 fn apply_exec_config(config: &mut SessionConfig, overrides: ExecConfigOverrides) {
@@ -672,12 +693,16 @@ fn decide_relocation_line(required: &euler_core::RelocationRequired) -> Result<b
 /// Declining resumes nothing.
 fn apply_resume_relocation(
     prefix: &mut Vec<euler_event::EventEnvelope>,
-    live_root: &Path,
+    config: &SessionConfig,
     accept_relocation_flag: bool,
     relocation: RelocationConsent,
     writer: &ProvenanceWriter,
 ) -> Result<()> {
-    let Some(required) = euler_core::plan_relocation(prefix, live_root)? else {
+    // Relocation can change only project identity. Validate the accepted event
+    // shape and exact launch-provided host authority before consent and before
+    // the writer can append anything.
+    preflight_resume_authority(config, prefix)?;
+    let Some(required) = euler_core::plan_relocation(prefix, &config.root)? else {
         return Ok(());
     };
     let accept = if accept_relocation_flag {
@@ -730,6 +755,7 @@ where
         .to_owned();
     let root = std::env::current_dir()?;
     let mut config = session_config(root, run.provider_id.clone(), run.model.clone(), session_id);
+    apply_workspace_authority(&mut config, &run)?;
     apply_permission_reviewer(&mut config, &run);
     config.extensions_enabled = resolve_session_extensions(&config.root, &run.extensions)?;
     configure(&mut config);
@@ -742,7 +768,7 @@ where
     }
     apply_resume_relocation(
         &mut prefix,
-        &config.root,
+        &config,
         run.accept_relocation,
         relocation,
         &writer,

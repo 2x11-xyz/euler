@@ -36,6 +36,12 @@ impl<D: PermissionDecider> Session<D> {
             payload.insert("extension_id".to_owned(), extension_id.into());
             payload.insert("command".to_owned(), command.into());
         }
+        if matches!(call.name.as_str(), "run_shell" | "git_status" | "git_diff") {
+            payload.insert(
+                "workspace_authority".to_owned(),
+                self.tools.workspace_authority_payload(),
+            );
+        }
         let tool_call_event_id = self.emit_with_parent(
             EventKind::TOOL_CALL,
             payload,
@@ -192,6 +198,10 @@ impl<D: PermissionDecider> Session<D> {
                     .record_success(self.tools.reteach_identity(&call.name, &call.input));
                 if let Some(patch) = execution.patch.as_ref() {
                     let mut payload = object([
+                        (
+                            "workspace_root",
+                            patch.workspace_root.to_string_lossy().into_owned().into(),
+                        ),
                         ("path", patch.path.clone().into()),
                         ("old", patch.before.clone().into()),
                         ("new", patch.after.clone().into()),
@@ -203,9 +213,18 @@ impl<D: PermissionDecider> Session<D> {
                         payload.clone(),
                         Some(tool_call_event_id.clone()),
                     )?;
-                    match self.tools.apply_patch_cancellable(patch, cancellation) {
+                    match self
+                        .tools
+                        .apply_patch_cancellable_observed(patch, cancellation)
+                    {
                         Ok(()) => {}
-                        Err(ToolError::Cancelled) => {
+                        Err(failure) if matches!(failure.error, ToolError::Cancelled) => {
+                            self.emit_observed_changes(
+                                &call.id,
+                                patch.origin,
+                                &failure.file_changes,
+                                &tool_call_event_id,
+                            )?;
                             self.emit_cancelled_tool_result(
                                 call,
                                 tool_call_event_id,
@@ -214,11 +233,17 @@ impl<D: PermissionDecider> Session<D> {
                             )?;
                             return Err(SessionError::Cancelled);
                         }
-                        Err(error) => {
+                        Err(failure) => {
+                            self.emit_observed_changes(
+                                &call.id,
+                                patch.origin,
+                                &failure.file_changes,
+                                &tool_call_event_id,
+                            )?;
                             self.emit_failed_tool_result(
                                 call.id,
                                 execution.name,
-                                error.to_string(),
+                                failure.error.to_string(),
                                 tool_call_event_id,
                                 tool_started,
                             )?;
@@ -230,7 +255,7 @@ impl<D: PermissionDecider> Session<D> {
                         payload,
                         Some(patch_proposed_id),
                     )?;
-                    let pre_image_blob = maybe_store_pre_image(self.config.root.as_path(), patch);
+                    let pre_image_blob = maybe_store_pre_image(patch);
                     let file_change_id = self.emit_with_parent(
                         EventKind::FILE_CHANGE,
                         file_change_payload(&call.id, patch, pre_image_blob.as_deref()),
@@ -317,15 +342,33 @@ impl<D: PermissionDecider> Session<D> {
         if execution.file_changes.is_empty() {
             return Ok(());
         }
-        debug_assert_eq!(execution.name, "run_shell");
-        for change in &execution.file_changes {
+        debug_assert!(matches!(
+            execution.name.as_str(),
+            "run_shell" | "git_status" | "git_diff"
+        ));
+        self.emit_observed_changes(
+            call_id,
+            &execution.name,
+            &execution.file_changes,
+            tool_call_event_id,
+        )
+    }
+
+    fn emit_observed_changes(
+        &mut self,
+        call_id: &str,
+        origin: &str,
+        changes: &[crate::ObservedFileChange],
+        tool_call_event_id: &str,
+    ) -> Result<(), SessionError> {
+        for change in changes {
             let file_change_id = self.emit_with_parent(
                 EventKind::FILE_CHANGE,
-                observed_file_change_payload(call_id, "run_shell", change),
+                observed_file_change_payload(call_id, origin, change),
                 Some(tool_call_event_id.to_owned()),
             )?;
             let mut observed_diff =
-                observed_file_diff_payload(call_id, &file_change_id, "run_shell", change);
+                observed_file_diff_payload(call_id, &file_change_id, origin, change);
             self.redactor
                 .redact_payload_fields(&mut observed_diff, &["diff"]);
             self.emit_with_parent(
@@ -404,7 +447,7 @@ pub(crate) fn tool_result_payload(
     let mut payload = object([
         ("id", call_id.into()),
         ("name", execution.name.clone().into()),
-        ("ok", true.into()),
+        ("ok", execution.failure.is_none().into()),
         ("output", redacted_output.clone().into()),
     ]);
     if let Some(budget) = execution.output_preview_budget {
@@ -429,19 +472,25 @@ pub(crate) fn tool_result_payload(
     if let Some(exit_code) = execution.exit_code {
         payload.insert("exit_code".to_owned(), exit_code.into());
     }
+    if let Some(failure) = &execution.failure {
+        payload.insert("failure_kind".to_owned(), failure.kind().into());
+    }
     // Reaching this builder means the executor returned a completed
-    // ToolExecution. That is distinct from the process outcome: a nonzero
-    // exit makes the canonical tool operation fail while its output and exit
-    // code remain durable evidence.
+    // ToolExecution. That is distinct from the operation outcome: a nonzero
+    // process exit or typed non-exit failure narrows `ok` while output and
+    // compatibility status remain durable evidence.
     let succeeded = tool_result_succeeded(&payload);
     payload.insert("ok".to_owned(), succeeded.into());
     if !succeeded {
-        let exit_code = execution.exit_code.unwrap_or(-1);
-        debug_assert_ne!(exit_code, 0, "zero exit code must be successful");
-        payload.insert(
-            "error".to_owned(),
-            format!("process exited with code {exit_code}").into(),
-        );
+        let error = if let Some(failure) = &execution.failure {
+            failure.error()
+        } else {
+            let exit_code = execution.exit_code.unwrap_or(-1);
+            debug_assert_ne!(exit_code, 0, "zero exit code must be successful");
+            payload.insert("failure_kind".to_owned(), "process-exit".into());
+            format!("process exited with code {exit_code}")
+        };
+        payload.insert("error".to_owned(), redactor.redact(&error).into());
     }
     payload
 }
@@ -457,6 +506,7 @@ pub(crate) fn tool_cancelled_payload(
         ("name", name.into()),
         ("ok", false.into()),
         ("error", "tool cancelled".into()),
+        ("failure_kind", "cancelled".into()),
         ("cancelled", true.into()),
     ]);
     if let Some(execution) = execution {
@@ -496,6 +546,10 @@ pub(crate) fn file_change_payload(
         ("tool_call_id", tool_call_id.to_owned().into()),
         ("origin", patch.origin.into()),
         ("action", patch.action.into()),
+        (
+            "workspace_root",
+            patch.workspace_root.to_string_lossy().into_owned().into(),
+        ),
         ("path", patch.path.clone().into()),
         ("old_path", Value::Null),
         (
@@ -516,12 +570,12 @@ pub(crate) fn file_change_payload(
     payload
 }
 
-pub(crate) fn maybe_store_pre_image(root: &std::path::Path, patch: &PatchEvents) -> Option<String> {
+pub(crate) fn maybe_store_pre_image(patch: &PatchEvents) -> Option<String> {
     // v0: modify-only. Adds have empty before; restore-as-delete is product debt.
     if patch.action != "modify" || patch.before.is_empty() {
         return None;
     }
-    crate::checkpoints::store_pre_image(root, &patch.path, &patch.before)
+    crate::checkpoints::store_pre_image(&patch.workspace_root, &patch.path, &patch.before)
 }
 
 pub(crate) fn file_diff_payload(
@@ -538,6 +592,10 @@ pub(crate) fn file_diff_payload(
     object([
         ("tool_call_id", tool_call_id.to_owned().into()),
         ("file_change_id", file_change_id.to_owned().into()),
+        (
+            "workspace_root",
+            patch.workspace_root.to_string_lossy().into_owned().into(),
+        ),
         ("path", patch.path.clone().into()),
         ("old_path", Value::Null),
         ("action", patch.action.into()),
@@ -557,4 +615,138 @@ pub(crate) fn file_diff_payload(
                 .map_or(Value::Null, std::convert::Into::into),
         ),
     ])
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::canvas::{assemble_canvas, AutoCompactionPolicy};
+    use crate::tools::ToolExecutionFailure;
+
+    fn execution(exit_code: i32, failure: Option<ToolExecutionFailure>) -> ToolExecution {
+        ToolExecution {
+            name: "run_shell".to_owned(),
+            output: "collected output".to_owned(),
+            output_preview_budget: None,
+            project_context_snapshot_digest: None,
+            exit_code: Some(exit_code),
+            failure,
+            patch: None,
+            file_changes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn typed_non_exit_failures_never_claim_a_normal_process_exit() {
+        let cases = [
+            (
+                ToolExecutionFailure::TimedOut { timeout_ms: 250 },
+                "timeout",
+                "command timed out after 250 ms and its process group was killed",
+            ),
+            (
+                ToolExecutionFailure::Signaled { signal: 15 },
+                "signal",
+                "command terminated by signal 15",
+            ),
+            (
+                ToolExecutionFailure::AbnormalTermination,
+                "abnormal-termination",
+                "command terminated abnormally without an exit code",
+            ),
+            (
+                ToolExecutionFailure::SupervisionFailed,
+                "supervision-failed",
+                "command supervision failed after launch; its process group was killed",
+            ),
+            (
+                ToolExecutionFailure::WorkspaceMutation {
+                    tool_name: "git_diff".to_owned(),
+                },
+                "workspace-mutation",
+                "workspace mutation was observed during git_diff; the Git view was invalidated",
+            ),
+        ];
+
+        for (failure, kind, error) in cases {
+            let payload = tool_result_payload(
+                "call".to_owned(),
+                &execution(-1, Some(failure)),
+                &SecretRedactor::new(),
+            );
+            assert_eq!(payload.get("ok"), Some(&Value::Bool(false)));
+            assert_eq!(
+                payload.get("failure_kind").and_then(Value::as_str),
+                Some(kind)
+            );
+            assert_eq!(payload.get("error").and_then(Value::as_str), Some(error));
+            assert_eq!(
+                payload.get("output").and_then(Value::as_str),
+                Some("collected output")
+            );
+            assert_eq!(payload.get("exit_code").and_then(Value::as_i64), Some(-1));
+            assert!(!error.contains("exited with code"));
+        }
+    }
+
+    #[test]
+    fn ordinary_nonzero_exit_remains_a_process_exit_failure() {
+        let payload = tool_result_payload(
+            "call".to_owned(),
+            &execution(101, None),
+            &SecretRedactor::new(),
+        );
+
+        assert_eq!(payload.get("ok"), Some(&Value::Bool(false)));
+        assert_eq!(
+            payload.get("failure_kind").and_then(Value::as_str),
+            Some("process-exit")
+        );
+        assert_eq!(
+            payload.get("error").and_then(Value::as_str),
+            Some("process exited with code 101")
+        );
+    }
+
+    #[test]
+    fn signal_failure_reaches_model_input_without_becoming_a_process_exit() {
+        let call = EventEnvelope::new(
+            "session",
+            "agent",
+            None,
+            EventKind::TOOL_CALL,
+            object([
+                ("id", "call-signal".into()),
+                ("name", "run_shell".into()),
+                ("input", serde_json::json!({"command": "fixture"})),
+            ]),
+        );
+        let result = EventEnvelope::new(
+            "session",
+            "agent",
+            Some(call.id.clone()),
+            EventKind::TOOL_RESULT,
+            tool_result_payload(
+                "call-signal".to_owned(),
+                &execution(-1, Some(ToolExecutionFailure::Signaled { signal: 15 })),
+                &SecretRedactor::new(),
+            ),
+        );
+        let canvas = assemble_canvas(&[call, result], &AutoCompactionPolicy::default());
+        let input = canvas
+            .iter()
+            .map(super::super::model_input_item)
+            .find(|item| matches!(item, euler_provider::ModelInputItem::ToolOutput { .. }))
+            .expect("model-facing tool output");
+
+        assert!(matches!(
+            input,
+            euler_provider::ModelInputItem::ToolOutput {
+                ok: false,
+                exit_code: Some(-1),
+                error: Some(error),
+                ..
+            } if error == "command terminated by signal 15"
+        ));
+    }
 }

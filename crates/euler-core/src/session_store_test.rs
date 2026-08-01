@@ -1138,7 +1138,7 @@ fn refresh_metadata_persists_event_root_over_stale_sidecar_root() {
 }
 
 #[test]
-fn root_projection_uses_first_session_start() {
+fn duplicate_session_start_invalidates_root_projection() {
     let (temp, store) = test_store();
     let first_root = project_root(temp.path(), "first-root");
     let later_root = project_root(temp.path(), "later-root");
@@ -1151,8 +1151,8 @@ fn root_projection_uses_first_session_start() {
         .expect("find")
         .expect("record");
 
-    let expected = expected_root(&first_root);
-    assert_eq!(listed.root(), Some(expected.as_path()));
+    assert_eq!(listed.status(), SessionStatus::Invalid);
+    assert_eq!(listed.root(), None);
 }
 
 #[test]

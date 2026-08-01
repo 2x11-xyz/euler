@@ -16,6 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install workspace sandbox backend
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - name: Provider catalog sync tests
         run: python3 -m unittest scripts.test_sync_provider_catalog
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -36,3 +38,19 @@ jobs:
         run: cargo nextest run --workspace
       - name: Doc tests
         run: cargo test --workspace --doc
+
+  macos-structured-authority:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-macos-structured-authority-${{ hashFiles('Cargo.lock') }}
+      - name: Check workspace
+        run: cargo check --locked --workspace --all-targets
+      - name: Test structured workspace authority
+        run: cargo test --locked -p euler-core structured_ -- --nocapture

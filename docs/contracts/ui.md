@@ -107,6 +107,15 @@ legible and fights user palettes.)
 - **Context** rows: `fg` with syntax highlighting, no sign.
 - Semantics ride on the sign column + luminance **only**. No row-fill
   background anywhere, on any row or any span within a row.
+- File identity in transcript diffs, turn recaps, session-diff aggregation,
+  and exit file counts is `(workspace_root, relative path)`, not the relative
+  path alone. User-visible paths include the root so equal paths in two
+  attached writable roots remain distinct. Legacy events without
+  `workspace_root` inherit the first `session.start.root` when it is present.
+  A malformed absolute or parent-traversing event path cannot replace its
+  recorded root during display; the UI keeps both identities visible with a
+  guarded `root::path` form. Checkpoint pickers apply the same rule and use the
+  active primary root for legacy checkpoint references.
 
 ### Collapsed tool output preview (v4 spec amendment)
 
@@ -142,6 +151,18 @@ promotes, or reorders lines.
   `exit_code` is always failure, including for legacy events that also carry
   `ok: true`; raw legacy metadata cannot turn `exit 101` into a successful
   `Ran` block, suppress a failed extension result, or produce a passing recap.
+  A negative compatibility status for timeout, supervision loss, cancellation,
+  signal termination, abnormal termination, or an invalidated Git view remains
+  failed, while its durable error names that condition instead of presenting it
+  as a normal process exit. The `-1` compatibility sentinel is never rendered
+  as though it were an observed normal exit code.
+
+- A `workspace.restore` row renders as a revert only when `restored` is true.
+  Failed restores use the error style and retain any following partial
+  `file.change` / `file.diff` evidence in live ingestion and replay.
+- Exit recap resume commands preserve the full session id and include one
+  shell-quoted `--writable-root` / `--runtime-root` flag for every resolved
+  non-primary authority root needed to make the command work.
 
 ### Fold
 
@@ -320,9 +341,12 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   result receives exactly one cancelled `tool.result`; partial subprocess
   output and workspace changes completed before termination remain canonical
   evidence and are never reported as successful completion. After process
-  termination, ordinary `run_shell` performs its existing bounded evidence
-  scan (4,096 files, 256 KiB per file, 64 MiB total) before closing the result;
-  that finite scan may make transcript closure follow the process stop.
+  termination, ordinary `run_shell` performs its bounded evidence scan (4,096
+  granular entries, 256 KiB retained text per file, 64 MiB granular bytes,
+  plus a separately bounded opaque-subtree metadata/content fold) before
+  closing the result. That finite scan may make transcript closure follow the
+  process stop. An incomplete post-scan closes as an explicit failure and does
+  not claim that no files changed.
 
 ### Streaming, scroll, motion
 
@@ -539,10 +563,15 @@ session to the current folder.
 `/permissions` offers session-local postures before its advanced
 per-capability controls: **Read only** permits `fs-read`, `provenance-read`,
 and `diagnostics-read`; **Ask every time** puts every capability in `ask`; and
-**Full access (unsandboxed)** permits every capability for the current
-session. **Auto in workspace sandbox** stays visibly unavailable until an
-enforced Linux workspace-sandbox backend exists. A permission posture is not
-a sandbox claim and does not override secret/config guardrails. Applying a
+**Full capability access** permits every capability for the current session.
+None of these postures changes subprocess authority: the launch-selected
+workspace profile remains selected, unavailable enforcement keeps subprocesses
+blocked, and `/permissions` shows its row as launch-controlled. `/status`
+reports the successful profile probe or unavailability,
+the profile, every writable root (primary then attached), and every explicit
+read-only runtime root. When unavailable, those roots are labelled requested,
+not active. A permission posture is not a sandbox claim and does not override
+secret/config guardrails. Applying a
 posture clears transient session grants, so a prior session approval cannot
 silently survive a switch to **Ask every time**; explicit project/user rules
 remain separately visible in the advanced controls.

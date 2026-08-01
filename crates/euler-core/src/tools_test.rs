@@ -90,7 +90,7 @@ fn skill_read_returns_only_the_frozen_body_without_a_capability() {
 use serde_json::json;
 use std::env;
 #[cfg(unix)]
-use std::os::unix::fs::symlink;
+use std::os::unix::{ffi::OsStrExt as _, fs::symlink};
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -336,6 +336,92 @@ fn read_file_rejects_zero_bounds() {
     ));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn structured_reads_and_writes_reject_a_same_device_nested_bind_mount() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    struct Unmount(std::path::PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            if let Ok(target) = CString::new(self.0.as_os_str().as_bytes()) {
+                // SAFETY: `target` is NUL-terminated; lazy detach keeps test
+                // cleanup reliable if an assertion still holds a descriptor.
+                unsafe {
+                    libc::umount2(target.as_ptr(), libc::MNT_DETACH);
+                }
+            }
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    let nested = workspace.join("mounted");
+    for directory in [&workspace, &outside, &nested] {
+        fs::create_dir(directory).expect("fixture directory");
+    }
+    fs::write(outside.join("secret.txt"), "outside").expect("outside fixture");
+    assert_eq!(
+        fs::metadata(&workspace).expect("workspace metadata").dev(),
+        fs::metadata(&outside).expect("outside metadata").dev(),
+        "fixture must exercise a same-device bind"
+    );
+    let source = CString::new(outside.as_os_str().as_bytes()).expect("source path");
+    let target = CString::new(nested.as_os_str().as_bytes()).expect("target path");
+    // SAFETY: both mount paths are live, NUL-terminated directories and the
+    // remaining pointer arguments are unused for MS_BIND.
+    let mounted = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if mounted != 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+            eprintln!("skipping bind-mount integration check: {error}");
+            return;
+        }
+        panic!("bind mount fixture failed: {error}");
+    }
+    let _unmount = Unmount(nested);
+    let registry = ToolRegistry::new(&workspace);
+
+    for error in [
+        registry
+            .execute("read_file", &json!({"path": "mounted/secret.txt"}))
+            .expect_err("nested mount read must fail"),
+        registry
+            .execute(
+                "edit_file",
+                &json!({"path": "mounted/secret.txt", "old": "outside", "new": "changed"}),
+            )
+            .expect_err("nested mount edit must fail"),
+        registry
+            .execute(
+                "write_file",
+                &json!({"path": "mounted/created.txt", "content": "changed"}),
+            )
+            .expect_err("nested mount create must fail"),
+    ] {
+        assert!(matches!(
+            error,
+            ToolError::SandboxUnavailable(SandboxUnavailableReason::UnsafeMountTopology)
+        ));
+    }
+    assert_eq!(
+        fs::read_to_string(outside.join("secret.txt")).expect("outside unchanged"),
+        "outside"
+    );
+    assert!(!outside.join("created.txt").exists());
+}
+
 #[test]
 fn edit_file_rejects_overlapping_replacement_matches() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -431,7 +517,7 @@ fn edit_file_rejects_create_through_symlink_escape() {
     assert!(matches!(
         error,
         ToolError::PathOutsideWorkspace {
-            reason: "path escapes the workspace root",
+            reason: "path escapes every attached writable root",
             ..
         }
     ));
@@ -566,14 +652,14 @@ fn write_file_rejects_absolute_and_traversal_paths_without_writing() {
     assert!(matches!(
         absolute_error,
         ToolError::PathOutsideWorkspace {
-            reason: "absolute paths are not allowed",
+            reason: "path escapes every attached writable root",
             ..
         }
     ));
     assert!(matches!(
         traversal_error,
         ToolError::PathOutsideWorkspace {
-            reason: "path escapes the workspace root",
+            reason: "path escapes every attached writable root",
             ..
         }
     ));
@@ -603,7 +689,7 @@ fn write_file_rejects_create_through_symlink_escape() {
     assert!(matches!(
         error,
         ToolError::PathOutsideWorkspace {
-            reason: "path escapes the workspace root",
+            reason: "path escapes every attached writable root",
             ..
         }
     ));
@@ -681,6 +767,67 @@ fn apply_patch_rechecks_cancellation_at_the_write_boundary() {
 
     assert!(matches!(error, ToolError::Cancelled));
     assert!(!temp.path().join("cancelled.txt").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn structured_write_failure_records_partial_mutation() {
+    const CHILD_ENV: &str = "EULER_TEST_PARTIAL_STRUCTURED_WRITE_CHILD";
+    const CHILD_TEST: &str =
+        "tools::tools_test::partial_structured_write_child_records_observed_change";
+    let output = Command::new(std::env::current_exe().expect("current test binary"))
+        .args(["--exact", CHILD_TEST, "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("run isolated file-size-limited child");
+    assert!(
+        output.status.success(),
+        "child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn partial_structured_write_child_records_observed_change() {
+    if std::env::var_os("EULER_TEST_PARTIAL_STRUCTURED_WRITE_CHILD").is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("limited.txt");
+    fs::write(&target, "before").expect("fixture");
+    let root = temp.path().canonicalize().expect("canonical root");
+    let registry = ToolRegistry::new(&root);
+    let resolved = ResolvedWorkspacePath {
+        workspace_root: root,
+        relative: "limited.txt".to_owned(),
+        absolute: target.clone(),
+    };
+
+    // Isolate the process-wide limit in this dedicated child test process.
+    // Ignoring SIGXFSZ makes the over-limit write return EFBIG so Euler can
+    // observe the partially-written inode before the process exits.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let limit = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+    }
+    let failure = registry
+        .write_resolved_file_observed(&resolved, "replacement", false, None)
+        .expect_err("write must exceed child file-size limit");
+
+    assert!(matches!(failure.error, ToolError::Io(_)));
+    assert_eq!(failure.file_changes.len(), 1);
+    let change = &failure.file_changes[0];
+    assert_eq!(change.path, "limited.txt");
+    assert_eq!(change.action, "modify");
+    assert_eq!(change.before_byte_len, 6);
+    assert_eq!(change.after_byte_len, 1);
+    assert_eq!(fs::read(&target).expect("partial file"), b"r");
 }
 
 #[test]
@@ -1101,6 +1248,7 @@ fn run_shell_apply_patch_heredoc_tag_collision_fails_without_shell_exec() {
     assert!(!temp.path().join("created.txt").exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_apply_patch_prefix_collision_executes_as_ordinary_shell() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1120,6 +1268,7 @@ fn run_shell_apply_patch_prefix_collision_executes_as_ordinary_shell() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn non_apply_patch_shell_commands_still_execute_normally() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1137,8 +1286,415 @@ fn non_apply_patch_shell_commands_still_execute_normally() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn run_shell_isolates_euler_controls_and_keeps_project_env() {
+fn run_shell_does_not_walk_large_read_only_worktree_collection() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let collection = temp.path().join(".worktrees/checkout");
+    fs::create_dir_all(&collection).expect("worktree collection");
+    for index in 0..=crate::MAX_WORKSPACE_SNAPSHOT_FILES {
+        fs::write(collection.join(format!("fixture-{index:04}")), "x").expect("fixture");
+    }
+    let registry = ToolRegistry::new(temp.path());
+
+    let execution = registry
+        .execute("run_shell", &json!({"command": "printf ok > marker.txt"}))
+        .expect("ordinary shell remains usable");
+
+    assert_eq!(execution.exit_code, Some(0));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("marker.txt")).unwrap(),
+        "ok"
+    );
+    assert!(execution
+        .file_changes
+        .iter()
+        .all(|change| !change.path.starts_with(".worktrees/")));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn run_shell_observes_worktree_collection_created_after_pre_snapshot() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+
+    let execution = registry
+        .execute(
+            "run_shell",
+            &json!({"command": "mkdir -p .worktrees/checkout; printf changed > .worktrees/checkout/file.txt"}),
+        )
+        .expect("ordinary shell");
+
+    let change = execution
+        .file_changes
+        .iter()
+        .find(|change| change.path == ".worktrees/checkout/file.txt")
+        .expect("new collection contents must be observed");
+    assert_eq!(change.file_type, "regular");
+    assert_eq!(change.action, "add");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_shell_rejects_external_hardlink_before_command_starts() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    let outside_file = outside.join("shared");
+    fs::write(&outside_file, "unchanged").expect("outside file");
+    fs::hard_link(&outside_file, workspace.join("alias")).expect("workspace alias");
+    let registry = ToolRegistry::new(&workspace);
+
+    let error = registry
+        .execute("run_shell", &json!({"command": "touch marker"}))
+        .expect_err("external alias must block launch");
+
+    assert!(matches!(
+        error,
+        ToolError::WorkspaceObservationIncomplete {
+            phase: "before",
+            reason: WorkspaceSnapshotError::ExternalHardlink,
+            ..
+        }
+    ));
+    assert!(!workspace.join("marker").exists());
+    assert_eq!(fs::read_to_string(outside_file).unwrap(), "unchanged");
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_tools_reject_external_hardlink_before_reading() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    let canary = "OUTSIDE_HARDLINK_CONTENT_CANARY";
+    let outside_file = outside.join("sensitive.txt");
+    fs::write(&outside_file, format!("outside\n{canary}\n")).expect("outside file");
+    let alias = workspace.join("alias.txt");
+    fs::hard_link(&outside_file, &alias).expect("workspace alias");
+    let registry = ToolRegistry::new(&workspace);
+
+    let errors = [
+        registry
+            .execute("read_file", &json!({"path": "alias.txt"}))
+            .expect_err("read must reject external alias"),
+        registry
+            .execute(
+                "edit_file",
+                &json!({"path": "alias.txt", "old": "outside", "new": "changed"}),
+            )
+            .expect_err("edit preparation must reject external alias"),
+        registry
+            .execute(
+                "apply_patch",
+                &json!({
+                    "patch": "*** Begin Patch\n*** Update File: alias.txt\n@@\n-outside\n+changed\n*** End Patch"
+                }),
+            )
+            .expect_err("patch preparation must reject external alias"),
+    ];
+
+    assert!(errors
+        .iter()
+        .all(|error| matches!(error, ToolError::HardlinkedStructuredFile)));
+    assert!(errors
+        .iter()
+        .all(|error| !error.to_string().contains(canary)));
+    assert_eq!(
+        fs::read_to_string(&outside_file).expect("outside content unchanged"),
+        format!("outside\n{canary}\n")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_write_rechecks_hardlink_before_preimage_observation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    let target = workspace.join("target.txt");
+    fs::write(&target, "original\n").expect("initial target");
+    let registry = ToolRegistry::new(&workspace);
+    let execution = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "target.txt", "old": "original", "new": "changed"}),
+        )
+        .expect("prepare edit before substitution");
+
+    fs::remove_file(&target).expect("remove prepared target");
+    let canary = "LATE_EXTERNAL_HARDLINK_CANARY";
+    let outside_file = outside.join("sensitive.txt");
+    fs::write(&outside_file, format!("original\n{canary}\n")).expect("outside file");
+    fs::hard_link(&outside_file, &target).expect("substitute external alias");
+
+    let failure = registry
+        .apply_patch_cancellable_observed(
+            execution.patch.as_ref().expect("patch"),
+            &CancellationToken::new(),
+        )
+        .expect_err("late external alias must fail before observation");
+
+    assert!(matches!(failure.error, ToolError::HardlinkedStructuredFile));
+    assert!(failure.file_changes.is_empty());
+    assert!(!failure.error.to_string().contains(canary));
+    assert_eq!(
+        fs::read_to_string(&outside_file).expect("outside content unchanged"),
+        format!("original\n{canary}\n")
+    );
+}
+
+#[test]
+fn structured_write_rejects_stale_preimage_after_prepare() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("target.txt");
+    fs::write(&target, "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+    let execution = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "target.txt", "old": "old", "new": "agent"}),
+        )
+        .expect("prepare edit");
+
+    fs::write(&target, "user\n").expect("concurrent user edit");
+    let error = registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect_err("stale preimage must not be overwritten");
+
+    assert!(matches!(error, ToolError::StalePreparedWrite));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "user\n");
+}
+
+#[test]
+fn structured_writes_reject_read_only_worktree_collection() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::create_dir(temp.path().join(".worktrees")).expect("collection");
+    let registry = ToolRegistry::new(temp.path());
+
+    let error = registry
+        .execute(
+            "write_file",
+            &json!({"path": ".worktrees/new.txt", "content": "no"}),
+        )
+        .expect_err("protected collection");
+
+    assert!(matches!(error, ToolError::PathOutsideWorkspace { .. }));
+    assert!(!temp.path().join(".worktrees/new.txt").exists());
+}
+
+#[test]
+fn structured_tools_use_canonical_absolute_paths_for_attached_roots() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let primary = temp.path().join("primary");
+    let attached = temp.path().join("attached");
+    fs::create_dir(&primary).expect("primary");
+    fs::create_dir(&attached).expect("attached");
+    let target = attached.join("note.txt");
+    fs::write(&target, "alpha\n").expect("target");
+    let registry = ToolRegistry::with_workspace_authority(
+        &primary,
+        vec![attached.clone()],
+        Vec::new(),
+        SubprocessSandbox::Disabled,
+    );
+    let target = target.canonicalize().expect("canonical target");
+    let target_str = target.to_string_lossy();
+
+    let read = registry
+        .execute("read_file", &json!({"path": target_str.as_ref()}))
+        .expect("read attached file");
+    assert_eq!(read.output, "alpha\n");
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": target_str.as_ref(), "old": "alpha", "new": "beta"}),
+        )
+        .expect("prepare attached edit");
+    let edit = edit.patch.expect("edit patch");
+    assert_eq!(edit.workspace_root, attached.canonicalize().unwrap());
+    assert_eq!(edit.path, "note.txt");
+    registry.apply_patch(&edit).expect("apply attached edit");
+
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n@@\n-beta\n+gamma\n*** End Patch",
+        target.display()
+    );
+    let update = registry
+        .execute("apply_patch", &json!({"patch": patch}))
+        .expect("prepare attached apply_patch");
+    registry
+        .apply_patch(update.patch.as_ref().expect("update patch"))
+        .expect("apply attached patch");
+    assert_eq!(fs::read_to_string(target).unwrap(), "gamma\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_write_rejects_parent_symlink_substitution_after_prepare() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(workspace.join("src")).expect("workspace src");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(workspace.join("src/note.txt"), "old\n").expect("workspace target");
+    fs::write(outside.join("note.txt"), "outside\n").expect("outside target");
+    let registry = ToolRegistry::new(&workspace);
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "src/note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+
+    fs::rename(workspace.join("src"), workspace.join("original-src")).expect("move parent");
+    symlink(&outside, workspace.join("src")).expect("substitute parent symlink");
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("substituted parent must fail closed");
+
+    assert!(matches!(error, ToolError::PathOutsideWorkspace { .. }));
+    assert_eq!(
+        fs::read_to_string(outside.join("note.txt")).unwrap(),
+        "outside\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("original-src/note.txt")).unwrap(),
+        "old\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_read_fd_open_rejects_parent_symlink_substitution_after_resolution() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(workspace.join("src")).expect("workspace src");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(workspace.join("src/note.txt"), "inside\n").expect("workspace target");
+    fs::write(outside.join("note.txt"), "outside\n").expect("outside target");
+    let registry = ToolRegistry::new(&workspace);
+    let resolved = registry
+        .resolve_workspace_path("src/note.txt", false)
+        .expect("resolve inside path");
+
+    fs::rename(workspace.join("src"), workspace.join("original-src")).expect("move parent");
+    symlink(&outside, workspace.join("src")).expect("substitute parent symlink");
+    let error = open_workspace_read_file(&resolved, &registry.structured_path_authority)
+        .expect_err("fd-anchored read must reject the substituted parent");
+
+    assert!(matches!(error, ToolError::Io(_)));
+    assert_eq!(
+        fs::read_to_string(outside.join("note.txt")).expect("outside remains unread by fixture"),
+        "outside\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_tools_reject_selected_root_substitution() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let original = temp.path().join("original-workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    let registry = ToolRegistry::with_subprocess_sandbox(&workspace, SubprocessSandbox::Disabled);
+
+    fs::rename(&workspace, &original).expect("move selected root");
+    symlink(&outside, &workspace).expect("substitute selected root");
+    let error = registry
+        .execute(
+            "write_file",
+            &json!({"path": "escaped.txt", "content": "must not escape"}),
+        )
+        .expect_err("substituted root must fail closed");
+
+    assert!(matches!(
+        error,
+        ToolError::SandboxUnavailable(SandboxUnavailableReason::AuthorityInspectionFailed)
+    ));
+    assert!(!outside.join("escaped.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_tools_reject_fifo_authority_without_opening_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let fifo = temp.path().join("host.fifo");
+    let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+    // SAFETY: the path is a valid NUL-terminated pathname inside the fixture.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let registry = ToolRegistry::with_subprocess_sandbox(temp.path(), SubprocessSandbox::Disabled);
+
+    assert!(matches!(
+        registry.execute("read_file", &json!({"path": "host.fifo"})),
+        Err(ToolError::UnsupportedFileType { .. })
+    ));
+    assert!(matches!(
+        registry.execute(
+            "edit_file",
+            &json!({"path": "host.fifo", "old": "x", "new": "y"})
+        ),
+        Err(ToolError::UnsupportedFileType { .. })
+    ));
+}
+
+#[test]
+fn invalid_root_cannot_gain_authority_after_registry_construction() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let missing = temp.path().join("missing");
+    let registry = ToolRegistry::with_subprocess_sandbox(&missing, SubprocessSandbox::Disabled);
+    fs::create_dir(&missing).expect("create formerly missing root");
+
+    assert!(matches!(
+        registry.execute(
+            "write_file",
+            &json!({"path": "late.txt", "content": "late"})
+        ),
+        Err(ToolError::SandboxUnavailable(
+            SandboxUnavailableReason::InvalidWorkspace
+        ))
+    ));
+    assert!(!missing.join("late.txt").exists());
+}
+
+#[test]
+fn invalid_runtime_root_does_not_disable_structured_file_authority() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let missing_runtime = temp.path().join("missing-runtime");
+    let registry = ToolRegistry::with_workspace_authority(
+        temp.path(),
+        Vec::new(),
+        vec![missing_runtime],
+        SubprocessSandbox::Disabled,
+    );
+    let write = registry
+        .execute(
+            "write_file",
+            &json!({"path": "structured.txt", "content": "structured"}),
+        )
+        .expect("prepare structured write");
+    registry
+        .apply_patch(write.patch.as_ref().expect("patch"))
+        .expect("apply structured write");
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("structured.txt")).unwrap(),
+        "structured"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn run_shell_uses_a_minimal_environment_and_isolates_parent_controls() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     let workspace = tempfile::tempdir().expect("workspace");
     let user_home = tempfile::tempdir().expect("user home");
@@ -1202,35 +1758,11 @@ fn run_shell_isolates_euler_controls_and_keeps_project_env() {
         .split('|')
         .collect();
     assert_eq!(values.len(), 15);
-    assert_eq!(values[0], "visible");
-    assert_eq!(Path::new(values[1]), user_home.path());
+    assert_eq!(values[0], "");
+    assert_eq!(Path::new(values[1]), Path::new("/tmp/home"));
     assert!(values[2..8].iter().all(|value| value.is_empty()));
-    assert_eq!(values[8], "tokenizer-visible");
-    let isolated_euler_home = PathBuf::from(values[9]);
-    assert!(isolated_euler_home.is_absolute());
-    assert!(isolated_euler_home.is_dir());
-    assert_ne!(isolated_euler_home, parent_euler_home);
-    assert_ne!(isolated_euler_home, default_euler_home);
-    assert!(values[10..14].iter().all(|value| value.is_empty()));
-    assert_eq!(values[14], "my_crate=trace");
+    assert!(values[8..].iter().all(|value| value.is_empty()));
     assert_secret_sentinels_absent(&execution.output);
-
-    fs::write(isolated_euler_home.join("marker"), "persisted").expect("isolated marker");
-    let reused = registry
-        .execute(
-            "run_shell",
-            &json!({
-                "command": "printf '%s|%s|%s' \"$EULER_HOME\" \"$(cat \"$EULER_HOME/marker\")\" \"$RUST_LOG\""
-            }),
-        )
-        .expect("second shell");
-    assert_eq!(
-        reused.output,
-        format!(
-            "exit 0\n{}|persisted|my_crate=trace",
-            isolated_euler_home.display()
-        )
-    );
 
     let case_distinct = registry
         .execute(
@@ -1240,9 +1772,7 @@ fn run_shell_isolates_euler_controls_and_keeps_project_env() {
             }),
         )
         .expect("shell with case-distinct project variables");
-    assert!(case_distinct
-        .output
-        .contains("project-model|project-log|project-home"));
+    assert_eq!(case_distinct.output, "exit 0\n||");
 
     let explicit = registry
         .execute(
@@ -1253,9 +1783,6 @@ fn run_shell_isolates_euler_controls_and_keeps_project_env() {
         )
         .expect("shell with explicit controls");
     assert!(explicit.output.contains("/explicit|debug"));
-
-    drop(registry);
-    assert!(!isolated_euler_home.exists());
 }
 
 fn assert_secret_sentinels_absent(output: &str) {
@@ -1306,7 +1833,7 @@ fn resolve_path_rejects_symlink_escape() {
     assert!(matches!(
         error,
         ToolError::PathOutsideWorkspace {
-            reason: "path escapes the workspace root",
+            reason: "path escapes every attached writable root",
             ..
         }
     ));
@@ -1338,7 +1865,7 @@ fn read_file_rejects_parent_traversal_escape() {
     assert!(matches!(
         error,
         ToolError::PathOutsideWorkspace {
-            reason: "path escapes the workspace root",
+            reason: "path escapes every attached writable root",
             ..
         }
     ));
@@ -1358,7 +1885,7 @@ fn apply_patch_rejects_absolute_add_path_with_actionable_diagnostic() {
     assert!(matches!(
         error,
         ToolError::PathOutsideWorkspace {
-            reason: "absolute paths are not allowed",
+            reason: "path escapes every attached writable root",
             ..
         }
     ));
@@ -1368,11 +1895,11 @@ fn apply_patch_rejects_absolute_add_path_with_actionable_diagnostic() {
         "message names the path: {message}"
     );
     assert!(
-        message.contains("outside the workspace root"),
+        message.contains("outside workspace authority"),
         "message states the real cause: {message}"
     );
     assert!(
-        message.contains("paths must be relative and stay inside the workspace root"),
+        message.contains("use a relative primary-workspace path or an absolute path inside an attached writable root"),
         "message says how to proceed: {message}"
     );
     assert!(
@@ -1398,7 +1925,7 @@ fn apply_patch_rejects_traversal_add_path_with_actionable_diagnostic() {
         "message names the path: {message}"
     );
     assert!(
-        message.contains("outside the workspace root"),
+        message.contains("outside workspace authority"),
         "message states the real cause: {message}"
     );
 }
@@ -1426,13 +1953,13 @@ fn read_file_and_edit_file_reject_absolute_paths_with_actionable_diagnostic() {
         assert!(matches!(
             error,
             ToolError::PathOutsideWorkspace {
-                reason: "absolute paths are not allowed",
+                reason: "path escapes every attached writable root",
                 ..
             }
         ));
         let message = error.to_string();
         assert!(message.contains("anything.txt"));
-        assert!(message.contains("outside the workspace root"));
+        assert!(message.contains("outside workspace authority"));
     }
 }
 
@@ -1491,6 +2018,7 @@ fn non_path_schema_errors_still_report_invalid_field() {
     assert!(matches!(error, ToolError::InvalidField("path")));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_kills_command_and_process_group_at_timeout() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1507,11 +2035,57 @@ fn run_shell_kills_command_and_process_group_at_timeout() {
         .expect("timeout is a tool result, not an error");
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
     assert_eq!(execution.exit_code, Some(-1));
+    assert_eq!(
+        execution.failure,
+        Some(ToolExecutionFailure::TimedOut { timeout_ms: 200 })
+    );
     assert!(execution.output.contains("timed out after 200 ms"));
     assert!(execution.output.contains("phase_one"));
     assert!(!execution.output.contains("phase_two"));
 }
 
+#[cfg(unix)]
+#[test]
+fn supervised_process_preserves_a_real_child_signal_as_termination() {
+    let mut child = std::process::Command::new("sh");
+    child.args(["-c", "kill -TERM $$"]);
+
+    let outcome = run_process(child, None, &CancellationToken::new()).expect("run child");
+
+    assert_eq!(
+        outcome.termination,
+        ProcessTermination::Signaled {
+            signal: libc::SIGTERM
+        }
+    );
+}
+
+#[test]
+fn non_exit_process_headers_name_the_terminal_condition_without_claiming_exit() {
+    for (termination, expected) in [
+        (ProcessTermination::TimedOut, "timed out"),
+        (ProcessTermination::Cancelled, "cancelled"),
+        (
+            ProcessTermination::Signaled { signal: 15 },
+            "terminated by signal 15",
+        ),
+        (
+            ProcessTermination::AbnormalTermination,
+            "terminated abnormally",
+        ),
+        (ProcessTermination::SupervisionFailed, "supervision failed"),
+    ] {
+        let (compatibility_status, header, _cancelled) = shell_termination(termination, 250);
+        assert_eq!(compatibility_status, -1);
+        assert!(header.contains(expected), "unexpected header: {header}");
+        assert!(
+            !header.to_ascii_lowercase().contains("exit"),
+            "a non-exit terminal condition must not claim an exit: {header}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_cancellation_kills_command_and_process_group() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1565,6 +2139,7 @@ fn run_shell_cancellation_kills_command_and_process_group() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_cancellation_still_kills_descendants_after_shell_leader_exits() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1609,18 +2184,27 @@ fn run_shell_timeout_ms_is_bounded() {
     assert!(error.to_string().contains("timeout_ms"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_fast_command_unaffected_by_timeout_default() {
     let temp = tempfile::tempdir().expect("temp dir");
     let registry = ToolRegistry::new(temp.path());
     let execution = registry
-        .execute("run_shell", &json!({"command": "printf fast"}))
+        .execute(
+            "run_shell",
+            &json!({"command": "printf fast; printf stderr >&2"}),
+        )
         .expect("fast command");
     assert_eq!(execution.exit_code, Some(0));
+    assert_eq!(execution.failure, None);
     assert!(execution.output.contains("fast"));
+    assert!(execution.output.contains("stderr"));
+    assert!(!execution.output.contains("__EULER_SANDBOX_"));
+    assert!(!execution.output.contains('\0'));
     assert!(!execution.output.contains("timed out"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_retains_complete_output_behind_a_bounded_preview() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1650,6 +2234,7 @@ fn run_shell_retains_complete_output_behind_a_bounded_preview() {
     assert!(!preview.contains("line-250\n"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn git_status_retains_complete_output_behind_a_bounded_preview() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -2074,32 +2659,53 @@ fn intercepted_run_shell_heredoc_counts_against_apply_patch() {
 }
 
 #[test]
-fn selected_sandbox_normalizes_subprocess_io_failures() {
-    let sandboxed = normalize_sandbox_subprocess_error(
-        true,
-        ToolError::Io(std::io::Error::other("raw launcher detail")),
-    );
+fn sandbox_normalizes_subprocess_io_failures() {
+    let sandboxed = normalize_sandbox_subprocess_error(ToolError::Io(std::io::Error::other(
+        "raw launcher detail",
+    )));
     assert!(matches!(
         sandboxed,
         ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
     ));
-
-    let host = normalize_sandbox_subprocess_error(
-        false,
-        ToolError::Io(std::io::Error::other("ordinary host error")),
-    );
-    assert!(matches!(host, ToolError::Io(_)));
 }
 
 #[test]
-fn sandbox_timeout_before_readiness_hides_launcher_output() {
+fn sandbox_timeout_before_readiness_hides_unframed_output() {
     let output = collected_agent_output(
-        "bwrap: host mount detail".to_owned(),
-        "more host detail".to_owned(),
-        true,
+        "unframed stdout".to_owned(),
+        "unframed stderr".to_owned(),
         true,
     )
     .expect("timeout is not a sandbox availability failure");
 
     assert!(output.is_empty());
+}
+
+#[test]
+fn sandbox_success_accepts_independently_framed_agent_streams() {
+    let output = collected_agent_output(
+        "unexpected pre-frame bytes\0__EULER_SANDBOX_STDOUT_READY__\0child stdout\n".to_owned(),
+        "unexpected pre-frame bytes\0__EULER_SANDBOX_STDERR_READY__\0child stderr\n".to_owned(),
+        false,
+    )
+    .expect("both readiness frames prove inner command output");
+
+    assert_eq!(output, "child stdout\nchild stderr\n");
+    assert!(!output.contains("pre-frame"));
+}
+
+#[test]
+fn sandbox_missing_either_readiness_frame_returns_only_safe_failure() {
+    let error = collected_agent_output(
+        "\0__EULER_SANDBOX_STDOUT_READY__\0child stdout".to_owned(),
+        "unframed stderr".to_owned(),
+        false,
+    )
+    .expect_err("stderr without its independent frame is not child output");
+
+    assert!(matches!(
+        error,
+        ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
+    ));
+    assert!(!error.to_string().contains("unframed stderr"));
 }

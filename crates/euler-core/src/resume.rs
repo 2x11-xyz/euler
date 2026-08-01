@@ -55,6 +55,8 @@ pub enum ResumeError {
     UnknownKind { kind: String },
     #[error("resume incompatible: duplicate event id in accepted provenance prefix")]
     DuplicateEventId,
+    #[error("resume incompatible: invalid session.start placement ({reason})")]
+    SessionStartShape { reason: String },
     #[error(
         "resume incompatible: terminal event {event_id} for agent {agent} matches multiple open \
          model calls"
@@ -92,6 +94,8 @@ pub enum ResumeError {
     ProjectContextBootstrap { reason: String },
     #[error("{message}")]
     WorkspaceMismatch { message: String },
+    #[error("resume incompatible: workspace authority changed ({reason})")]
+    WorkspaceAuthority { reason: String },
     #[error(transparent)]
     Session(#[from] crate::session::SessionError),
     #[error(transparent)]
@@ -107,8 +111,7 @@ pub fn fold_session(
     config: &SessionConfig,
     events: Vec<EventEnvelope>,
 ) -> Result<FoldedSession, ResumeError> {
-    preflight_events(&events)?;
-    preflight_project_context(config, &events)?;
+    preflight_fold(config, &events)?;
     let initial = ModelTarget::new(config.provider.clone(), config.model.clone());
     let mut target_at_event = initial;
     let mut reasoning_effort = config.reasoning_effort;
@@ -208,6 +211,24 @@ pub fn fold_session(
     })
 }
 
+fn preflight_fold(config: &SessionConfig, events: &[EventEnvelope]) -> Result<(), ResumeError> {
+    preflight_events(events)?;
+    preflight_project_context(config, events)?;
+    preflight_workspace_authority(config, events)
+}
+
+/// Validate the non-relocatable launch authority before a caller can append a
+/// relocation event. Workspace identity is intentionally excluded because a
+/// consented relocation changes that identity; event shape and host authority
+/// must already be valid and exact.
+pub fn preflight_resume_authority(
+    config: &SessionConfig,
+    events: &[EventEnvelope],
+) -> Result<(), ResumeError> {
+    preflight_events(events)?;
+    preflight_workspace_authority(config, events)
+}
+
 /// Project-context resume preflight (ADR 0017): fail closed on a missing,
 /// partial, duplicated, or inconsistent bootstrap and on a malformed latest
 /// snapshot — only the legacy shape (no summary and no snapshot) resumes
@@ -247,6 +268,131 @@ fn preflight_project_context(
         });
     }
     Ok(())
+}
+
+/// Workspace authority is launch configuration, but an attachment expands
+/// which host directories model-controlled tools may change. Current logs
+/// therefore resume only with the exact durable attached-root set and profile.
+/// Legacy/unrestricted logs may be narrowed to the enforced primary root, but
+/// never acquire an attachment during resume.
+fn preflight_workspace_authority(
+    config: &SessionConfig,
+    events: &[EventEnvelope],
+) -> Result<(), ResumeError> {
+    let (configured_roots, configured_runtime_roots) = configured_authority_paths(config)?;
+    let Some(start) = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_START)
+    else {
+        return if configured_roots.is_empty() && configured_runtime_roots.is_empty() {
+            Ok(())
+        } else {
+            Err(ResumeError::WorkspaceAuthority {
+                reason: "a legacy session without session.start cannot acquire attached writable or read-only runtime roots"
+                    .to_owned(),
+            })
+        };
+    };
+    let Some(authority) = start
+        .payload
+        .get("workspace_authority")
+        .and_then(Value::as_object)
+    else {
+        return if configured_roots.is_empty() && configured_runtime_roots.is_empty() {
+            Ok(())
+        } else {
+            Err(ResumeError::WorkspaceAuthority {
+                reason: "a legacy session cannot acquire attached writable roots".to_owned(),
+            })
+        };
+    };
+    let mode = authority.get("mode").and_then(Value::as_str);
+    if mode == Some("unrestricted-host") {
+        return if configured_roots.is_empty() && configured_runtime_roots.is_empty() {
+            Ok(())
+        } else {
+            Err(ResumeError::WorkspaceAuthority {
+                reason: "a session without durable attachments cannot acquire them on resume"
+                    .to_owned(),
+            })
+        };
+    }
+    let recorded_profile = authority.get("profile").and_then(Value::as_str);
+    let configured_profile = match config.subprocess_sandbox {
+        crate::SubprocessSandbox::Enforce(profile) => Some(profile.as_str()),
+        crate::SubprocessSandbox::Disabled => None,
+    };
+    if !matches!(mode, Some("disabled" | "enforced")) {
+        return Err(ResumeError::WorkspaceAuthority {
+            reason: "the session has an unknown authority mode".to_owned(),
+        });
+    }
+    if (mode == Some("disabled")) != (configured_profile.is_none()) {
+        return Err(ResumeError::WorkspaceAuthority {
+            reason: "the subprocess authority mode differs from session start".to_owned(),
+        });
+    }
+    if recorded_profile != configured_profile {
+        return Err(ResumeError::WorkspaceAuthority {
+            reason: "the sandbox profile differs from session start".to_owned(),
+        });
+    }
+    let recorded_roots = recorded_authority_paths(authority, "attached_writable_roots")?;
+    if recorded_roots != configured_roots {
+        return Err(ResumeError::WorkspaceAuthority {
+            reason: "the attached writable-root set differs from session start".to_owned(),
+        });
+    }
+    let recorded_runtime_roots = recorded_authority_paths(authority, "read_only_runtime_roots")?;
+    if recorded_runtime_roots != configured_runtime_roots {
+        return Err(ResumeError::WorkspaceAuthority {
+            reason: "the read-only runtime-root set differs from session start".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn configured_authority_paths(
+    config: &SessionConfig,
+) -> Result<(Vec<String>, Vec<String>), ResumeError> {
+    let writable = crate::canonical_writable_roots(&config.root, &config.attached_writable_roots)
+        .map_err(|_| ResumeError::WorkspaceAuthority {
+        reason: "the configured writable-root set is invalid".to_owned(),
+    })?;
+    let runtime = crate::canonical_runtime_roots(&writable, &config.subprocess_runtime_roots)
+        .map_err(|_| ResumeError::WorkspaceAuthority {
+            reason: "the configured runtime-root set is invalid".to_owned(),
+        })?;
+    Ok((
+        writable
+            .into_iter()
+            .skip(1)
+            .map(|root| crate::session_root::session_root_for_event(&root))
+            .collect(),
+        runtime
+            .iter()
+            .map(|root| crate::session_root::session_root_for_event(root))
+            .collect(),
+    ))
+}
+
+fn recorded_authority_paths(
+    authority: &serde_json::Map<String, Value>,
+    key: &'static str,
+) -> Result<Vec<String>, ResumeError> {
+    authority
+        .get(key)
+        .and_then(Value::as_array)
+        .and_then(|roots| {
+            roots
+                .iter()
+                .map(Value::as_str)
+                .map(|root| root.map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| ResumeError::WorkspaceAuthority {
+            reason: format!("the {key} record is malformed"),
+        })
 }
 
 /// Facts for the relocation-consent card and the durable event an accepted
@@ -559,8 +705,9 @@ pub fn resume_session_from_folded_prefix<D>(
     mut folded: FoldedSession,
 ) -> Result<ResumeOutcome<D>, ResumeError> {
     // This is the mutation boundary: even doc-hidden callers that bypass
-    // `fold_session` cannot append recovery events to an ambiguous prefix.
-    preflight_events(&folded.events)?;
+    // `fold_session` cannot append recovery events to an incompatible prefix
+    // or expand the live workspace/project-context authority.
+    preflight_fold(&config, &folded.events)?;
     let events_folded = folded.events.len();
     let active_target = folded.active_target.clone();
     let reasoning_effort = folded.reasoning_effort;
@@ -677,6 +824,26 @@ fn policy_from_object(
 }
 
 fn preflight_events(events: &[EventEnvelope]) -> Result<(), ResumeError> {
+    let session_start_positions = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| {
+            (event.kind.as_str() == EventKind::SESSION_START).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    match session_start_positions.as_slice() {
+        [] | [0] => {}
+        [index] => {
+            return Err(ResumeError::SessionStartShape {
+                reason: format!("the only session.start appears at index {index}, not index 0"),
+            })
+        }
+        _ => {
+            return Err(ResumeError::SessionStartShape {
+                reason: "more than one session.start is present".to_owned(),
+            })
+        }
+    }
     let mut event_ids = BTreeSet::new();
     for event in events {
         preflight_event(event)?;

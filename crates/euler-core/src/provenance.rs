@@ -473,7 +473,13 @@ fn has_explicit_semantic_parent(event: &EventEnvelope) -> bool {
         return false;
     }
     match event.kind.as_str() {
-        EventKind::PERMISSION_DECISION | EventKind::TOOL_RESULT | EventKind::AGENT_RESULT => true,
+        EventKind::PERMISSION_DECISION
+        | EventKind::TOOL_RESULT
+        | EventKind::PATCH_PROPOSED
+        | EventKind::PATCH_APPLIED
+        | EventKind::FILE_CHANGE
+        | EventKind::FILE_DIFF
+        | EventKind::AGENT_RESULT => true,
         EventKind::ERROR => {
             event
                 .payload

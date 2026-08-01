@@ -172,6 +172,27 @@ impl AppCore {
         if let Some(reviewer) = self.status.permission_reviewer.as_deref() {
             status.push_str(&format!("\npermission reviewer: {reviewer}"));
         }
+        status.push_str(&format!(
+            "\nworkspace authority: {}",
+            self.status.workspace_authority
+        ));
+        for (index, root) in self.status.writable_roots.iter().enumerate() {
+            let label = if index == 0 { "primary" } else { "attached" };
+            let qualifier = if self.status.workspace_authority_enforced {
+                "writable root"
+            } else {
+                "requested writable root"
+            };
+            status.push_str(&format!("\n{qualifier} ({label}): {}", root.display()));
+        }
+        for root in &self.status.read_only_runtime_roots {
+            let qualifier = if self.status.workspace_authority_enforced {
+                "read-only runtime root"
+            } else {
+                "requested read-only runtime root"
+            };
+            status.push_str(&format!("\n{qualifier}: {}", root.display()));
+        }
         self.notice_item(status)
     }
 
