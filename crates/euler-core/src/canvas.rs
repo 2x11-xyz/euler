@@ -142,6 +142,15 @@ pub enum CanvasItem {
         role: CanvasRole,
         content: String,
     },
+    /// A user-explicit activation resolved from the immutable skill snapshot.
+    /// It maps to a user-role provider item, but carries classification so a
+    /// child with project-context `none` cannot inherit the frozen body via
+    /// ordinary parent-canvas inclusion.
+    SkillActivation {
+        event_id: String,
+        snapshot_digest: String,
+        content: String,
+    },
     Projection {
         event_id: String,
         content: String,
@@ -202,6 +211,7 @@ impl CanvasItem {
         match self {
             Self::ProjectContext { event_id, .. }
             | Self::Message { event_id, .. }
+            | Self::SkillActivation { event_id, .. }
             | Self::Projection { event_id, .. }
             | Self::Slot { event_id, .. }
             | Self::ExtensionContribution { event_id, .. }
@@ -342,8 +352,15 @@ fn collect_canvas_items(
             }
         }
         match event.kind.as_str() {
-            EventKind::USER_MESSAGE => push_message(&mut items, CanvasRole::User, event),
-            EventKind::ASSISTANT_MESSAGE => push_message(&mut items, CanvasRole::Assistant, event),
+            EventKind::USER_MESSAGE => push_message(
+                &mut items,
+                CanvasRole::User,
+                event,
+                pinned.map(|pinned| pinned.candidate_digest.as_str()),
+            ),
+            EventKind::ASSISTANT_MESSAGE => {
+                push_message(&mut items, CanvasRole::Assistant, event, None)
+            }
             EventKind::EXTENSION_CONTRIBUTION => {
                 if let Some(contribution) = pending_contributions.get(&index) {
                     items.push(contribution.item.clone());
@@ -679,7 +696,25 @@ fn event_index_pair(events: &[EventEnvelope], first: &str, second: &str) -> Opti
     None
 }
 
-fn push_message(items: &mut Vec<CanvasItem>, role: CanvasRole, event: &EventEnvelope) {
+fn push_message(
+    items: &mut Vec<CanvasItem>,
+    role: CanvasRole,
+    event: &EventEnvelope,
+    admitted_snapshot_digest: Option<&str>,
+) {
+    if role == CanvasRole::User && event.payload.contains_key("skill_activation") {
+        if let (Some(content), Some(snapshot_digest)) = (
+            string_field(event, "model_content"),
+            skill_activation_digest(event, admitted_snapshot_digest),
+        ) {
+            items.push(CanvasItem::SkillActivation {
+                event_id: event.id.clone(),
+                snapshot_digest,
+                content,
+            });
+            return;
+        }
+    }
     if let Some(content) = string_field(event, "content") {
         items.push(CanvasItem::Message {
             event_id: event.id.clone(),
@@ -687,6 +722,23 @@ fn push_message(items: &mut Vec<CanvasItem>, role: CanvasRole, event: &EventEnve
             content,
         });
     }
+}
+
+fn skill_activation_digest(
+    event: &EventEnvelope,
+    admitted_snapshot_digest: Option<&str>,
+) -> Option<String> {
+    let activation = event.payload.get("skill_activation")?.as_object()?;
+    if activation.get("schema_version")?.as_u64()? != 1 {
+        return None;
+    }
+    let nested = activation.get("snapshot_digest")?.as_str()?;
+    let classified = event
+        .payload
+        .get("project_context_snapshot_digest")?
+        .as_str()?;
+    (nested == classified && Some(classified) == admitted_snapshot_digest)
+        .then(|| classified.to_owned())
 }
 
 fn extension_contribution_item(event: &EventEnvelope) -> Option<CanvasItem> {
@@ -1320,6 +1372,7 @@ fn render_canvas_item(item: &CanvasItem) -> String {
         CanvasItem::Message { role, content, .. } => {
             format!("{}: {content}", role.as_str())
         }
+        CanvasItem::SkillActivation { content, .. } => format!("user: {content}"),
         CanvasItem::Projection { content, .. } => format!("projection: {content}"),
         CanvasItem::Slot {
             extension_id,

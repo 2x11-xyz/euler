@@ -458,6 +458,14 @@ impl SteeringQueue {
         state.unresolved_admission = Some(id);
     }
 
+    /// Release the protection installed by `persist_next_for_round` when the
+    /// candidate was rejected deterministically before an admission existed.
+    /// The row remains queued and editable; only ambiguous durability failures
+    /// retain the unresolved marker.
+    pub(super) fn release_rejected_admission(&self) {
+        self.state().unresolved_admission = None;
+    }
+
     fn finish_empty_boundary(
         state: &mut SteeringState,
         boundary: RoundBoundary,

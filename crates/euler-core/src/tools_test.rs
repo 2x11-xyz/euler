@@ -12,6 +12,7 @@ fn skill_read_is_exposed_only_when_frozen_skills_exist() {
     registry.set_frozen_skills([FrozenSkill {
         snapshot_digest: "a".repeat(64),
         name: "commit-writing".to_owned(),
+        description: "Write focused commits".to_owned(),
         scope: "user".to_owned(),
         path: "user/commit-writing/SKILL.md".to_owned(),
         body_digest: "digest".to_owned(),
@@ -34,6 +35,7 @@ fn skill_read_is_never_advertised_to_children() {
     registry.set_frozen_skills([FrozenSkill {
         snapshot_digest: "b".repeat(64),
         name: "commit-writing".to_owned(),
+        description: "Write focused commits".to_owned(),
         scope: "project".to_owned(),
         path: ".euler/skills/commit-writing/SKILL.md".to_owned(),
         body_digest: "digest".to_owned(),
@@ -56,6 +58,7 @@ fn skill_read_returns_only_the_frozen_body_without_a_capability() {
     registry.set_frozen_skills([FrozenSkill {
         snapshot_digest: "c".repeat(64),
         name: "commit-writing".to_owned(),
+        description: "Write focused commits".to_owned(),
         scope: "user".to_owned(),
         path: "user/commit-writing/SKILL.md".to_owned(),
         body_digest: "digest".to_owned(),

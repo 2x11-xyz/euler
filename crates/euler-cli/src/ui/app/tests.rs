@@ -1068,6 +1068,28 @@ fn queued_steer_preview_is_visual_only() {
 }
 
 #[test]
+fn active_skill_command_queues_through_the_steering_path() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.in_flight_label = Some(MODEL_TURN_IN_FLIGHT_LABEL.to_owned());
+
+    assert_eq!(
+        core.handle_command_action(CommandAction::ActivateSkill {
+            name: "review".to_owned(),
+            arguments: Some("check tests".to_owned()),
+        }),
+        CoreEffect::Render
+    );
+
+    assert_eq!(core.queued_inputs.snapshot(), ["/skill:review check tests"]);
+}
+
+#[test]
 fn queued_inputs_auto_flush_fifo_after_normal_completion() {
     let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "first");

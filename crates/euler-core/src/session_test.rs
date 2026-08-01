@@ -36,6 +36,34 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
 
 #[test]
+fn explicit_skill_command_parser_reserves_only_the_byte_zero_prefix() {
+    assert_eq!(
+        parse_skill_command("/skill:review focus\nmore").expect("valid command"),
+        Some(("review", Some("focus\nmore")))
+    );
+    assert_eq!(
+        parse_skill_command(" /skill:review").expect("indented literal"),
+        None
+    );
+    assert_eq!(
+        parse_skill_command("Use /skill:review").expect("prose"),
+        None
+    );
+    assert!(matches!(
+        parse_skill_command("/skill:Review"),
+        Err(SessionError::InvalidSkillCommand)
+    ));
+    assert!(matches!(
+        parse_skill_command("/skill:"),
+        Err(SessionError::InvalidSkillCommand)
+    ));
+    assert!(matches!(
+        parse_skill_command("/skill:/skill:review"),
+        Err(SessionError::InvalidSkillCommand)
+    ));
+}
+
+#[test]
 fn max_output_tokens_propagates_to_model_request_and_model_call() {
     let temp = tempfile::tempdir().expect("temp dir");
     let captured = Arc::new(Mutex::new(None));
@@ -3418,6 +3446,24 @@ mod project_context_seam {
         repo
     }
 
+    fn repo_with_skill(
+        temp: &tempfile::TempDir,
+        name: &str,
+        description: &str,
+        body: &str,
+    ) -> PathBuf {
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).expect("git dir");
+        let skill_dir = repo.join(".euler/skills").join(name);
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
+        )
+        .expect("write skill");
+        repo
+    }
+
     fn dormant_config(root: &Path) -> SessionConfig {
         let mut config = SessionConfig::new(root);
         config.provider = "capture".to_owned();
@@ -3465,6 +3511,139 @@ mod project_context_seam {
                 _ => None,
             })
             .collect()
+    }
+
+    fn user_messages(request: &ModelRequest) -> Vec<String> {
+        request
+            .input
+            .iter()
+            .filter_map(|item| match item {
+                ModelInputItem::Message {
+                    role: ModelRole::User,
+                    content,
+                } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn explicit_skill_activation_preserves_literal_and_sends_frozen_body() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = repo_with_skill(
+            &temp,
+            "review",
+            "Review a change carefully.",
+            "Inspect the frozen diff.",
+        );
+        let config = admitted_config(&root);
+        let (mut session, captured) = captured_session(config);
+        assert_eq!(
+            session.skill_catalog(),
+            vec![crate::SkillCatalogEntry {
+                name: "review".to_owned(),
+                description: "Review a change carefully.".to_owned(),
+            }]
+        );
+        std::fs::write(
+            root.join(".euler/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: changed\n---\nLIVE BODY",
+        )
+        .expect("mutate live skill");
+
+        let literal = "/skill:review focus on safety";
+        let events = session.run_turn(literal).expect("skill turn");
+        let user = events
+            .iter()
+            .find(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+            .expect("user message");
+        assert_eq!(user.payload["content"], json!(literal));
+        assert_eq!(user.payload["skill_activation"]["name"], json!("review"));
+        assert_eq!(
+            user.payload["skill_activation"]["arguments"],
+            json!("focus on safety")
+        );
+        let model_content = user.payload["model_content"]
+            .as_str()
+            .expect("resolved model content");
+        assert!(model_content.contains("Inspect the frozen diff."));
+        assert!(model_content.contains("    focus on safety"));
+        assert!(!model_content.contains("LIVE BODY"));
+        assert_eq!(
+            user_messages(&captured_request(&captured)),
+            vec![model_content.to_owned()]
+        );
+    }
+
+    #[test]
+    fn explicit_skill_activation_rejects_unknown_before_admission() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = repo_with_skill(&temp, "review", "Review changes.", "Frozen body.");
+        let (mut session, captured) = captured_session(admitted_config(&root));
+        let before = session.events().len();
+
+        let error = session
+            .run_turn("/skill:missing")
+            .expect_err("unknown skill must fail");
+
+        assert!(matches!(
+            error,
+            SessionError::SkillUnavailable { ref name } if name == "missing"
+        ));
+        assert_eq!(session.events().len(), before);
+        assert!(captured.lock().expect("capture lock").is_none());
+    }
+
+    #[test]
+    fn explicit_skill_activation_uses_the_same_steering_admission_seam() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = repo_with_skill(&temp, "review", "Review changes.", "Frozen body.");
+        let (mut session, captured) = captured_session(admitted_config(&root));
+        let queue = Arc::new(SteeringQueue::default());
+        session.set_steering_queue(Arc::clone(&queue));
+        queue.push_steering_back("/skill:review check tests".to_owned());
+
+        let events = session.run_turn("start").expect("steered skill turn");
+
+        let user_events = events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+            .collect::<Vec<_>>();
+        assert_eq!(user_events.len(), 2);
+        assert_eq!(
+            user_events[1].payload["content"],
+            json!("/skill:review check tests")
+        );
+        assert!(user_events[1].payload["model_content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Frozen body.")));
+        let messages = user_messages(&captured_request(&captured));
+        assert_eq!(messages[0], "start");
+        assert!(messages[1].contains("Frozen body."));
+        assert!(messages[1].contains("    check tests"));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn rejected_skill_steering_does_not_claim_ambiguous_durability() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = repo_with_skill(&temp, "review", "Review changes.", "Frozen body.");
+        let (mut session, _captured) = captured_session(admitted_config(&root));
+        let queue = Arc::new(SteeringQueue::default());
+        session.set_steering_queue(Arc::clone(&queue));
+        queue.push_steering_back("/skill:missing".to_owned());
+
+        let error = session
+            .run_turn("start")
+            .expect_err("unknown steered skill must fail before admission");
+
+        assert!(matches!(
+            error,
+            SessionError::SkillUnavailable { ref name } if name == "missing"
+        ));
+        assert_eq!(queue.snapshot(), ["/skill:missing"]);
+        assert!(!queue.has_unresolved_admission());
+        assert_eq!(queue.remove(0).as_deref(), Some("/skill:missing"));
     }
 
     #[derive(Debug)]
@@ -3728,6 +3907,33 @@ mod project_context_seam {
     }
 
     #[test]
+    fn child_policy_filters_explicit_skill_activation_by_snapshot() {
+        let digest = "d".repeat(64);
+        let fold = ProjectContextFold::Admitted(Box::new(PinnedProjectContext::for_test(
+            "snapshot",
+            digest.clone(),
+            "rendered",
+            "e".repeat(64),
+        )));
+        let activation = CanvasItem::SkillActivation {
+            event_id: "activation".to_owned(),
+            snapshot_digest: digest,
+            content: "frozen project guidance".to_owned(),
+        };
+
+        let mut isolated = vec![activation.clone()];
+        apply_child_project_context_policy(&mut isolated, ProjectContextPolicy::None, &fold);
+        assert!(isolated.is_empty());
+
+        let mut inherited = vec![activation.clone()];
+        apply_child_project_context_policy(&mut inherited, ProjectContextPolicy::Inherit, &fold);
+        assert!(inherited.contains(&activation));
+        assert!(inherited
+            .iter()
+            .any(|item| matches!(item, CanvasItem::ProjectContext { .. })));
+    }
+
+    #[test]
     fn child_inherit_supplies_the_snapshot_even_without_parent_canvas() {
         let temp = tempfile::tempdir().expect("temp");
         let root = repo_with_euler_md(&temp, REPO_TEXT);
@@ -3924,6 +4130,48 @@ mod project_context_seam {
             "byte-equivalent after resume"
         );
         assert!(resumed_items[0].contains(REPO_TEXT));
+    }
+
+    #[test]
+    fn explicit_skill_activation_replays_its_frozen_model_content_after_resume() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_skill(&temp, "review", "Review changes.", "Frozen body.");
+        let log_path = temp.path().join("log").join("events.jsonl");
+        std::fs::create_dir_all(log_path.parent().expect("parent")).expect("log dir");
+        let (session, _captured) = captured_session(admitted_config(&root));
+        let mut session =
+            session.with_provenance(crate::ProvenanceWriter::new(&log_path).expect("writer"));
+        session
+            .run_turn("/skill:review original request")
+            .expect("skill turn");
+        drop(session);
+        std::fs::write(
+            root.join(".euler/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: changed\n---\nLIVE BODY",
+        )
+        .expect("mutate live skill");
+
+        let captured = Arc::new(Mutex::new(None));
+        let provider = CapturingProvider::new(Arc::clone(&captured));
+        let mut config = SessionConfig::new(&root);
+        config.provider = "capture".to_owned();
+        config.model = "test-model".to_owned();
+        let outcome = resume_session_with_outcome(
+            config,
+            ProviderSet::single(provider),
+            ScriptedDecider::new(Vec::new()),
+            &log_path,
+        )
+        .expect("resume");
+        let mut resumed = outcome.session;
+        assert_eq!(resumed.skill_catalog()[0].description, "Review changes.");
+        resumed.run_turn("again").expect("resumed turn");
+
+        let messages = user_messages(&captured_request(&captured));
+        assert!(messages[0].contains("Frozen body."));
+        assert!(messages[0].contains("    original request"));
+        assert!(!messages[0].contains("LIVE BODY"));
+        assert_eq!(messages[1], "again");
     }
 
     #[test]

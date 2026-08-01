@@ -247,6 +247,15 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   suffix; and when the budget is four cells or fewer (at or below the suffix
   width) the ` ...` suffix is dropped and the body is a bare hard cut. The
   running footer hint reads `⏎ steer`.
+- Skill commands: each accepted frozen skill contributes one dynamic
+  `/skill:<name>` palette row using its catalog description. Selecting it with
+  optional request text submits the canonical literal command through the same
+  idle, steering, or queued-follow-up path as ordinary input. The TUI keeps a
+  cache of the immutable session catalog while the session runs on a worker;
+  core admission remains authoritative and rejects stale or unavailable names
+  without starting a turn. Transcript and composer history show the compact
+  literal command. The exact expanded model input remains inspectable in the
+  event's `model_content` and provenance blob when externalized.
 - Footer: **one** line below the composer — two hard-edged clusters:
   contextual hints then `cwd (branch)` flush-left; `model · ctx N%` with an
   optional `· $N.NNN` (plus the session name once named) flush-right. The cost

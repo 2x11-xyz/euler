@@ -1,5 +1,5 @@
 use super::theme::ThemeChoice;
-use euler_core::{ActiveGrant, ApprovalMode, GrantSource, ReasoningEffort};
+use euler_core::{ActiveGrant, ApprovalMode, GrantSource, ReasoningEffort, SkillCatalogEntry};
 use euler_sdk::Capability;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +24,8 @@ pub struct CommandContext {
     pub extension_items: Vec<ExtensionManagerItem>,
     /// Extension slash entries (⋄ annotated in the palette).
     pub extension_slash_commands: Vec<ExtensionSlashCommand>,
+    /// Read-only cache of the current session's immutable core skill catalog.
+    pub skill_commands: Vec<SkillCatalogEntry>,
     /// Saved `/code-swarm` reviewer model set (provider::model strings).
     pub code_swarm_models: Vec<String>,
     /// Current session-local compaction controls for `/compaction`.
@@ -140,6 +142,7 @@ pub struct PaletteEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PaletteEntryKind {
     Core,
+    Skill,
     Extension {
         extension_id: String,
         command: String,
@@ -167,6 +170,20 @@ impl PaletteEntry {
                 command: cmd.command.clone(),
                 enabled: cmd.enabled,
             },
+        }
+    }
+
+    pub fn from_skill(skill: &SkillCatalogEntry) -> Self {
+        let description = skill
+            .description
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        Self {
+            token: format!("/skill:{}", skill.name),
+            summary: format!("skill · {description}"),
+            args: "[request]".to_owned(),
+            kind: PaletteEntryKind::Skill,
         }
     }
 
@@ -464,6 +481,10 @@ pub enum CommandAction {
         name: String,
     },
     CompactSession,
+    ActivateSkill {
+        name: String,
+        arguments: Option<String>,
+    },
     SetCompactionPolicy {
         automatic: bool,
         stubs: bool,
@@ -789,6 +810,12 @@ pub fn filter_palette_entries(input: &str, context: &CommandContext) -> Vec<Pale
         .filter(|spec| command_matches(spec, &needle))
         .map(PaletteEntry::from_core)
         .collect();
+    for skill in &context.skill_commands {
+        let entry = PaletteEntry::from_skill(skill);
+        if palette_token_matches(&entry.token, &needle) {
+            entries.push(entry);
+        }
+    }
     for cmd in &context.extension_slash_commands {
         if palette_token_matches(&cmd.token, &needle) {
             entries.push(PaletteEntry::from_extension(cmd));
@@ -962,12 +989,12 @@ pub fn permission_advanced_choices(grants: &[(GrantSource, ActiveGrant)]) -> Vec
     choices
 }
 
-pub fn help_text() -> String {
-    command_table()
-        .iter()
-        .map(help_line)
-        .collect::<Vec<_>>()
-        .join("\n")
+pub fn help_text(context: &CommandContext) -> String {
+    let mut lines = command_table().iter().map(help_line).collect::<Vec<_>>();
+    if !context.skill_commands.is_empty() {
+        lines.push("/skill:<name> [request] - activate a frozen session skill".to_owned());
+    }
+    lines.join("\n")
 }
 
 fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> CommandEffect {
@@ -1004,15 +1031,42 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/permissions" => CommandEffect::Action(CommandAction::OpenPermissions),
         "/resume" => CommandEffect::Action(CommandAction::OpenResumePicker),
         "/rollback" => rollback_effect(context),
-        "/help" => CommandEffect::Action(CommandAction::ShowHelp { text: help_text() }),
+        "/help" => CommandEffect::Action(CommandAction::ShowHelp {
+            text: help_text(context),
+        }),
         "/quit" => CommandEffect::Action(CommandAction::Quit),
         "/copy" => CommandEffect::Action(CommandAction::CopyLastAssistantResponse),
         "/timestamps" => CommandEffect::Action(CommandAction::ToggleTimestamps),
         "/diff" => CommandEffect::Action(CommandAction::ShowDiff),
         "/usage" => CommandEffect::Action(CommandAction::ShowUsage),
         "/code-swarm" => code_swarm_effect(parsed.arg, context),
+        token if token.starts_with("/skill:") => skill_effect(token, parsed.arg, context),
         token => extension_slash_or_unknown(token, parsed.arg, context),
     }
+}
+
+fn skill_effect(token: &str, arg: Option<&str>, context: &CommandContext) -> CommandEffect {
+    let name = token
+        .strip_prefix("/skill:")
+        .expect("skill dispatch arm checked the prefix");
+    if name.is_empty() {
+        return CommandEffect::Message("usage: /skill:<name> [request]".to_owned());
+    }
+    // The UI deliberately performs exact catalog membership rather than
+    // owning a second copy of the core name grammar. Every catalog name has
+    // already passed discovery validation, and admission revalidates the
+    // reserved command against the authoritative registry.
+    if !context
+        .skill_commands
+        .iter()
+        .any(|skill| skill.name == name)
+    {
+        return CommandEffect::Message(format!("skill is not available in this session: {name}"));
+    }
+    CommandEffect::Action(CommandAction::ActivateSkill {
+        name: name.to_owned(),
+        arguments: arg.map(str::to_owned),
+    })
 }
 
 /// `/code-swarm` — set up the reviewer swarm; it does not run one.
@@ -1670,8 +1724,45 @@ mod tests {
     }
 
     #[test]
+    fn skill_catalog_drives_palette_dispatch_and_help() {
+        let context = CommandContext {
+            skill_commands: vec![SkillCatalogEntry {
+                name: "review".to_owned(),
+                description: "Review a change carefully.".to_owned(),
+            }],
+            ..CommandContext::default()
+        };
+
+        let entries = filter_palette_entries("/skill:rev", &context);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].token, "/skill:review");
+        assert_eq!(entries[0].args, "[request]");
+        assert_eq!(entries[0].kind, PaletteEntryKind::Skill);
+        assert_eq!(
+            dispatch_command("/skill:review focus on safety", &context),
+            CommandEffect::Action(CommandAction::ActivateSkill {
+                name: "review".to_owned(),
+                arguments: Some("focus on safety".to_owned()),
+            })
+        );
+        assert_eq!(
+            dispatch_command("/skill:missing", &context),
+            CommandEffect::Message("skill is not available in this session: missing".to_owned())
+        );
+        assert!(!matches!(
+            dispatch_command("/skill:/skill:review", &context),
+            CommandEffect::Action(CommandAction::ActivateSkill { .. })
+        ));
+        assert!(!matches!(
+            dispatch_command("/skill:bad/name", &context),
+            CommandEffect::Action(CommandAction::ActivateSkill { .. })
+        ));
+        assert!(help_text(&context).contains("/skill:<name> [request]"));
+    }
+
+    #[test]
     fn help_text_uses_catalog_theme_usage() {
-        assert!(help_text().contains(&format!(
+        assert!(help_text(&CommandContext::default()).contains(&format!(
             "/theme [{}] - switch theme",
             ThemeChoice::format_canonical_ids("|")
         )));

@@ -714,6 +714,99 @@ fn no_snapshot_folds_absent() {
     );
 }
 
+fn recorded_skill_activation(
+    bootstrap: &ProjectContextBootstrap,
+    arguments: Option<&str>,
+) -> EventEnvelope {
+    let manifest = bootstrap.manifest.as_ref().expect("admitted manifest");
+    let skill = manifest.skills.first().expect("frozen skill");
+    let mut activation = euler_event::object([
+        ("schema_version", 1.into()),
+        ("name", skill.name.clone().into()),
+        ("scope", skill.scope.as_str().into()),
+        ("source", skill.path.clone().into()),
+        ("body_digest", skill.body_digest.clone().into()),
+        ("snapshot_digest", bootstrap.candidate_digest.clone().into()),
+    ]);
+    if let Some(arguments) = arguments {
+        activation.insert("arguments".to_owned(), arguments.to_owned().into());
+    }
+    let payload = euler_event::object([
+        (
+            "content",
+            framing::render_skill_command(&skill.name, arguments).into(),
+        ),
+        (
+            "model_content",
+            framing::render_skill_activation(
+                &skill.name,
+                skill.scope.as_str(),
+                &skill.path,
+                &skill.body_digest,
+                &skill.body,
+                arguments,
+            )
+            .into(),
+        ),
+        ("skill_activation", activation.into()),
+        (
+            "project_context_snapshot_digest",
+            bootstrap.candidate_digest.clone().into(),
+        ),
+    ]);
+    EventEnvelope::new("session", "root", None, EventKind::USER_MESSAGE, payload)
+}
+
+#[test]
+fn explicit_skill_activation_fold_recomputes_snapshot_owned_bytes() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    write_skill(
+        &repo.join(".euler/skills"),
+        "review",
+        "Review carefully.",
+        "Inspect the frozen diff.\n",
+    );
+    let bootstrap = admitted(&repo);
+    let activation = recorded_skill_activation(&bootstrap, Some("focus on safety"));
+    let mut events = bootstrap_events(&bootstrap);
+    events.push(activation.clone());
+    assert!(fold_project_context(&events).is_ok());
+
+    let mut tampered = events.clone();
+    tampered
+        .last_mut()
+        .expect("activation")
+        .payload
+        .insert("model_content".to_owned(), "forged guidance".into());
+    assert!(fold_project_context(&tampered).is_err());
+
+    let mut unclassified = events.clone();
+    unclassified
+        .last_mut()
+        .expect("activation")
+        .payload
+        .remove("project_context_snapshot_digest");
+    assert!(fold_project_context(&unclassified).is_err());
+
+    let mut reclassified = events.clone();
+    let event = reclassified.last_mut().expect("activation");
+    event.payload.insert(
+        "project_context_snapshot_digest".to_owned(),
+        "f".repeat(64).into(),
+    );
+    event
+        .payload
+        .get_mut("skill_activation")
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("activation object")
+        .insert("snapshot_digest".to_owned(), "f".repeat(64).into());
+    assert!(fold_project_context(&reclassified).is_err());
+
+    assert!(fold_project_context(&[activation]).is_err());
+}
+
 #[test]
 fn malformed_latest_snapshot_rejects_and_never_resurrects_an_older_one() {
     let temp = tempfile::tempdir().expect("temp");

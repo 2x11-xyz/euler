@@ -436,6 +436,11 @@ Core owns framing on all three admission paths:
 3. `skill_read` results: the frozen body returns through ordinary
    `tool.call`/`tool.result` events with the same core-framed header (skill
    name, source identity) and indentation rules as startup sources.
+4. Explicit `/skill:<name> [request]` activation: the literal command remains
+   the durable user content, while core records and projects an exact
+   `model_content` expansion from the frozen snapshot. The skill body and live
+   arguments use separate core-marked sections, with every source line
+   indented.
 
 The provider-neutral order is fixed Euler instructions, at most one
 `ProjectContext` item, then every existing input item in its original relative
@@ -483,6 +488,18 @@ truncated or demoted to make either equation pass.
   bytes; call and result are ordinary provenance events carrying the owning
   candidate snapshot digest. Supporting files stay governed by existing tools
   and permissions.
+- `/skill:<name> [request]` is the core-reserved explicit activation command.
+  Only a byte-zero prefix is active; names use the same exact normalized
+  grammar as discovery. The optional request is free-form and may span lines.
+  Invalid or unavailable names fail before event admission. The session
+  resolves only its frozen registry, records the
+  literal command as `user.message.content`, and records the exact framed
+  model input as `model_content` with versioned activation metadata. Resume
+  and replay use those persisted bytes and never re-read or re-resolve a live
+  skill file. Model-facing folds recompute the literal command, metadata,
+  classification, and framed bytes from the recorded frozen snapshot;
+  malformed or altered activation records fail closed. The TUI catalog is a
+  cache for discovery; the core registry is authoritative at admission.
 
 ## Child agents and the guardian
 
@@ -497,10 +514,11 @@ ordinary tool-call budget: `skill_read` is advertised only to the root driver
 or an inheriting child with a nonzero tool budget, while a zero-tool child
 receives the inherited framed evidence but no definition.
 
-Every startup instruction item, catalog item, and `skill_read` result carries
-a project-context classification and snapshot digest through its event and
-canvas projection. Child request assembly filters that complete class unless
-`project_context` is `inherit`, even when `include_parent_canvas` is true. A
+Every startup instruction item, catalog item, `skill_read` result, and explicit
+skill activation carries a project-context classification and snapshot digest
+through its event and canvas projection. Child request assembly filters that
+complete class unless `project_context` is `inherit`, even when
+`include_parent_canvas` is true. A
 filtered tool result removes its paired call as well, preserving provider
 tool-pair shape. `tool_result_get` enforces the same boundary against the
 canonical event stream: a `none` child cannot rehydrate a classified result,
