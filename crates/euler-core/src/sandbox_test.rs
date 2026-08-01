@@ -3,7 +3,6 @@ use crate::{ToolError, ToolRegistry};
 use serde_json::json;
 #[cfg(target_os = "linux")]
 use std::env;
-#[cfg(target_os = "linux")]
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::io::{self, Read};
