@@ -1,8 +1,10 @@
 #![allow(clippy::too_many_lines)] // integration-test exemption for integration test modules
 #[cfg(target_os = "linux")]
 use euler_core::canvas::projected_tool_output;
+#[cfg(target_os = "linux")]
+use euler_core::permissions::ApprovalMode;
 use euler_core::permissions::{
-    ApprovalMode, DeciderVerdict, PermissionDecider, PermissionRequest, ScriptedDecider,
+    DeciderVerdict, PermissionDecider, PermissionRequest, ScriptedDecider,
 };
 use euler_core::{
     assemble_canvas, fold_model_target, fold_reasoning_effort, AutoCompactionPolicy, CanvasItem,
