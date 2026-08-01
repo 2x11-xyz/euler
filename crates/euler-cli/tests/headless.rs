@@ -5607,6 +5607,31 @@ fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
     tui.quit();
 
     let final_state = pty_final_state_text(&tui.output, 24, 80);
+    if let Some(reason) = rendered_sandbox_unavailable_reason(&final_state) {
+        let failed_blocks = final_state
+            .lines()
+            .filter(|line| line.contains("• Ran … · ✗"))
+            .count();
+        assert_eq!(
+            failed_blocks, 3,
+            "all three approved calls must fail closed as distinct blocks ({reason}):\n{final_state}"
+        );
+        assert_eq!(
+            final_state
+                .lines()
+                .filter(|line| line.contains("allowed for session"))
+                .count(),
+            1,
+            "the permission decision must still commit exactly once:\n{final_state}"
+        );
+        for output in ["alpha-one", "beta-two", "gamma-three"] {
+            assert!(
+                !final_state.contains(output),
+                "failed-closed shell output `{output}` must not appear:\n{final_state}"
+            );
+        }
+        return;
+    }
     let mut failures = Vec::new();
     for cmd in ["printf alpha-one", "printf beta-two", "printf gamma-three"] {
         let headers = final_state
@@ -6022,11 +6047,18 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
         "turn did not finish:\n{}",
         tui.screen_text()
     );
-    assert!(
-        tui.wait_for_screen("25 more lines · ctrl+o expand"),
-        "fold affordance missing:\n{}",
-        tui.screen_text()
-    );
+    if !tui.wait_for_screen("25 more lines · ctrl+o expand") {
+        let screen = tui.screen_text();
+        let Some(reason) = rendered_sandbox_unavailable_reason(&screen) else {
+            panic!("fold affordance missing:\n{screen}");
+        };
+        assert!(
+            !screen.contains("tool-line-15"),
+            "an unavailable sandbox must not expose command output ({reason}):\n{screen}"
+        );
+        tui.quit();
+        return;
+    }
 
     // Expand (replay 1): hidden middle output rows become visible.
     tui.write("\x0f");
@@ -6087,6 +6119,23 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
         "fold-toggle replays corrupted history:\n{}\nFinal emulator state:\n{state}",
         failures.join("\n")
     );
+}
+
+fn rendered_sandbox_unavailable_reason(rendered: &str) -> Option<&'static str> {
+    [
+        euler_core::SandboxUnavailableReason::UnsupportedPlatform,
+        euler_core::SandboxUnavailableReason::BubblewrapMissing,
+        euler_core::SandboxUnavailableReason::CannotEnforce,
+        euler_core::SandboxUnavailableReason::InvalidWorkspace,
+        euler_core::SandboxUnavailableReason::InvalidWritableRoots,
+        euler_core::SandboxUnavailableReason::InvalidRuntimeRoots,
+        euler_core::SandboxUnavailableReason::AuthorityInspectionFailed,
+        euler_core::SandboxUnavailableReason::UnsafeSpecialNode,
+        euler_core::SandboxUnavailableReason::UnsafeMountTopology,
+    ]
+    .into_iter()
+    .map(euler_core::SandboxUnavailableReason::message)
+    .find(|reason| rendered.contains(reason))
 }
 
 #[test]

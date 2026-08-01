@@ -13,11 +13,15 @@ env:
 
 jobs:
   checks:
-    # The enforced-profile gate below requires unprivileged user namespaces;
-    # GitHub's Ubuntu 24.04 image deliberately restricts that kernel feature.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Enable the user-namespace test fixture
+        run: |
+          sudo sysctl -w kernel.unprivileged_userns_clone=1
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Install workspace sandbox backend
         run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - name: Provider catalog sync tests
