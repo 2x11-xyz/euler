@@ -88,17 +88,22 @@ fn skill_read_returns_only_the_frozen_body_without_a_capability() {
     }
 }
 use serde_json::json;
+#[cfg(target_os = "linux")]
 use std::env;
 #[cfg(unix)]
 use std::os::unix::{ffi::OsStrExt as _, fs::symlink};
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 
+#[cfg(target_os = "linux")]
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(target_os = "linux")]
 struct EnvRestore {
     saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
 
+#[cfg(target_os = "linux")]
 impl EnvRestore {
     fn capture(names: &[&'static str]) -> Self {
         Self {
@@ -110,6 +115,7 @@ impl EnvRestore {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for EnvRestore {
     fn drop(&mut self) {
         for (name, value) in &self.saved {
@@ -1785,6 +1791,7 @@ fn run_shell_uses_a_minimal_environment_and_isolates_parent_controls() {
     assert!(explicit.output.contains("/explicit|debug"));
 }
 
+#[cfg(target_os = "linux")]
 fn assert_secret_sentinels_absent(output: &str) {
     for secret in [
         "anthropic-secret",

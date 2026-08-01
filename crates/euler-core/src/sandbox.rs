@@ -2175,6 +2175,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::time::Duration;
 
+    #[cfg(target_os = "linux")]
     fn command_arguments(command: &Command) -> Vec<String> {
         command
             .get_args()

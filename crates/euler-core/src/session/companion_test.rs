@@ -112,6 +112,7 @@ fn companion_cancellation_keeps_partial_change_and_result_parentage() {
     assert_eq!(result.payload["cancelled"], json!(true));
 }
 
+#[cfg(target_os = "linux")]
 fn assert_observed_changes_parented_to(
     events: &[EventEnvelope],
     tool_call_event_id: &str,
