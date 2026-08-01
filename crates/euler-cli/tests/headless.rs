@@ -850,7 +850,11 @@ fn exec_streams_events_before_a_blocking_tool_completes() {
 
     let mut streamed = false;
     loop {
-        match rx.recv_timeout(Duration::from_secs(15)) {
+        // Enforced workspace preflight can contend with the other process-level
+        // fixtures in a parallel nextest run. The synchronization remains the
+        // tool-call line itself; this bound only prevents a broken child from
+        // hanging the suite forever.
+        match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(line) if line.contains("tool.call: run_shell") => {
                 streamed = true;
                 break;
