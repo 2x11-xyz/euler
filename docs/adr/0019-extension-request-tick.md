@@ -36,6 +36,20 @@ order. The exact closed input is:
 {"through_event_id":"<accepted durable tail event id>"}
 ```
 
+Contributor discovery is one immutable per-request snapshot of entries and
+their owning extension ids. Pre-tick admission and execution reuse it; dynamic
+or failed registration cannot nominate an owner for admission and then evade
+the corresponding execution or failure latch. The ordinary full canvas gets
+the first opportunity to fit or settle eligible shadow compaction. Only when
+that settled canvas remains over its byte budget may admission temporarily
+omit durable slots owned by the snapshotted contributors so the boundary that
+must refresh, clear, or suppress them can run. This provisional canvas is
+never snapshotted or sent to a provider. Final full assembly and all byte/token
+checks remain authoritative. A successful or no-op owner is included normally;
+a failed owner is omitted by its latch. The settled full pre-tick request stays
+the growth-comparison baseline, so an already-present slot is not relabeled as
+tick-created growth.
+
 The command's result must be a JSON object but is ignored and not persisted.
 Durable effects use existing capability-gated host APIs. Model-facing effects
 use bounded context slots; typed UI effects use existing plan presentation;
@@ -60,9 +74,14 @@ failure produces exactly one canonical extension `error` with fixed host text
 and `failure` equal to `command_error` or `panic`, latches that contributor for
 the rest of the live Session, and does not suppress later contributors or the
 root request. The latch affects only the request tick; otherwise valid model
-tools and terminal-idle work from that extension remain available. An ordinary
-command-host error is not duplicated by the latch. Resume starts a new
-process-local latch. Cancellation stops the boundary. An unresolved
+tools and terminal-idle work from that extension remain available. Because a
+latched contributor can no longer refresh or clear its model-facing state,
+live root request assembly withholds its durable context slots for the rest of
+the Session rather than presenting stale state. The events are not deleted.
+Resume starts with a fresh process-local latch, restores normal latest-slot
+projection, and lets the resumed tick refresh it before the provider request.
+An ordinary command-host error is not duplicated by the latch. Cancellation
+stops the boundary. An unresolved
 authoritative provenance append retains the existing fatal writer fence; the
 tick adds no alternate recovery policy. If no live provenance writer or
 durable tail is available, this optional observer point is skipped before tick
@@ -81,5 +100,6 @@ dependency.
   provenance projection into the canvas.
 - Tick side effects may make final request assembly exceed its normal context
   budget; growth from a fitting pre-tick request then fails honestly without
-  starting another post-tick compaction cycle. A no-op or failed tick does not
-  replace the legacy admission decision for an unchanged baseline request.
+  starting another post-tick compaction cycle. Provisional admission cannot
+  bypass that final check. A no-op or failed tick does not replace the legacy
+  admission decision for an unchanged settled full baseline request.

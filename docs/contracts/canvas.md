@@ -96,8 +96,11 @@ Extensions may contribute bounded context through named slots. Slot content is
 rendered under core-generated `[slot <extension-id>:<slot>]` headers with every
 content line indented, so extension text cannot spoof canvas section markers.
 Live request assembly projects only slots whose owning extension id is
-currently enabled. Disabling/removing an extension hides its slots on the next
-snapshot without deleting durable state; re-enabling restores the latest slot.
+currently enabled and whose request tick has not failed in the live Session.
+Disabling/removing an extension or latching its failed request tick hides its
+slots on the next snapshot without deleting durable state. Re-enabling a
+disabled extension restores the latest slot; resuming clears the process-local
+tick latch so the resumed contributor can restore or refresh it.
 Slots are folded independently over the full accepted log and therefore stay
 out of shadow-compaction snapshots and shadow provider input: a compactor
 cannot bake a superseded slot value into its durable projection. Raw
@@ -111,13 +114,16 @@ Root request ticks (ADR 0019) run after the request's final compaction decision
 and before final canvas assembly and the purpose-free `canvas.snapshot`.
 Their command results and provenance queries are never canvas items. Only
 ordinary already-admitted substrates such as bounded context slots can affect
-the freshly assembled request. A tick cannot start a second compaction cycle;
-if its admitted slot update makes the final request exceed the normal context
-budget, request assembly fails honestly before provider invocation. The exact
-pre-tick request is the compatibility baseline: a no-op or failed optional
-tick does not replace an otherwise unchanged legacy admission decision.
-Shadow compaction and every child/companion/reviewer canvas omit the tick
-boundary.
+the freshly assembled request. Core discovers one immutable tick snapshot per
+request and reuses its entries and owner ids. The ordinary full canvas owns
+compaction first. If it remains byte-over-budget, a provisional pre-tick view
+may omit only those snapshotted owners' slots so they can refresh, clear, or
+fail and latch. That view is never emitted as `canvas.snapshot` or sent to a
+provider. A tick cannot start a second compaction cycle; the full post-tick
+canvas and every final byte/token check remain authoritative. The settled full
+pre-tick request is the compatibility baseline, so a no-op does not make an
+already-present slot look like new growth. Shadow compaction and every
+child/companion/reviewer canvas omit the tick boundary.
 
 Run and queue lifecycle events are control/provenance state, never model
 content. In particular, private pending `queue.enqueued` or `queue.replaced`

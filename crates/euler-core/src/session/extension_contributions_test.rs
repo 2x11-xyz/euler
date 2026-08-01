@@ -1,5 +1,5 @@
 use super::*;
-use crate::canvas::CanvasItem;
+use crate::canvas::{CanvasItem, CompactionTier};
 use crate::compaction::WorkingStateProjection;
 use crate::permissions::{ApprovalMode, DeciderVerdict, ScriptedDecider};
 use crate::provenance::ProvenanceWriter;
@@ -240,6 +240,9 @@ impl Extension for RequestTickFixture {
 struct FailingTickWorkflowExtension {
     trace: Arc<Mutex<RequestTickTrace>>,
     state: Arc<Mutex<TestExtensionState>>,
+    tick_capabilities: Vec<Capability>,
+    registration_calls: Arc<AtomicUsize>,
+    fail_registration_call: Option<usize>,
 }
 
 impl FailingTickWorkflowExtension {
@@ -255,7 +258,20 @@ impl FailingTickWorkflowExtension {
                 cancel_after_idle: None,
                 steer_after_idle: None,
             })),
+            tick_capabilities: Vec::new(),
+            registration_calls: Arc::new(AtomicUsize::new(0)),
+            fail_registration_call: None,
         }
+    }
+
+    fn with_tick_capabilities(mut self, capabilities: Vec<Capability>) -> Self {
+        self.tick_capabilities = capabilities;
+        self
+    }
+
+    fn with_registration_failure_on_call(mut self, call: usize) -> Self {
+        self.fail_registration_call = Some(call);
+        self
     }
 }
 
@@ -265,17 +281,23 @@ impl Extension for FailingTickWorkflowExtension {
             id: "failing-tick-workflow".to_owned(),
             version: "0.1.0".to_owned(),
             display_name: "Failing tick workflow fixture".to_owned(),
-            capabilities: Vec::new(),
+            capabilities: self.tick_capabilities.clone(),
         }
     }
 
     fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        let call = self.registration_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if self.fail_registration_call == Some(call) {
+            return Err(ExtensionError::Message(
+                "fixture registration failure".to_owned(),
+            ));
+        }
         registrar.register_command(
             "request-tick",
             Box::new(RequestTickCommand {
                 id: "failing-tick-workflow".to_owned(),
                 trace: Arc::clone(&self.trace),
-                required_capabilities: Vec::new(),
+                required_capabilities: self.tick_capabilities.clone(),
                 result: json!({}),
                 fail: true,
                 query_provenance: false,
@@ -744,8 +766,12 @@ fn request_tick_boundary_is_unchanged_without_contributors() {
     let boundary_ran = {
         let mut on_event = |_: &EventEnvelope| flushed += 1;
         let mut sink = EventSink::new(event_count, &mut on_event);
+        let cancellation = CancellationToken::new();
+        let snapshot = session
+            .snapshot_request_ticks(&cancellation)
+            .expect("empty request-tick snapshot");
         session
-            .run_request_ticks(&CancellationToken::new(), &mut sink)
+            .run_request_tick_snapshot(snapshot, &cancellation, &mut sink)
             .expect("empty request-tick boundary")
     };
 
@@ -775,8 +801,12 @@ fn request_tick_boundary_without_provenance_skips_discovery_and_execution() {
     let boundary_ran = {
         let mut on_event = |_: &EventEnvelope| flushed += 1;
         let mut sink = EventSink::new(event_count, &mut on_event);
+        let cancellation = CancellationToken::new();
+        let snapshot = session
+            .snapshot_request_ticks(&cancellation)
+            .expect("provenance-free request-tick snapshot");
         session
-            .run_request_ticks(&CancellationToken::new(), &mut sink)
+            .run_request_tick_snapshot(snapshot, &cancellation, &mut sink)
             .expect("provenance-free request-tick boundary")
     };
 
@@ -928,6 +958,54 @@ fn no_op_or_failed_request_tick_preserves_legacy_admission_for_oversized_baselin
 }
 
 #[test]
+fn provisional_tick_admission_never_bypasses_the_authoritative_final_budget() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    let tick = RequestTickFixture::new("no-op-tick", Arc::clone(&trace));
+    let (mut session, requests) = session_with_request_ticks(
+        &temp,
+        vec![tick],
+        vec![FixtureResponse::Assistant("must not run".to_owned())],
+    );
+    session.config.auto_compaction.automatic = false;
+    session.config.auto_compaction.tier = CompactionTier::Off;
+    session.config.auto_compaction.budget_bytes = 512;
+    session
+        .emit(
+            EventKind::CONTEXT_SLOT_UPDATED,
+            object([
+                ("extension_id", "no-op-tick".into()),
+                ("slot", "health".into()),
+                ("content", "x".repeat(2_048).into()),
+            ]),
+        )
+        .expect("seed oversized slot");
+
+    let error = session
+        .run_turn("inspect")
+        .expect_err("unchanged oversized slot must fail the final full canvas");
+
+    assert!(matches!(error, SessionError::ContextBudgetExhausted { .. }));
+    assert_eq!(
+        trace
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .calls
+            .get("no-op-tick"),
+        Some(&1),
+        "provisional admission exists only to reach the tick"
+    );
+    assert!(requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty());
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::CANVAS_SNAPSHOT));
+}
+
+#[test]
 fn request_ticks_share_one_cutoff_run_in_id_order_and_compose_before_snapshot() {
     let temp = tempfile::tempdir().expect("temp");
     let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
@@ -1056,11 +1134,13 @@ fn request_tick_failures_isolate_latch_and_do_not_prompt_or_block_root() {
 }
 
 #[test]
-fn failed_request_tick_does_not_disable_model_tools_or_idle_work() {
+fn authority_failed_request_tick_hides_stale_slots_without_disabling_other_work() {
     let temp = tempfile::tempdir().expect("temp");
     let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
-    let extension = FailingTickWorkflowExtension::new(Arc::clone(&trace));
+    let extension = FailingTickWorkflowExtension::new(Arc::clone(&trace))
+        .with_tick_capabilities(vec![Capability::Network]);
     let state = Arc::clone(&extension.state);
+    let good = RequestTickFixture::new("z-good", Arc::clone(&trace));
     let (provider, requests) = CapturingProvider::new(vec![
         FixtureResponse::Assistant("first".to_owned()),
         FixtureResponse::ToolCalls(vec![ToolCall {
@@ -1074,30 +1154,52 @@ fn failed_request_tick_does_not_disable_model_tools_or_idle_work() {
     config
         .extensions_enabled
         .insert("failing-tick-workflow".to_owned());
+    config.extensions_enabled.insert("z-good".to_owned());
     let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
         .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    // Wire the later contributor first so validation does not add irrelevant
+    // registration calls to the combined workflow fixture.
+    session
+        .wire_extension(Arc::new(good))
+        .expect("wire later tick");
     session
         .wire_extension(Arc::new(extension))
         .expect("wire combined extension");
+    session.config.auto_compaction.automatic = false;
+    session.config.auto_compaction.tier = CompactionTier::Off;
+    session.config.auto_compaction.budget_bytes = 512;
+    let stale_slot_content = format!("stale workflow health {}", "x".repeat(2_048));
+    let stale_slot_id = session
+        .emit(
+            EventKind::CONTEXT_SLOT_UPDATED,
+            object([
+                ("extension_id", "failing-tick-workflow".into()),
+                ("slot", "health".into()),
+                ("content", stale_slot_content.clone().into()),
+            ]),
+        )
+        .expect("seed durable stale slot");
 
     session.run_turn("first").expect("first turn");
     session.run_turn("second").expect("second turn");
 
-    assert_eq!(
-        trace
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .calls
-            .get("failing-tick-workflow"),
-        Some(&1),
-        "only the failed request-tick contribution is latched"
-    );
+    let trace = trace.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(trace.calls.get("failing-tick-workflow"), None);
+    assert_eq!(trace.calls.get("z-good"), Some(&3));
+    assert_eq!(trace.order, ["z-good", "z-good", "z-good"]);
+    drop(trace);
     let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
     assert_eq!(requests.len(), 3);
-    assert!(requests[1]
+    assert!(requests
+        .iter()
+        .all(|request| request.input.iter().all(|item| !matches!(
+            item,
+            ModelInputItem::Message { content, .. } if content.contains(&stale_slot_content)
+        ))));
+    assert!(requests.iter().all(|request| request
         .tools
         .iter()
-        .any(|tool| tool.name == "update_workflow"));
+        .any(|tool| tool.name == "update_workflow")));
     drop(requests);
     let state = state.lock().unwrap_or_else(PoisonError::into_inner);
     assert_eq!(state.model_tool_calls, 1);
@@ -1115,6 +1217,123 @@ fn failed_request_tick_does_not_disable_model_tools_or_idle_work() {
         .collect::<Vec<_>>();
     assert_eq!(tick_failures.len(), 1);
     assert_eq!(tick_failures[0].payload["failure"], json!("command_error"));
+    assert!(session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::CANVAS_SNAPSHOT
+                && event.payload.get("purpose").is_none()
+        })
+        .all(|event| event
+            .payload
+            .get("selected_event_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().all(|id| id.as_str() != Some(&stale_slot_id)))));
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::PERMISSION_PROMPT));
+}
+
+#[test]
+fn registration_failed_request_tick_hides_stale_slots_and_isolates_the_latch() {
+    let temp = tempfile::tempdir().expect("temp");
+    let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
+    // Call 1 wires the extension, call 2 captures the driver tool catalog,
+    // and call 3 is request-tick declaration reentry. Only that third call
+    // fails, proving the tick latch does not disable otherwise valid surfaces.
+    let extension =
+        FailingTickWorkflowExtension::new(Arc::clone(&trace)).with_registration_failure_on_call(3);
+    let registration_calls = Arc::clone(&extension.registration_calls);
+    let state = Arc::clone(&extension.state);
+    let good = RequestTickFixture::new("z-good", Arc::clone(&trace));
+    let (provider, requests) = CapturingProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-update".to_owned(),
+            name: "update_workflow".to_owned(),
+            input: json!({"items": ["still available"]}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut config = super::super::SessionConfig::new(temp.path());
+    config
+        .extensions_enabled
+        .insert("failing-tick-workflow".to_owned());
+    config.extensions_enabled.insert("z-good".to_owned());
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    session
+        .wire_extension(Arc::new(good))
+        .expect("wire later tick");
+    session
+        .wire_extension(Arc::new(extension))
+        .expect("wire combined extension");
+    session.config.auto_compaction.automatic = false;
+    session.config.auto_compaction.tier = CompactionTier::Off;
+    session.config.auto_compaction.budget_bytes = 512;
+    let stale_slot_content = format!("stale registered health {}", "x".repeat(2_048));
+    let stale_slot_id = session
+        .emit(
+            EventKind::CONTEXT_SLOT_UPDATED,
+            object([
+                ("extension_id", "failing-tick-workflow".into()),
+                ("slot", "health".into()),
+                ("content", stale_slot_content.clone().into()),
+            ]),
+        )
+        .expect("seed durable stale slot");
+
+    session
+        .run_turn("inspect")
+        .expect("root and later tick continue");
+
+    let trace = trace.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(trace.calls.get("failing-tick-workflow"), None);
+    assert_eq!(trace.calls.get("z-good"), Some(&2));
+    assert_eq!(trace.order, ["z-good", "z-good"]);
+    drop(trace);
+    assert!(registration_calls.load(Ordering::SeqCst) > 3);
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(requests.len(), 2);
+    assert!(requests
+        .iter()
+        .all(|request| request.input.iter().all(|item| !matches!(
+            item,
+            ModelInputItem::Message { content, .. } if content.contains(&stale_slot_content)
+        ))));
+    assert!(requests.iter().all(|request| request
+        .tools
+        .iter()
+        .any(|tool| tool.name == "update_workflow")));
+    drop(requests);
+    let state = state.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(state.model_tool_calls, 1);
+    assert_eq!(state.idle_calls, 1);
+    drop(state);
+    let tick_failures = session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && event.payload.get("extension_id").and_then(Value::as_str)
+                    == Some("failing-tick-workflow")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tick_failures.len(), 1, "one canonical registration failure");
+    assert_eq!(tick_failures[0].payload["failure"], json!("command_error"));
+    assert!(tick_failures[0].payload.get("command").is_none());
+    assert!(session
+        .events()
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::CANVAS_SNAPSHOT
+                && event.payload.get("purpose").is_none()
+        })
+        .all(|event| event
+            .payload
+            .get("selected_event_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().all(|id| id.as_str() != Some(&stale_slot_id)))));
 }
 
 #[test]
@@ -1263,22 +1482,37 @@ fn request_tick_runs_once_before_each_logical_root_model_request() {
 }
 
 #[test]
-fn request_tick_failure_latch_resets_on_durable_resume() {
+fn request_tick_failure_latch_resets_on_resume_and_allows_slot_refresh() {
     let temp = tempfile::tempdir().expect("temp");
     let log = temp.path().join("events.jsonl");
     let trace = Arc::new(Mutex::new(RequestTickTrace::default()));
-    let mut extension = RequestTickFixture::new("bad-tick", Arc::clone(&trace));
-    extension.result = json!("invalid result");
+    let mut extension = RequestTickFixture::new("bad-tick", Arc::clone(&trace))
+        .with_capabilities(vec![Capability::Network, Capability::ContextSlot]);
+    extension.update_slot = true;
     let mut config = super::super::SessionConfig::new(temp.path());
     config.extensions_enabled.insert(extension.id.clone());
+    config.auto_compaction.automatic = false;
+    config.auto_compaction.tier = CompactionTier::Off;
+    config.auto_compaction.budget_bytes = 512;
     let resume_config = config.clone();
-    let (first_provider, _) =
+    let (first_provider, first_requests) =
         CapturingProvider::new(vec![FixtureResponse::Assistant("first".to_owned())]);
     let mut session = Session::new(config, first_provider, ScriptedDecider::new(Vec::new()))
         .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
     session
         .wire_extension(Arc::new(extension.clone()))
         .expect("wire first tick");
+    let stale_slot_content = format!("stale before resume {}", "x".repeat(2_048));
+    session
+        .emit(
+            EventKind::CONTEXT_SLOT_UPDATED,
+            object([
+                ("extension_id", "bad-tick".into()),
+                ("slot", "bad-tick".into()),
+                ("content", stale_slot_content.clone().into()),
+            ]),
+        )
+        .expect("seed durable stale slot");
     session.run_turn("first").expect("first turn");
     assert_eq!(
         trace
@@ -1286,8 +1520,20 @@ fn request_tick_failure_latch_resets_on_durable_resume() {
             .unwrap_or_else(PoisonError::into_inner)
             .calls
             .get("bad-tick"),
-        Some(&1)
+        None,
+        "missing standing authority latches before command execution"
     );
+    let first_requests = first_requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(first_requests.len(), 1);
+    assert!(first_requests
+        .iter()
+        .all(|request| request.input.iter().all(|item| !matches!(
+            item,
+            ModelInputItem::Message { content, .. } if content.contains(&stale_slot_content)
+        ))));
+    drop(first_requests);
     drop(session);
 
     let (resumed_provider, resumed_requests) =
@@ -1302,6 +1548,8 @@ fn request_tick_failure_latch_resets_on_durable_resume() {
     resumed
         .wire_extension(Arc::new(extension))
         .expect("rewire resumed tick");
+    resumed.set_permission_mode(Capability::Network, ApprovalMode::SessionAllow);
+    resumed.set_permission_mode(Capability::ContextSlot, ApprovalMode::SessionAllow);
     resumed.run_turn("second").expect("resumed turn");
 
     assert_eq!(
@@ -1310,16 +1558,22 @@ fn request_tick_failure_latch_resets_on_durable_resume() {
             .unwrap_or_else(PoisonError::into_inner)
             .calls
             .get("bad-tick"),
-        Some(&2),
+        Some(&1),
         "resume owns a fresh process-local failure latch"
     );
-    assert_eq!(
-        resumed_requests
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .len(),
-        1
-    );
+    let resumed_requests = resumed_requests
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(resumed_requests.len(), 1);
+    assert!(resumed_requests[0].input.iter().any(|item| matches!(
+        item,
+        ModelInputItem::Message { content, .. }
+            if content.contains("bad-tick at ")
+    )));
+    assert!(resumed_requests[0].input.iter().all(|item| !matches!(
+        item,
+        ModelInputItem::Message { content, .. } if content.contains(&stale_slot_content)
+    )));
 }
 
 #[test]

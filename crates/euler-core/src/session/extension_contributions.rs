@@ -77,6 +77,30 @@ enum RequestTickEntry {
     },
 }
 
+impl RequestTickEntry {
+    fn extension_id(&self) -> &str {
+        match self {
+            Self::Contributor(contributor) => &contributor.extension_id,
+            Self::RegistrationFailure { extension_id, .. } => extension_id,
+        }
+    }
+}
+
+/// One immutable view of the request-tick boundary. Discovery is untrusted
+/// extension code, so pre-tick admission and later execution must share this
+/// exact snapshot rather than asking an extension to nominate itself twice.
+#[derive(Default)]
+pub(super) struct RequestTickSnapshot {
+    entries: Vec<RequestTickEntry>,
+    owner_ids: BTreeSet<String>,
+}
+
+impl RequestTickSnapshot {
+    pub(super) fn owner_ids(&self) -> &BTreeSet<String> {
+        &self.owner_ids
+    }
+}
+
 fn registration_failure_kind(error: &ExtensionHostError) -> ExtensionFailureKind {
     if matches!(error, ExtensionHostError::RegistrationPanic(_)) {
         ExtensionFailureKind::Panic
@@ -118,14 +142,32 @@ impl<D: PermissionDecider> Session<D> {
         Ok(())
     }
 
-    /// Run every enabled request-tick contribution against one immutable
-    /// accepted-prefix cutoff. The caller owns placement after the final
-    /// compaction decision and before the admitted canvas snapshot. Returns
-    /// `true` only when a durable cutoff existed and at least one tick entry
-    /// was attempted, which is the boundary that can invalidate an already
-    /// admitted canvas selection.
-    pub(super) fn run_request_ticks<F>(
+    /// Discover the enabled contributors once for a logical root request.
+    /// Without a writer no durable cutoff can exist, so preserve the legacy
+    /// no-work path and do not re-enter untrusted extension code.
+    pub(super) fn snapshot_request_ticks(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<RequestTickSnapshot, SessionError> {
+        if cancellation.is_cancelled() {
+            return Err(SessionError::Cancelled);
+        }
+        if self.provenance.is_none() {
+            return Ok(RequestTickSnapshot::default());
+        }
+        let entries = self.request_tick_entries();
+        let owner_ids = entries
+            .iter()
+            .map(RequestTickEntry::extension_id)
+            .map(str::to_owned)
+            .collect();
+        Ok(RequestTickSnapshot { entries, owner_ids })
+    }
+
+    /// Execute exactly the request snapshot used by pre-tick admission.
+    pub(super) fn run_request_tick_snapshot<F>(
         &mut self,
+        snapshot: RequestTickSnapshot,
         cancellation: &CancellationToken,
         sink: &mut EventSink<'_, F>,
     ) -> Result<bool, SessionError>
@@ -135,15 +177,7 @@ impl<D: PermissionDecider> Session<D> {
         if cancellation.is_cancelled() {
             return Err(SessionError::Cancelled);
         }
-        // Without a live writer there can be no accepted durable cutoff.
-        // Skip before re-entering untrusted extension discovery: this
-        // optional observer point must not add work or faults to an
-        // otherwise provenance-free request.
-        if self.provenance.is_none() {
-            return Ok(false);
-        }
-        let entries = self.request_tick_entries();
-        if entries.is_empty() {
+        if snapshot.entries.is_empty() || self.provenance.is_none() {
             return Ok(false);
         }
 
@@ -159,7 +193,7 @@ impl<D: PermissionDecider> Session<D> {
             return Ok(false);
         };
 
-        for entry in entries {
+        for entry in snapshot.entries {
             if cancellation.is_cancelled() {
                 return Err(SessionError::Cancelled);
             }

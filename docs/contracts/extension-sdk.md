@@ -450,6 +450,18 @@ same exact closed input:
 {"through_event_id":"<accepted durable tail event id>"}
 ```
 
+Core discovers one immutable snapshot of tick entries and owner ids for the
+request, then reuses that exact snapshot for both admission and execution.
+Dynamic or failed registration cannot nominate an owner to gain admission and
+then avoid its execution/failure outcome. The ordinary full canvas first gets
+all configured compaction handling. If it still exceeds the byte budget, a
+provisional pre-tick view may omit only the snapshotted owners' durable slots
+so they can refresh, clear, or latch. The provisional view is never a
+`canvas.snapshot` and never reaches a provider. The authoritative post-tick
+assembly restores successful/no-op owners, suppresses failed owners, and must
+pass every ordinary final budget check. Its request-growth comparison retains
+the settled full pre-tick request as the compatibility baseline.
+
 During that invocation every `HostApi::query_provenance` call is pinned to the
 shared inclusive cutoff. Omitting `through_event_id` injects it; supplying the
 same id is accepted; supplying any other id fails the query. A contributor
@@ -473,9 +485,14 @@ failure records exactly one canonical `error` with fixed host text and
 for the remainder of the live Session, and does not suppress later
 contributors or the root request. The latch applies only to the request tick;
 otherwise valid model tools and terminal-idle work from that extension remain
-available. A command error or panic already recorded by the ordinary command
-host is not duplicated by the tick latch. Resume retries contributors with a
-fresh process-local failure latch. Cancellation stops the boundary.
+available. Live root request assembly does withhold that contributor's durable
+context slots after the latch: a contributor that cannot refresh or clear its
+state cannot leave stale state model-facing. This suppression does not delete
+slot events. Resume retries contributors with a fresh process-local failure
+latch and restores normal latest-slot projection so a successful resumed tick
+can refresh it before provider invocation. A command error or panic already
+recorded by the ordinary command host is not duplicated by the tick latch.
+Cancellation stops the boundary.
 Authoritative provenance failure retains the ordinary fatal writer fence. If
 no live writer or durable tail is available, the optional tick point is
 skipped before its contributor discovery rather than making the root request
