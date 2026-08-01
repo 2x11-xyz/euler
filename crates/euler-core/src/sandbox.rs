@@ -509,11 +509,7 @@ const RUNTIME_MOUNTS: &[&str] = &[
 /// non-overlapping checkout can instead be attached as another root.
 const READ_ONLY_WORKSPACE_SURFACES: &[&str] = &[".worktrees"];
 const SYSTEM_SANDBOX_PATH: &str = "/usr/bin:/bin";
-/// A cold, CPU-saturated host can take several seconds to schedule the nested
-/// namespace child even after authority inspection succeeds. Keep the probe
-/// bounded without treating ordinary scheduler pressure as proof that the
-/// profile cannot be enforced.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Keep host-backed authority inspection bounded. An incomplete inspection
 /// blocks subprocess launch rather than silently weakening the boundary.
 #[cfg(target_os = "linux")]

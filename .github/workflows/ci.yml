@@ -13,7 +13,10 @@ env:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 hosted runners restrict the unprivileged user namespaces
+    # Bubblewrap needs. Euler correctly fails closed there; this gate uses the
+    # still-supported image where it can exercise the real enforced profile.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Install workspace sandbox backend
