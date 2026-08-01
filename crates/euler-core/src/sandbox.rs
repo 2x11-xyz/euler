@@ -497,6 +497,7 @@ const SYSTEM_SANDBOX_PATH: &str = "/usr/bin:/bin";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Keep host-backed authority inspection bounded. An incomplete inspection
 /// blocks subprocess launch rather than silently weakening the boundary.
+#[cfg(target_os = "linux")]
 const MAX_AUTHORITY_SCAN_ENTRIES: usize = 1_000_000;
 pub const MAX_WRITABLE_ROOTS: usize = 8;
 pub const MAX_RUNTIME_ROOTS: usize = 8;
