@@ -11,7 +11,7 @@ use crate::file_diff::{
 use crate::permissions::{ApprovalMode, PermissionDecider};
 use crate::redaction::SecretRedactor;
 use crate::tools::{PatchEvents, ToolError, ToolExecution, ToolExecutionOutcome};
-use euler_event::{object, EventEnvelope, EventKind, JsonObject};
+use euler_event::{object, tool_result_succeeded, EventEnvelope, EventKind, JsonObject};
 use euler_provider::ToolCall;
 use euler_sdk::{CancellationToken, Capability};
 use serde_json::Value;
@@ -246,7 +246,8 @@ impl<D: PermissionDecider> Session<D> {
                     )?;
                 }
                 self.emit_observed_tool_changes(&call.id, &execution, &tool_call_event_id)?;
-                let mut payload = tool_success_payload(call.id, &execution, &self.redactor);
+                let mut payload = tool_result_payload(call.id, &execution, &self.redactor);
+                let succeeded = tool_result_succeeded(&payload);
                 if let Some(source) = covered_grant_source {
                     // Ran under an existing grant — the ledger shows a dim
                     // `· session grant` on the tool header instead of a fresh
@@ -264,7 +265,7 @@ impl<D: PermissionDecider> Session<D> {
                     &self.config.session_id,
                     &tool_name,
                     elapsed_ms(tool_started),
-                    true,
+                    succeeded,
                 );
             }
             Ok(ToolExecutionOutcome::Cancelled(execution)) => {
@@ -394,7 +395,7 @@ impl<D: PermissionDecider> Session<D> {
     }
 }
 
-pub(crate) fn tool_success_payload(
+pub(crate) fn tool_result_payload(
     call_id: String,
     execution: &ToolExecution,
     redactor: &SecretRedactor,
@@ -427,6 +428,20 @@ pub(crate) fn tool_success_payload(
     }
     if let Some(exit_code) = execution.exit_code {
         payload.insert("exit_code".to_owned(), exit_code.into());
+    }
+    // Reaching this builder means the executor returned a completed
+    // ToolExecution. That is distinct from the process outcome: a nonzero
+    // exit makes the canonical tool operation fail while its output and exit
+    // code remain durable evidence.
+    let succeeded = tool_result_succeeded(&payload);
+    payload.insert("ok".to_owned(), succeeded.into());
+    if !succeeded {
+        let exit_code = execution.exit_code.unwrap_or(-1);
+        debug_assert_ne!(exit_code, 0, "zero exit code must be successful");
+        payload.insert(
+            "error".to_owned(),
+            format!("process exited with code {exit_code}").into(),
+        );
     }
     payload
 }

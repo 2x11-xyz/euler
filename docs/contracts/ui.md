@@ -138,6 +138,10 @@ promotes, or reorders lines.
   exit status) and trailing whitespace padding is never stored, so the
   collapsed and expanded views agree on line count and order by
   construction. The expanded view is the full buffer, in buffer order.
+- The header status uses the canonical effective tool outcome. A nonzero
+  `exit_code` is always failure, including for legacy events that also carry
+  `ok: true`; raw legacy metadata cannot turn `exit 101` into a successful
+  `Ran` block, suppress a failed extension result, or produce a passing recap.
 
 ### Fold
 

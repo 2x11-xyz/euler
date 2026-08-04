@@ -4,7 +4,7 @@ use crate::{
     ApplyPatchDocument, ApplyPatchError, ObservedFileChange, SandboxAvailability,
     SandboxUnavailableReason, SubprocessSandbox,
 };
-use euler_event::{EventEnvelope, EventKind};
+use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use euler_provider::ToolDefinition;
 use euler_sdk::{CancellationToken, Capability};
 use serde_json::json;
@@ -1644,12 +1644,8 @@ fn tool_result_get(
         .get("name")
         .and_then(Value::as_str)
         .unwrap_or("tool");
-    let ok = event
-        .payload
-        .get("ok")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let content = tool_result_content(event, ok);
+    let ok = tool_result_succeeded(&event.payload);
+    let content = tool_result_content(event);
     let window = rehydrate_window(content, offset_bytes, max_bytes);
     let status = if ok { "ok" } else { "failed" };
     let mut output = format!(
@@ -1712,21 +1708,14 @@ fn find_tool_result_event<'a>(
     Ok(event)
 }
 
-fn tool_result_content(event: &EventEnvelope, ok: bool) -> &str {
-    if ok {
-        event
-            .payload
-            .get("output")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-    } else {
-        event
-            .payload
-            .get("error")
-            .and_then(Value::as_str)
-            .or_else(|| event.payload.get("output").and_then(Value::as_str))
-            .unwrap_or("")
-    }
+fn tool_result_content(event: &EventEnvelope) -> &str {
+    event
+        .payload
+        .get("output")
+        .and_then(Value::as_str)
+        .filter(|output| !output.is_empty())
+        .or_else(|| event.payload.get("error").and_then(Value::as_str))
+        .unwrap_or("")
 }
 
 struct RehydrateWindow {

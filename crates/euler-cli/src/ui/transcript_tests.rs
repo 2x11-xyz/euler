@@ -4583,6 +4583,25 @@ fn vt100_failed_tool_with_exit_code_and_empty_error_has_no_dangling_colon() {
 }
 
 #[test]
+fn vt100_legacy_ok_true_with_exit_101_renders_as_failure() {
+    let events = vec![event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("name", "run_shell".into()),
+            ("ok", true.into()),
+            ("output", "exit 101\ncompiler error".into()),
+            ("exit_code", 101.into()),
+        ]),
+    )];
+
+    let contents = rendered_screen(&events, &Theme::default(), 64, 5);
+
+    assert!(contents.contains("Ran"), "{contents}");
+    assert!(contents.contains("✗ exit 101"), "{contents}");
+    assert!(!contents.contains("exit 101\n"), "{contents}");
+}
+
+#[test]
 fn failed_tool_run_previews_head_and_tail_in_buffer_order() {
     // v4 amendment: failures use the same head+tail preview as successes —
     // no informative-line promotion. The loud failure signal lives in the
