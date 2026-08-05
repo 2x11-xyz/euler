@@ -4,14 +4,14 @@ use super::{
     approval_mode_str, canvas_snapshot_payload, context_budget_exhausted, elapsed_ms,
     file_change_payload, file_diff_payload, maybe_store_pre_image, model_input_item,
     permission_decision_payload, permission_request_for_tool, tool_cancelled_payload,
-    tool_success_payload, validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop,
+    tool_result_payload, validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop,
     RoundLoopConfig, RoundLoopIo, RoundOutcome, Session, SessionError, TurnState,
     SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
 use euler_agents::{generated_agent_id, AgentResult, AgentTask, SpawnedAgent};
-use euler_event::{object, EventEnvelope, EventKind, JsonObject};
+use euler_event::{object, tool_result_succeeded, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{
     catalog::{ModelCostRates, ModelCostSource, ModelUsageCost},
     ModelInputItem, ModelRequest, ModelRole, ModelStreamEvent, ProviderError, ProviderSet,
@@ -472,12 +472,12 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                     return Ok(());
                 }
                 self.record_observed_file_changes(&call.id, &execution.file_changes)?;
-                self.emit_tool_success(call, execution, tool_call_event_id)?;
+                let succeeded = self.emit_tool_result(call, execution, tool_call_event_id)?;
                 crate::diagnostics::tool_exec_end(
                     &self.session_id,
                     &tool_name,
                     elapsed_ms(tool_started),
-                    true,
+                    succeeded,
                 );
             }
             Ok(crate::tools::ToolExecutionOutcome::Cancelled(execution)) => {
@@ -605,15 +605,16 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         Ok(())
     }
 
-    fn emit_tool_success(
+    fn emit_tool_result(
         &mut self,
         call: ToolCall,
         execution: crate::tools::ToolExecution,
         tool_call_event_id: String,
-    ) -> Result<(), SessionError> {
-        let payload = tool_success_payload(call.id, &execution, &self.redactor);
+    ) -> Result<bool, SessionError> {
+        let payload = tool_result_payload(call.id, &execution, &self.redactor);
+        let succeeded = tool_result_succeeded(&payload);
         self.append(EventKind::TOOL_RESULT, payload, Some(tool_call_event_id))?;
-        Ok(())
+        Ok(succeeded)
     }
 
     fn emit_tool_failure(

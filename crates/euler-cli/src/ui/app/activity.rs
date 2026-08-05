@@ -5,9 +5,9 @@
 //! depend on a hidden wall-clock read. Model content is deliberately absent
 //! from this module: a delta's kind is enough to establish response activity.
 
-use super::turn_recap::{effective_tool_result_ok, shell_exit_code, TurnRecapAccumulator};
+use super::turn_recap::{shell_exit_code, TurnRecapAccumulator};
 use chrono::{DateTime, Utc};
-use euler_event::{EventEnvelope, EventKind};
+use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -393,7 +393,7 @@ impl RunActivityProjection {
 
     fn observe_check_result(&mut self, event: &EventEnvelope, at: Option<DateTime<Utc>>) -> bool {
         let kind = classify_check(payload_str(event, "name").unwrap_or_default());
-        let ok = effective_tool_result_ok(event);
+        let ok = tool_result_succeeded(&event.payload);
         self.latest_milestone = Some(outcome_milestone(
             kind.milestone(),
             ok,
@@ -663,7 +663,7 @@ fn is_publish_command(command: &str) -> bool {
 }
 
 fn tool_milestone(tool: &ActiveTool, event: &EventEnvelope) -> String {
-    let ok = effective_tool_result_ok(event);
+    let ok = tool_result_succeeded(&event.payload);
     match tool.kind {
         ToolKind::Check(kind) => outcome_milestone(kind.milestone(), ok, shell_exit_code(event)),
         ToolKind::Inspection if ok => "inspection completed".to_owned(),

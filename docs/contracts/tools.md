@@ -105,6 +105,15 @@ Semantics:
 | `tool_result_get` | FsRead | Rehydrate a demoted, compacted, or previewed tool result from the **current session** by `event_id` (required); optional `offset_bytes` (default `0`) and `max_bytes` (default 64 KiB) select a byte window. Session-local and project-context-policy-aware for children. |
 | `code_swarm_review` | AgentSpawn | Session-level review gate over required explicit `focus` (≤7 KiB) and `context` (≤256 KiB). The calling agent gathers material first through ordinary tools, so this gate has no hidden file, git, GitHub, or network authority. It forwards only that supplied context and a small reviewer brief — never ambient session canvas — fans out the persisted reviewer set, and returns every finding for caller adjudication. Optional: `personas`, `models` (non-empty one-off override; an empty model-facing list is omission), `max_tokens`. Advertised only in the root session when the `code-swarm` extension is wired and enabled; companions never see it (depth one). Config, result shape, and failure honesty: multi-agent contract. |
 
+Process launch/executor completion and process success are separate facts.
+`run_shell` and direct Git tools retain collected output and the observed exit
+code whenever execution reaches a process result, but only exit code zero is a
+successful `tool.result`. A nonzero exit is canonical failure (`ok: false`, an
+`error`, plus any collected `output` and `exit_code`) and is supplied to the
+next model as failed tool output. Legacy event compatibility is owned by the
+effective-outcome rule in `docs/contracts/events.md`, not by individual tool or
+UI special cases.
+
 Under ordinary host execution, agent-controlled shell and Git subprocesses
 inherit project environment variables, including `HOME` and `RUST_LOG`, but
 not credential-shaped values or the owning Euler process's routing, TTY, and
