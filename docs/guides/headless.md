@@ -25,7 +25,13 @@ Flags:
 - `--reasoning-effort xsmall|small|medium|large|xlarge|max` sets Euler's reasoning knob. `max` is available on GPT-5.6 Luna, Sol, and Terra. Codex's `ultra` mode is not a provider effort: it combines wire-level `max` with proactive multi-agent delegation, which Euler does not yet expose as a driver workflow.
 - `--auto-approve read-only|trusted-local` controls headless permissions.
   - `read-only` is the default: file reads are allowed; writes and shell are denied.
-  - `trusted-local`: file reads, file writes, and shell are session-allowed.
+  - `trusted-local`: file reads, file writes, and shell are session-allowed;
+    shell/Git processes still require the independent no-network workspace
+    sandbox and never fall back to host execution.
+- Repeat `--writable-root <path>` to attach another non-overlapping writable
+  directory. Repeat `--runtime-root <path>` to expose a non-overlapping
+  toolchain/runtime directory read-only and add it to the sandbox PATH. Both
+  sets are durable session authority and must match on resume.
 - `--extensions <ids>` enables a comma-separated list. Use `--extensions none`
   for no extensions.
 - `--max-tool-rounds N` sets a positive hard ceiling. Default is unlimited.

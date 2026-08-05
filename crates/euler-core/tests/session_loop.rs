@@ -1,7 +1,10 @@
 #![allow(clippy::too_many_lines)] // integration-test exemption for integration test modules
+#[cfg(target_os = "linux")]
 use euler_core::canvas::projected_tool_output;
+#[cfg(target_os = "linux")]
+use euler_core::permissions::ApprovalMode;
 use euler_core::permissions::{
-    ApprovalMode, DeciderVerdict, PermissionDecider, PermissionRequest, ScriptedDecider,
+    DeciderVerdict, PermissionDecider, PermissionRequest, ScriptedDecider,
 };
 use euler_core::{
     assemble_canvas, fold_model_target, fold_reasoning_effort, AutoCompactionPolicy, CanvasItem,
@@ -20,6 +23,10 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt as _;
+#[cfg(target_os = "linux")]
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -74,6 +81,28 @@ fn session_new_records_session_start_first() {
         .to_string_lossy()
         .to_string();
     assert_eq!(payload_str(start, "root"), Some(expected_root.as_str()));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn run_shell_fails_closed_as_unsupported_platform_without_mutation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+
+    let error = registry
+        .execute(
+            "run_shell",
+            &json!({"command": "printf changed > must-not-exist"}),
+        )
+        .expect_err("non-Linux subprocess execution must fail closed");
+
+    assert!(matches!(
+        error,
+        euler_core::ToolError::SandboxUnavailable(
+            euler_core::SandboxUnavailableReason::UnsupportedPlatform
+        )
+    ));
+    assert!(!temp.path().join("must-not-exist").exists());
 }
 
 #[test]
@@ -291,6 +320,7 @@ fn fold_reasoning_effort_replays_valid_effort_events() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn scripted_session_records_read_edit_shell_summary_sequence() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1592,6 +1622,7 @@ fn read_file_records_session_allow_permission_decision() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn ask_permission_prompt_is_flushed_before_decider_returns() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1641,6 +1672,7 @@ fn ask_permission_prompt_is_flushed_before_decider_returns() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn allow_session_makes_second_use_session_allow_without_second_prompt() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1686,6 +1718,7 @@ fn allow_session_makes_second_use_session_allow_without_second_prompt() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn statically_safe_command_auto_approves_without_prompt() {
     // Issue #78: under mode=ask, a statically-safe read-only command runs
@@ -1747,6 +1780,7 @@ fn statically_safe_command_auto_approves_without_prompt() {
     assert!(session.list_grants().is_empty());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn statically_unsafe_command_still_prompts_under_ask() {
     // The static-safe seam must not widen: an unknown binary keeps the
@@ -1783,6 +1817,7 @@ fn statically_unsafe_command_still_prompts_under_ask() {
     assert_eq!(payload_str(decisions[0], "mode"), Some("ask"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
     // Review v2 §8: a command covered by an existing scoped session grant
@@ -1834,6 +1869,7 @@ fn scoped_grant_covers_later_calls_without_fresh_decision_records() {
     assert_eq!(payload_str(results[1], "grant_source"), Some("session"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn tool_output_redacts_known_values_and_token_shapes() {
     // Issue #56 incident repro: a granted shell command read a secret store;
@@ -1880,6 +1916,7 @@ fn tool_output_redacts_known_values_and_token_shapes() {
     assert!(output.contains("name=OPENROUTER_API_KEY"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn tool_output_preview_is_derived_after_secret_redaction() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -1922,6 +1959,7 @@ fn tool_output_preview_is_derived_after_secret_redaction() {
     assert!(preview.contains("tool_result_get"), "{preview}");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn user_rule_records_scope_and_covers_a_fresh_session() {
     // Permissions v2 (#79): a durable user rule persists to the home store,
@@ -1992,6 +2030,7 @@ fn user_rule_records_scope_and_covers_a_fresh_session() {
     assert_eq!(payload_str(results[0], "grant_source"), Some("user"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn scoped_shell_grant_covers_compound_when_every_segment_granted_or_safe() {
     // Issue #78: coverage is segment-aware. After a `touch` session grant,
@@ -2045,6 +2084,7 @@ fn scoped_shell_grant_covers_compound_when_every_segment_granted_or_safe() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn scoped_shell_grant_does_not_cover_ungranted_unsafe_segment() {
     // A `touch` grant must not authorize `touch a && mkdir evil`: the
@@ -2086,6 +2126,7 @@ fn scoped_shell_grant_does_not_cover_ungranted_unsafe_segment() {
     assert!(!temp.path().join("second-ran").exists());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn redirect_command_is_never_covered_or_auto_approved() {
     // `ls > file` is not statically analyzable: it must neither
@@ -2234,7 +2275,7 @@ fn scoped_fs_grant_does_not_cover_dotdot_or_symlink_escapes() {
 }
 
 #[test]
-fn fs_read_tools_share_required_capability() {
+fn built_in_git_views_require_shell_exec_because_repo_config_can_run_helpers() {
     let registry = ToolRegistry::new(".");
 
     assert_eq!(
@@ -2243,16 +2284,17 @@ fn fs_read_tools_share_required_capability() {
     );
     assert_eq!(
         registry.required_capability("git_status"),
-        Some(Capability::FsRead)
+        Some(Capability::ShellExec)
     );
     assert_eq!(
         registry.required_capability("git_diff"),
-        Some(Capability::FsRead)
+        Some(Capability::ShellExec)
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn git_status_records_session_allow_fs_read_permission_decision() {
+fn git_status_records_explicit_shell_exec_permission_decision() {
     let temp = tempfile::tempdir().expect("temp dir");
     let provider = ScriptedProvider::new(vec![
         FixtureResponse::ToolCalls(vec![ToolCall {
@@ -2265,20 +2307,24 @@ fn git_status_records_session_allow_fs_read_permission_decision() {
     let mut session = Session::new(
         SessionConfig::new(temp.path()),
         provider,
-        ScriptedDecider::new(vec![]),
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
     );
 
     session.run_turn("git status").expect("turn");
 
     assert_eq!(
         count_kind(session.events(), EventKind::PERMISSION_PROMPT),
-        0
+        1
     );
     let call = event_for_tool(session.events(), EventKind::TOOL_CALL, "call-git");
+    let prompt = find_kind(session.events(), EventKind::PERMISSION_PROMPT);
     let decision = find_kind(session.events(), EventKind::PERMISSION_DECISION);
-    assert_eq!(decision.parent.as_deref(), Some(call.id.as_str()));
-    assert_eq!(payload_str(decision, "capability"), Some("fs-read"));
-    assert_eq!(payload_str(decision, "mode"), Some("session-allow"));
+    assert_eq!(prompt.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(decision.parent.as_deref(), Some(prompt.id.as_str()));
+    assert!(event_index(session.events(), &call.id) < event_index(session.events(), &prompt.id));
+    assert_eq!(payload_str(decision, "capability"), Some("shell-exec"));
+    assert_eq!(payload_str(decision, "mode"), Some("ask"));
+    assert_eq!(payload_str(decision, "grant_scope"), Some("once"));
     assert_eq!(
         decision
             .payload
@@ -2942,6 +2988,54 @@ fn apply_patch_parse_failure_persists_sanitized_error_without_file_change() {
     assert!(!tool_result_json.contains("*** Begin Patch"));
 }
 
+#[cfg(unix)]
+#[test]
+fn external_hardlink_read_persists_only_the_authority_failure() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    let canary = "EXTERNAL_HARDLINK_PROVENANCE_CANARY";
+    let outside_file = outside.join("sensitive.txt");
+    fs::write(&outside_file, format!("{canary}\n")).expect("outside fixture");
+    fs::hard_link(&outside_file, workspace.join("alias.txt")).expect("workspace alias");
+    let log = temp.path().join("events.jsonl");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-hardlink-read".to_owned(),
+            name: "read_file".to_owned(),
+            input: json!({"path": "alias.txt"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(&workspace),
+        provider,
+        ScriptedDecider::new(vec![]),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+
+    session
+        .run_turn("read alias")
+        .expect("failed read is a tool result");
+
+    let events = logged_events(&log);
+    let tool_result = event_for_tool(&events, EventKind::TOOL_RESULT, "call-hardlink-read");
+    assert_eq!(tool_result.payload["ok"], json!(false));
+    assert!(payload_str(tool_result, "error")
+        .is_some_and(|error| error.contains("reject multiply-linked files")));
+    let durable_log = fs::read_to_string(&log).expect("durable provenance");
+    assert!(!durable_log.contains(canary));
+    assert!(!session.events().iter().any(|event| event
+        .to_json_line()
+        .expect("serialize event")
+        .contains(canary)));
+    let canvas = assemble_canvas(session.events(), &AutoCompactionPolicy::default());
+    let (_, output) = tool_output_item(&canvas, "call-hardlink-read");
+    assert!(!output.contains(canary));
+}
+
 #[test]
 fn run_shell_apply_patch_intercept_uses_fs_write_and_file_change_origin() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -2997,6 +3091,90 @@ fn run_shell_apply_patch_intercept_uses_fs_write_and_file_change_origin() {
         .contains("intercepted apply_patch"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_intercepted_patch_preserves_structured_origin() {
+    const CHILD_ENV: &str = "EULER_TEST_PARTIAL_INTERCEPTED_PATCH_CHILD";
+    const CHILD_TEST: &str = "failed_intercepted_patch_child_preserves_structured_origin";
+    let output = Command::new(std::env::current_exe().expect("current test binary"))
+        .args(["--exact", CHILD_TEST, "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("run isolated file-size-limited child");
+    assert!(
+        output.status.success(),
+        "child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_intercepted_patch_child_preserves_structured_origin() {
+    if std::env::var_os("EULER_TEST_PARTIAL_INTERCEPTED_PATCH_CHILD").is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("note.txt");
+    fs::write(&target, "before\n").expect("fixture");
+    let command = "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: note.txt\n@@\n-before\n+replacement\n*** End Patch\nPATCH";
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-partial-shell-apply".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": command}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+
+    // Keep the process-wide file limit in this isolated child. Interception
+    // uses the structured writer, so EFBIG leaves one observed byte without
+    // launching a shell process.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let limit = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+    }
+    session
+        .run_turn("intercept patch")
+        .expect("failed tool result returns to the model");
+
+    let changes = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .collect::<Vec<_>>();
+    let diffs = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::FILE_DIFF)
+        .collect::<Vec<_>>();
+    assert_eq!(changes.len(), 1, "events: {:?}", session.events());
+    assert_eq!(diffs.len(), 1, "events: {:?}", session.events());
+    assert_eq!(fs::read(&target).expect("partial target"), b"r");
+    let change = changes[0];
+    let diff = diffs[0];
+    let tool_call = event_for_tool(
+        session.events(),
+        EventKind::TOOL_CALL,
+        "call-partial-shell-apply",
+    );
+    assert_eq!(payload_str(change, "origin"), Some("run_shell:apply_patch"));
+    assert_eq!(payload_str(diff, "origin"), Some("run_shell:apply_patch"));
+    assert_eq!(change.parent.as_deref(), Some(tool_call.id.as_str()));
+    assert_eq!(count_kind(session.events(), EventKind::PATCH_APPLIED), 0);
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_plain_write_emits_file_change_and_diff() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3019,10 +3197,8 @@ fn run_shell_plain_write_emits_file_change_and_diff() {
     assert!(matches!(error, SessionError::Provider(_)));
 
     let events = logged_events(&log);
-    let file_change = find_kind(&events, EventKind::FILE_CHANGE);
-    let file_diff = find_kind(&events, EventKind::FILE_DIFF);
-
-    assert_shell_file_change_sequence(&events, "call-shell-write");
+    let (file_change, file_diff) =
+        assert_shell_file_change_sequence(&events, "call-shell-write", "shell-created.txt");
     assert_eq!(
         fs::read_to_string(temp.path().join("shell-created.txt")).expect("read created"),
         "hello\n"
@@ -3044,6 +3220,131 @@ fn run_shell_plain_write_emits_file_change_and_diff() {
     assert!(diff.contains("+hello"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn git_diff_helper_mutation_emits_git_origin_provenance_and_nonzero_result() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path();
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(workspace)
+        .status()
+        .expect("git available");
+    assert!(initialized.success(), "initialize repository");
+    for (key, value) in [
+        ("user.email", "euler-test@example.invalid"),
+        ("user.name", "Euler Test"),
+    ] {
+        let configured = std::process::Command::new("git")
+            .args(["config", key, value])
+            .current_dir(workspace)
+            .status()
+            .expect("configure repository");
+        assert!(configured.success(), "configure {key}");
+    }
+    fs::write(
+        workspace.join(".gitattributes"),
+        "tracked.txt filter=hostile\n",
+    )
+    .expect("attributes");
+    fs::write(workspace.join("tracked.txt"), "before\n").expect("tracked file");
+    let added = std::process::Command::new("git")
+        .args(["add", ".gitattributes", "tracked.txt"])
+        .current_dir(workspace)
+        .status()
+        .expect("git add");
+    assert!(added.success(), "git add fixture");
+    let committed = std::process::Command::new("git")
+        .args(["commit", "--quiet", "-m", "fixture"])
+        .current_dir(workspace)
+        .status()
+        .expect("git commit");
+    assert!(committed.success(), "git commit fixture");
+
+    let marker = workspace.join("filter-invoked");
+    let helper = workspace.join("filter-helper");
+    let marker_quoted = format!("'{}'", marker.to_string_lossy().replace('\'', "'\\''"));
+    fs::write(
+        &helper,
+        format!("#!/bin/sh\nprintf invoked > {marker_quoted}\ncat\n"),
+    )
+    .expect("write filter helper");
+    let mut permissions = fs::metadata(&helper)
+        .expect("filter helper metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&helper, permissions).expect("make filter helper executable");
+    let configured = std::process::Command::new("git")
+        .arg("config")
+        .arg("filter.hostile.clean")
+        .arg(&helper)
+        .current_dir(workspace)
+        .status()
+        .expect("configure clean filter");
+    assert!(configured.success(), "configure clean filter");
+    fs::write(workspace.join("tracked.txt"), "after\n").expect("modify tracked file");
+
+    let log = workspace.join("events.jsonl");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-git-diff".to_owned(),
+        name: "git_diff".to_owned(),
+        input: json!({}),
+    }])]);
+    let mut session = Session::new(
+        SessionConfig::new(workspace),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+
+    let error = session
+        .run_turn("inspect diff then fail")
+        .expect_err("provider exhausts after tool");
+    assert!(matches!(error, SessionError::Provider(_)));
+    assert_eq!(
+        fs::read_to_string(&marker).expect("filter marker"),
+        "invoked"
+    );
+
+    let events = logged_events(&log);
+    let file_change = events
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::FILE_CHANGE
+                && payload_str(event, "path") == Some("filter-invoked")
+        })
+        .expect("filter marker file.change");
+    let file_diff = events
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::FILE_DIFF
+                && payload_str(event, "file_change_id") == Some(file_change.id.as_str())
+        })
+        .expect("filter marker file.diff");
+    assert_eq!(payload_str(file_change, "origin"), Some("git_diff"));
+    assert_eq!(payload_str(file_diff, "origin"), Some("git_diff"));
+    assert_eq!(payload_str(file_change, "action"), Some("add"));
+
+    let result = event_for_tool(&events, EventKind::TOOL_RESULT, "call-git-diff");
+    assert_eq!(result.payload.get("ok"), Some(&json!(false)));
+    assert_eq!(result.payload.get("exit_code"), Some(&json!(-1)));
+    assert_eq!(
+        payload_str(result, "failure_kind"),
+        Some("workspace-mutation")
+    );
+    assert_eq!(
+        payload_str(result, "error"),
+        Some("workspace mutation was observed during git_diff; the Git view was invalidated")
+    );
+    assert!(!payload_str(result, "error")
+        .expect("git mutation error")
+        .contains("process exited"));
+    assert!(payload_str(result, "output")
+        .expect("git result output")
+        .contains("observed workspace mutation"));
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_plain_modify_emits_file_change_and_diff() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3067,10 +3368,8 @@ fn run_shell_plain_modify_emits_file_change_and_diff() {
     assert!(matches!(error, SessionError::Provider(_)));
 
     let events = logged_events(&log);
-    let file_change = find_kind(&events, EventKind::FILE_CHANGE);
-    let file_diff = find_kind(&events, EventKind::FILE_DIFF);
-
-    assert_shell_file_change_sequence(&events, "call-shell-modify");
+    let (file_change, file_diff) =
+        assert_shell_file_change_sequence(&events, "call-shell-modify", "note.txt");
     assert_eq!(
         fs::read_to_string(temp.path().join("note.txt")).expect("read note"),
         "beta\n"
@@ -3095,6 +3394,7 @@ fn run_shell_plain_modify_emits_file_change_and_diff() {
     assert!(diff.contains("+beta"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_plain_delete_emits_metadata_without_deleted_content_diff() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3118,10 +3418,8 @@ fn run_shell_plain_delete_emits_metadata_without_deleted_content_diff() {
     assert!(matches!(error, SessionError::Provider(_)));
 
     let events = logged_events(&log);
-    let file_change = find_kind(&events, EventKind::FILE_CHANGE);
-    let file_diff = find_kind(&events, EventKind::FILE_DIFF);
-
-    assert_shell_file_change_sequence(&events, "call-shell-delete");
+    let (file_change, file_diff) =
+        assert_shell_file_change_sequence(&events, "call-shell-delete", "gone.txt");
     assert!(!temp.path().join("gone.txt").exists());
     assert_eq!(payload_str(file_change, "action"), Some("delete"));
     assert_eq!(payload_str(file_change, "path"), Some("gone.txt"));
@@ -3143,6 +3441,7 @@ fn run_shell_plain_delete_emits_metadata_without_deleted_content_diff() {
         .contains("remove me"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_secret_like_write_omits_file_diff_content() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3165,10 +3464,8 @@ fn run_shell_secret_like_write_omits_file_diff_content() {
     assert!(matches!(error, SessionError::Provider(_)));
 
     let events = logged_events(&log);
-    let file_change = find_kind(&events, EventKind::FILE_CHANGE);
-    let file_diff = find_kind(&events, EventKind::FILE_DIFF);
-
-    assert_shell_file_change_sequence(&events, "call-shell-secret");
+    let (file_change, file_diff) =
+        assert_shell_file_change_sequence(&events, "call-shell-secret", ".env");
     assert_eq!(payload_str(file_change, "path"), Some(".env"));
     assert_eq!(payload_str(file_diff, "path"), Some(".env"));
     assert_eq!(file_diff.payload.get("diff"), Some(&json!(null)));
@@ -3182,6 +3479,7 @@ fn run_shell_secret_like_write_omits_file_diff_content() {
         .contains("secret-value"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn run_shell_binary_write_omits_file_diff_content() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3204,10 +3502,8 @@ fn run_shell_binary_write_omits_file_diff_content() {
     assert!(matches!(error, SessionError::Provider(_)));
 
     let events = logged_events(&log);
-    let file_change = find_kind(&events, EventKind::FILE_CHANGE);
-    let file_diff = find_kind(&events, EventKind::FILE_DIFF);
-
-    assert_shell_file_change_sequence(&events, "call-shell-binary");
+    let (file_change, file_diff) =
+        assert_shell_file_change_sequence(&events, "call-shell-binary", "binary.dat");
     assert_eq!(payload_str(file_change, "action"), Some("add"));
     assert_eq!(payload_str(file_change, "path"), Some("binary.dat"));
     assert_eq!(file_diff.payload.get("diff"), Some(&json!(null)));
@@ -3588,6 +3884,7 @@ fn partial_stream_error_forwards_deltas_then_provider_error() {
     assert!(saw_error);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn permission_events_match_approval_mode() {
     let ask_events = run_shell_with_mode(
@@ -3630,6 +3927,7 @@ fn permission_events_match_approval_mode() {
     assert_decision(&always_deny_events, "always-deny", false);
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn shell_tool_result_nonzero_exit_is_a_canonical_failure() {
     let events = run_shell_with_mode(ApprovalMode::SessionAllow, vec![], "exit 101", "");
@@ -3663,9 +3961,11 @@ fn shell_tool_result_nonzero_exit_is_a_canonical_failure() {
         payload_str(result, "error"),
         Some("process exited with code 101")
     );
+    assert_eq!(payload_str(result, "failure_kind"), Some("process-exit"));
     assert_eq!(payload_str(result, "output"), Some("exit 101\n"));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn shell_nonzero_exit_reaches_the_next_provider_as_failed_output() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3712,6 +4012,71 @@ fn shell_nonzero_exit_reaches_the_next_provider_as_failed_output() {
     assert!(prompt.contains("[tool failed] exit 101"), "{prompt}");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn shell_timeout_is_a_typed_failure_in_provenance_and_model_input() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = request_log();
+    let provider = CapturingProvider::new(
+        "fixture",
+        vec![
+            vec![
+                Ok(ModelStreamEvent::ToolCall(ToolCall {
+                    id: "call-timeout".to_owned(),
+                    name: "run_shell".to_owned(),
+                    input: json!({"command": "sleep 30", "timeout_ms": 100}),
+                })),
+                finished(StopReason::ToolUse),
+            ],
+            text_stream("done"),
+        ],
+        requests.clone(),
+    );
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![]),
+    );
+    session.set_permission_mode(Capability::ShellExec, ApprovalMode::SessionAllow);
+
+    session.run_turn("time out").expect("turn");
+
+    let result = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::TOOL_RESULT
+                && payload_str(event, "id") == Some("call-timeout")
+        })
+        .expect("timeout result");
+    assert_eq!(result.payload.get("ok"), Some(&json!(false)));
+    assert_eq!(result.payload.get("exit_code"), Some(&json!(-1)));
+    assert_eq!(payload_str(result, "failure_kind"), Some("timeout"));
+    assert_eq!(
+        payload_str(result, "error"),
+        Some("command timed out after 100 ms and its process group was killed")
+    );
+    assert!(!payload_str(result, "error")
+        .expect("timeout error")
+        .contains("process exited"));
+
+    let requests = request_log_guard(&requests);
+    let retry = requests.get(1).expect("request after timeout");
+    assert!(matches!(
+        retry
+            .input
+            .iter()
+            .find(|item| matches!(item, euler_provider::ModelInputItem::ToolOutput { .. })),
+        Some(euler_provider::ModelInputItem::ToolOutput {
+            ok: false,
+            error: Some(error),
+            exit_code: Some(-1),
+            ..
+        }) if error.contains("timed out after 100 ms")
+    ));
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn shell_tool_result_keeps_complete_output_with_a_bounded_preview() {
     let command = "i=1; while [ \"$i\" -le 500 ]; do printf 'line-%03d-abcdefghijklmnopqrstuvwxyz\\n' \"$i\"; i=$((i + 1)); done";
@@ -3752,6 +4117,7 @@ fn shell_tool_result_keeps_complete_output_with_a_bounded_preview() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn git_tool_result_nonzero_exit_is_a_canonical_failure() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -3766,7 +4132,7 @@ fn git_tool_result_nonzero_exit_is_a_canonical_failure() {
     let mut session = Session::new(
         SessionConfig::new(temp.path()),
         provider,
-        ScriptedDecider::new(vec![]),
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
     );
 
     session.run_turn("git status").expect("turn");
@@ -3798,6 +4164,7 @@ fn git_tool_result_nonzero_exit_is_a_canonical_failure() {
     assert_ne!(exit_code, 0);
     let expected_error = format!("process exited with code {exit_code}");
     assert_eq!(payload_str(result, "error"), Some(expected_error.as_str()));
+    assert_eq!(payload_str(result, "failure_kind"), Some("process-exit"));
 }
 
 #[test]
@@ -5536,6 +5903,7 @@ fn rename_session_persists_canonical_event_after_start() {
     assert_eq!(payload_str(&persisted[1], "name"), Some("live name"));
 }
 
+#[cfg(target_os = "linux")]
 fn run_shell_with_mode(
     mode: ApprovalMode,
     decisions: Vec<DeciderVerdict>,
@@ -5569,11 +5937,13 @@ fn run_shell_with_mode(
     session.events().to_vec()
 }
 
+#[cfg(target_os = "linux")]
 struct ObservingDecider {
     observed: Arc<Mutex<Vec<String>>>,
     verdict: DeciderVerdict,
 }
 
+#[cfg(target_os = "linux")]
 impl PermissionDecider for ObservingDecider {
     fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
         let observed = self.observed.lock().expect("observed sink lock");
@@ -5587,6 +5957,7 @@ impl PermissionDecider for ObservingDecider {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn event_position(events: &[EventEnvelope], kind: &'static str) -> usize {
     events
         .iter()
@@ -6061,6 +6432,7 @@ fn finished(stop_reason: StopReason) -> Result<ModelStreamEvent, ProviderError> 
     })
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn credential_in_tool_call_argument_warns_stays_faithful_and_scrubs_on_demand() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -6136,6 +6508,7 @@ fn credential_in_tool_call_argument_warns_stays_faithful_and_scrubs_on_demand() 
     assert!(session.scrub_candidates().is_empty());
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn scrub_expansion_preserves_the_shell_result_preview_budget() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -6327,10 +6700,28 @@ fn assert_patch_file_change_sequence(events: &[EventEnvelope], call_id: &str) {
     assert!(event_index(events, &file_change.id) < event_index(events, &tool_result.id));
 }
 
-fn assert_shell_file_change_sequence(events: &[EventEnvelope], call_id: &str) {
+#[cfg(target_os = "linux")]
+fn assert_shell_file_change_sequence<'a>(
+    events: &'a [EventEnvelope],
+    call_id: &str,
+    path: &str,
+) -> (&'a EventEnvelope, &'a EventEnvelope) {
     let tool_call = event_for_tool(events, EventKind::TOOL_CALL, call_id);
-    let file_change = find_kind(events, EventKind::FILE_CHANGE);
-    let file_diff = find_kind(events, EventKind::FILE_DIFF);
+    let file_change = events
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::FILE_CHANGE
+                && payload_str(event, "tool_call_id") == Some(call_id)
+                && payload_str(event, "path") == Some(path)
+        })
+        .expect("path-specific file.change");
+    let file_diff = events
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::FILE_DIFF
+                && payload_str(event, "file_change_id") == Some(file_change.id.as_str())
+        })
+        .expect("path-specific file.diff");
     let tool_result = event_for_tool(events, EventKind::TOOL_RESULT, call_id);
 
     assert_eq!(file_change.parent.as_deref(), Some(tool_call.id.as_str()));
@@ -6345,6 +6736,7 @@ fn assert_shell_file_change_sequence(events: &[EventEnvelope], call_id: &str) {
     assert!(event_index(events, &tool_call.id) < event_index(events, &file_change.id));
     assert!(event_index(events, &file_change.id) < event_index(events, &file_diff.id));
     assert!(event_index(events, &file_diff.id) < event_index(events, &tool_result.id));
+    (file_change, file_diff)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -6378,6 +6770,7 @@ fn selected_ids(event: &EventEnvelope) -> Vec<String> {
         .collect()
 }
 
+#[cfg(target_os = "linux")]
 fn assert_decision(events: &[EventEnvelope], mode: &str, allowed: bool) {
     let decision = events
         .iter()
@@ -6399,6 +6792,7 @@ fn assert_decision(events: &[EventEnvelope], mode: &str, allowed: bool) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn has_subsequence(actual: &[String], expected: &[&str]) -> bool {
     let mut index = 0;
     for kind in actual {
@@ -7200,6 +7594,184 @@ fn edit_file_modify_stores_workspace_checkpoint_and_rollback_restores() {
         .expect("original checkpoint event");
     assert_eq!(payload_str(original, "pre_image_blob"), Some(blob.as_str()));
     assert_eq!(payload_str(original, "action"), Some("modify"));
+}
+
+#[test]
+fn rollback_failure_without_mutation_records_a_failed_restore_only() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("note.txt");
+    fs::write(&target, "before").expect("fixture");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-edit".to_owned(),
+        name: "edit_file".to_owned(),
+        input: json!({"path": "note.txt", "old": "before", "new": "after"}),
+    }])]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    let _ = session.run_turn("edit").expect_err("provider queue ends");
+    let checkpoint_id = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .expect("checkpoint file.change")
+        .id
+        .clone();
+    fs::remove_file(&target).expect("remove target before restore");
+    let prior_len = session.events().len();
+
+    session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect_err("missing target must fail without mutation");
+
+    let emitted = &session.events()[prior_len..];
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].kind.as_str(), EventKind::WORKSPACE_RESTORE);
+    assert_eq!(emitted[0].payload["restored"], json!(false));
+    assert!(emitted[0].payload["error"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rollback_failure_preserves_observed_partial_mutation_provenance() {
+    const CHILD_ENV: &str = "EULER_TEST_PARTIAL_ROLLBACK_CHILD";
+    const CHILD_TEST: &str =
+        "rollback_failure_child_preserves_observed_partial_mutation_provenance";
+    let output = Command::new(std::env::current_exe().expect("current test binary"))
+        .args(["--exact", CHILD_TEST, "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("run isolated file-size-limited child");
+    assert!(
+        output.status.success(),
+        "child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rollback_failure_child_preserves_observed_partial_mutation_provenance() {
+    if std::env::var_os("EULER_TEST_PARTIAL_ROLLBACK_CHILD").is_none() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("note.txt");
+    fs::write(&target, "before").expect("fixture");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-edit".to_owned(),
+        name: "edit_file".to_owned(),
+        input: json!({"path": "note.txt", "old": "before", "new": "after"}),
+    }])]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    let _ = session.run_turn("edit").expect_err("provider queue ends");
+    let checkpoint_id = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .expect("checkpoint file.change")
+        .id
+        .clone();
+    let prior_len = session.events().len();
+
+    // Keep the process-wide limit in this dedicated child. Ignoring SIGXFSZ
+    // makes the restore return EFBIG after truncation and one written byte.
+    unsafe {
+        libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        let limit = libc::rlimit {
+            rlim_cur: 1,
+            rlim_max: 1,
+        };
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limit), 0);
+    }
+    let error = session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect_err("restore must exceed child file-size limit");
+    assert!(matches!(
+        &error,
+        SessionError::Tool(euler_core::ToolError::Io(_))
+    ));
+    let expected_error = error.to_string();
+    assert_eq!(fs::read(&target).expect("partial target"), b"b");
+
+    let emitted = &session.events()[prior_len..];
+    assert_eq!(
+        emitted.len(),
+        3,
+        "failure, change, and diff are durable facts"
+    );
+    let restore = &emitted[0];
+    assert_eq!(restore.kind.as_str(), EventKind::WORKSPACE_RESTORE);
+    assert_eq!(restore.payload["restored"], json!(false));
+    assert_eq!(payload_str(restore, "error"), Some(expected_error.as_str()));
+    let change = &emitted[1];
+    assert_eq!(change.kind.as_str(), EventKind::FILE_CHANGE);
+    assert_eq!(change.parent.as_deref(), Some(restore.id.as_str()));
+    assert_eq!(change.payload["workspace_restore_id"], json!(restore.id));
+    assert_eq!(change.payload["origin"], json!("workspace_restore"));
+    assert_eq!(change.payload["before_byte_len"], json!(5));
+    assert_eq!(change.payload["after_byte_len"], json!(1));
+    let diff = &emitted[2];
+    assert_eq!(diff.kind.as_str(), EventKind::FILE_DIFF);
+    assert_eq!(diff.parent.as_deref(), Some(restore.id.as_str()));
+    assert_eq!(diff.payload["file_change_id"], json!(change.id));
+    assert_eq!(diff.payload["workspace_restore_id"], json!(restore.id));
+}
+
+#[test]
+fn attached_root_checkpoint_restores_only_into_its_recorded_root() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let primary = temp.path().join("primary");
+    let attached = temp.path().join("attached");
+    fs::create_dir(&primary).expect("primary");
+    fs::create_dir(&attached).expect("attached");
+    let target = attached.join("note.txt");
+    fs::write(&target, "before\n").expect("target");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-attached-edit".to_owned(),
+        name: "edit_file".to_owned(),
+        input: json!({
+            "path": target.to_string_lossy(),
+            "old": "before",
+            "new": "after"
+        }),
+    }])]);
+    let mut config = SessionConfig::new(&primary);
+    config.attached_writable_roots = vec![attached.clone()];
+    let mut session = Session::new(
+        config,
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+
+    let _ = session
+        .run_turn("edit attached file")
+        .expect_err("provider ends after tools");
+    assert_eq!(fs::read_to_string(&target).expect("edited"), "after\n");
+    let change = find_kind(session.events(), EventKind::FILE_CHANGE);
+    assert_eq!(payload_str(change, "path"), Some("note.txt"));
+    let canonical_attached = attached.canonicalize().expect("canonical attached");
+    assert_eq!(
+        payload_str(change, "workspace_root"),
+        Some(canonical_attached.to_string_lossy().as_ref())
+    );
+    let checkpoint_id = change.id.clone();
+
+    let outcome = session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect("restore attached checkpoint");
+    assert_eq!(outcome.workspace_root, canonical_attached.to_string_lossy());
+    assert_eq!(fs::read_to_string(&target).expect("restored"), "before\n");
+    assert!(!primary.join("note.txt").exists());
 }
 
 #[test]

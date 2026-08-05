@@ -860,6 +860,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
     status.session_id = Some(session_id.clone());
     status.reasoning_effort = Some(reasoning_effort.as_str().to_owned());
     status.git_branch = detect_git_branch(&status.cwd);
+    populate_workspace_authority_status(&mut status, session);
     // /status visibility line (ADR 0011): only a non-default reviewer shows.
     if session.permission_reviewer() != euler_core::PermissionReviewer::User {
         status.permission_reviewer = Some(session.permission_reviewer().as_str().to_owned());
@@ -907,6 +908,35 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         initial_context,
         authenticated_providers,
     }
+}
+
+fn workspace_authority_status(session: &Session<TuiDecider>) -> (String, bool) {
+    match session.subprocess_sandbox() {
+        euler_core::SubprocessSandbox::Disabled => {
+            ("disabled · subprocesses blocked".to_owned(), false)
+        }
+        euler_core::SubprocessSandbox::Enforce(profile) => {
+            match session.cached_sandbox_availability() {
+                Some(euler_core::SandboxAvailability::Enforced(_)) => {
+                    (format!("enforced · {}", profile.as_str()), true)
+                }
+                Some(euler_core::SandboxAvailability::Unavailable(reason)) => {
+                    (format!("unavailable · {}", reason.message()), false)
+                }
+                None => (format!("configured · {}", profile.as_str()), false),
+            }
+        }
+    }
+}
+
+fn populate_workspace_authority_status(status: &mut StatusSnapshot, session: &Session<TuiDecider>) {
+    let (authority, enforced) = workspace_authority_status(session);
+    status.workspace_authority = authority;
+    status.workspace_authority_enforced = enforced;
+    status.writable_roots = std::iter::once(session.workspace_root().to_path_buf())
+        .chain(session.attached_writable_roots().iter().cloned())
+        .collect();
+    status.read_only_runtime_roots = session.subprocess_runtime_roots().to_vec();
 }
 
 fn session_primary_agent_id(session: &Session<TuiDecider>) -> Option<String> {
@@ -1073,16 +1103,19 @@ impl AppCore {
         let AppState::Idle { session } = &self.state else {
             return Vec::new();
         };
+        let legacy_primary_root = session.workspace_root().to_string_lossy().into_owned();
         session
             .workspace_checkpoints()
             .into_iter()
             .map(|item| {
-                crate::ui::commands::CheckpointItem::new(
-                    item.event_id,
-                    item.action,
-                    item.path,
-                    item.ts,
-                )
+                let workspace_root = if item.workspace_root.is_empty() {
+                    legacy_primary_root.clone()
+                } else {
+                    item.workspace_root
+                };
+                let path =
+                    crate::ui::workspace_path::workspace_path_display(&(workspace_root, item.path));
+                crate::ui::commands::CheckpointItem::new(item.event_id, item.action, path, item.ts)
             })
             .collect()
     }
@@ -1392,6 +1425,8 @@ impl AppCore {
             session_id,
             events.len(),
             self::turn_recap::session_files_changed_count(events),
+            self.status.writable_roots.get(1..).unwrap_or_default(),
+            &self.status.read_only_runtime_roots,
         )
     }
 
@@ -2343,7 +2378,7 @@ impl AppCore {
             }
             CommandAction::SetPermissionPosture { posture } => self.set_permission_posture(posture),
             CommandAction::PermissionSandboxUnavailable => self.notice_item(
-                "auto in workspace sandbox is not available yet; no permission policy changed"
+                "workspace sandbox roots are fixed at launch; see /status; no permission policy changed"
                     .to_owned(),
             ),
             CommandAction::OpenPermissions => self.open_permissions_picker(),
@@ -2414,17 +2449,22 @@ impl AppCore {
             return self.notice_item("rollback waits for the active turn".to_owned());
         };
         let prior_len = session.events().len();
-        match session.restore_workspace_checkpoint(&event_id) {
+        let outcome = session.restore_workspace_checkpoint(&event_id);
+        let new_events = session.events()[prior_len..].to_vec();
+        for event in new_events {
+            self.transcript.push_event(event);
+            self.queue_finalized_visual_output_for_latest_event();
+        }
+        self.rebuild_bottom_surface();
+        match outcome {
             Ok(outcome) => {
-                let new_events = session.events()[prior_len..].to_vec();
-                for event in new_events {
-                    self.transcript.push_event(event);
-                    self.queue_finalized_visual_output_for_latest_event();
-                }
-                self.rebuild_bottom_surface();
+                let restored_path = crate::ui::workspace_path::workspace_path_display(&(
+                    outcome.workspace_root,
+                    outcome.path,
+                ));
                 self.notice = Some(format!(
-                    "restored {} from checkpoint {}",
-                    outcome.path, outcome.checkpoint_event_id
+                    "restored {restored_path} from checkpoint {}",
+                    outcome.checkpoint_event_id
                 ));
                 CoreEffect::Render
             }
@@ -2528,6 +2568,7 @@ impl AppCore {
         self.reply_tx = inactive_permission_reply_sender();
         self.active_permission_cancellation = None;
         self.primary_agent_id = primary_agent_id;
+        populate_workspace_authority_status(&mut self.status, &session);
         self.install_state(AppState::Idle {
             session: Box::new(session),
         });
@@ -3277,20 +3318,18 @@ struct SessionDiffEntry {
 /// Latest `file.diff` per path for files this session touched (not full WT).
 fn session_attributed_diffs(events: &[EventEnvelope]) -> Vec<SessionDiffEntry> {
     use std::collections::BTreeMap;
-    let mut latest: BTreeMap<String, SessionDiffEntry> = BTreeMap::new();
+    let mut latest: BTreeMap<(String, String), SessionDiffEntry> = BTreeMap::new();
+    let legacy_primary_root = crate::ui::workspace_path::session_primary_root(events);
     for event in events {
         if event.kind.as_str() != EventKind::FILE_DIFF {
             continue;
         }
-        let path = event
-            .payload
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_owned();
-        if path.is_empty() {
+        let Some(path_key) =
+            crate::ui::workspace_path::workspace_path_key(event, legacy_primary_root)
+        else {
             continue;
-        }
+        };
+        let path = crate::ui::workspace_path::workspace_path_display(&path_key);
         let action = event
             .payload
             .get("action")
@@ -3319,7 +3358,7 @@ fn session_attributed_diffs(events: &[EventEnvelope]) -> Vec<SessionDiffEntry> {
             .and_then(|v| v.as_str())
             .map(str::to_owned);
         latest.insert(
-            path.clone(),
+            path_key,
             SessionDiffEntry {
                 path,
                 action,

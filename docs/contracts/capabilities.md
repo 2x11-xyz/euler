@@ -24,6 +24,21 @@ actually-untrusted code requires a separate OS-level isolation milestone; a
 subprocess alone is not that boundary. Do not describe extension capabilities
 as a security boundary against malicious extension code.
 
+Agent-controlled core shell and direct Git tools are a distinct case. On Linux
+they run only after Euler proves the launch-selected Bubblewrap workspace
+profile; on an unsupported or unenforceable host they fail closed. That OS
+boundary constrains filesystem authority independently of the permission
+decision. Allowing `shell-exec`, including through a full-capability posture,
+does not expose ordinary host paths outside the selected writable roots, fixed
+read-only system runtime allowlist, and explicit read-only runtime roots.
+Host-backed roots containing IPC/device nodes, a filesystem outside the
+contracted ordinary-filesystem allowlist, a magic-link route, or a nested mount
+are rejected using kernel resolution and mount identity. The profile has no
+host network namespace. Conversely, the sandbox does not approve a capability:
+a denied or uncovered capability still denies or asks even when the OS
+boundary is ready. The no-network profile is fixed at launch, not inferred
+from a permission posture.
+
 ## V0 Capability Scopes
 
 Minimum v0 scopes:
@@ -287,10 +302,11 @@ analysis reasons about the whole line:
   `-fprint`/`-fprint0`/`-fprintf`), `rg` (no `--pre`/`--hostname-bin`/
   `--search-zip`/`-z`, including bundled shorts), `base64` (no
   `-o`/`--output`), `sed` (only `sed -n Np` / `sed -n M,Np` print-range
-  form), `git` (only `status`/`log`/`diff`/`show`/`branch` as the token
-  immediately after `git` — any global flag rejects — with no
-  `--output`/`--ext-diff`/`--textconv`/`--exec` args, and `branch` only as
-  a pure listing query). Binary names match the first token exactly
+  form). Git is never static-safe: even nominally read-only subcommands can
+  invoke repository-selected fsmonitor, filter, diff, textconv, or submodule
+  helpers and may refresh index state. Use the built-in Git view tools for the
+  minimized, fully observed path; they still require `shell-exec`. Binary names
+  match the first token exactly
   (`/bin/ls` and `env ls` do not match); unquoted globs reject the
   flag-inspected binaries because runtime expansion could inject
   flag-shaped tokens.
@@ -309,6 +325,10 @@ analysis reasons about the whole line:
   are checked, and flags that could carry an attached path reject. A
   rejected segment is simply not statically safe: the command falls back to
   the ordinary ask path (fail open to ask, never a new denial surface).
+  V0 static-safety analysis remains scoped to the primary workspace root.
+  Paths in an attached writable root therefore fall back to the ordinary ask
+  path even though the independently enforced subprocess sandbox mounts that
+  root.
 - A command is **statically safe** iff it parses AND every segment is safe
   AND every segment's path arguments are confined to the workspace.
 

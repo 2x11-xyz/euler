@@ -2,10 +2,11 @@
 
 use euler_core::permissions::{DeciderVerdict, PermissionDecider, PermissionRequest};
 use euler_core::{
-    assemble_canvas, fold_session, read_resume_prefix, resume_session, resume_session_from_prefix,
-    resume_session_with_outcome, AutoCompactionPolicy, CanvasItem, CompactionStatus,
-    CompactionTier, ContextLimitConfig, ModelTarget, ProvenanceWriter, ReasoningEffort,
-    ResumeError, Session, SessionConfig, WorkingStateProjection,
+    assemble_canvas, fold_session, read_resume_prefix, resume_session,
+    resume_session_from_folded_prefix, resume_session_from_prefix, resume_session_with_outcome,
+    AutoCompactionPolicy, CanvasItem, CompactionStatus, CompactionTier, ContextLimitConfig,
+    ModelTarget, ProvenanceWriter, ReasoningEffort, ResumeError, Session, SessionConfig,
+    WorkingStateProjection,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
@@ -83,6 +84,59 @@ fn fold_reproduces_live_target_usage_and_context_limit_fields() {
     assert_eq!(
         folded.context_limit_emitted.as_ref(),
         session.context_limit_emitted()
+    );
+}
+
+#[test]
+fn forged_folded_prefix_cannot_expand_workspace_authority_before_append() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let primary = temp.path().join("primary");
+    let attached = temp.path().join("attached");
+    fs::create_dir(&primary).expect("primary");
+    fs::create_dir(&attached).expect("attached");
+    let base = SessionConfig::new(&primary);
+    let session = Session::new(
+        base.clone(),
+        ScriptedProvider::new(Vec::new()),
+        CountingDecider::default(),
+    );
+    let mut events = session.events().to_vec();
+    let parent = events.last().map(|event| event.id.clone());
+    events.push(EventEnvelope::new(
+        base.session_id.clone(),
+        base.agent_id.clone(),
+        parent,
+        EventKind::MODEL_CALL,
+        object([
+            ("provider", base.provider.clone().into()),
+            ("model", base.model.clone().into()),
+            ("canvas_items", 0.into()),
+        ]),
+    ));
+    let folded = fold_session(&base, events.clone()).expect("base fold");
+    let log = temp.path().join("events.jsonl");
+    write_events(&log, &events);
+    let before = fs::read(&log).expect("read prefix");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut expanded = base;
+    expanded.attached_writable_roots.push(attached);
+
+    let error = match resume_session_from_folded_prefix(
+        expanded,
+        ProviderSet::single(ScriptedProvider::new(Vec::new())),
+        CountingDecider::default(),
+        writer,
+        folded,
+    ) {
+        Ok(_) => panic!("forged folded prefix must not expand authority"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, ResumeError::WorkspaceAuthority { .. }));
+    assert_eq!(
+        fs::read(&log).expect("read unchanged prefix"),
+        before,
+        "authority preflight must run before recovery closure append"
     );
 }
 
@@ -1505,6 +1559,57 @@ fn fold_rejects_duplicate_event_ids_with_a_bounded_incompatibility() {
         error.to_string(),
         "resume incompatible: duplicate event id in accepted provenance prefix"
     );
+}
+
+#[test]
+fn resume_rejects_a_late_session_start_before_appending_or_acquiring_authority() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let events = vec![
+        user_message("legacy prefix"),
+        session_start("fixture", "fixture"),
+    ];
+    write_events(&log, &events);
+    let before = fs::read(&log).expect("read original log");
+
+    let error = match resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("late start resumed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        ResumeError::SessionStartShape { reason } if reason.contains("not index 0")
+    ));
+    assert_eq!(fs::read(&log).expect("read unchanged log"), before);
+}
+
+#[test]
+fn resume_rejects_duplicate_session_starts_before_appending_recovery() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let first = session_start("fixture", "fixture");
+    let second = session_start("fixture", "fixture");
+    write_events(&log, &[first, second]);
+    let before = fs::read(&log).expect("read original log");
+
+    let error = match resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    ) {
+        Ok(_) => panic!("duplicate session.start resumed"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(error, ResumeError::SessionStartShape { .. }));
+    assert_eq!(fs::read(&log).expect("read unchanged log"), before);
 }
 
 #[test]

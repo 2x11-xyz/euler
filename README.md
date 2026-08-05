@@ -71,6 +71,11 @@ cargo build --release
 
 Rust 1.80+ recommended. Linux and macOS.
 
+Agent-controlled shell and built-in Git processes require Bubblewrap on Linux
+(`sudo apt-get install bubblewrap` on Debian/Ubuntu). They fail closed when the
+backend is missing and on macOS, where Euler does not yet have an equivalent OS
+workspace boundary; structured file tools remain available.
+
 ## Authenticate
 
 ```sh

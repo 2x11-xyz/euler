@@ -60,10 +60,11 @@ impl ProvenanceWriter {
             }
             events.push(EventEnvelope::from_json_line(line.text).map_err(io::Error::other)?);
         }
+        let checkpoint_authority = CheckpointAuthority::from_events(&events, workspace_root)?;
         let mut pass = ScrubPass::default();
 
         for event in &mut events {
-            self.scrub_event(event, secrets, workspace_root, &mut pass)?;
+            self.scrub_event(event, secrets, &checkpoint_authority, &mut pass)?;
         }
         self.sweep_content_stores(secrets, &mut pass)?;
         // State projections can carry the rewritten artifact pointers. Make
@@ -98,7 +99,7 @@ impl ProvenanceWriter {
         &self,
         event: &mut EventEnvelope,
         secrets: &[String],
-        workspace_root: Option<&Path>,
+        checkpoint_authority: &CheckpointAuthority,
         pass: &mut ScrubPass,
     ) -> io::Result<()> {
         let mut changed = false;
@@ -109,6 +110,11 @@ impl ProvenanceWriter {
         if event.kind.as_str() == EventKind::EXTENSION_ARTIFACT {
             changed |= self.scrub_extension_artifact(event, secrets, pass)?;
         }
+        let checkpoint = if event.kind.as_str() == EventKind::FILE_CHANGE {
+            checkpoint_authority.checkpoint_for_event(event)?
+        } else {
+            None
+        };
         let replacements = scrub_secrets_in_object(&mut event.payload, secrets);
         if replacements > 0 {
             pass.report.replacements += replacements;
@@ -132,24 +138,20 @@ impl ProvenanceWriter {
             changed = true;
         }
 
-        if event.kind.as_str() == EventKind::FILE_CHANGE {
-            if let (Some(root), Some(old_hash)) = (
-                workspace_root,
+        if let Some((root, old_hash)) = checkpoint {
+            let path = crate::checkpoints::checked_checkpoint_blob_path(&root, &old_hash)?;
+            // A content hash can exist in several workspace-scoped stores.
+            // Cache per concrete root/path so each store gets its own new
+            // object and retirement; hash-only caching would update the
+            // second event pointer without touching its backing directory.
+            let cache_key = path.to_string_lossy().into_owned();
+            if let Some(rewrite) =
+                pass.rewrite_cached_file(StoreKind::Checkpoint, cache_key, path, secrets)?
+            {
                 event
                     .payload
-                    .get("pre_image_blob")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-            ) {
-                let path = crate::checkpoints::checkpoint_blob_path(root, &old_hash);
-                if let Some(rewrite) =
-                    pass.rewrite_cached_file(StoreKind::Checkpoint, old_hash, path, secrets)?
-                {
-                    event
-                        .payload
-                        .insert("pre_image_blob".to_owned(), rewrite.new_hash.into());
-                    changed = true;
-                }
+                    .insert("pre_image_blob".to_owned(), rewrite.new_hash.into());
+                changed = true;
             }
         }
 
@@ -291,6 +293,152 @@ impl ProvenanceWriter {
         }
         result
     }
+}
+
+/// Roots from which this scrub may resolve workspace checkpoint pointers.
+/// The current primary root comes from the live/session-store caller. Attached
+/// roots come only from the first durable `session.start` authority record;
+/// a `file.change.workspace_root` can select one of those roots but can never
+/// introduce a new host path.
+#[derive(Default)]
+struct CheckpointAuthority {
+    legacy_primary: Option<PathBuf>,
+    roots: BTreeMap<String, PathBuf>,
+}
+
+impl CheckpointAuthority {
+    fn from_events(events: &[EventEnvelope], workspace_root: Option<&Path>) -> io::Result<Self> {
+        let mut authority = Self::default();
+        if let Some(root) = workspace_root {
+            let normalized = crate::session_root::normalize_session_root(root);
+            authority.roots.insert(
+                crate::session_root::session_root_for_event(&normalized),
+                normalized.clone(),
+            );
+            authority.legacy_primary = Some(normalized);
+        }
+
+        let Some(start) = events
+            .first()
+            .filter(|event| event.kind.as_str() == EventKind::SESSION_START)
+        else {
+            return Ok(authority);
+        };
+        match start.payload.get("root") {
+            Some(serde_json::Value::String(root)) if !root.is_empty() => {
+                let path = PathBuf::from(root);
+                validate_recorded_root_shape(&path)?;
+                authority.roots.insert(root.clone(), path.clone());
+                // A root-less file.change predates explicit multi-root
+                // provenance and therefore belongs to the session's original
+                // primary, even when the session was later relocated.
+                authority.legacy_primary = Some(path);
+            }
+            Some(serde_json::Value::String(_)) | None => {}
+            Some(_) => return Err(invalid_data("session workspace root is malformed")),
+        }
+
+        if let Some(recorded) = start.payload.get("workspace_authority") {
+            let recorded = recorded
+                .as_object()
+                .ok_or_else(|| invalid_data("session workspace authority is malformed"))?;
+            if let Some(attached) = recorded.get("attached_writable_roots") {
+                if !attached.is_null() {
+                    let attached = attached.as_array().ok_or_else(|| {
+                        invalid_data("session attached writable-root authority is malformed")
+                    })?;
+                    for root in attached {
+                        let root =
+                            root.as_str()
+                                .filter(|root| !root.is_empty())
+                                .ok_or_else(|| {
+                                    invalid_data(
+                                        "session attached writable-root authority is malformed",
+                                    )
+                                })?;
+                        let path = PathBuf::from(root);
+                        validate_recorded_root_shape(&path)?;
+                        authority.roots.insert(root.to_owned(), path);
+                    }
+                }
+            }
+        }
+
+        let relocation_roots =
+            crate::project_context::validated_relocation_roots(events).map_err(|error| {
+                invalid_data(format!("session relocation chain is invalid: {error}"))
+            })?;
+        for root in relocation_roots {
+            let path = PathBuf::from(&root);
+            validate_recorded_root_shape(&path)?;
+            authority.roots.insert(root, path);
+        }
+        Ok(authority)
+    }
+
+    fn checkpoint_for_event(&self, event: &EventEnvelope) -> io::Result<Option<(PathBuf, String)>> {
+        let Some(hash) = event.payload.get("pre_image_blob") else {
+            return Ok(None);
+        };
+        let hash = hash
+            .as_str()
+            .filter(|hash| is_sha256_hex(hash))
+            .ok_or_else(|| invalid_data("file-change checkpoint has an invalid hash"))?
+            .to_owned();
+
+        let root = match event.payload.get("workspace_root") {
+            None => self.legacy_primary.as_ref(),
+            Some(serde_json::Value::String(root)) if root.is_empty() => {
+                self.legacy_primary.as_ref()
+            }
+            Some(serde_json::Value::String(root)) => self.roots.get(root),
+            Some(_) => {
+                return Err(invalid_data(
+                    "file-change checkpoint workspace root is malformed",
+                ));
+            }
+        }
+        .ok_or_else(|| {
+            invalid_data("file-change checkpoint is outside durable workspace authority")
+        })?;
+        Ok(Some((validate_checkpoint_root(root)?, hash)))
+    }
+}
+
+fn validate_recorded_root_shape(root: &Path) -> io::Result<()> {
+    use std::path::Component;
+
+    if !root.is_absolute()
+        || root == Path::new("/")
+        || root
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(invalid_data(
+            "session attached writable-root authority is not a canonical absolute path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_root(root: &Path) -> io::Result<PathBuf> {
+    validate_recorded_root_shape(root)?;
+    let canonical = fs::canonicalize(root).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot resolve checkpoint workspace root {}: {error}",
+                root.display()
+            ),
+        )
+    })?;
+    if canonical != root || !fs::metadata(&canonical)?.is_dir() {
+        return Err(invalid_data(format!(
+            "checkpoint workspace root no longer matches durable authority: {}",
+            root.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

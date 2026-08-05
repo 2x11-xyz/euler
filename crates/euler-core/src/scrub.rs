@@ -136,8 +136,12 @@ fn plural(count: usize) -> &'static str {
 /// and sidecar.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScrubSurfaces<'a> {
-    /// Workspace root for `.euler/checkpoints` pre-images (from the session's
-    /// recorded root). `None` skips checkpoint scrubbing.
+    /// Current primary workspace root for `.euler/checkpoints` pre-images
+    /// (from the live session or session-store projection). The scrub engine
+    /// obtains attached roots from the first durable `session.start`
+    /// authority, but never from an individual `file.change`. `None` leaves
+    /// legacy/primary checkpoint pointers without a trusted root; explicitly
+    /// attached pointers still require their durable authority entry.
     pub workspace_root: Option<&'a Path>,
 }
 

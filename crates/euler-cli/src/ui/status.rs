@@ -65,6 +65,11 @@ pub struct StatusSnapshot {
     /// `/status` is answerable mid-turn and `AppState::TurnInFlight` does not
     /// carry the session. Refreshed whenever the modes behind it change.
     pub permission_envelope: Option<String>,
+    /// Actual agent-subprocess boundary, independent of permission posture.
+    pub workspace_authority: String,
+    pub workspace_authority_enforced: bool,
+    pub writable_roots: Vec<PathBuf>,
+    pub read_only_runtime_roots: Vec<PathBuf>,
 }
 
 impl StatusSnapshot {
@@ -80,6 +85,10 @@ impl StatusSnapshot {
             extension_slots: StatusSlots::default(),
             permission_reviewer: None,
             permission_envelope: None,
+            workspace_authority: "unknown".to_owned(),
+            workspace_authority_enforced: false,
+            writable_roots: Vec::new(),
+            read_only_runtime_roots: Vec::new(),
         }
     }
 }

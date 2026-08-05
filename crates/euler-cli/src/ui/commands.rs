@@ -361,7 +361,8 @@ pub enum PermissionPosture {
     ReadOnly,
     /// Require an explicit decision for every capability.
     AskEveryTime,
-    /// Allow every capability for this session without a sandbox boundary.
+    /// Allow every capability for this session without changing the
+    /// independently selected OS workspace boundary.
     FullAccess,
 }
 
@@ -377,7 +378,7 @@ impl PermissionPosture {
         match self {
             Self::ReadOnly => "Read only",
             Self::AskEveryTime => "Ask every time",
-            Self::FullAccess => "Full access (unsandboxed)",
+            Self::FullAccess => "Full capability access",
         }
     }
 
@@ -389,7 +390,9 @@ impl PermissionPosture {
             Self::AskEveryTime => {
                 "clear session approvals; ask before each operation not covered by a durable rule"
             }
-            Self::FullAccess => "allow every capability for this session; no OS sandbox is active",
+            Self::FullAccess => {
+                "allow every capability for this session; this does not disable the launch-controlled workspace boundary"
+            }
         }
     }
 
@@ -426,7 +429,9 @@ impl PermissionPosture {
                 "Ask every time · uncovered operations ask · durable grants and \
                  statically-safe commands run without one"
             }
-            Self::FullAccess => "Full access · unsandboxed · every capability allowed this session",
+            Self::FullAccess => {
+                "Full capability access · every capability allowed · workspace boundary launch-controlled"
+            }
         }
     }
 
@@ -916,12 +921,12 @@ pub fn permission_choices_with_state(
             current: active == Some(posture),
         })
         .collect::<Vec<_>>();
-    // Shown, never hidden, so the roadmap stays legible — but not selectable
-    // until a verified Linux workspace-sandbox backend exists (ADR 0014).
+    // Authority roots are launch configuration, not a permission posture.
+    // Keep one informational row so users do not mistake capability policy
+    // for the independently enforced filesystem boundary.
     choices.push(PermissionChoice::Unavailable {
-        label: "Auto in workspace sandbox (not available)".to_owned(),
-        detail: "requires the Linux workspace sandbox; selecting this does not change permissions"
-            .to_owned(),
+        label: "Workspace sandbox (launch-controlled)".to_owned(),
+        detail: "see /status for enforcement and requested writable/read-only roots".to_owned(),
     });
     choices.push(PermissionChoice::Advanced {
         label: "Advanced capability settings ›".to_owned(),
@@ -1406,7 +1411,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn permission_postures_have_explicit_non_sandboxed_mappings() {
+    fn permission_postures_do_not_change_workspace_sandboxing() {
         for capability in [
             Capability::FsRead,
             Capability::ProvenanceRead,
@@ -1439,7 +1444,7 @@ mod tests {
         }
         assert!(PermissionPosture::FullAccess
             .detail()
-            .contains("no OS sandbox"));
+            .contains("does not disable the launch-controlled workspace boundary"));
     }
 
     #[test]

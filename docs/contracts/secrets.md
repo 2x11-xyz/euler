@@ -214,8 +214,13 @@ Both remove every occurrence from **every persistent surface**:
   state (recursive JSON string/key walk);
 - externalized `blobs/` — a blob holding a secret is rewritten under a fresh
   content hash, re-pointed, and the superseded file removed;
-- workspace `.euler/checkpoints` pre-images — rewritten and re-pointed the
-  same way when the session's root is known;
+- workspace `.euler/checkpoints` pre-images in the primary and attached
+  writable roots — rewritten and re-pointed the same way. A checkpoint event
+  may select only the caller-supplied primary root or an attached root in the
+  first durable `session.start.workspace_authority`; an event-local
+  `workspace_root` never expands scrub authority. Malformed hashes, roots
+  outside that set, and roots that no longer resolve to their recorded
+  canonical directory fail the scrub before a success audit is appended;
 - extension content-addressed artifacts — rewritten under fresh hashes and
   re-pointed in their `extension.artifact` events;
 - extension private state, including projections that duplicate artifact

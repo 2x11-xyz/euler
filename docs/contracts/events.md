@@ -181,11 +181,21 @@ envelope `v` per `docs/contracts/persistence.md`.
   lifecycle reopen. Changed content at the same revision and identical content
    from a different extension remain distinct events. Legacy summary/content-
    only events remain renderable.
-- `tool.call`: `id`, `name`, `input` (structured JSON).
+- `tool.call`: `id`, `name`, `input` (structured JSON). Agent-controlled
+  subprocess calls (`run_shell`, `git_status`, `git_diff`) additionally carry
+  host-derived `workspace_authority`: requested profile/roots, actual
+  profile-probe result (`available` or `unavailable`), and the writable/read-
+  only bind sources selected by a successful probe. An unavailable boundary
+  has null selected roots; configured or uncanonicalized paths are never
+  reported as active authority. This event precedes execution: the required
+  final mount-topology/magic-link and special-node inspection or launcher may
+  still fail closed, and the corresponding `tool.result` records that failure
+  rather than rewriting the accepted call.
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
-  accompany `error` when the tool produced output before failing; cancellation
-  output may be partial, while a normally exited process output is complete).
+  accompany `error` when the tool produced output before failing; cancellation,
+  timeout, and supervision-failure output may be partial, while a normally
+  exited process output is complete).
   `ok` is the canonical tool-operation outcome, not merely a statement that
   the executor returned. For a process-backed tool, a nonzero `exit_code`
   requires `ok: false` and `error`; collected `output` and the exit code remain
@@ -194,6 +204,19 @@ envelope `v` per `docs/contracts/persistence.md`.
   compatibility mapping for legacy events that recorded `ok: true` beside a
   nonzero exit: preserve the event bytes, but project the operation as failed
   in diagnostics, transcript, canvas/provider input, activity, and recaps.
+  A process-backed producer may add `failure_kind`: `process-exit`, `timeout`,
+  `signal`, `abnormal-termination`, `supervision-failed`,
+  `workspace-mutation`, or `cancelled`. `process-exit`
+  means `exit_code` is the observed nonzero process status. The other kinds
+  name a non-normal terminal condition and may retain `exit_code: -1` as the
+  established display/compatibility status; their `error` must state the real
+  condition and must not claim that the process exited normally. `signal`
+  carries the observed signal number in its error; `abnormal-termination`
+  means the host supplied neither an exit code nor a signal. A
+  `workspace-mutation` result means a built-in Git view was invalidated after
+  the bounded post-run observation detected changes, even if the Git process
+  itself exited zero. Readers still derive effective success only through the
+  rule above; `failure_kind` supplies diagnosis, never a second success flag.
   `output` is the complete redacted text supplied by the tool (and may be
   partial on the failure path described above). A producer that bounds the
   active display may add `output_preview_max_bytes` and
@@ -222,6 +245,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   any observed file changes completed before its owned process group was
   stopped. The ordinary-shell workspace observation remains bounded by the
   frozen file-snapshot limits in the tool/UI contracts.
+  `git_status` and `git_diff` are also observed subprocesses. A repository-
+  selected helper that mutates a writable root makes the Git view fail while
+  retaining the changes; its `file.change`/`file.diff` events carry the Git
+  tool name as `origin`, never the misleading `run_shell` origin.
   Optional `grant_source` (`"session"` | `"project"`) marks a run covered by
   an existing scoped grant; optional `static_safe: true` marks a run
   auto-approved by static command-safety analysis (see
@@ -285,24 +312,43 @@ envelope `v` per `docs/contracts/persistence.md`.
   root-driver `model.call` binds the exact purpose-free `canvas.snapshot` that
   selected it, then becomes provenance-only. A prepared snapshot with no
   accepted call consumes nothing. It is never reclassified as `user.message`.
-- `patch.proposed` / `patch.applied`: `path`, `old`, `new`. For
+- `patch.proposed` / `patch.applied`: `workspace_root`, `path`, `old`, `new`.
+  `workspace_root` is the canonical writable root in which `path` is relative;
+  legacy events without it mean the primary session root. For
   `modify`-style edits, `old` and `new` are the requested replacement or patch
   hunk text, not guaranteed whole-file before/after content. Whole-file
   identity belongs in `file.change` hashes and byte lengths. These events may
   still contain raw edit text until the patch-event redaction contract is
   revised separately.
-- `file.change`: `tool_call_id`, `origin`, `action`, `path`, `old_path`,
+- `file.change`: either `tool_call_id` or `workspace_restore_id`, plus
+  `origin`, `action`, `workspace_root`, `path`, `old_path`,
   `before_sha256`, `after_sha256`, `before_byte_len`, `after_byte_len`,
   `diff_redaction`; optional `pre_image_blob` (sha256 hex) when a workspace
   checkpoint pre-image was stored for this edit. This event is metadata-only:
   `origin` is descriptive edit metadata with known values `edit_file`,
-  `apply_patch`, `run_shell:apply_patch`, and `run_shell`; `action` is `add`,
-  `modify`, or `delete`, `old_path` is null, and `diff_redaction` is `omitted`.
+  `apply_patch`, `run_shell:apply_patch`, `run_shell`, `git_status`, `git_diff`,
+  and `workspace_restore`; `action` is `add`, `modify`, or `delete`,
+  `old_path` is null, and
+  `diff_redaction` is `omitted`.
   `run_shell:apply_patch` means Euler intercepted a strict apply-patch heredoc
   before shell execution; it does not mean a shell process ran. `run_shell`
   means Euler observed a bounded net filesystem change around an ordinary shell
-  process under the workspace root. For delete, `after_sha256` is null and
-  `after_byte_len` is `0`.
+  process in one explicitly writable root. `git_status` and `git_diff` name a
+  side effect observed around the corresponding built-in Git view.
+  A structured write that fails after opening or creating its target emits any
+  fd-observed net change with its ordinary tool origin and parents it directly
+  to `tool.call`; it does not emit `patch.applied`.
+  `workspace_root` disambiguates the same relative `path` across roots. For
+  delete, `after_sha256` is null and `after_byte_len` is `0`.
+  Snapshot-observed subprocess changes additionally carry `file_type`, nullable
+  `before_file_type` / `after_file_type`, `before_metadata_sha256` /
+  `after_metadata_sha256`, and numeric `before_mode` / `after_mode`.
+  `file_type` names the after type, or the before type for a delete. Content
+  digests identify regular-file bytes or the type-specific observed value
+  (for example, symlink target bytes or an opaque-subtree fingerprint);
+  metadata digests cover stable Unix identity, ownership, mode, size, link
+  count, and modification/change timestamps. Legacy and structured-edit
+  events may omit these snapshot-only fields.
   No raw file content, before/after content, or unified diff bytes belong in
   this payload. This is only a `file.change` payload rule.
   When present, `pre_image_blob` is a content-addressed hash of the pre-edit
@@ -314,28 +360,64 @@ envelope `v` per `docs/contracts/persistence.md`.
   pre-images for safe single-file `edit_file` / `apply_patch` **modify** only;
   adds, deletes, multi-file shell observations, and external disk drift are out
   of scope.
-- `workspace.restore`: `path`, `checkpoint_event_id`, `blob_sha256`,
-  `restored` (always `true` on success). Appended when the user restores a
+- `workspace.restore`: `workspace_root`, `path`, `checkpoint_event_id`, `blob_sha256`,
+  `restored`, and `error` when `restored` is false. Appended when the user restores a
   workspace file via `/rollback` to the pre-image of a prior `file.change`.
   The transcript is never rewritten: restore is new provenance; the dead-end
-  history stays queryable. Rendered as
-  `↩ reverted <path> → ckpt <checkpoint_event_id> · files restored, history intact`.
-- `file.diff`: `tool_call_id`, `file_change_id`, `path`, `old_path`,
+  history stays queryable. Success is rendered as `↩ reverted <path> → ckpt
+  <checkpoint_event_id> · files restored, history intact`. A structured
+  restore that fails after changing its already-open target emits
+  `restored: false`, a redacted truthful error, and sibling `file.change` /
+  `file.diff` evidence with `origin: "workspace_restore"` and
+  `workspace_restore_id` instead of inventing a tool call. Failure without a
+  net mutation emits only the failed restore event and is never rendered as a
+  successful revert.
+- `file.diff`: either `tool_call_id` or `workspace_restore_id`, plus
+  `file_change_id`, `workspace_root`, `path`, `old_path`,
   `action`, `origin`, `diff`, `truncated`, `truncation`, `omitted_reason`;
   optional `before_sha256`, `after_sha256`, `before_byte_len`,
-  `after_byte_len`, `line_count`.
+  `after_byte_len`, `line_count`, and the snapshot-observation type, metadata,
+  and mode fields defined for `file.change` above.
   This is the canonical user-visible code-change artifact for safe edit paths.
   It is emitted for `edit_file`, `apply_patch`, strict intercepted
-  `run_shell:apply_patch`, and bounded ordinary `run_shell` workspace
-  observations. Emitted actions are `add`, `modify`, and `delete`; `rename`
-  remains reserved event vocabulary. Ordinary shell observations do not parse
-  shell command strings and do not claim arbitrary writes outside the workspace
-  root. They compare bounded pre/post snapshots of regular workspace files,
-  skip symlinks and common build/dependency/cache/local-state directories such
-  as `.git`, `.euler`, and `target`, and emit no shell file-change events if
-  either snapshot is incomplete. Large or binary content can still produce
-  metadata-only file events with `diff=null`. Deletes never include deleted
-  content and use `omitted_reason="delete-content"`.
+  `run_shell:apply_patch`, bounded ordinary `run_shell` workspace observations,
+  and side effects from the built-in `git_status` / `git_diff` views. Emitted
+  actions are `add`, `modify`, and `delete`; `rename` remains reserved event
+  vocabulary. Ordinary shell observations do not parse shell command strings.
+  The OS sandbox prevents writes outside the attached writable-root set. Euler
+  compares a pre/post snapshot for every writable root. The granular fold
+  records regular files, symlink targets, ordinary and empty directories,
+  mode/metadata changes, and special filesystem entries.
+  The relative path `.` represents metadata on the writable root directory
+  itself (for example, `chmod "$PWD"`).
+  Large regular files are fully hashed while their content is withheld from
+  diffs. A writable inode whose hardlink count exceeds the aliases observed
+  across all writable roots blocks the command before launch; otherwise a
+  change through an in-authority hardlink produces a change for every alias.
+
+  Common build/dependency/VCS/cache/local-state directories such as `.git`,
+  `.euler`, and `target` are represented by one `opaque-directory` entry rather
+  than silently skipped. Its fingerprint covers the bounded complete namespace
+  walk and metadata of every descendant, plus content for small regular files
+  until the documented opaque-content hash budget is consumed. A changed
+  fingerprint proves that durable net state in the subtree changed, but it does
+  not identify the descendant and an unchanged fingerprint is not a byte-for-
+  byte completeness claim for large or budget-exhausted content. Accordingly,
+  its `file.diff` has `diff=null` and `omitted_reason="excluded-surface"`.
+  The root-level `.worktrees` collection is different: it is overlaid read-only
+  in the subprocess sandbox and rejected by structured writes, so it is recorded
+  as `read-only-directory` without a recursive walk and is not a permitted
+  mutation surface of that root.
+  Only collections discovered and mounted before process launch receive that
+  classification. A collection created by the command is scanned as ordinary
+  writable content using the prelaunch snapshot's frozen protected-surface set.
+
+  Exceeding a granular file/byte/read limit or the opaque namespace limit makes
+  the snapshot incomplete. An incomplete pre-snapshot blocks the command; an
+  incomplete post-snapshot fails the tool explicitly without claiming a
+  complete change set. Metadata-only, binary, symlink, directory, special-file,
+  and opaque changes use a specific `omitted_reason`. Deletes never include
+  deleted regular-file content and use `omitted_reason="delete-content"`.
   `diff` is a bounded unified diff when safety checks pass and is null when
   omitted; `truncation` is `none` or `tail`. Generated diffs use zero context
   lines. `file.diff` may contain raw code diff text and is for transcript /
@@ -461,7 +543,15 @@ envelope `v` per `docs/contracts/persistence.md`.
   `session.start` `root` is used (listing and picker, current-directory
   grouping, resume checks, and the recorded path a later relocation card
   renders), and its `new_identity` governs resume comparison.
-- `session.start`: `provider`, `model`, optional `root`. `root` is only a
+- `session.start`: `provider`, `model`, optional `root`, and
+  `workspace_authority`. The authority object records mode/profile, canonical
+  attached writable roots, and explicit read-only runtime roots. Resume
+  requires an exact profile and root-set match; legacy sessions can be narrowed
+  to the enforced primary root but cannot acquire attachments on resume.
+  Before an accepted relocation can be appended, resume validates this exact
+  non-relocatable authority against launch configuration. Relocation changes
+  project identity, never host authority.
+  `root` is only a
   filesystem path string derived from `SessionConfig.root`; it is not an
   arbitrary JSON object or workflow identity token. To emit or compare it,
   Euler applies one normalization policy: if the configured path is relative,
@@ -472,9 +562,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   string form. Non-UTF-8 paths may collapse through lossy conversion; that is
   accepted for local discovery metadata, not for security identity.
   Older streams may omit `root`; omission means unknown, not the reader's
-  current directory. The first readable `session.start` is the root authority;
-  later duplicate `session.start` events, if present in malformed histories,
-  do not update root projection. `session.json.root` is an advisory transition
+  current directory. A resumable modern stream has exactly one `session.start`
+  at index zero; a legacy stream has none anywhere. A late or duplicate start
+  is incompatible and is rejected before recovery, relocation, or authority
+  acquisition. `session.json.root` is an advisory transition
   fallback only when the event stream is readable and the first `session.start`
   has no usable `root`; if the event stream is unreadable or corrupt, projected
   root is unknown even if the sidecar contains a root. `root` is local discovery
@@ -690,11 +781,16 @@ envelope `v` per `docs/contracts/persistence.md`.
   `tool.call` when no prompt was emitted).
 - `patch.proposed` parents its `tool.call`; `patch.applied` parents its
   `patch.proposed`.
-- Structured `file.change` parents the `patch.applied` event that records the
-  edit it summarizes. Bounded ordinary `run_shell` file observations parent the
+- Successful structured `file.change` parents the `patch.applied` event that
+  records the edit it summarizes. A net mutation observed after a failed
+  structured write parents the originating `tool.call`, because no patch was
+  successfully applied. Bounded ordinary `run_shell` file observations parent the
   originating `tool.call`, because there is no canonical patch event for that
   shell process. The final `tool.result` still parents the original
   `tool.call`, not the `file.change`.
+- A failed `workspace.restore` is a session-level terminal fact. Any mutation
+  it observed is represented by sibling `file.change` and `file.diff` events
+  parented directly to that restore event.
 - `file.diff` parents the same event as the matching `file.change`. It is a
   sibling display projection, not the parent of `tool.result`. Its
   `file_change_id` references the matching `file.change`.

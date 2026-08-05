@@ -95,6 +95,7 @@ pub(crate) struct Relocation {
 struct RelocationFold {
     governing_identity: Option<RelocationIdentity>,
     projected_root: Option<String>,
+    historical_roots: Vec<String>,
 }
 
 /// Validate one `project.context.relocated` payload's shape, in isolation
@@ -171,6 +172,7 @@ fn fold_relocations(
 ) -> Result<RelocationFold, String> {
     let mut governing_identity = snapshot_identity;
     let mut projected_root = None;
+    let mut historical_roots = Vec::new();
     for (index, event) in events.iter().enumerate() {
         if event.kind.as_str() != EventKind::PROJECT_CONTEXT_RELOCATED {
             continue;
@@ -211,11 +213,13 @@ fn fold_relocations(
             }
         }
         governing_identity = Some(relocation.new_identity);
+        historical_roots.push(relocation.new_root.clone());
         projected_root = Some(relocation.new_root);
     }
     Ok(RelocationFold {
         governing_identity,
         projected_root,
+        historical_roots,
     })
 }
 
@@ -228,6 +232,15 @@ fn fold_relocations(
 pub(crate) fn projected_new_root(events: &[EventEnvelope]) -> Result<Option<String>, String> {
     let base = snapshot_identity(events)?;
     Ok(fold_relocations(events, base)?.projected_root)
+}
+
+/// Every primary workspace root admitted by the validated relocation chain,
+/// in durable order. Callers that resolve historical workspace-owned state
+/// may use these roots as authority; event-local paths remain selectors and
+/// can never expand the set.
+pub(crate) fn validated_relocation_roots(events: &[EventEnvelope]) -> Result<Vec<String>, String> {
+    let base = snapshot_identity(events)?;
+    Ok(fold_relocations(events, base)?.historical_roots)
 }
 
 /// The workspace identity governing the accepted event prefix (the snapshot

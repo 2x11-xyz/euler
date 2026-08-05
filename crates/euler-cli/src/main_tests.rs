@@ -2715,6 +2715,45 @@ fn accept_relocation_flag_parses_for_run_tui_and_exec() {
 }
 
 #[test]
+fn workspace_authority_flags_preserve_root_order() {
+    let mut args = [
+        "run",
+        "--writable-root",
+        "/work/second",
+        "--runtime-root",
+        "/opt/rust",
+        "--writable-root",
+        "/work/third",
+    ]
+    .iter()
+    .copied()
+    .map(str::to_owned);
+    let run = unwrap_run(Args::parse_with_env(&mut args, EnvArgs::default()).expect("parse"));
+
+    assert_eq!(
+        run.writable_roots,
+        vec![PathBuf::from("/work/second"), PathBuf::from("/work/third")]
+    );
+    assert_eq!(run.runtime_roots, vec![PathBuf::from("/opt/rust")]);
+}
+
+#[test]
+fn workspace_authority_path_flags_require_values() {
+    for (flag, expected) in [
+        ("--writable-root", "--writable-root requires a path"),
+        ("--runtime-root", "--runtime-root requires a path"),
+    ] {
+        let values = ["run", flag];
+        let mut args = values.iter().copied().map(str::to_owned);
+        let error = match Args::parse_with_env(&mut args, EnvArgs::default()) {
+            Ok(_) => panic!("{flag} without a path must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
+
+#[test]
 fn project_context_rejects_bad_values_and_duplicates() {
     for (args, expected) in [
         (

@@ -60,6 +60,8 @@ impl RawArgsParser {
                 no_tty: false,
                 linefeed_history_insert: None,
                 project_context: None,
+                writable_roots: Vec::new(),
+                runtime_roots: Vec::new(),
                 accept_relocation: false,
             },
             top_level_command: None,
@@ -117,6 +119,8 @@ impl RawArgsParser {
             "--reasoning-effort" => self.parse_reasoning_effort(args),
             "--permission-reviewer" => self.parse_permission_reviewer(args),
             "--project-context" => self.parse_project_context(args),
+            "--writable-root" => self.parse_writable_root(args),
+            "--runtime-root" => self.parse_runtime_root(args),
             "--accept-relocation" => {
                 self.parsed.accept_relocation = true;
                 Ok(ArgParseFlow::Continue)
@@ -230,6 +234,28 @@ impl RawArgsParser {
         };
         self.parsed.provenance_path = PathBuf::from(value);
         self.parsed.provenance_from_cli = true;
+        Ok(ArgParseFlow::Continue)
+    }
+
+    fn parse_writable_root(
+        &mut self,
+        args: &mut impl Iterator<Item = String>,
+    ) -> Result<ArgParseFlow> {
+        let root = args
+            .next()
+            .ok_or_else(|| anyhow!("--writable-root requires a path"))?;
+        self.parsed.writable_roots.push(PathBuf::from(root));
+        Ok(ArgParseFlow::Continue)
+    }
+
+    fn parse_runtime_root(
+        &mut self,
+        args: &mut impl Iterator<Item = String>,
+    ) -> Result<ArgParseFlow> {
+        let root = args
+            .next()
+            .ok_or_else(|| anyhow!("--runtime-root requires a path"))?;
+        self.parsed.runtime_roots.push(PathBuf::from(root));
         Ok(ArgParseFlow::Continue)
     }
 

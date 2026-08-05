@@ -60,7 +60,9 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::WorkspaceRestore {
             path,
             checkpoint_event_id,
-        } => format!("workspace.restore: {path} → ckpt {checkpoint_event_id}\n"),
+            restored,
+            error,
+        } => line_oriented_workspace_restore(path, checkpoint_event_id, *restored, error),
         super::TranscriptItem::CheckStarted { name } => format!("check.started: {name}\n"),
         super::TranscriptItem::CheckResult { name, ok, .. } => {
             line_oriented_check_result(name, *ok)
@@ -76,6 +78,19 @@ pub(super) fn render_line_oriented_item(item: &super::TranscriptItem) -> String 
         super::TranscriptItem::Companion { .. } => line_oriented_companion(item),
         super::TranscriptItem::Error { source, message } => format!("error: {source}: {message}\n"),
         super::TranscriptItem::Notice(message) => format!("notice: {message}\n"),
+    }
+}
+
+fn line_oriented_workspace_restore(
+    path: &str,
+    checkpoint_event_id: &str,
+    restored: bool,
+    error: &str,
+) -> String {
+    if restored {
+        format!("workspace.restore: {path} → ckpt {checkpoint_event_id}\n")
+    } else {
+        format!("workspace.restore failed: {path} → ckpt {checkpoint_event_id}: {error}\n")
     }
 }
 

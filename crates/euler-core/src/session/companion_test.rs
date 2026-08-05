@@ -12,6 +12,232 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 #[test]
+fn companion_structured_patch_events_keep_their_semantic_parents() {
+    let (temp, _log, mut session) = session_with_provider(
+        ScriptedProvider::new(vec![
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-edit".to_owned(),
+                name: "edit_file".to_owned(),
+                input: json!({"path": "note.txt", "old": "alpha", "new": "beta"}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ]),
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    std::fs::write(temp.path().join("note.txt"), "alpha").expect("fixture");
+
+    session
+        .spawn_companion(task_with_caps([Capability::FsWrite]))
+        .expect("companion");
+
+    let call = only_event(session.events(), EventKind::TOOL_CALL);
+    let proposed = only_event(session.events(), EventKind::PATCH_PROPOSED);
+    let applied = only_event(session.events(), EventKind::PATCH_APPLIED);
+    let change = only_event(session.events(), EventKind::FILE_CHANGE);
+    let diff = only_event(session.events(), EventKind::FILE_DIFF);
+    let result = only_event(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(proposed.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(applied.parent.as_deref(), Some(proposed.id.as_str()));
+    assert_eq!(change.parent.as_deref(), Some(applied.id.as_str()));
+    assert_eq!(diff.parent.as_deref(), Some(applied.id.as_str()));
+    assert_eq!(diff.payload["file_change_id"], json!(change.id));
+    assert_eq!(result.parent.as_deref(), Some(call.id.as_str()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn companion_observed_shell_changes_parent_the_originating_tool_call() {
+    let (temp, _log, mut session) = session_with_provider(
+        ScriptedProvider::new(vec![
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-shell".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": "printf changed > marker.txt"}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ]),
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+
+    session
+        .spawn_companion(task_with_caps([Capability::ShellExec]))
+        .expect("companion");
+
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("marker.txt")).expect("marker"),
+        "changed"
+    );
+    let call = only_event(session.events(), EventKind::TOOL_CALL);
+    assert_observed_changes_parented_to(session.events(), &call.id, "marker.txt");
+    let result = only_event(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(result.parent.as_deref(), Some(call.id.as_str()));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn companion_cancellation_keeps_partial_change_and_result_parentage() {
+    let (temp, _log, mut session) = session_with_provider(
+        ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-shell".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "touch started; sleep 30"}),
+        }])]),
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    );
+    let cancellation = euler_sdk::CancellationSource::new();
+    let token = cancellation.token();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result =
+            session.spawn_companion_with_cancel(task_with_caps([Capability::ShellExec]), token);
+        sender.send((session, result)).expect("result receiver");
+    });
+    let started = temp.path().join("started");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !started.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(started.exists(), "fixture command did not start");
+    cancellation.cancel();
+    let (session, result) = receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("cancelled companion returns");
+    worker.join().expect("worker");
+    assert!(matches!(result, Err(SessionError::Cancelled)));
+
+    let call = only_event(session.events(), EventKind::TOOL_CALL);
+    assert_observed_changes_parented_to(session.events(), &call.id, "started");
+    let result = only_event(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(result.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(result.payload["cancelled"], json!(true));
+}
+
+#[cfg(target_os = "linux")]
+fn assert_observed_changes_parented_to(
+    events: &[EventEnvelope],
+    tool_call_event_id: &str,
+    expected_path: &str,
+) {
+    let changes = events_of_kind(events, EventKind::FILE_CHANGE);
+    let diffs = events_of_kind(events, EventKind::FILE_DIFF);
+    assert!(
+        changes
+            .iter()
+            .any(|event| event.payload["path"] == json!(expected_path)),
+        "expected observed change for {expected_path}"
+    );
+    assert_eq!(diffs.len(), changes.len());
+    assert!(
+        changes
+            .iter()
+            .chain(diffs.iter())
+            .all(|event| event.parent.as_deref() == Some(tool_call_event_id)),
+        "every observed change and diff must retain the tool.call parent"
+    );
+    for change in changes {
+        assert!(diffs
+            .iter()
+            .any(|diff| diff.payload["file_change_id"] == json!(change.id)));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn companion_failed_partial_write_evidence_keeps_the_tool_call_parent() {
+    const CHILD_ENV: &str = "EULER_TEST_COMPANION_PARTIAL_WRITE_CHILD";
+    const CHILD_TEST: &str =
+        "session::companion::tests::companion_partial_write_child_records_semantic_parent";
+    let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .args(["--exact", CHILD_TEST, "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("run isolated file-size-limited child");
+    assert!(
+        output.status.success(),
+        "child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn companion_partial_write_child_records_semantic_parent() {
+    if std::env::var_os("EULER_TEST_COMPANION_PARTIAL_WRITE_CHILD").is_none() {
+        return;
+    }
+    let (temp, _log, mut session) = session_with_provider(
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let target = temp.path().join("limited.txt");
+    std::fs::write(&target, "before").expect("fixture");
+    let writer = session
+        .provenance
+        .as_ref()
+        .expect("companion provenance")
+        .clone();
+    let child_agent = "root:partial-child".to_owned();
+    let call = session
+        .appender_as(&writer, &child_agent)
+        .append(
+            EventKind::TOOL_CALL,
+            object([
+                ("id", "call-partial".into()),
+                ("name", "edit_file".into()),
+                ("input", json!({"path": "limited.txt"})),
+            ]),
+            None,
+        )
+        .expect("tool.call");
+
+    let mut original_limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        assert_eq!(libc::getrlimit(libc::RLIMIT_FSIZE, &mut original_limit), 0);
+    }
+    let old_handler = unsafe { libc::signal(libc::SIGXFSZ, libc::SIG_IGN) };
+    let limited = libc::rlimit {
+        rlim_cur: 1,
+        rlim_max: original_limit.rlim_max,
+    };
+    unsafe {
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &limited), 0);
+    }
+    let failure = session
+        .tools
+        .write_workspace_file_at_observed(temp.path(), "limited.txt", "replacement")
+        .expect_err("write must fail after one byte");
+    unsafe {
+        assert_eq!(libc::setrlimit(libc::RLIMIT_FSIZE, &original_limit), 0);
+        libc::signal(libc::SIGXFSZ, old_handler);
+    }
+    assert_eq!(std::fs::read(&target).expect("partial file"), b"r");
+    assert_eq!(failure.file_changes.len(), 1);
+
+    let redactor = session.redactor.clone();
+    let mut appender = session.appender_as(&writer, &child_agent);
+    append_companion_observed_file_changes(
+        &mut appender,
+        &redactor,
+        "call-partial",
+        "edit_file",
+        &failure.file_changes,
+        &call.id,
+    )
+    .expect("record partial mutation");
+
+    let change = only_event(session.events(), EventKind::FILE_CHANGE);
+    let diff = only_event(session.events(), EventKind::FILE_DIFF);
+    assert_eq!(change.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(diff.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(diff.payload["file_change_id"], json!(change.id));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn companion_tool_output_is_redacted() {
     // Review finding on #56: the companion loop emitted raw tool output,
     // bypassing the parent session's redaction chokepoint.

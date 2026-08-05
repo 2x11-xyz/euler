@@ -70,9 +70,11 @@ pub use extension_registry::{
 };
 pub use file_diff::{
     capture_workspace_snapshot, file_diff_projection, observed_file_change_payload,
-    observed_file_diff_payload, observed_file_diff_projection, FileDiffProjection, FileDiffSource,
-    ObservedFileChange, WorkspaceSnapshot, MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_SNAPSHOT_FILES,
-    MAX_WORKSPACE_SNAPSHOT_FILE_BYTES, MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
+    observed_file_diff_payload, observed_file_diff_projection, recapture_workspace_snapshot,
+    validate_workspace_snapshot_hardlinks, FileDiffProjection, FileDiffSource, ObservedFileChange,
+    WorkspaceSnapshot, WorkspaceSnapshotError, MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_OPAQUE_ENTRIES,
+    MAX_WORKSPACE_SNAPSHOT_FILES, MAX_WORKSPACE_SNAPSHOT_FILE_BYTES,
+    MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
 };
 pub use grants::{
     ActiveGrant, GrantScope, ProjectGrantError, ProjectGrantStore, ScopePattern, ScopePatternError,
@@ -98,14 +100,15 @@ pub use provenance::{
     DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT,
 };
 pub use resume::{
-    fold_session, plan_relocation, read_resume_prefix, resume_session,
+    fold_session, plan_relocation, preflight_resume_authority, read_resume_prefix, resume_session,
     resume_session_from_folded_prefix, resume_session_from_prefix,
     resume_session_from_prefix_with_outcome, resume_session_with_outcome, FoldedSession,
     RelocationRequired, ResumeError, ResumeOutcome, ResumeWarning,
 };
 pub use sandbox::{
-    probe_workspace_sandbox, SandboxAvailability, SandboxProfile, SandboxUnavailableReason,
-    SubprocessSandbox,
+    canonical_runtime_roots, canonical_writable_roots, probe_workspace_sandbox,
+    probe_workspace_sandbox_with_roots, SandboxAvailability, SandboxProfile,
+    SandboxUnavailableReason, SubprocessSandbox, MAX_RUNTIME_ROOTS, MAX_WRITABLE_ROOTS,
 };
 pub use session::{
     fold_model_target, fold_reasoning_effort, system_instruction_bytes, AgentReporter,

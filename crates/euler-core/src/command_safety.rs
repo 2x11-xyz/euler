@@ -34,7 +34,7 @@
 //! match `ls`. Unquoted glob characters (`*`, `?`, `[`) stay literal words
 //! for the read-only binaries (their flags cannot make them write), but any
 //! unquoted glob rejects the flag-inspected binaries (`find`, `rg`,
-//! `base64`, `sed`, `git`) because runtime expansion could inject
+//! `base64`, `sed`) because runtime expansion could inject
 //! flag-shaped tokens (a file named `-delete` in `find . *`).
 //!
 //! ## Workspace confinement (security review F1)
@@ -117,7 +117,6 @@ impl CommandSegment {
             "rg" => is_safe_rg(&args),
             "base64" => is_safe_base64(&args),
             "sed" => is_safe_sed(&args),
-            "git" => is_safe_git(&args),
             _ => false,
         }
     }
@@ -460,56 +459,6 @@ fn is_sed_print_range(arg: &str) -> bool {
         (Some(m), Some(n), None) => is_number(m) && is_number(n),
         _ => false,
     }
-}
-
-/// Read-only `git`: the token right after `git` must be one of the allowed
-/// subcommands — ANY global option (`-C`, `-c`, `-p`/`--paginate`,
-/// `--git-dir`, `--exec-path`, `--work-tree`, `--config-env`,
-/// `--namespace`, and every other leading flag) rejects, stricter than a
-/// denylist and immune to option growth.
-fn is_safe_git(args: &[&str]) -> bool {
-    let Some((&subcommand, rest)) = args.split_first() else {
-        return false;
-    };
-    if !matches!(subcommand, "status" | "log" | "diff" | "show" | "branch") {
-        return false;
-    }
-    if rest.iter().any(|arg| is_unsafe_git_subcommand_arg(arg)) {
-        return false;
-    }
-    if subcommand == "branch" {
-        return git_branch_args_are_read_only(rest);
-    }
-    true
-}
-
-fn is_unsafe_git_subcommand_arg(arg: &str) -> bool {
-    // --output writes files; --ext-diff / --textconv / --exec run
-    // configured external commands.
-    matches!(arg, "--output" | "--ext-diff" | "--textconv" | "--exec")
-        || arg.starts_with("--output=")
-        || arg.starts_with("--exec=")
-}
-
-/// `git branch` is safe only as a pure listing query: bare, or made
-/// exclusively of read-only flags. Any positional argument or unknown flag
-/// may create, rename, or delete branches.
-fn git_branch_args_are_read_only(args: &[&str]) -> bool {
-    args.iter().all(|arg| {
-        matches!(
-            *arg,
-            "--list"
-                | "-l"
-                | "--show-current"
-                | "-a"
-                | "--all"
-                | "-r"
-                | "--remotes"
-                | "-v"
-                | "-vv"
-                | "--verbose"
-        ) || arg.starts_with("--format=")
-    })
 }
 
 #[cfg(test)]
@@ -867,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn git_read_only_subcommands_are_safe() {
+    fn git_commands_are_never_static_safe() {
         for command in [
             "git status",
             "git log -p -1",
@@ -878,14 +827,6 @@ mod tests {
             "git branch --show-current",
             "git branch --list -v",
             "git branch --format='%(refname)'",
-        ] {
-            assert!(safe(command), "expected safe: {command}");
-        }
-    }
-
-    #[test]
-    fn git_mutating_and_global_forms_are_unsafe() {
-        for command in [
             "git fetch",
             "git checkout status", // first positional is the subcommand
             "git branch -d feature",
@@ -923,7 +864,6 @@ mod tests {
         // inject flag-shaped tokens (a file literally named `-delete`).
         assert!(!safe("find . -name *.rs"));
         assert!(!safe("rg pattern *"));
-        assert!(!safe("git status *"));
         // Quoted globs are literal text.
         assert!(safe("find . -name '*.rs'"));
         assert!(safe("rg pattern \"*.rs\""));

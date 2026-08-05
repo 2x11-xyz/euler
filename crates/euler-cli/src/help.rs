@@ -18,6 +18,9 @@ const SESSION_OPTIONS: &str = "  \
                              (default: user)
   --project-context <p>      auto, on, or off: load this project's EULER.md
                              guidance (default: auto)
+  --writable-root <path>     Attach another writable root (repeatable)
+  --runtime-root <path>      Expose a read-only runtime/toolchain directory
+                             to Linux agent subprocesses (repeatable)
   --accept-relocation        On resume, move the session to the current folder
                              when it last ran somewhere else
   --auth-file <path>         Read credentials from <path>

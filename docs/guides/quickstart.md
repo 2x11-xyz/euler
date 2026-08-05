@@ -14,6 +14,12 @@ cargo build --release
 Use `./target/release/euler` in the examples below, or put it on your `PATH` as
 `euler`.
 
+On Linux, install Bubblewrap before asking Euler to run shell commands or Git
+views (`sudo apt-get install bubblewrap` on Debian/Ubuntu). Those subprocess
+tools fail closed without it. macOS currently supports structured file tools
+but not agent-controlled subprocesses because no equivalent enforced workspace
+boundary is implemented yet.
+
 ## Authenticate
 
 Euler has one browser/OAuth login path today: ChatGPT.

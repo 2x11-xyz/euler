@@ -210,7 +210,7 @@ fn finish_update_chunk(
 
 fn non_empty_patch_path(path: &str) -> Result<String, ApplyPatchError> {
     if path.is_empty() {
-        Err(ApplyPatchError::Invalid("the file header needs a path, e.g. `*** Add File: src/lib.rs` (relative to the workspace root)"))
+        Err(ApplyPatchError::Invalid("the file header needs a path, e.g. `*** Add File: src/lib.rs` (relative to the primary workspace, or an authorized attached-root absolute path)"))
     } else {
         Ok(path.to_owned())
     }

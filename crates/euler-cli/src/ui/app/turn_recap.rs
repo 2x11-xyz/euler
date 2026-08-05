@@ -1,8 +1,10 @@
 //! Turn-end recap and exit-recap formatting (Warm Ledger §5.7 / §5.8).
 
 use crate::ui::status::short_session_id;
+use crate::ui::workspace_path::{session_primary_root, workspace_path_display, workspace_path_key};
 use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnRecap {
@@ -64,7 +66,7 @@ impl TurnRecap {
 
 pub fn turn_recap_from_events(events: &[EventEnvelope], start: usize) -> TurnRecap {
     let slice = events.get(start..).unwrap_or(&[]);
-    let (paths, added, removed) = aggregate_turn_files(slice);
+    let (paths, added, removed) = aggregate_turn_files(slice, session_primary_root(events));
     let test_status = detect_test_status(slice);
     TurnRecap {
         file_count: paths.len(),
@@ -75,29 +77,30 @@ pub fn turn_recap_from_events(events: &[EventEnvelope], start: usize) -> TurnRec
     }
 }
 
-fn aggregate_turn_files(events: &[EventEnvelope]) -> (Vec<String>, usize, usize) {
-    let mut latest: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+fn aggregate_turn_files(
+    events: &[EventEnvelope],
+    legacy_primary_root: Option<&str>,
+) -> (Vec<String>, usize, usize) {
+    let mut latest: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
     for event in events {
         match event.kind.as_str() {
             EventKind::FILE_DIFF => {
-                let path = payload_str(event, "path").unwrap_or("");
-                if path.is_empty() {
+                let Some(path) = workspace_path_key(event, legacy_primary_root) else {
                     continue;
-                }
+                };
                 let (added, removed) = event
                     .payload
                     .get("diff")
                     .and_then(|v| v.as_str())
                     .map(count_diff_lines)
                     .unwrap_or((0, 0));
-                latest.insert(path.to_owned(), (added, removed));
+                latest.insert(path, (added, removed));
             }
             EventKind::FILE_CHANGE => {
-                let path = payload_str(event, "path").unwrap_or("");
-                if path.is_empty() {
+                let Some(path) = workspace_path_key(event, legacy_primary_root) else {
                     continue;
-                }
-                latest.entry(path.to_owned()).or_insert((0, 0));
+                };
+                latest.entry(path).or_insert((0, 0));
             }
             _ => {}
         }
@@ -108,7 +111,7 @@ fn aggregate_turn_files(events: &[EventEnvelope]) -> (Vec<String>, usize, usize)
     for (path, (a, r)) in latest {
         added += a;
         removed += r;
-        paths.push(path);
+        paths.push(workspace_path_display(&path));
     }
     (paths, added, removed)
 }
@@ -333,11 +336,12 @@ fn payload_str<'a>(event: &'a EventEnvelope, key: &str) -> Option<&'a str> {
 
 pub fn session_files_changed_count(events: &[EventEnvelope]) -> usize {
     let mut paths = std::collections::BTreeSet::new();
+    let legacy_primary_root = session_primary_root(events);
     for event in events {
         match event.kind.as_str() {
             EventKind::FILE_DIFF | EventKind::FILE_CHANGE => {
-                if let Some(path) = payload_str(event, "path").filter(|p| !p.is_empty()) {
-                    paths.insert(path.to_owned());
+                if let Some(path) = workspace_path_key(event, legacy_primary_root) {
+                    paths.insert(path);
                 }
             }
             _ => {}
@@ -350,6 +354,8 @@ pub fn exit_recap_lines(
     session_id: &str,
     event_count: usize,
     files_changed: usize,
+    attached_writable_roots: &[PathBuf],
+    read_only_runtime_roots: &[PathBuf],
 ) -> Vec<ExitRecapLine> {
     let full_id = if session_id.is_empty() {
         "e????"
@@ -357,15 +363,28 @@ pub fn exit_recap_lines(
         session_id
     };
     let short_id = short_session_id(full_id);
+    let mut resume_command = format!("euler --resume {full_id}");
+    for root in attached_writable_roots {
+        resume_command.push_str(" --writable-root ");
+        resume_command.push_str(&shell_quote_path(root));
+    }
+    for root in read_only_runtime_roots {
+        resume_command.push_str(" --runtime-root ");
+        resume_command.push_str(&shell_quote_path(root));
+    }
     vec![
         ExitRecapLine::Normal(format!(
             "session {short_id} saved · {event_count} events · {files_changed} files changed"
         )),
         // The resume command must keep the full ULID so it actually works
         // when copy-pasted; only the headline above uses the short form.
-        ExitRecapLine::Normal(format!("resume  euler --resume {full_id}")),
+        ExitRecapLine::Normal(format!("resume  {resume_command}")),
         ExitRecapLine::Faint("export  euler extension run session-export …".to_owned()),
     ]
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\"'\"'"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -427,6 +446,73 @@ mod tests {
         let recap = turn_recap_from_events(&events, 0);
         assert_eq!(recap.summary_line(), "1 file · +2 −1 · tests pass");
         assert_eq!(recap.files_line().as_deref(), Some("src/a.rs"));
+    }
+
+    #[test]
+    fn recap_keeps_equal_relative_paths_in_distinct_writable_roots() {
+        let events = vec![
+            event(
+                EventKind::SESSION_START,
+                object([("root", "/work/primary".into())]),
+            ),
+            event(
+                EventKind::FILE_DIFF,
+                object([
+                    ("workspace_root", "/work/primary".into()),
+                    ("path", "src/lib.rs".into()),
+                    ("diff", "+primary\n".into()),
+                ]),
+            ),
+            event(
+                EventKind::FILE_DIFF,
+                object([
+                    ("workspace_root", "/work/attached".into()),
+                    ("path", "src/lib.rs".into()),
+                    ("diff", "+attached\n".into()),
+                ]),
+            ),
+        ];
+
+        let recap = turn_recap_from_events(&events, 1);
+
+        assert_eq!(recap.file_count, 2);
+        assert_eq!(recap.added, 2);
+        assert_eq!(
+            recap.paths,
+            vec![
+                "/work/attached/src/lib.rs".to_owned(),
+                "/work/primary/src/lib.rs".to_owned(),
+            ]
+        );
+        assert_eq!(session_files_changed_count(&events), 2);
+    }
+
+    #[test]
+    fn legacy_primary_path_and_rooted_primary_path_share_one_identity() {
+        let events = vec![
+            event(
+                EventKind::SESSION_START,
+                object([("root", "/work/primary".into())]),
+            ),
+            event(
+                EventKind::FILE_CHANGE,
+                object([("path", "src/lib.rs".into())]),
+            ),
+            event(
+                EventKind::FILE_DIFF,
+                object([
+                    ("workspace_root", "/work/primary".into()),
+                    ("path", "src/lib.rs".into()),
+                    ("diff", "+new\n".into()),
+                ]),
+            ),
+        ];
+
+        let recap = turn_recap_from_events(&events, 1);
+
+        assert_eq!(recap.file_count, 1);
+        assert_eq!(recap.paths, vec!["/work/primary/src/lib.rs"]);
+        assert_eq!(session_files_changed_count(&events), 1);
     }
 
     #[test]
@@ -542,7 +628,7 @@ mod tests {
 
     #[test]
     fn exit_recap_is_at_most_five_lines_and_copy_ready() {
-        let lines = exit_recap_lines("e0147", 42, 3);
+        let lines = exit_recap_lines("e0147", 42, 3, &[], &[]);
         assert!(lines.len() <= 5);
         assert!(lines[1].text().contains("euler --resume e0147"));
         assert!(lines[2].is_faint());
@@ -550,7 +636,7 @@ mod tests {
 
     #[test]
     fn exit_recap_shortens_saved_headline_but_keeps_full_id_in_resume_command() {
-        let lines = exit_recap_lines("01KX488KQ6DXYPYGB0FK7GFD4T", 42, 3);
+        let lines = exit_recap_lines("01KX488KQ6DXYPYGB0FK7GFD4T", 42, 3, &[], &[]);
         assert!(
             lines[0].text().contains("session efd4t saved"),
             "headline should use the short display id: {:?}",
@@ -562,6 +648,18 @@ mod tests {
                 .contains("euler --resume 01KX488KQ6DXYPYGB0FK7GFD4T"),
             "resume command must stay copy-ready with the full ULID: {:?}",
             lines[1]
+        );
+    }
+
+    #[test]
+    fn multi_root_exit_recap_preserves_copy_ready_authority_flags() {
+        let writable = vec![PathBuf::from("/srv/attached root")];
+        let runtime = vec![PathBuf::from("/opt/toolchain's sysroot")];
+        let lines = exit_recap_lines("session-1", 5, 0, &writable, &runtime);
+
+        assert_eq!(
+            lines[1].text(),
+            "resume  euler --resume session-1 --writable-root '/srv/attached root' --runtime-root '/opt/toolchain'\"'\"'s sysroot'"
         );
     }
 

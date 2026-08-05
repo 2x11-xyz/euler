@@ -16,6 +16,8 @@ use ratatui::{
     Terminal,
 };
 use serde_json::json;
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Mutex};
@@ -29,6 +31,89 @@ mod permission_tests;
 /// configures nothing.
 fn core() -> AppCore {
     TestCore::builder().build()
+}
+
+#[test]
+fn failed_rollback_ingests_the_terminal_restore_event_into_the_live_transcript() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let target = temp.path().join("note.txt");
+    std::fs::write(&target, "before").expect("fixture");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-edit".to_owned(),
+        name: "edit_file".to_owned(),
+        input: json!({"path": "note.txt", "old": "before", "new": "after"}),
+    }])]);
+    let (decider, channels) = TuiDecider::new();
+    let mut session = Session::new(
+        euler_core::SessionConfig::new(temp.path()),
+        provider,
+        decider,
+    );
+    session.set_permission_mode(Capability::FsWrite, ApprovalMode::SessionAllow);
+    let _ = session.run_turn("edit").expect_err("provider queue ends");
+    let checkpoint_id = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .expect("checkpoint")
+        .id
+        .clone();
+    std::fs::remove_file(&target).expect("force restore failure before mutation");
+    let mut core = AppCore::new(session, channels);
+    let prior_len = core.transcript.events().len();
+
+    let effect = core.rollback_workspace_checkpoint(checkpoint_id);
+
+    assert_eq!(effect, CoreEffect::Render);
+    let emitted = &core.transcript.events()[prior_len..];
+    assert!(emitted.iter().any(|event| {
+        event.kind.as_str() == EventKind::WORKSPACE_RESTORE
+            && event.payload["restored"] == json!(false)
+    }));
+    assert!(transcript::project_events(core.transcript.events())
+        .iter()
+        .any(|item| matches!(
+            item,
+            TranscriptItem::WorkspaceRestore {
+                restored: false,
+                ..
+            }
+        )));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn unsafe_workspace_node_is_shown_as_requested_not_enforced_authority() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let _listener = UnixListener::bind(temp.path().join("host.sock")).expect("host socket");
+    let (decider, channels) = TuiDecider::new();
+    let session = Session::new(
+        euler_core::SessionConfig::new(temp.path()),
+        EchoProvider,
+        decider,
+    );
+
+    let core = AppCore::new(session, channels);
+
+    assert!(!core.status.workspace_authority_enforced);
+    assert_eq!(
+        core.status.workspace_authority,
+        "configured · workspace-no-network"
+    );
+    assert_eq!(core.status.writable_roots, vec![temp.path().to_path_buf()]);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("new app is idle");
+    };
+    assert_eq!(
+        session.sandbox_availability(),
+        Some(euler_core::SandboxAvailability::Unavailable(
+            euler_core::SandboxUnavailableReason::UnsafeSpecialNode
+        ))
+    );
+    assert!(workspace_authority_status(session)
+        .0
+        .starts_with("unavailable ·"));
 }
 
 /// Fluent builder for the tests' `AppCore`. Replaces the former six positional
@@ -3771,7 +3856,7 @@ fn permission_envelope_follows_a_replaced_session_into_the_next_turn() {
             .permission_envelope
             .as_deref()
             .expect("snapshot")
-            .starts_with("Full access"),
+            .starts_with("Full capability access"),
         "envelope: {:?}",
         core.status.permission_envelope
     );
@@ -3787,7 +3872,7 @@ fn permission_envelope_follows_a_replaced_session_into_the_next_turn() {
 
     let in_flight = last_permissions_line(&mut core);
     assert!(
-        in_flight.contains("Read only") && !in_flight.contains("Full access"),
+        in_flight.contains("Read only") && !in_flight.contains("Full capability access"),
         "stale envelope from the replaced session: {in_flight:?}"
     );
 }
@@ -3925,6 +4010,97 @@ fn launch_auth_file_override_threads_into_the_core_for_resume_seeding() {
         core.auth_file.as_deref(),
         Some(std::path::Path::new("/tmp/custom-auth.json"))
     );
+}
+
+#[test]
+fn in_app_resume_reuses_the_launch_workspace_authority() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let attached = temp.path().join("attached");
+    let runtime = temp.path().join("runtime");
+    std::fs::create_dir(&attached).expect("attached root");
+    std::fs::create_dir(&runtime).expect("runtime root");
+    let store = SessionStore::new(EulerHome::from_root(temp.path().join(".euler")).expect("home"))
+        .expect("store");
+    let record = store.create_session().expect("target session");
+    let root = std::env::current_dir().expect("current workspace");
+    persist_resume_authority_fixture(&record, &root, &attached, &runtime);
+
+    let (decider, channels) = TuiDecider::new();
+    let mut current_config = euler_core::SessionConfig::new(&root);
+    current_config.session_id = "current-authority-session".to_owned();
+    current_config.model = "echo".to_owned();
+    current_config.attached_writable_roots = vec![attached.clone()];
+    current_config.subprocess_runtime_roots = vec![runtime.clone()];
+    let current = Session::new(current_config, EchoProvider, decider);
+    let mut core = AppCore::new(current, channels);
+    core.session_store = Some(store);
+
+    let resumed = core
+        .build_tui_resume(record.id())
+        .expect("matching launch authority resumes");
+
+    assert_eq!(resumed.session.workspace_root(), root);
+    assert_eq!(resumed.session.attached_writable_roots(), [attached]);
+    assert_eq!(resumed.session.subprocess_runtime_roots(), [runtime]);
+}
+
+#[test]
+fn in_app_resume_rejects_mismatched_launch_workspace_authority_without_appending() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let recorded_attached = temp.path().join("recorded-attached");
+    let current_attached = temp.path().join("current-attached");
+    let runtime = temp.path().join("runtime");
+    for root in [&recorded_attached, &current_attached, &runtime] {
+        std::fs::create_dir(root).expect("authority root");
+    }
+    let store = SessionStore::new(EulerHome::from_root(temp.path().join(".euler")).expect("home"))
+        .expect("store");
+    let record = store.create_session().expect("target session");
+    let root = std::env::current_dir().expect("current workspace");
+    persist_resume_authority_fixture(&record, &root, &recorded_attached, &runtime);
+    let before = std::fs::read(record.events_path()).expect("target log before resume");
+
+    let (decider, channels) = TuiDecider::new();
+    let mut current_config = euler_core::SessionConfig::new(&root);
+    current_config.session_id = "mismatched-authority-session".to_owned();
+    current_config.model = "echo".to_owned();
+    current_config.attached_writable_roots = vec![current_attached];
+    current_config.subprocess_runtime_roots = vec![runtime];
+    let current = Session::new(current_config, EchoProvider, decider);
+    let mut core = AppCore::new(current, channels);
+    core.session_store = Some(store);
+
+    let error = match core.build_tui_resume(record.id()) {
+        Ok(_) => panic!("mismatched launch authority must fail"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error.to_string().contains("workspace authority changed"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        std::fs::read(record.events_path()).expect("target log after refusal"),
+        before,
+        "authority refusal must happen before opening a provenance writer"
+    );
+}
+
+fn persist_resume_authority_fixture(
+    record: &euler_core::SessionRecord,
+    root: &std::path::Path,
+    attached: &std::path::Path,
+    runtime: &std::path::Path,
+) {
+    let (decider, _channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(root);
+    config.session_id = record.id().to_owned();
+    config.model = "echo".to_owned();
+    config.attached_writable_roots = vec![attached.to_path_buf()];
+    config.subprocess_runtime_roots = vec![runtime.to_path_buf()];
+    let mut session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(record.events_path()).expect("target writer"));
+    session.run_turn("persist fixture").expect("fixture turn");
 }
 
 #[test]
@@ -4469,6 +4645,40 @@ fn turn_recap_never_renders_without_its_worked_divider() {
         !text.contains("1 file"),
         "recap must not render without its divider: {text:?}"
     );
+}
+
+#[test]
+fn session_diff_keeps_equal_relative_paths_in_distinct_writable_roots() {
+    let events = vec![
+        event(
+            EventKind::SESSION_START,
+            object([("root", "/work/primary".into())]),
+        ),
+        event(
+            EventKind::FILE_DIFF,
+            object([
+                ("workspace_root", "/work/primary".into()),
+                ("path", "src/lib.rs".into()),
+                ("action", "modify".into()),
+                ("diff", "+primary\n".into()),
+            ]),
+        ),
+        event(
+            EventKind::FILE_DIFF,
+            object([
+                ("workspace_root", "/work/attached".into()),
+                ("path", "src/lib.rs".into()),
+                ("action", "modify".into()),
+                ("diff", "+attached\n".into()),
+            ]),
+        ),
+    ];
+
+    let diffs = session_attributed_diffs(&events);
+
+    assert_eq!(diffs.len(), 2);
+    assert_eq!(diffs[0].path, "/work/attached/src/lib.rs");
+    assert_eq!(diffs[1].path, "/work/primary/src/lib.rs");
 }
 
 // A turn that changed no files renders the divider (there was elapsed time

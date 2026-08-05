@@ -101,7 +101,9 @@ impl AppCore {
         Ok(lines[start..].to_vec())
     }
 
-    fn build_tui_resume(&mut self, session_id: &str) -> Result<TuiResume> {
+    pub(super) fn build_tui_resume(&mut self, session_id: &str) -> Result<TuiResume> {
+        let (attached_writable_roots, subprocess_runtime_roots, subprocess_sandbox) =
+            self.current_workspace_authority()?;
         let record = self
             .session_store()?
             .find_session(session_id)?
@@ -114,6 +116,9 @@ impl AppCore {
             self.status.model.clone(),
             session_id.to_owned(),
         );
+        seed_config.attached_writable_roots = attached_writable_roots.clone();
+        seed_config.subprocess_runtime_roots = subprocess_runtime_roots.clone();
+        seed_config.subprocess_sandbox = subprocess_sandbox;
         seed_config.extensions_enabled =
             resolve_session_extensions(&seed_config.root, &self.extensions)?;
         let observer = resolve_round_observer(&self.observe)?;
@@ -134,6 +139,9 @@ impl AppCore {
             original.model.clone(),
             session_id.to_owned(),
         );
+        config.attached_writable_roots = attached_writable_roots;
+        config.subprocess_runtime_roots = subprocess_runtime_roots;
+        config.subprocess_sandbox = subprocess_sandbox;
         config.extensions_enabled = seed_config.extensions_enabled;
         config.round_observer = seed_config.round_observer;
         // Compaction window follows the active model after fold (post-switch).
@@ -176,6 +184,19 @@ impl AppCore {
         })
     }
 
+    fn current_workspace_authority(
+        &self,
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>, euler_core::SubprocessSandbox)> {
+        match &self.state {
+            AppState::Idle { session } => Ok((
+                session.attached_writable_roots().to_vec(),
+                session.subprocess_runtime_roots().to_vec(),
+                session.subprocess_sandbox(),
+            )),
+            _ => Err(anyhow!("resume needs an idle session")),
+        }
+    }
+
     pub(super) fn accept_tui_resume(
         &mut self,
         session_id: String,
@@ -191,6 +212,7 @@ impl AppCore {
         self.reply_tx = inactive_permission_reply_sender();
         self.active_permission_cancellation = None;
         self.primary_agent_id = primary_agent_id;
+        super::populate_workspace_authority_status(&mut self.status, &resume.session);
         self.install_state(AppState::Idle {
             session: Box::new(resume.session),
         });

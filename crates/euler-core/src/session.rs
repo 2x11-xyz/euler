@@ -11,6 +11,9 @@ use crate::compaction::{
     build_compaction_candidate, projection_prompt, select_layer1_candidates, should_compact,
     validate_candidate, CompactionCandidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
 };
+use crate::file_diff::{
+    observed_workspace_restore_change_payload, observed_workspace_restore_diff_payload,
+};
 use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
 use crate::guardian::PermissionReviewer;
 use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, PermissionGate};
@@ -21,7 +24,7 @@ use crate::sandbox::SubprocessSandbox;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
-use crate::tools::{ReteachTracker, ToolError, ToolRegistry};
+use crate::tools::{ReteachTracker, StructuredWriteFailure, ToolError, ToolRegistry};
 use crate::EventBus;
 use euler_agents::{generated_agent_id, AgentError, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
@@ -177,9 +180,17 @@ pub struct SessionConfig {
     pub model: String,
     pub reasoning_effort: ReasoningEffort,
     pub root: PathBuf,
+    /// Additional host directories the user explicitly attached as writable
+    /// authority for this session. Subprocess access to these roots requires
+    /// an enforced sandbox profile; structured file tools still resolve every
+    /// path canonically against this closed set.
+    pub attached_writable_roots: Vec<PathBuf>,
+    /// Explicit read-only directories exposed to sandboxed subprocesses for
+    /// language runtimes and toolchains. They never confer write authority.
+    pub subprocess_runtime_roots: Vec<PathBuf>,
     /// Whether agent-controlled subprocesses must use a core sandbox profile.
-    /// Disabled is the default until a user-facing mode can promise real
-    /// enforcement on the current host.
+    /// Disabled means subprocesses fail closed; it never authorizes direct
+    /// host execution.
     pub subprocess_sandbox: SubprocessSandbox,
     /// `None` (default) = unlimited rounds per turn; a turn ends when the
     /// model finishes, fails, or the user cancels. Set only when a hard
@@ -251,7 +262,9 @@ impl SessionConfig {
             model: "fixture".to_owned(),
             reasoning_effort: ReasoningEffort::Medium,
             root: root.into(),
-            subprocess_sandbox: SubprocessSandbox::Disabled,
+            attached_writable_roots: Vec::new(),
+            subprocess_runtime_roots: Vec::new(),
+            subprocess_sandbox: SubprocessSandbox::default(),
             max_tool_rounds: None,
             provider_transport_retries: 2,
             provider_transport_retry_backoff_ms: vec![1000, 3000],
@@ -369,6 +382,7 @@ pub enum SessionError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceRestoreOutcome {
     pub event_id: String,
+    pub workspace_root: String,
     pub path: String,
     pub checkpoint_event_id: String,
     pub blob_sha256: String,
@@ -919,8 +933,12 @@ impl<D> Session<D> {
     }
 
     pub fn new_with_providers(config: SessionConfig, providers: ProviderSet, decider: D) -> Self {
-        let mut tools =
-            ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
+        let mut tools = ToolRegistry::with_workspace_authority(
+            config.root.clone(),
+            config.attached_writable_roots.clone(),
+            config.subprocess_runtime_roots.clone(),
+            config.subprocess_sandbox,
+        );
         if let Some(project_context) = config.project_context.as_ref() {
             tools.set_frozen_skills(project_context.frozen_skills());
         }
@@ -1038,6 +1056,28 @@ impl<D> Session<D> {
     /// The live workspace root, for a `/new` acknowledgment card's folder label.
     pub fn workspace_root(&self) -> &std::path::Path {
         &self.config.root
+    }
+
+    pub fn attached_writable_roots(&self) -> &[PathBuf] {
+        &self.config.attached_writable_roots
+    }
+
+    pub fn subprocess_runtime_roots(&self) -> &[PathBuf] {
+        &self.config.subprocess_runtime_roots
+    }
+
+    pub fn subprocess_sandbox(&self) -> SubprocessSandbox {
+        self.config.subprocess_sandbox
+    }
+
+    pub fn sandbox_availability(&self) -> Option<crate::SandboxAvailability> {
+        self.tools.sandbox_availability()
+    }
+
+    /// Return the profile's cached enforcement result without performing the
+    /// complete first-use authority probe.
+    pub fn cached_sandbox_availability(&self) -> Option<crate::SandboxAvailability> {
+        self.tools.cached_sandbox_availability()
     }
 
     /// Build the fresh session `/new` composes, with the bootstrap obtained
@@ -1699,8 +1739,12 @@ impl<D> Session<D> {
         latest_model_usage_used_tokens: Option<u64>,
         context_limit_emitted: Option<ModelTarget>,
     ) -> Self {
-        let mut tools =
-            ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
+        let mut tools = ToolRegistry::with_workspace_authority(
+            config.root.clone(),
+            config.attached_writable_roots.clone(),
+            config.subprocess_runtime_roots.clone(),
+            config.subprocess_sandbox,
+        );
         if let Ok(fold) = crate::project_context::fold_project_context(&events) {
             if let Some(pinned) = fold.admitted() {
                 tools.set_frozen_skills(pinned.frozen_skills());
@@ -1988,8 +2032,9 @@ impl<D: PermissionDecider> Session<D> {
     }
 
     /// Restore one workspace file to the pre-image captured on a `file.change`
-    /// event. Appends a new `workspace.restore` ledger event; never rewrites
-    /// history.
+    /// event. Appends a terminal `workspace.restore` ledger event on success
+    /// or write failure; never rewrites history. A failed write also records
+    /// any fd-observed mutation beneath that restore event.
     pub fn restore_workspace_checkpoint(
         &mut self,
         checkpoint_event_id: &str,
@@ -2023,31 +2068,71 @@ impl<D: PermissionDecider> Session<D> {
                 event_id: checkpoint_event_id.to_owned(),
             })?
             .to_owned();
-        let content = checkpoints::load_pre_image(self.config.root.as_path(), &blob_sha256)
-            .map_err(|error| SessionError::CheckpointBlob(error.to_string()))?;
-        self.tools
-            .write_workspace_file(&path, &content)
+        let workspace_root = checkpoint
+            .payload
+            .get("workspace_root")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| self.config.root.clone(), PathBuf::from);
+        let workspace_root = self
+            .tools
+            .canonical_writable_root_selector(&workspace_root)
             .map_err(SessionError::from)?;
-        let payload = object([
-            ("path", path.clone().into()),
-            ("checkpoint_event_id", checkpoint_event_id.to_owned().into()),
-            ("blob_sha256", blob_sha256.clone().into()),
-            ("restored", true.into()),
-        ]);
-        self.emit_control_event_required(EventKind::WORKSPACE_RESTORE, payload)?;
-        let event_id = self
-            .bus
-            .events()
-            .last()
-            .expect("workspace.restore just accepted")
-            .id
-            .clone();
+        let content = checkpoints::load_pre_image(&workspace_root, &blob_sha256)
+            .map_err(|error| SessionError::CheckpointBlob(error.to_string()))?;
+        let restore_payload = |restored: bool, error: Option<String>| {
+            let mut payload = object([
+                (
+                    "workspace_root",
+                    workspace_root.to_string_lossy().into_owned().into(),
+                ),
+                ("path", path.clone().into()),
+                ("checkpoint_event_id", checkpoint_event_id.to_owned().into()),
+                ("blob_sha256", blob_sha256.clone().into()),
+                ("restored", restored.into()),
+            ]);
+            if let Some(error) = error {
+                payload.insert("error".to_owned(), error.into());
+            }
+            payload
+        };
+        if let Err(failure) =
+            self.tools
+                .write_workspace_file_at_observed(&workspace_root, &path, &content)
+        {
+            let error_message = self.redactor.redact(&failure.error.to_string());
+            return self
+                .fail_workspace_restore(restore_payload(false, Some(error_message)), failure);
+        }
+        let event_id = self.emit(EventKind::WORKSPACE_RESTORE, restore_payload(true, None))?;
         Ok(WorkspaceRestoreOutcome {
             event_id,
+            workspace_root: workspace_root.to_string_lossy().into_owned(),
             path,
             checkpoint_event_id: checkpoint_event_id.to_owned(),
             blob_sha256,
         })
+    }
+
+    fn fail_workspace_restore(
+        &mut self,
+        payload: JsonObject,
+        failure: StructuredWriteFailure,
+    ) -> Result<WorkspaceRestoreOutcome, SessionError> {
+        let restore_id = self.emit(EventKind::WORKSPACE_RESTORE, payload)?;
+        for change in &failure.file_changes {
+            let file_change_id = self.emit_with_parent(
+                EventKind::FILE_CHANGE,
+                observed_workspace_restore_change_payload(&restore_id, change),
+                Some(restore_id.clone()),
+            )?;
+            let mut diff_payload =
+                observed_workspace_restore_diff_payload(&restore_id, &file_change_id, change);
+            self.redactor
+                .redact_payload_fields(&mut diff_payload, &["diff"]);
+            self.emit_with_parent(EventKind::FILE_DIFF, diff_payload, Some(restore_id.clone()))?;
+        }
+        Err(failure.error.into())
     }
 
     pub fn run_turn(&mut self, user_message: &str) -> Result<Vec<EventEnvelope>, SessionError> {
@@ -3615,6 +3700,10 @@ fn session_start_payload(config: &SessionConfig) -> JsonObject {
             },
         ),
         ("root", session_root_for_event(&config.root).into()),
+        (
+            "workspace_authority",
+            workspace_authority_config_payload(config),
+        ),
     ]);
     if let Some(bootstrap) = &config.project_context {
         payload.insert(
@@ -3623,6 +3712,44 @@ fn session_start_payload(config: &SessionConfig) -> JsonObject {
         );
     }
     payload
+}
+
+fn workspace_authority_config_payload(config: &SessionConfig) -> Value {
+    let canonical_writable_roots =
+        crate::canonical_writable_roots(&config.root, &config.attached_writable_roots).ok();
+    let attached_writable_roots = canonical_writable_roots.as_ref().map(|roots| {
+        roots
+            .iter()
+            .skip(1)
+            .map(|root| session_root_for_event(root))
+            .collect::<Vec<_>>()
+    });
+    let runtime_roots = canonical_writable_roots
+        .as_ref()
+        .and_then(|writable_roots| {
+            crate::canonical_runtime_roots(writable_roots, &config.subprocess_runtime_roots)
+                .ok()
+                .map(|roots| {
+                    roots
+                        .iter()
+                        .map(|root| session_root_for_event(root))
+                        .collect::<Vec<_>>()
+                })
+        });
+    match config.subprocess_sandbox {
+        SubprocessSandbox::Disabled => json!({
+            "mode": "disabled",
+            "profile": null,
+            "attached_writable_roots": attached_writable_roots,
+            "read_only_runtime_roots": runtime_roots,
+        }),
+        SubprocessSandbox::Enforce(profile) => json!({
+            "mode": "enforced",
+            "profile": profile.as_str(),
+            "attached_writable_roots": attached_writable_roots,
+            "read_only_runtime_roots": runtime_roots,
+        }),
+    }
 }
 
 /// Push the fresh-session bootstrap into the bus: `session.start`, then —

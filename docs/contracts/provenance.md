@@ -107,8 +107,12 @@ event parents the previous persisted event in that same batch.
 
 The semantic-parent exception list is closed: `permission.decision` may parent
 its `permission.prompt`; `tool.result` may parent its `tool.call`;
+`patch.proposed` may parent its `tool.call`; `patch.applied` may parent its
+`patch.proposed`; `file.change` and its sibling `file.diff` may parent the
+owning `patch.applied`, `tool.call`, or failed `workspace.restore`;
 `agent.result` may parent its `agent.spawn`; extension error events may parent
-the triggering extension decision/command event. Adding another exception
+the triggering extension decision/command event. These rules apply equally to
+root and companion tool execution. Adding another exception
 requires updating this contract and adding tests. A semantic-parent event still
 advances the linear spine: its successor in the batch (or the next append)
 parents the semantic event's id, not the event before it. This linear parent

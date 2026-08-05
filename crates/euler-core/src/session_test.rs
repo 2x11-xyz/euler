@@ -77,6 +77,118 @@ fn session_config_forwards_requested_subprocess_sandbox_to_tool_registry() {
     assert_eq!(session.tools.sandbox_availability(), Some(expected));
 }
 
+#[test]
+fn resume_requires_exact_durable_workspace_authority() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let primary = temp.path().join("primary");
+    let attached = temp.path().join("attached");
+    let runtime = temp.path().join("runtime");
+    std::fs::create_dir(&primary).expect("primary");
+    std::fs::create_dir(&attached).expect("attached");
+    std::fs::create_dir(&runtime).expect("runtime");
+    let mut config = SessionConfig::new(primary);
+    config.attached_writable_roots = vec![attached];
+    config.subprocess_runtime_roots = vec![runtime];
+    config.subprocess_sandbox = SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork);
+    let session = Session::new(
+        config.clone(),
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let events = session.events().to_vec();
+
+    crate::fold_session(&config, events.clone()).expect("same authority resumes");
+    let mut missing_attachment = config.clone();
+    missing_attachment.attached_writable_roots.clear();
+    assert!(matches!(
+        crate::fold_session(&missing_attachment, events.clone()),
+        Err(crate::ResumeError::WorkspaceAuthority { .. })
+    ));
+    let mut changed_profile = config;
+    changed_profile.subprocess_sandbox = SubprocessSandbox::Disabled;
+    assert!(matches!(
+        crate::fold_session(&changed_profile, events),
+        Err(crate::ResumeError::WorkspaceAuthority { .. })
+    ));
+}
+
+#[test]
+fn legacy_session_cannot_gain_attached_roots_on_resume() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let primary = temp.path().join("primary");
+    let attached = temp.path().join("attached");
+    std::fs::create_dir(&primary).expect("primary");
+    std::fs::create_dir(&attached).expect("attached");
+    let base = SessionConfig::new(&primary);
+    let session = Session::new(
+        base.clone(),
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let mut events = session.events().to_vec();
+    events[0].payload.remove("workspace_authority");
+
+    crate::fold_session(&base, events.clone()).expect("legacy authority narrows to primary");
+    let mut expanded = base;
+    expanded.attached_writable_roots.push(attached);
+    assert!(matches!(
+        crate::fold_session(&expanded, events),
+        Err(crate::ResumeError::WorkspaceAuthority { .. })
+    ));
+}
+
+fn legacy_events_without_session_start() -> Vec<EventEnvelope> {
+    vec![EventEnvelope::new(
+        "legacy-session",
+        "root",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "legacy input".into())]),
+    )]
+}
+
+#[test]
+fn legacy_session_without_start_cannot_gain_an_attached_writable_root() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let primary = temp.path().join("primary");
+    let attached = temp.path().join("attached");
+    std::fs::create_dir(&primary).expect("primary");
+    std::fs::create_dir(&attached).expect("attached");
+    let base = SessionConfig::new(&primary);
+    let events = legacy_events_without_session_start();
+
+    crate::fold_session(&base, events.clone()).expect("legacy authority narrows to primary");
+    let mut expanded = base;
+    expanded.attached_writable_roots.push(attached);
+
+    assert!(matches!(
+        crate::fold_session(&expanded, events),
+        Err(crate::ResumeError::WorkspaceAuthority { reason })
+            if reason.contains("without session.start")
+    ));
+}
+
+#[test]
+fn legacy_session_without_start_cannot_gain_a_read_only_runtime_root() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let primary = temp.path().join("primary");
+    let runtime = temp.path().join("runtime");
+    std::fs::create_dir(&primary).expect("primary");
+    std::fs::create_dir(&runtime).expect("runtime");
+    let base = SessionConfig::new(&primary);
+    let events = legacy_events_without_session_start();
+
+    crate::fold_session(&base, events.clone()).expect("legacy authority narrows to primary");
+    let mut expanded = base;
+    expanded.subprocess_runtime_roots.push(runtime);
+
+    assert!(matches!(
+        crate::fold_session(&expanded, events),
+        Err(crate::ResumeError::WorkspaceAuthority { reason })
+            if reason.contains("without session.start")
+    ));
+}
+
 /// Provider whose invoke fails with an error message echoing request
 /// fragments — models real HTTP 4xx bodies that quote what was sent.
 #[derive(Debug)]

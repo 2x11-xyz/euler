@@ -1142,10 +1142,12 @@ fn normalize_events(
     driver_snapshot_links: &BTreeMap<String, String>,
 ) -> Result<Value, String> {
     let id_map = event_id_map(&events);
+    let authority_paths = authority_path_labels(&events);
     let values = events
         .into_iter()
         .map(|event| {
             let event_id = event.id.clone();
+            let event_session = event.session.clone();
             let mut value = serde_json::to_value(event).expect("event json");
             let object = value.as_object_mut().expect("event object");
             replace_allowed(
@@ -1202,6 +1204,7 @@ fn normalize_events(
                         Value::String(file_change_id),
                     );
                 }
+                normalize_authority_paths(payload, &event_session, &authority_paths, allowlist);
             }
             if object.get("kind").and_then(Value::as_str) == Some(EventKind::SESSION_START) {
                 if let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) {
@@ -1219,6 +1222,103 @@ fn normalize_events(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(Value::Array(values))
+}
+
+fn authority_path_labels(events: &[EventEnvelope]) -> BTreeMap<(String, String), String> {
+    let mut labels = BTreeMap::new();
+    for event in events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::SESSION_START)
+    {
+        if let Some(root) = event.payload.get("root").and_then(Value::as_str) {
+            labels.insert(
+                (event.session.clone(), root.to_owned()),
+                "<root>".to_owned(),
+            );
+        }
+        let Some(authority) = event
+            .payload
+            .get("workspace_authority")
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        for (field, label) in [
+            ("attached_writable_roots", "attached-root"),
+            ("read_only_runtime_roots", "runtime-root"),
+        ] {
+            let Some(paths) = authority.get(field).and_then(Value::as_array) else {
+                continue;
+            };
+            for (index, path) in paths.iter().filter_map(Value::as_str).enumerate() {
+                labels.insert(
+                    (event.session.clone(), path.to_owned()),
+                    format!("<{label}-{index}>"),
+                );
+            }
+        }
+    }
+    labels
+}
+
+fn normalize_authority_paths(
+    payload: &mut serde_json::Map<String, Value>,
+    session: &str,
+    labels: &BTreeMap<(String, String), String>,
+    allowlist: &BTreeSet<&'static str>,
+) {
+    normalize_authority_path_field(payload, "workspace_root", session, labels, allowlist);
+    let Some(authority) = payload
+        .get_mut("workspace_authority")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for field in [
+        "attached_writable_roots",
+        "read_only_runtime_roots",
+        "writable_roots",
+        "requested_writable_roots",
+        "requested_read_only_runtime_roots",
+    ] {
+        normalize_authority_path_field(authority, field, session, labels, allowlist);
+    }
+}
+
+fn normalize_authority_path_field(
+    object: &mut serde_json::Map<String, Value>,
+    field: &'static str,
+    session: &str,
+    labels: &BTreeMap<(String, String), String>,
+    allowlist: &BTreeSet<&'static str>,
+) {
+    let Some(value) = object.get_mut(field) else {
+        return;
+    };
+    let mut replaced = false;
+    match value {
+        Value::String(path) => {
+            if let Some(label) = labels.get(&(session.to_owned(), path.clone())) {
+                *path = label.clone();
+                replaced = true;
+            }
+        }
+        Value::Array(paths) => {
+            for path in paths {
+                let Some(raw) = path.as_str() else {
+                    continue;
+                };
+                if let Some(label) = labels.get(&(session.to_owned(), raw.to_owned())) {
+                    *path = Value::String(label.clone());
+                    replaced = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    if replaced {
+        require_allowed(allowlist, field);
+    }
 }
 
 struct DriverSnapshotCandidate {
@@ -1439,6 +1539,12 @@ fn nondeterministic_fields() -> BTreeSet<&'static str> {
         "canvas_snapshot_id",
         "file_change_id",
         "root",
+        "workspace_root",
+        "attached_writable_roots",
+        "read_only_runtime_roots",
+        "writable_roots",
+        "requested_writable_roots",
+        "requested_read_only_runtime_roots",
     ])
 }
 

@@ -69,40 +69,37 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
     assert!(lines[6].contains("\"content\":\"user: hello skeleton\""));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
-fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
+fn agent_shell_isolates_parent_controls_or_fails_closed() {
+    assert_agent_shell_isolation(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a Linux host with an enforceable Bubblewrap profile"]
+fn linux_host_enforces_agent_shell_isolation() {
+    assert_agent_shell_isolation(true);
+}
+
+#[cfg(target_os = "linux")]
+fn assert_agent_shell_isolation(require_enforced: bool) {
     let exe = env!("CARGO_BIN_EXE_euler");
     let user_home = isolated_home();
     let outer_euler_home = tempfile::tempdir().expect("outer Euler home");
     let workspace = tempfile::tempdir().expect("workspace");
-    let extension_dir = tempfile::tempdir().expect("extension dir");
-    write_extension_manifest(extension_dir.path(), "default-only-extension", "0.1.0");
-
-    let linked = command_with_home(exe, &user_home)
-        .env_remove("EULER_HOME")
-        .args(["extension", "link", path_str(extension_dir.path())])
-        .output()
-        .expect("link extension in default home");
-    assert!(
-        linked.status.success(),
-        "link stderr: {}",
-        String::from_utf8_lossy(&linked.stderr)
-    );
-    let default_list = command_with_home(exe, &user_home)
-        .env_remove("EULER_HOME")
-        .args(["extension", "list"])
-        .output()
-        .expect("list default-home extensions");
-    assert!(
-        default_list.status.success(),
-        "default list stderr: {}",
-        String::from_utf8_lossy(&default_list.stderr)
-    );
-    assert!(String::from_utf8_lossy(&default_list.stdout).contains("default-only-extension"));
+    let command_marker = workspace.path().join("agent-command-ran");
+    let host_home_marker = user_home.path().join(".euler/host-home-marker");
+    std::fs::create_dir_all(host_home_marker.parent().expect("marker parent"))
+        .expect("host Euler home");
+    std::fs::write(&host_home_marker, "must stay hidden").expect("host marker");
 
     let nested_command = format!(
-        "printf 'rust-log=%s\\nchild-home=%s\\n' \"$RUST_LOG\" \"$EULER_HOME\"; {} extension list",
-        shell_quote(exe)
+        "printf ran > {}; \
+         printf 'rust-log=%s\\nhome=%s\\neuler-home=%s\\n' \"$RUST_LOG\" \"$HOME\" \"$EULER_HOME\"; \
+         if test -e {}; then printf 'host-home-visible\\n'; fi",
+        shell_quote(path_str(&command_marker)),
+        shell_quote(path_str(&host_home_marker))
     );
     let script = write_fixture_script(
         workspace.path(),
@@ -158,26 +155,75 @@ fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
     );
 
     let events = read_jsonl(&log);
-    let tool_output = events
+    let tool_call = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .unwrap_or_else(|| panic!("run_shell tool call; events: {events:#?}"));
+    let enforcement = tool_call
+        .payload
+        .get("workspace_authority")
+        .and_then(|authority| authority.get("enforcement"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("workspace enforcement posture; event: {tool_call:#?}"));
+    let tool_result = events
         .iter()
         .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
-        .and_then(|event| event.payload.get("output"))
+        .unwrap_or_else(|| panic!("run_shell tool result; events: {events:#?}"));
+    if enforcement == "unavailable" {
+        assert_eq!(
+            tool_result.payload.get("ok"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(tool_result.payload.get("output").is_none());
+        let error = tool_result
+            .payload
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .expect("concise sandbox error");
+        assert!(
+            [
+                euler_core::SandboxUnavailableReason::BubblewrapMissing,
+                euler_core::SandboxUnavailableReason::CannotEnforce,
+                euler_core::SandboxUnavailableReason::AuthorityInspectionFailed,
+                euler_core::SandboxUnavailableReason::UnsafeSpecialNode,
+                euler_core::SandboxUnavailableReason::UnsafeMountTopology,
+            ]
+            .iter()
+            .any(|reason| reason.message() == error),
+            "unexpected workspace sandbox error: {error}"
+        );
+        assert!(
+            !command_marker.exists(),
+            "unavailable authority must not fall back to host execution"
+        );
+        assert!(
+            !require_enforced,
+            "Linux enforcement fixture was unavailable: {error}"
+        );
+        return;
+    }
+    assert_eq!(enforcement, "available");
+    let tool_output = tool_result
+        .payload
+        .get("output")
         .and_then(serde_json::Value::as_str)
-        .expect("nested Euler tool output");
-    assert!(tool_output.contains("rust-log=project_under_test=trace"));
-    assert!(!tool_output.contains("default-only-extension"));
+        .unwrap_or_else(|| panic!("nested Euler tool output; events: {events:#?}"));
+    assert_eq!(
+        std::fs::read_to_string(&command_marker).expect("agent command marker"),
+        "ran"
+    );
+    assert!(tool_output.contains("rust-log=\n"));
+    assert!(tool_output.contains("euler-home=\n"));
+    assert!(!tool_output.contains("host-home-visible"));
     let child_home = tool_output
         .lines()
-        .find_map(|line| line.strip_prefix("child-home="))
+        .find_map(|line| line.strip_prefix("home="))
         .map(PathBuf::from)
-        .expect("isolated child Euler home");
+        .expect("private child home");
     assert!(child_home.is_absolute());
+    assert_eq!(child_home, PathBuf::from("/tmp/home"));
     assert_ne!(child_home, outer_euler_home.path());
     assert_ne!(child_home, user_home.path().join(".euler"));
-    assert!(
-        !child_home.exists(),
-        "temporary child home should be removed"
-    );
 }
 
 #[test]
@@ -804,7 +850,11 @@ fn exec_streams_events_before_a_blocking_tool_completes() {
 
     let mut streamed = false;
     loop {
-        match rx.recv_timeout(Duration::from_secs(15)) {
+        // Enforced workspace preflight can contend with the other process-level
+        // fixtures in a parallel nextest run. The synchronization remains the
+        // tool-call line itself; this bound only prevents a broken child from
+        // hanging the suite forever.
+        match rx.recv_timeout(Duration::from_secs(60)) {
             Ok(line) if line.contains("tool.call: run_shell") => {
                 streamed = true;
                 break;
@@ -5561,6 +5611,31 @@ fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
     tui.quit();
 
     let final_state = pty_final_state_text(&tui.output, 24, 80);
+    if let Some(reason) = rendered_sandbox_unavailable_reason(&final_state) {
+        let failed_blocks = final_state
+            .lines()
+            .filter(|line| line.contains("• Ran … · ✗"))
+            .count();
+        assert_eq!(
+            failed_blocks, 3,
+            "all three approved calls must fail closed as distinct blocks ({reason}):\n{final_state}"
+        );
+        assert_eq!(
+            final_state
+                .lines()
+                .filter(|line| line.contains("allowed for session"))
+                .count(),
+            1,
+            "the permission decision must still commit exactly once:\n{final_state}"
+        );
+        for output in ["alpha-one", "beta-two", "gamma-three"] {
+            assert!(
+                !final_state.contains(output),
+                "failed-closed shell output `{output}` must not appear:\n{final_state}"
+            );
+        }
+        return;
+    }
     let mut failures = Vec::new();
     for cmd in ["printf alpha-one", "printf beta-two", "printf gamma-three"] {
         let headers = final_state
@@ -5976,11 +6051,18 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
         "turn did not finish:\n{}",
         tui.screen_text()
     );
-    assert!(
-        tui.wait_for_screen("25 more lines · ctrl+o expand"),
-        "fold affordance missing:\n{}",
-        tui.screen_text()
-    );
+    if !tui.wait_for_screen("25 more lines · ctrl+o expand") {
+        let screen = tui.screen_text();
+        let Some(reason) = rendered_sandbox_unavailable_reason(&screen) else {
+            panic!("fold affordance missing:\n{screen}");
+        };
+        assert!(
+            !screen.contains("tool-line-15"),
+            "an unavailable sandbox must not expose command output ({reason}):\n{screen}"
+        );
+        tui.quit();
+        return;
+    }
 
     // Expand (replay 1): hidden middle output rows become visible.
     tui.write("\x0f");
@@ -6041,6 +6123,23 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
         "fold-toggle replays corrupted history:\n{}\nFinal emulator state:\n{state}",
         failures.join("\n")
     );
+}
+
+fn rendered_sandbox_unavailable_reason(rendered: &str) -> Option<&'static str> {
+    [
+        euler_core::SandboxUnavailableReason::UnsupportedPlatform,
+        euler_core::SandboxUnavailableReason::BubblewrapMissing,
+        euler_core::SandboxUnavailableReason::CannotEnforce,
+        euler_core::SandboxUnavailableReason::InvalidWorkspace,
+        euler_core::SandboxUnavailableReason::InvalidWritableRoots,
+        euler_core::SandboxUnavailableReason::InvalidRuntimeRoots,
+        euler_core::SandboxUnavailableReason::AuthorityInspectionFailed,
+        euler_core::SandboxUnavailableReason::UnsafeSpecialNode,
+        euler_core::SandboxUnavailableReason::UnsafeMountTopology,
+    ]
+    .into_iter()
+    .map(euler_core::SandboxUnavailableReason::message)
+    .find(|reason| rendered.contains(reason))
 }
 
 #[test]
@@ -7903,6 +8002,7 @@ fn path_str(path: &Path) -> &str {
     path.to_str().expect("utf8 path")
 }
 
+#[cfg(target_os = "linux")]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -8324,6 +8424,82 @@ fn exec_resume_relocation_requires_accept_relocation_flag() {
             .any(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_RELOCATED),
         "an accepted relocation must record a durable project.context.relocated event"
     );
+}
+
+#[test]
+fn accepted_relocation_cannot_append_before_workspace_authority_preflight() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let temp = tempfile::tempdir().expect("temp");
+    let workspace_a = temp.path().join("a");
+    let workspace_b = temp.path().join("b");
+    let attached = temp.path().join("attached");
+    std::fs::create_dir_all(&workspace_a).expect("a");
+    std::fs::create_dir_all(&workspace_b).expect("b");
+    std::fs::create_dir_all(&attached).expect("attached");
+    let log = temp.path().join("session-authority.jsonl");
+    let script = write_fixture_script(
+        temp.path(),
+        "reloc-authority.json",
+        &serde_json::json!({
+            "version": 1,
+            "responses": [{"events": [
+                {"text_delta": "ok"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}]
+        })
+        .to_string(),
+    );
+    let script_option = format!("event-script={}", path_str(&script));
+    let create = command_with_home(exe, &home)
+        .current_dir(&workspace_a)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--provenance",
+            path_str(&log),
+            "--writable-root",
+            path_str(&attached),
+            "--auto-approve",
+            "read-only",
+            "first prompt",
+        ])
+        .output()
+        .expect("create session");
+    assert!(
+        create.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    let before = std::fs::read(&log).expect("accepted prefix bytes");
+
+    // Omitting the launch-owned attachment is an authority mismatch. Even an
+    // explicit relocation yes cannot append before that mismatch is rejected.
+    let resumed = command_with_home(exe, &home)
+        .current_dir(&workspace_b)
+        .args([
+            "exec",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &script_option,
+            "--resume",
+            path_str(&log),
+            "--accept-relocation",
+            "--auto-approve",
+            "read-only",
+            "second prompt",
+        ])
+        .output()
+        .expect("resume with mismatched authority");
+
+    assert!(!resumed.status.success());
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(stderr.contains("workspace authority changed"), "{stderr}");
+    assert_eq!(std::fs::read(&log).expect("unchanged prefix bytes"), before);
 }
 
 /// The relocation-consent card (ADR 0017 phase 3) is presented before a

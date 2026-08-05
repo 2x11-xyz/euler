@@ -1,8 +1,9 @@
-use crate::sandbox::WorkspaceSandbox;
+use crate::sandbox::{StructuredPathAuthority, WorkspaceSandbox};
 use crate::{
     apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
-    ApplyPatchDocument, ApplyPatchError, ObservedFileChange, SandboxAvailability,
-    SandboxUnavailableReason, SubprocessSandbox,
+    recapture_workspace_snapshot, validate_workspace_snapshot_hardlinks, ApplyPatchDocument,
+    ApplyPatchError, ObservedFileChange, SandboxAvailability, SandboxUnavailableReason,
+    SubprocessSandbox, WorkspaceSnapshot, WorkspaceSnapshotError,
 };
 use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use euler_provider::ToolDefinition;
@@ -12,9 +13,9 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 use thiserror::Error;
 
 /// Rung-2 escalation threshold (issue #94): the first failure of a
@@ -28,7 +29,7 @@ const RETEACH_AFTER_CONSECUTIVE_FAILURES: u32 = 2;
 /// in tools_test.rs runs each `*** Begin Patch` block through the real
 /// parser so this text can never drift into syntax the parser rejects.
 const APPLY_PATCH_RETEACH: &str = r#"apply_patch full format specification:
-A patch is one envelope that adds or updates exactly one file. Paths are relative to the workspace root; delete and rename are not supported. Send one patch per file.
+A patch is one envelope that adds or updates exactly one file. Paths are relative to the primary workspace root, or canonical absolute paths inside a root explicitly listed by the tool description; delete and rename are not supported. Send one patch per file.
 
 Add a new file (every content line starts with `+`):
 *** Begin Patch
@@ -60,7 +61,7 @@ pub enum ToolError {
     MissingField(&'static str),
     #[error("invalid field `{0}`")]
     InvalidField(&'static str),
-    #[error("path `{path}` is outside the workspace root ({reason}); paths must be relative and stay inside the workspace root")]
+    #[error("path `{path}` is outside workspace authority ({reason}); use a relative primary-workspace path or an absolute path inside an attached writable root")]
     PathOutsideWorkspace { path: String, reason: &'static str },
     #[error("invalid patch: {0}")]
     InvalidPatch(&'static str),
@@ -68,6 +69,8 @@ pub enum ToolError {
     FileAlreadyExists,
     #[error("parent directory does not exist")]
     ParentDirectoryMissing,
+    #[error("structured file tool path `{path}` is not a regular file")]
+    UnsupportedFileType { path: String },
     #[error("unsupported tool `{0}`")]
     Unsupported(String),
     #[error("replacement text matched {0} times; expected exactly one")]
@@ -78,6 +81,30 @@ pub enum ToolError {
     UpdateHunkOverlap { hunk: usize, previous_hunk: usize },
     #[error("{0}")]
     SandboxUnavailable(SandboxUnavailableReason),
+    #[error(
+        "agent subprocesses require Euler's enforced workspace sandbox; host execution is not an authority boundary"
+    )]
+    WorkspaceAuthorityRequired,
+    #[error("workspace observation was incomplete {phase} the command ({reason}); {consequence}")]
+    WorkspaceObservationIncomplete {
+        phase: &'static str,
+        reason: WorkspaceSnapshotError,
+        consequence: &'static str,
+    },
+    #[error("workspace observation was incomplete {phase} ({reason}); {consequence}")]
+    StructuredWriteObservationIncomplete {
+        phase: &'static str,
+        reason: WorkspaceSnapshotError,
+        consequence: &'static str,
+    },
+    #[error(
+        "structured file tools reject multiply-linked files because an alias may be outside workspace authority; use run_shell only when every alias is inside attached writable roots"
+    )]
+    HardlinkedStructuredFile,
+    #[error(
+        "file changed after the structured write was prepared; inspect it and prepare a new edit"
+    )]
+    StalePreparedWrite,
     #[error("tool cancelled")]
     Cancelled,
     #[error(transparent)]
@@ -97,8 +124,52 @@ pub struct ToolExecution {
     /// rehydration must preserve it so child policy cannot be bypassed.
     pub project_context_snapshot_digest: Option<String>,
     pub exit_code: Option<i32>,
+    pub(crate) failure: Option<ToolExecutionFailure>,
     pub patch: Option<PatchEvents>,
     pub file_changes: Vec<ObservedFileChange>,
+}
+
+/// A completed executor can still own a failed tool operation without a
+/// normal process exit. Preserve that distinction until the canonical
+/// `tool.result` payload is built instead of reverse-engineering a sentinel
+/// exit code or human-readable output.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ToolExecutionFailure {
+    TimedOut { timeout_ms: u64 },
+    Signaled { signal: i32 },
+    AbnormalTermination,
+    SupervisionFailed,
+    WorkspaceMutation { tool_name: String },
+}
+
+impl ToolExecutionFailure {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::TimedOut { .. } => "timeout",
+            Self::Signaled { .. } => "signal",
+            Self::AbnormalTermination => "abnormal-termination",
+            Self::SupervisionFailed => "supervision-failed",
+            Self::WorkspaceMutation { .. } => "workspace-mutation",
+        }
+    }
+
+    pub(crate) fn error(&self) -> String {
+        match self {
+            Self::TimedOut { timeout_ms } => {
+                format!("command timed out after {timeout_ms} ms and its process group was killed")
+            }
+            Self::Signaled { signal } => format!("command terminated by signal {signal}"),
+            Self::AbnormalTermination => {
+                "command terminated abnormally without an exit code".to_owned()
+            }
+            Self::SupervisionFailed => {
+                "command supervision failed after launch; its process group was killed".to_owned()
+            }
+            Self::WorkspaceMutation { tool_name } => format!(
+                "workspace mutation was observed during {tool_name}; the Git view was invalidated"
+            ),
+        }
+    }
 }
 
 /// Result of a tool invocation that was admitted before cancellation.
@@ -111,6 +182,21 @@ pub struct ToolExecution {
 pub(crate) enum ToolExecutionOutcome {
     Completed(ToolExecution),
     Cancelled(ToolExecution),
+}
+
+#[derive(Debug)]
+pub(crate) struct StructuredWriteFailure {
+    pub(crate) error: ToolError,
+    pub(crate) file_changes: Vec<ObservedFileChange>,
+}
+
+impl StructuredWriteFailure {
+    fn without_change(error: ToolError) -> Self {
+        Self {
+            error,
+            file_changes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -129,6 +215,7 @@ pub struct OutputPreviewBudget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PatchEvents {
+    pub(crate) workspace_root: PathBuf,
     pub path: String,
     pub before: String,
     pub after: String,
@@ -176,8 +263,12 @@ impl ReteachTracker {
 #[derive(Debug)]
 pub struct ToolRegistry {
     root: PathBuf,
+    attached_writable_roots: Vec<PathBuf>,
+    runtime_roots: Vec<PathBuf>,
+    writable_authority_error: Option<SandboxUnavailableReason>,
+    runtime_authority_error: Option<SandboxUnavailableReason>,
+    structured_path_authority: StructuredPathAuthority,
     workspace_sandbox: Option<WorkspaceSandbox>,
-    agent_euler_home: OnceLock<tempfile::TempDir>,
     skills: BTreeMap<String, FrozenSkill>,
 }
 
@@ -196,26 +287,64 @@ pub struct FrozenSkill {
 
 impl ToolRegistry {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self::with_subprocess_sandbox(root, SubprocessSandbox::Disabled)
+        Self::with_subprocess_sandbox(root, SubprocessSandbox::default())
     }
 
-    /// Build a registry whose agent-controlled subprocesses either execute
-    /// normally or must use the supplied workspace profile. An unavailable
-    /// selected profile is retained so execution can fail closed with a
-    /// concise diagnostic rather than silently falling back to the host.
+    /// Build a registry whose agent-controlled subprocesses are either blocked
+    /// or must use the supplied workspace profile. An unavailable selected
+    /// profile is retained so execution can fail closed with a concise
+    /// diagnostic rather than silently falling back to the host.
     pub fn with_subprocess_sandbox(
         root: impl Into<PathBuf>,
         subprocess_sandbox: SubprocessSandbox,
     ) -> Self {
-        let root = root.into();
+        Self::with_workspace_authority(root, Vec::new(), Vec::new(), subprocess_sandbox)
+    }
+
+    /// Build a registry with an explicit set of additional writable roots.
+    /// Additional roots are usable by agent subprocesses only with an
+    /// enforced OS sandbox; a disabled configuration blocks subprocess tools
+    /// with a stable error.
+    pub fn with_workspace_authority(
+        root: impl Into<PathBuf>,
+        attached_writable_roots: Vec<PathBuf>,
+        runtime_roots: Vec<PathBuf>,
+        subprocess_sandbox: SubprocessSandbox,
+    ) -> Self {
+        let requested_root = root.into();
         let workspace_sandbox = match subprocess_sandbox {
             SubprocessSandbox::Disabled => None,
-            SubprocessSandbox::Enforce(profile) => Some(WorkspaceSandbox::new(&root, profile)),
+            SubprocessSandbox::Enforce(profile) => Some(WorkspaceSandbox::new(
+                &requested_root,
+                &attached_writable_roots,
+                &runtime_roots,
+                profile,
+            )),
         };
+        let (
+            root,
+            attached_writable_roots,
+            runtime_roots,
+            writable_authority_error,
+            runtime_authority_error,
+        ) = canonical_authority_configuration(
+            requested_root,
+            attached_writable_roots,
+            runtime_roots,
+        );
+        let structured_path_authority = StructuredPathAuthority::new(
+            std::iter::once(root.clone())
+                .chain(attached_writable_roots.iter().cloned())
+                .collect(),
+        );
         Self {
             root,
+            attached_writable_roots,
+            runtime_roots,
+            writable_authority_error,
+            runtime_authority_error,
+            structured_path_authority,
             workspace_sandbox,
-            agent_euler_home: OnceLock::new(),
             skills: BTreeMap::new(),
         }
     }
@@ -234,20 +363,76 @@ impl ToolRegistry {
         &self.root
     }
 
+    pub fn attached_writable_roots(&self) -> &[PathBuf] {
+        &self.attached_writable_roots
+    }
+
+    pub fn runtime_roots(&self) -> &[PathBuf] {
+        &self.runtime_roots
+    }
+
+    /// Host-derived provenance for an agent-controlled subprocess call. This
+    /// states the real execution envelope; it never treats cwd or requested
+    /// paths as proof of confinement.
+    pub(crate) fn workspace_authority_payload(&self) -> Value {
+        let configured = self.configured_authority_roots().ok();
+        let requested_writable_roots = configured
+            .as_ref()
+            .map(|(writable, _)| display_roots(writable));
+        let requested_runtime_roots = configured
+            .as_ref()
+            .map(|(_, runtime)| display_roots(runtime));
+        match &self.workspace_sandbox {
+            Some(sandbox) => {
+                let enforced = sandbox.availability().is_enforced();
+                let selected_writable_roots =
+                    enforced.then(|| display_roots(sandbox.writable_roots()));
+                let selected_read_only_roots =
+                    enforced.then(|| display_roots(&sandbox.read_only_mounts()));
+                json!({
+                    "mode": "enforced",
+                    "profile": sandbox.profile().as_str(),
+                    "enforcement": if enforced { "available" } else { "unavailable" },
+                    "writable_roots": selected_writable_roots,
+                    "read_only_runtime_roots": selected_read_only_roots,
+                    "requested_writable_roots": requested_writable_roots,
+                    "requested_read_only_runtime_roots": requested_runtime_roots,
+                })
+            }
+            None => json!({
+                "mode": "disabled",
+                "profile": null,
+                "enforcement": "disabled",
+                "writable_roots": Value::Null,
+                "read_only_runtime_roots": Value::Null,
+                "requested_writable_roots": requested_writable_roots,
+                "requested_read_only_runtime_roots": requested_runtime_roots,
+            }),
+        }
+    }
+
     /// The enforcement result for the selected profile, if subprocess
-    /// sandboxing was requested. `None` means ordinary host execution is the
-    /// configured posture.
+    /// sandboxing was requested. `None` means subprocess tools are blocked.
     pub fn sandbox_availability(&self) -> Option<SandboxAvailability> {
         self.workspace_sandbox
             .as_ref()
             .map(WorkspaceSandbox::availability)
     }
 
+    /// A cached enforcement result, if the configured profile has already
+    /// failed construction or completed its first-use probe. This never starts
+    /// an authority scan.
+    pub(crate) fn cached_sandbox_availability(&self) -> Option<SandboxAvailability> {
+        self.workspace_sandbox
+            .as_ref()
+            .and_then(WorkspaceSandbox::cached_availability)
+    }
+
     pub fn required_capability(&self, name: &str) -> Option<Capability> {
         match name {
-            "read_file" | "git_status" | "git_diff" | "tool_result_get" => Some(Capability::FsRead),
+            "read_file" | "tool_result_get" => Some(Capability::FsRead),
             "edit_file" | "write_file" | "apply_patch" => Some(Capability::FsWrite),
-            "run_shell" => Some(Capability::ShellExec),
+            "run_shell" | "git_status" | "git_diff" => Some(Capability::ShellExec),
             // Session-level review gate (tools contract): executed by the
             // session, not this registry, but gated here like every tool.
             "code_swarm_review" => Some(Capability::AgentSpawn),
@@ -340,8 +525,34 @@ impl ToolRegistry {
             "write_file" => self.write_file(input),
             "apply_patch" => self.apply_patch_tool(input),
             "run_shell" => return self.run_shell(input, cancellation),
-            "git_status" => return self.git(&["status", "--short"], "git_status", cancellation),
-            "git_diff" => return self.git(&["diff", "--"], "git_diff", cancellation),
+            "git_status" => {
+                return self.git(
+                    &[
+                        "--no-optional-locks",
+                        "-c",
+                        "core.fsmonitor=false",
+                        "status",
+                        "--short",
+                    ],
+                    "git_status",
+                    cancellation,
+                )
+            }
+            "git_diff" => {
+                return self.git(
+                    &[
+                        "--no-optional-locks",
+                        "-c",
+                        "core.fsmonitor=false",
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--",
+                    ],
+                    "git_diff",
+                    cancellation,
+                )
+            }
             "tool_result_get" => Err(ToolError::InvalidField(
                 "tool_result_get requires session events",
             )),
@@ -428,7 +639,7 @@ impl ToolRegistry {
     }
 
     pub fn model_tools(&self) -> Vec<ToolDefinition> {
-        let mut tools = coding_tool_definitions();
+        let mut tools = coding_tool_definitions(&self.canonical_attached_writable_roots());
         tools.push(tool_result_get_definition());
         if !self.skills.is_empty() {
             tools.push(skill_read_definition());
@@ -441,7 +652,7 @@ impl ToolRegistry {
     /// reach them; only the root driver (or an `inherit` child, once that
     /// lands) is eligible (docs/contracts/project-context.md).
     pub fn child_model_tools(&self) -> Vec<ToolDefinition> {
-        let mut tools = coding_tool_definitions();
+        let mut tools = coding_tool_definitions(&self.canonical_attached_writable_roots());
         tools.push(tool_result_get_definition());
         tools
     }
@@ -464,17 +675,18 @@ impl ToolRegistry {
             output_preview_budget: None,
             project_context_snapshot_digest: Some(skill.snapshot_digest.clone()),
             exit_code: None,
+            failure: None,
             patch: None,
             file_changes: Vec::new(),
         })
     }
 
     fn read_file(&self, input: &Value) -> Result<ToolExecution, ToolError> {
-        let path = self.resolve_path(required_str(input, "path")?)?;
+        let path = self.resolve_workspace_path(required_str(input, "path")?, false)?;
         let offset = optional_positive_usize(input, "offset")?.unwrap_or(1);
         let max_bytes = optional_positive_usize(input, "max_bytes")?.unwrap_or(DEFAULT_MAX_BYTES);
         let max_lines = optional_positive_usize(input, "max_lines")?.unwrap_or(DEFAULT_MAX_LINES);
-        let content = fs::read_to_string(path)?;
+        let content = self.read_resolved_file(&path)?;
         let output = bound_read_file_window(&content, offset, max_bytes, max_lines);
         Ok(ToolExecution {
             name: "read_file".to_owned(),
@@ -482,6 +694,7 @@ impl ToolRegistry {
             output_preview_budget: None,
             project_context_snapshot_digest: None,
             exit_code: None,
+            failure: None,
             patch: None,
             file_changes: Vec::new(),
         })
@@ -494,8 +707,9 @@ impl ToolRegistry {
         if old.is_empty() {
             return self.prepare_create(relative, new, "edit_file");
         }
-        let path = self.resolve_path(relative)?;
-        let content = fs::read_to_string(&path)?;
+        let path = self.resolve_workspace_path(relative, false)?;
+        self.ensure_writable_path(&path)?;
+        let content = self.read_resolved_file(&path)?;
         let count = overlapping_match_count(&content, old);
         if count != 1 {
             return Err(ToolError::ReplacementMatchCount(count));
@@ -510,8 +724,10 @@ impl ToolRegistry {
             output_preview_budget: None,
             project_context_snapshot_digest: None,
             exit_code: None,
+            failure: None,
             patch: Some(PatchEvents {
-                path: relative.to_owned(),
+                workspace_root: path.workspace_root,
+                path: path.relative,
                 // Full file contents, not the matched snippets: downstream
                 // diff projections derive line numbers from these.
                 before: content,
@@ -522,7 +738,7 @@ impl ToolRegistry {
                 after_sha256: after_sha,
                 before_byte_len: before_bytes_len,
                 after_byte_len: updated.len(),
-                write_path: path,
+                write_path: path.absolute,
                 write_content: updated,
             }),
             file_changes: Vec::new(),
@@ -545,8 +761,9 @@ impl ToolRegistry {
         content: &str,
         origin: &'static str,
     ) -> Result<ToolExecution, ToolError> {
-        let path = self.resolve_create_path(relative)?;
-        if path.exists() {
+        let path = self.resolve_workspace_path(relative, true)?;
+        self.ensure_writable_path(&path)?;
+        if path.absolute.exists() {
             return Err(ToolError::FileAlreadyExists);
         }
         Ok(ToolExecution {
@@ -555,8 +772,10 @@ impl ToolRegistry {
             output_preview_budget: None,
             project_context_snapshot_digest: None,
             exit_code: None,
+            failure: None,
             patch: Some(PatchEvents {
-                path: relative.to_owned(),
+                workspace_root: path.workspace_root,
+                path: path.relative,
                 before: String::new(),
                 after: content.to_owned(),
                 origin,
@@ -565,7 +784,7 @@ impl ToolRegistry {
                 after_sha256: hash_bytes(content.as_bytes()),
                 before_byte_len: 0,
                 after_byte_len: content.len(),
-                write_path: path,
+                write_path: path.absolute,
                 write_content: content.to_owned(),
             }),
             file_changes: Vec::new(),
@@ -589,8 +808,9 @@ impl ToolRegistry {
         };
         match parse_single_file_apply_patch(patch).map_err(tool_error_from_apply_patch)? {
             ApplyPatchDocument::Add { path, content } => {
-                let write_path = self.resolve_create_path(&path)?;
-                if write_path.exists() {
+                let resolved = self.resolve_workspace_path(&path, true)?;
+                self.ensure_writable_path(&resolved)?;
+                if resolved.absolute.exists() {
                     return Err(ToolError::FileAlreadyExists);
                 }
                 Ok(ToolExecution {
@@ -599,8 +819,10 @@ impl ToolRegistry {
                     output_preview_budget: None,
                     project_context_snapshot_digest: None,
                     exit_code: None,
+                    failure: None,
                     patch: Some(PatchEvents {
-                        path,
+                        workspace_root: resolved.workspace_root,
+                        path: resolved.relative,
                         before: String::new(),
                         after_sha256: hash_bytes(content.as_bytes()),
                         after_byte_len: content.len(),
@@ -609,15 +831,16 @@ impl ToolRegistry {
                         action: "add",
                         before_sha256: None,
                         before_byte_len: 0,
-                        write_path,
+                        write_path: resolved.absolute,
                         write_content: content,
                     }),
                     file_changes: Vec::new(),
                 })
             }
             ApplyPatchDocument::Update { path, chunks } => {
-                let write_path = self.resolve_path(&path)?;
-                let content = fs::read_to_string(&write_path)?;
+                let resolved = self.resolve_workspace_path(&path, false)?;
+                self.ensure_writable_path(&resolved)?;
+                let content = self.read_resolved_file(&resolved)?;
                 let updated = apply_patch_update_chunks(&content, &chunks)
                     .map_err(tool_error_from_apply_patch)?;
                 Ok(ToolExecution {
@@ -626,8 +849,10 @@ impl ToolRegistry {
                     output_preview_budget: None,
                     project_context_snapshot_digest: None,
                     exit_code: None,
+                    failure: None,
                     patch: Some(PatchEvents {
-                        path,
+                        workspace_root: resolved.workspace_root,
+                        path: resolved.relative,
                         before_sha256: Some(hash_bytes(content.as_bytes())),
                         after_sha256: hash_bytes(updated.as_bytes()),
                         before_byte_len: content.len(),
@@ -639,7 +864,7 @@ impl ToolRegistry {
                         after: updated.clone(),
                         origin,
                         action: "modify",
-                        write_path,
+                        write_path: resolved.absolute,
                         write_content: updated,
                     }),
                     file_changes: Vec::new(),
@@ -657,21 +882,128 @@ impl ToolRegistry {
         patch: &PatchEvents,
         cancellation: &CancellationToken,
     ) -> Result<(), ToolError> {
+        self.apply_patch_cancellable_observed(patch, cancellation)
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn apply_patch_cancellable_observed(
+        &self,
+        patch: &PatchEvents,
+        cancellation: &CancellationToken,
+    ) -> Result<(), StructuredWriteFailure> {
         // This is the final check before the filesystem mutation. Patch
         // parsing, permission review, and `patch.proposed` emission may all
         // have taken time during which the user pressed Esc.
         if cancellation.is_cancelled() {
-            return Err(ToolError::Cancelled);
+            return Err(StructuredWriteFailure::without_change(ToolError::Cancelled));
         }
-        fs::write(&patch.write_path, &patch.write_content)?;
+        let supplied = patch.workspace_root.join(&patch.path);
+        let resolved = self
+            .resolve_workspace_path_inner(&supplied.to_string_lossy(), patch.action == "add", true)
+            .map_err(StructuredWriteFailure::without_change)?;
+        self.ensure_writable_path(&resolved)
+            .map_err(StructuredWriteFailure::without_change)?;
+        if patch.action == "add" && resolved.absolute.exists() {
+            return Err(StructuredWriteFailure::without_change(
+                ToolError::FileAlreadyExists,
+            ));
+        }
+        if resolved.workspace_root != patch.workspace_root || resolved.absolute != patch.write_path
+        {
+            return Err(StructuredWriteFailure::without_change(
+                ToolError::PathOutsideWorkspace {
+                    path: display_path(&supplied.to_string_lossy()),
+                    reason: "path resolution changed after the write was prepared",
+                },
+            ));
+        }
+        if patch.action == "modify" {
+            let prepared_sha256 = hash_bytes(patch.before.as_bytes());
+            if patch.before_byte_len != patch.before.len()
+                || patch.before_sha256.as_deref() != Some(prepared_sha256.as_str())
+            {
+                return Err(StructuredWriteFailure::without_change(
+                    ToolError::StalePreparedWrite,
+                ));
+            }
+        }
+        let expected_before = (patch.action == "modify").then_some(patch.before.as_str());
+        self.write_resolved_file_observed(
+            &resolved,
+            &patch.write_content,
+            patch.action == "add",
+            expected_before,
+        )?;
         Ok(())
     }
 
     /// Write UTF-8 content to a workspace-relative path (used by `/rollback`).
     pub fn write_workspace_file(&self, relative: &str, content: &str) -> Result<(), ToolError> {
-        let path = self.resolve_path(relative)?;
-        fs::write(path, content)?;
+        let path = self.resolve_workspace_path(relative, false)?;
+        self.ensure_writable_path(&path)?;
+        self.write_resolved_file(&path, content, false, None)?;
         Ok(())
+    }
+
+    /// Restore a checkpoint into the exact writable root recorded by the
+    /// originating file event. The root itself must still be in this
+    /// session's explicit authority set.
+    pub fn write_workspace_file_at(
+        &self,
+        workspace_root: &Path,
+        relative: &str,
+        content: &str,
+    ) -> Result<(), ToolError> {
+        self.write_workspace_file_at_observed(workspace_root, relative, content)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Restore one checkpoint while retaining any mutation observed if the
+    /// structured write fails after opening its target.
+    pub(crate) fn write_workspace_file_at_observed(
+        &self,
+        workspace_root: &Path,
+        relative: &str,
+        content: &str,
+    ) -> Result<(), StructuredWriteFailure> {
+        let workspace_root = self
+            .canonical_writable_root_selector(workspace_root)
+            .map_err(StructuredWriteFailure::without_change)?;
+        let supplied = workspace_root.join(relative);
+        let path = self
+            .resolve_workspace_path_inner(&supplied.to_string_lossy(), false, true)
+            .map_err(StructuredWriteFailure::without_change)?;
+        if path.workspace_root != workspace_root {
+            return Err(StructuredWriteFailure::without_change(
+                ToolError::PathOutsideWorkspace {
+                    path: display_path(&supplied.to_string_lossy()),
+                    reason: "checkpoint root is not attached to this session",
+                },
+            ));
+        }
+        self.ensure_writable_path(&path)
+            .map_err(StructuredWriteFailure::without_change)?;
+        self.write_resolved_file_observed(&path, content, false, None)?;
+        Ok(())
+    }
+
+    pub(crate) fn canonical_writable_root_selector(
+        &self,
+        supplied: &Path,
+    ) -> Result<PathBuf, ToolError> {
+        let canonical = supplied.canonicalize()?;
+        if self
+            .canonical_roots()
+            .map_err(ToolError::SandboxUnavailable)?
+            .contains(&canonical)
+        {
+            Ok(canonical)
+        } else {
+            Err(ToolError::PathOutsideWorkspace {
+                path: display_path(&supplied.to_string_lossy()),
+                reason: "checkpoint root is not attached to this session",
+            })
+        }
     }
 
     fn run_shell(
@@ -691,50 +1023,45 @@ impl ToolRegistry {
                 )
                 .map(ToolExecutionOutcome::Completed);
         }
-        let timeout_ms = match optional_positive_usize(input, "timeout_ms")? {
-            None => DEFAULT_SHELL_TIMEOUT_MS,
-            Some(value) => {
-                let value = value as u64;
-                if value > MAX_SHELL_TIMEOUT_MS {
-                    return Err(ToolError::InvalidField("timeout_ms"));
-                }
-                value
-            }
-        };
-        let before = capture_workspace_snapshot(&self.root).ok();
-        let child = self.agent_subprocess("sh", &["-c", command])?;
-        let sandboxed = child.sandboxed;
-        let outcome = run_process(child.command, Some(timeout_ms), cancellation)
-            .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
+        let timeout_ms = shell_timeout_ms(input)?;
+        if self.workspace_sandbox.is_none() {
+            return Err(ToolError::WorkspaceAuthorityRequired);
+        }
+        let before = self.capture_writable_root_snapshots()?;
+        let child = self.agent_subprocess(&before, "sh", &["-c", command])?;
+        let outcome = run_agent_process(child, Some(timeout_ms), cancellation)
+            .map_err(normalize_sandbox_subprocess_error)?;
+        let termination = outcome.termination;
         let text = collected_agent_output(
             outcome.stdout,
             outcome.stderr,
-            sandboxed,
             matches!(
-                outcome.termination,
-                ProcessTermination::TimedOut | ProcessTermination::Cancelled
+                termination,
+                ProcessTermination::TimedOut
+                    | ProcessTermination::Cancelled
+                    | ProcessTermination::Signaled { .. }
+                    | ProcessTermination::AbnormalTermination
+                    | ProcessTermination::SupervisionFailed
             ),
         )?;
-        let after = capture_workspace_snapshot(&self.root).ok();
+        let after = self.recapture_writable_root_snapshots(&before)?;
         let file_changes = before
-            .zip(after)
-            .map_or_else(Vec::new, |(before, after)| before.changes_to(&after));
-        let (status, header, cancelled) = match outcome.termination {
-            ProcessTermination::Exited(status) => (status, format!("exit {status}"), false),
-            ProcessTermination::TimedOut => (
-                -1,
-                format!(
-                    "exit -1 (command timed out after {timeout_ms} ms and was killed; \
-pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
-                ),
-                false,
-            ),
-            ProcessTermination::Cancelled => (
-                -1,
-                "exit -1 (command cancelled and process group killed)".to_owned(),
-                true,
-            ),
+            .iter()
+            .zip(&after)
+            .flat_map(|(before, after)| before.changes_to(after))
+            .collect();
+        let failure = match termination {
+            ProcessTermination::TimedOut => Some(ToolExecutionFailure::TimedOut { timeout_ms }),
+            ProcessTermination::Signaled { signal } => {
+                Some(ToolExecutionFailure::Signaled { signal })
+            }
+            ProcessTermination::AbnormalTermination => {
+                Some(ToolExecutionFailure::AbnormalTermination)
+            }
+            ProcessTermination::SupervisionFailed => Some(ToolExecutionFailure::SupervisionFailed),
+            ProcessTermination::Exited(_) | ProcessTermination::Cancelled => None,
         };
+        let (status, header, cancelled) = shell_termination(termination, timeout_ms);
         let output = format!("{header}\n{text}");
         let execution = ToolExecution {
             name: "run_shell".to_owned(),
@@ -745,6 +1072,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             }),
             project_context_snapshot_digest: None,
             exit_code: Some(status),
+            failure,
             patch: None,
             file_changes,
         };
@@ -761,28 +1089,83 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
         name: &str,
         cancellation: &CancellationToken,
     ) -> Result<ToolExecutionOutcome, ToolError> {
-        let child = self.agent_subprocess("git", args)?;
-        let sandboxed = child.sandboxed;
-        let outcome = run_process(child.command, None, cancellation)
-            .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
-        let cancelled = outcome.termination == ProcessTermination::Cancelled;
-        let text = collected_agent_output(outcome.stdout, outcome.stderr, sandboxed, cancelled)?;
-        let status = match outcome.termination {
+        let before = self.capture_writable_root_snapshots()?;
+        let child = self.agent_subprocess(&before, "git", args)?;
+        // Git views are shell-exec capability operations: repository config,
+        // attributes, and submodules can still select subprocess helpers. Keep
+        // the common read path inert and observe every writable root around the
+        // invocation rather than pretending that `git status` is intrinsically
+        // side-effect free.
+        let outcome = run_agent_process(child, None, cancellation)
+            .map_err(normalize_sandbox_subprocess_error)?;
+        let termination = outcome.termination;
+        let cancelled = termination == ProcessTermination::Cancelled;
+        let interrupted = matches!(
+            termination,
+            ProcessTermination::Cancelled
+                | ProcessTermination::Signaled { .. }
+                | ProcessTermination::AbnormalTermination
+                | ProcessTermination::SupervisionFailed
+        );
+        let text = collected_agent_output(outcome.stdout, outcome.stderr, interrupted)?;
+        let after = self.recapture_writable_root_snapshots(&before)?;
+        let file_changes = before
+            .iter()
+            .zip(&after)
+            .flat_map(|(before, after)| before.changes_to(after))
+            .collect::<Vec<_>>();
+        let mut status = match termination {
             ProcessTermination::Exited(status) => status,
-            ProcessTermination::Cancelled => -1,
+            ProcessTermination::Cancelled
+            | ProcessTermination::Signaled { .. }
+            | ProcessTermination::AbnormalTermination
+            | ProcessTermination::SupervisionFailed => -1,
             ProcessTermination::TimedOut => unreachable!("git has no timeout"),
+        };
+        let terminal_failure = match termination {
+            ProcessTermination::Signaled { signal } => {
+                Some(ToolExecutionFailure::Signaled { signal })
+            }
+            ProcessTermination::AbnormalTermination => {
+                Some(ToolExecutionFailure::AbnormalTermination)
+            }
+            ProcessTermination::SupervisionFailed => Some(ToolExecutionFailure::SupervisionFailed),
+            ProcessTermination::Exited(_) | ProcessTermination::Cancelled => None,
+            ProcessTermination::TimedOut => unreachable!("git has no timeout"),
+        };
+        let mut failure = terminal_failure.clone();
+        let output = if !file_changes.is_empty() {
+            status = -1;
+            failure = Some(ToolExecutionFailure::WorkspaceMutation {
+                tool_name: name.to_owned(),
+            });
+            let terminal_note = terminal_failure
+                .as_ref()
+                .map(|failure| format!(" {}.", failure.error()))
+                .unwrap_or_default();
+            format!(
+                "Euler observed workspace mutation during {name}; the read view failed and all observed changes were recorded.{terminal_note}\n{text}"
+            )
+        } else if let Some(failure) = &terminal_failure {
+            format!(
+                "{}; writable roots were observed after termination.",
+                failure.error()
+            )
+        } else {
+            text
         };
         let execution = ToolExecution {
             name: name.to_owned(),
-            output: text,
+            output,
             output_preview_budget: Some(OutputPreviewBudget {
                 max_bytes: DEFAULT_MAX_BYTES,
                 max_lines: DEFAULT_MAX_LINES,
             }),
             project_context_snapshot_digest: None,
             exit_code: Some(status),
+            failure,
             patch: None,
-            file_changes: Vec::new(),
+            file_changes,
         };
         Ok(if cancelled {
             ToolExecutionOutcome::Cancelled(execution)
@@ -793,48 +1176,95 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
 
     /// Construct the child process for an agent-controlled command. The
     /// sandbox branch deliberately receives no host `current_dir`: Bubblewrap
-    /// establishes `/workspace` inside its private mount namespace.
-    fn agent_subprocess(&self, program: &str, args: &[&str]) -> Result<AgentSubprocess, ToolError> {
-        let sandboxed = self.workspace_sandbox.is_some();
-        let mut child = match &self.workspace_sandbox {
-            Some(sandbox) => sandbox
-                .command(program, args)
-                .map_err(ToolError::SandboxUnavailable)?,
-            None => {
-                let mut command = Command::new(program);
-                command.args(args).current_dir(&self.root);
-                command
-            }
-        };
-        // Defense in depth: Bubblewrap clears this environment too, while
-        // ordinary host execution needs an explicit child-process boundary.
-        scrub_agent_subprocess_env(&mut child);
-        if !sandboxed {
-            child.env("EULER_HOME", self.agent_euler_home()?);
+    /// establishes the canonical primary root at its same absolute path inside
+    /// the private mount namespace and enters it before executing the command.
+    fn agent_subprocess(
+        &self,
+        before: &[WorkspaceSnapshot],
+        program: &str,
+        args: &[&str],
+    ) -> Result<AgentSubprocess, ToolError> {
+        if self.workspace_sandbox.is_none() {
+            return Err(ToolError::WorkspaceAuthorityRequired);
         }
+        let sandbox = self
+            .workspace_sandbox
+            .as_ref()
+            .ok_or(ToolError::WorkspaceAuthorityRequired)?;
+        let read_only_surfaces = before
+            .iter()
+            .flat_map(WorkspaceSnapshot::frozen_read_only_surfaces)
+            .cloned()
+            .collect::<Vec<_>>();
+        let sandboxed = sandbox
+            .command(&read_only_surfaces, program, args)
+            .map_err(ToolError::SandboxUnavailable)?;
+        let (mut command, stdout, stderr) = sandboxed.into_parts();
+        // Defense in depth: Bubblewrap already clears this environment before
+        // entering the agent command.
+        scrub_agent_subprocess_env(&mut command);
         Ok(AgentSubprocess {
-            command: child,
-            sandboxed,
+            command,
+            stdout,
+            stderr,
         })
     }
 
-    fn agent_euler_home(&self) -> Result<&Path, ToolError> {
-        if let Some(home) = self.agent_euler_home.get() {
-            return Ok(home.path());
-        }
-        let candidate = tempfile::Builder::new()
-            .prefix("euler-agent-home-")
-            .tempdir()?;
-        let _ = self.agent_euler_home.set(candidate);
-        Ok(self
-            .agent_euler_home
-            .get()
-            .expect("an initialized agent Euler home cannot disappear")
-            .path())
+    fn capture_writable_root_snapshots(&self) -> Result<Vec<WorkspaceSnapshot>, ToolError> {
+        let snapshots = self
+            .canonical_roots()
+            .map_err(ToolError::SandboxUnavailable)?
+            .iter()
+            .map(|root| {
+                capture_workspace_snapshot(root).map_err(|reason| {
+                    ToolError::WorkspaceObservationIncomplete {
+                        phase: "before",
+                        reason,
+                        consequence: "the command was not started",
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_workspace_snapshot_hardlinks(&snapshots).map_err(|reason| {
+            ToolError::WorkspaceObservationIncomplete {
+                phase: "before",
+                reason,
+                consequence: "the command was not started",
+            }
+        })?;
+        Ok(snapshots)
     }
 
-    fn resolve_path(&self, relative: &str) -> Result<PathBuf, ToolError> {
-        self.resolve_path_inner(relative, false)
+    fn recapture_writable_root_snapshots(
+        &self,
+        before: &[WorkspaceSnapshot],
+    ) -> Result<Vec<WorkspaceSnapshot>, ToolError> {
+        // Revalidate the frozen authority before observing post-command state,
+        // then preserve each pre-command snapshot's exact protected-surface
+        // set. Rediscovery would let a newly-created `.worktrees` subtree be
+        // mislabeled as read-only and skipped.
+        self.canonical_roots()
+            .map_err(ToolError::SandboxUnavailable)?;
+        let after = before
+            .iter()
+            .map(|snapshot| {
+                recapture_workspace_snapshot(snapshot).map_err(|reason| {
+                    ToolError::WorkspaceObservationIncomplete {
+                        phase: "after",
+                        reason,
+                        consequence: "the command ran and may have changed files; Euler will not claim a complete change set",
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_workspace_snapshot_hardlinks(&after).map_err(|reason| {
+            ToolError::WorkspaceObservationIncomplete {
+                phase: "after",
+                reason,
+                consequence: "the command ran and may have changed files; Euler will not claim a complete change set",
+            }
+        })?;
+        Ok(after)
     }
 
     /// Canonicalized workspace-relative form of a model-supplied path, for
@@ -842,38 +1272,55 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
     /// resolves them. `None` when the path cannot be resolved inside the
     /// workspace - scoped grant matching then fails closed to the ask path.
     pub fn workspace_relative_path(&self, relative: &str) -> Option<PathBuf> {
-        let canonical = self.resolve_path_inner(relative, false).ok()?;
-        let root = self.root.canonicalize().ok()?;
-        canonical.strip_prefix(&root).ok().map(Path::to_path_buf)
+        let resolved = self.resolve_workspace_path(relative, false).ok()?;
+        if self.canonical_roots().ok()?.first() == Some(&resolved.workspace_root) {
+            Some(PathBuf::from(resolved.relative))
+        } else {
+            // V0 grant patterns have no durable root identity. Returning an
+            // invented index would let a scoped grant drift when attachment
+            // order changes, so attached-root writes always stay on the ask
+            // path unless the user grants the whole fs-write capability.
+            None
+        }
     }
 
-    fn resolve_create_path(&self, relative: &str) -> Result<PathBuf, ToolError> {
-        self.resolve_path_inner(relative, true)
-    }
-
-    fn resolve_path_inner(
+    fn resolve_workspace_path(
         &self,
-        relative: &str,
+        supplied: &str,
         parent_must_be_directory: bool,
-    ) -> Result<PathBuf, ToolError> {
-        if relative.is_empty() {
+    ) -> Result<ResolvedWorkspacePath, ToolError> {
+        self.resolve_workspace_path_inner(supplied, parent_must_be_directory, false)
+    }
+
+    fn resolve_workspace_path_inner(
+        &self,
+        supplied: &str,
+        parent_must_be_directory: bool,
+        allow_primary_absolute: bool,
+    ) -> Result<ResolvedWorkspacePath, ToolError> {
+        if supplied.is_empty() {
             return Err(ToolError::InvalidField("path"));
         }
-        let path = Path::new(relative);
-        if path.is_absolute() {
-            return Err(ToolError::PathOutsideWorkspace {
-                path: display_path(relative),
-                reason: "absolute paths are not allowed",
-            });
-        }
-        let root = self.root.canonicalize()?;
-        let full = root.join(path);
+        let roots = self
+            .canonical_roots()
+            .map_err(ToolError::SandboxUnavailable)?;
+        let path = Path::new(supplied);
+        let full = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            roots
+                .first()
+                .ok_or(ToolError::SandboxUnavailable(
+                    SandboxUnavailableReason::InvalidWorkspace,
+                ))?
+                .join(path)
+        };
         let canonical = if full.exists() {
             full.canonicalize()?
         } else {
             if full.symlink_metadata().is_ok() {
                 return Err(ToolError::PathOutsideWorkspace {
-                    path: display_path(relative),
+                    path: display_path(supplied),
                     reason:
                         "path is a symlink whose target cannot be verified inside the workspace",
                 });
@@ -886,43 +1333,553 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             let file_name = full.file_name().ok_or(ToolError::InvalidField("path"))?;
             parent.join(file_name)
         };
-        if !canonical.starts_with(&root) {
+        let primary_root = roots.first().cloned();
+        let Some(workspace_root) = roots.into_iter().find(|root| canonical.starts_with(root))
+        else {
             return Err(ToolError::PathOutsideWorkspace {
-                path: display_path(relative),
-                reason: "path escapes the workspace root",
+                path: display_path(supplied),
+                reason: "path escapes every attached writable root",
+            });
+        };
+        if path.is_absolute()
+            && !allow_primary_absolute
+            && primary_root.as_ref() == Some(&workspace_root)
+        {
+            return Err(ToolError::PathOutsideWorkspace {
+                path: display_path(supplied),
+                reason: "absolute paths are not allowed",
             });
         }
-        Ok(canonical)
+        if !path.is_absolute() && primary_root.as_ref() != Some(&workspace_root) {
+            return Err(ToolError::PathOutsideWorkspace {
+                path: display_path(supplied),
+                reason: "relative paths select only the primary workspace root",
+            });
+        }
+        let relative_path = canonical
+            .strip_prefix(&workspace_root)
+            .map_err(|_| ToolError::PathOutsideWorkspace {
+                path: display_path(supplied),
+                reason: "path escapes every attached writable root",
+            })?
+            .to_path_buf();
+        let relative = relative_path
+            .to_str()
+            .ok_or_else(|| ToolError::PathOutsideWorkspace {
+                path: display_path(supplied),
+                reason: "structured tool paths must be valid UTF-8 for durable provenance",
+            })?
+            .to_owned();
+        Ok(ResolvedWorkspacePath {
+            workspace_root,
+            relative,
+            absolute: canonical,
+        })
+    }
+
+    fn canonical_roots(&self) -> Result<Vec<PathBuf>, SandboxUnavailableReason> {
+        if let Some(reason) = self.writable_authority_error {
+            return Err(reason);
+        }
+        self.structured_path_authority.validate()?;
+        let selected = std::iter::once(self.root.clone())
+            .chain(self.attached_writable_roots.iter().cloned())
+            .collect::<Vec<_>>();
+        let current = crate::canonical_writable_roots(&self.root, &self.attached_writable_roots)
+            .map_err(|_| SandboxUnavailableReason::AuthorityInspectionFailed)?;
+        if current != selected {
+            return Err(SandboxUnavailableReason::AuthorityInspectionFailed);
+        }
+        Ok(selected)
+    }
+
+    fn ensure_writable_path(&self, path: &ResolvedWorkspacePath) -> Result<(), ToolError> {
+        if crate::sandbox::is_read_only_workspace_surface(Path::new(&path.relative)) {
+            return Err(ToolError::PathOutsideWorkspace {
+                path: path.absolute.to_string_lossy().into_owned(),
+                reason: "repository-local worktree collections are read-only; launch in the intended checkout (only non-overlapping roots can be attached)",
+            });
+        }
+        Ok(())
+    }
+
+    fn read_resolved_file(&self, path: &ResolvedWorkspacePath) -> Result<String, ToolError> {
+        self.structured_path_authority
+            .validate()
+            .map_err(ToolError::SandboxUnavailable)?;
+        let mut file = open_workspace_read_file(path, &self.structured_path_authority)?;
+        validate_open_structured_file(&file, path)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    }
+
+    fn write_resolved_file(
+        &self,
+        path: &ResolvedWorkspacePath,
+        content: &str,
+        create_new: bool,
+        expected_before: Option<&str>,
+    ) -> Result<(), ToolError> {
+        self.write_resolved_file_observed(path, content, create_new, expected_before)
+            .map_err(|failure| failure.error)
+    }
+
+    fn write_resolved_file_observed(
+        &self,
+        path: &ResolvedWorkspacePath,
+        content: &str,
+        create_new: bool,
+        expected_before: Option<&str>,
+    ) -> Result<(), StructuredWriteFailure> {
+        self.structured_path_authority
+            .validate()
+            .map_err(ToolError::SandboxUnavailable)
+            .map_err(StructuredWriteFailure::without_change)?;
+        let mut file = open_workspace_file(path, create_new, &self.structured_path_authority)
+            .map_err(StructuredWriteFailure::without_change)?;
+        // Validate before the provenance pre-image reads this descriptor.
+        // Otherwise an in-root hardlink to an out-of-authority inode would
+        // become a host-side read channel even though the later write check
+        // correctly refused to mutate it.
+        validate_open_structured_file(&file, path)
+            .map_err(StructuredWriteFailure::without_change)?;
+        let before = if create_new {
+            crate::file_diff::StructuredFileSnapshot::absent(&path.workspace_root, &path.relative)
+        } else {
+            crate::file_diff::StructuredFileSnapshot::capture_open_regular(
+                &path.workspace_root,
+                &path.relative,
+                &file,
+            )
+        }
+        .map_err(|reason| {
+            StructuredWriteFailure::without_change(
+                ToolError::StructuredWriteObservationIncomplete {
+                    phase: "before structured write",
+                    reason,
+                    consequence: "the file was not intentionally changed",
+                },
+            )
+        })?;
+        let result = self.write_open_file(&mut file, path, content, expected_before);
+        if let Err(error) = result {
+            // Link-count rejection occurs before this tool mutates the fd.
+            // Do not turn the rejected alias into a second provenance read.
+            if matches!(&error, ToolError::HardlinkedStructuredFile) {
+                return Err(StructuredWriteFailure::without_change(error));
+            }
+            let after = crate::file_diff::StructuredFileSnapshot::capture_open_regular(
+                &path.workspace_root,
+                &path.relative,
+                &file,
+            )
+            .map_err(|reason| {
+                StructuredWriteFailure::without_change(
+                    ToolError::StructuredWriteObservationIncomplete {
+                        phase: "after structured write failure",
+                        reason,
+                        consequence: "the write may have changed the file; Euler will not claim a complete change",
+                    },
+                )
+            })?;
+            return Err(StructuredWriteFailure {
+                error,
+                file_changes: before.change_to(&after).into_iter().collect(),
+            });
+        }
+        Ok(())
+    }
+
+    fn write_open_file(
+        &self,
+        file: &mut fs::File,
+        path: &ResolvedWorkspacePath,
+        content: &str,
+        expected_before: Option<&str>,
+    ) -> Result<(), ToolError> {
+        // Recheck immediately before mutation: a same-user host actor may
+        // have introduced a new alias after the pre-image validation.
+        validate_open_structured_file(file, path)?;
+        if let Some(expected) = expected_before {
+            let read_limit = u64::try_from(expected.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            let mut current = Vec::with_capacity(expected.len().saturating_add(1));
+            std::io::Read::by_ref(&mut *file)
+                .take(read_limit)
+                .read_to_end(&mut current)?;
+            if current != expected.as_bytes() {
+                return Err(ToolError::StalePreparedWrite);
+            }
+            file.seek(std::io::SeekFrom::Start(0))?;
+        }
+        validate_open_structured_file(file, path)?;
+        file.set_len(0)?;
+        file.write_all(content.as_bytes())?;
+        Ok(())
+    }
+
+    fn configured_authority_roots(
+        &self,
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), SandboxUnavailableReason> {
+        if let Some(reason) = self.writable_authority_error {
+            return Err(reason);
+        }
+        let writable = std::iter::once(self.root.clone())
+            .chain(self.attached_writable_roots.iter().cloned())
+            .collect();
+        if let Some(reason) = self.runtime_authority_error {
+            return Err(reason);
+        }
+        Ok((writable, self.runtime_roots.clone()))
+    }
+
+    fn canonical_attached_writable_roots(&self) -> Vec<PathBuf> {
+        self.canonical_roots()
+            .map(|roots| roots.into_iter().skip(1).collect())
+            .unwrap_or_default()
     }
 }
 
-/// One prepared agent-controlled process, with enough provenance to remove
-/// the sandbox launch prelude from captured output.
-struct AgentSubprocess {
-    command: Command,
-    sandboxed: bool,
+fn canonical_authority_configuration(
+    requested_root: PathBuf,
+    requested_writable_roots: Vec<PathBuf>,
+    requested_runtime_roots: Vec<PathBuf>,
+) -> (
+    PathBuf,
+    Vec<PathBuf>,
+    Vec<PathBuf>,
+    Option<SandboxUnavailableReason>,
+    Option<SandboxUnavailableReason>,
+) {
+    let writable = match crate::canonical_writable_roots(&requested_root, &requested_writable_roots)
+    {
+        Ok(roots) => roots,
+        Err(_) => {
+            let reason = if requested_root
+                .canonicalize()
+                .is_ok_and(|root| root.is_dir())
+            {
+                SandboxUnavailableReason::InvalidWritableRoots
+            } else {
+                SandboxUnavailableReason::InvalidWorkspace
+            };
+            return (
+                requested_root,
+                requested_writable_roots,
+                requested_runtime_roots,
+                Some(reason),
+                None,
+            );
+        }
+    };
+    let root = writable[0].clone();
+    let attached_writable_roots = writable[1..].to_vec();
+    match crate::canonical_runtime_roots(&writable, &requested_runtime_roots) {
+        Ok(runtime_roots) => (root, attached_writable_roots, runtime_roots, None, None),
+        Err(_) => (
+            root,
+            attached_writable_roots,
+            requested_runtime_roots,
+            None,
+            Some(SandboxUnavailableReason::InvalidRuntimeRoots),
+        ),
+    }
 }
 
-/// Preserve program output, but do not expose Bubblewrap diagnostics when the
-/// launcher did not reach the inner command. The readiness marker is emitted
-/// by the private sandbox wrapper only after its mount namespace exists.
+fn display_roots(roots: &[PathBuf]) -> Vec<String> {
+    roots
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+struct ResolvedWorkspacePath {
+    workspace_root: PathBuf,
+    relative: String,
+    absolute: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+fn open_workspace_read_file(
+    path: &ResolvedWorkspacePath,
+    _authority: &StructuredPathAuthority,
+) -> Result<fs::File, ToolError> {
+    crate::sandbox::open_structured_file_beneath(
+        &path.workspace_root,
+        Path::new(&path.relative),
+        libc::O_RDONLY | libc::O_NONBLOCK,
+        0,
+    )
+    .map_err(structured_open_error)
+}
+
+#[cfg(target_os = "linux")]
+fn open_workspace_file(
+    path: &ResolvedWorkspacePath,
+    create_new: bool,
+    _authority: &StructuredPathAuthority,
+) -> Result<fs::File, ToolError> {
+    let mut flags = libc::O_RDWR | libc::O_NONBLOCK;
+    if create_new {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    }
+    let mode = if create_new { 0o666 } else { 0 };
+    crate::sandbox::open_structured_file_beneath(
+        &path.workspace_root,
+        Path::new(&path.relative),
+        flags,
+        mode,
+    )
+    .map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            ToolError::FileAlreadyExists
+        } else {
+            structured_open_error(error)
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn structured_open_error(error: std::io::Error) -> ToolError {
+    match error.raw_os_error() {
+        Some(libc::EXDEV) => {
+            ToolError::SandboxUnavailable(SandboxUnavailableReason::UnsafeMountTopology)
+        }
+        Some(libc::ENOSYS) => {
+            ToolError::SandboxUnavailable(SandboxUnavailableReason::AuthorityInspectionFailed)
+        }
+        _ => ToolError::Io(error),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_workspace_read_file(
+    path: &ResolvedWorkspacePath,
+    authority: &StructuredPathAuthority,
+) -> Result<fs::File, ToolError> {
+    open_workspace_file_unix(path, libc::O_RDONLY | libc::O_NONBLOCK, authority)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_workspace_file(
+    path: &ResolvedWorkspacePath,
+    create_new: bool,
+    authority: &StructuredPathAuthority,
+) -> Result<fs::File, ToolError> {
+    let mut flags = libc::O_RDWR | libc::O_NONBLOCK;
+    if create_new {
+        flags |= libc::O_CREAT | libc::O_EXCL;
+    }
+    open_workspace_file_unix(path, flags, authority)
+}
+
+/// One descriptor-anchored component walker shared by structured reads and
+/// writes on Unix hosts without Linux `openat2`. Darwin additionally verifies
+/// the mount-table identity of every opened directory and final file.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_workspace_file_unix(
+    path: &ResolvedWorkspacePath,
+    flags: libc::c_int,
+    authority: &StructuredPathAuthority,
+) -> Result<fs::File, ToolError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Component;
+
+    let root = CString::new(path.workspace_root.as_os_str().as_bytes())
+        .map_err(|_| ToolError::InvalidField("path"))?;
+    // SAFETY: `root` is NUL-terminated and the returned descriptor is either
+    // negative or uniquely owned and immediately wrapped in `File`.
+    let root_fd = unsafe {
+        libc::open(
+            root.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if root_fd < 0 {
+        return Err(ToolError::Io(std::io::Error::last_os_error()));
+    }
+    // SAFETY: `open` returned a fresh descriptor owned by this function.
+    let root_directory = unsafe { fs::File::from_raw_fd(root_fd) };
+    validate_unix_structured_root(authority, &path.workspace_root, &root_directory)?;
+    let mut directory = root_directory.try_clone()?;
+    let components = Path::new(&path.relative)
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            _ => Err(ToolError::PathOutsideWorkspace {
+                path: path.relative.clone(),
+                reason: "structured write path is not a normalized workspace-relative path",
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (file_name, parent_components) = components
+        .split_last()
+        .ok_or(ToolError::InvalidField("path"))?;
+
+    for component in parent_components {
+        let component =
+            CString::new(component.as_bytes()).map_err(|_| ToolError::InvalidField("path"))?;
+        // SAFETY: the live directory fd and NUL-terminated component are
+        // valid. O_NOFOLLOW makes each directory hop an fd-anchored boundary.
+        let next_fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if next_fd < 0 {
+            return Err(ToolError::Io(std::io::Error::last_os_error()));
+        }
+        // SAFETY: `openat` returned a fresh descriptor owned by `next`.
+        let next = unsafe { fs::File::from_raw_fd(next_fd) };
+        validate_unix_structured_mount(authority, &path.workspace_root, &next)?;
+        directory = next;
+    }
+
+    let file_name =
+        CString::new(file_name.as_bytes()).map_err(|_| ToolError::InvalidField("path"))?;
+    let flags = flags | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    // SAFETY: the parent fd and final NUL-terminated name are valid. The mode
+    // is consulted only with O_CREAT.
+    let file_fd = unsafe { libc::openat(directory.as_raw_fd(), file_name.as_ptr(), flags, 0o666) };
+    if file_fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Err(ToolError::FileAlreadyExists)
+        } else {
+            Err(ToolError::Io(error))
+        };
+    }
+    // SAFETY: `openat` returned a fresh descriptor owned by `file`.
+    let file = unsafe { fs::File::from_raw_fd(file_fd) };
+    validate_unix_structured_mount(authority, &path.workspace_root, &file)?;
+    Ok(file)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn validate_unix_structured_root(
+    authority: &StructuredPathAuthority,
+    root: &Path,
+    descriptor: &fs::File,
+) -> Result<(), ToolError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        authority
+            .validate_opened_root(root, descriptor.as_raw_fd())
+            .map_err(ToolError::SandboxUnavailable)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (authority, root, descriptor);
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn validate_unix_structured_mount(
+    authority: &StructuredPathAuthority,
+    root: &Path,
+    candidate: &fs::File,
+) -> Result<(), ToolError> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd as _;
+
+        authority
+            .validate_opened_candidate(root, candidate.as_raw_fd())
+            .map_err(ToolError::SandboxUnavailable)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (authority, root, candidate);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn open_workspace_read_file(
+    path: &ResolvedWorkspacePath,
+    _authority: &StructuredPathAuthority,
+) -> Result<fs::File, ToolError> {
+    fs::File::open(&path.absolute).map_err(ToolError::Io)
+}
+
+#[cfg(not(unix))]
+fn open_workspace_file(
+    path: &ResolvedWorkspacePath,
+    create_new: bool,
+    _authority: &StructuredPathAuthority,
+) -> Result<fs::File, ToolError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    if create_new {
+        options.create_new(true);
+    }
+    options.open(&path.absolute).map_err(ToolError::Io)
+}
+
+#[cfg(unix)]
+fn hardlink_count(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.nlink()
+}
+
+#[cfg(not(unix))]
+fn hardlink_count(_metadata: &fs::Metadata) -> u64 {
+    1
+}
+
+fn validate_open_structured_file(
+    file: &fs::File,
+    path: &ResolvedWorkspacePath,
+) -> Result<(), ToolError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(ToolError::UnsupportedFileType {
+            path: path.absolute.to_string_lossy().into_owned(),
+        });
+    }
+    if hardlink_count(&metadata) > 1 {
+        return Err(ToolError::HardlinkedStructuredFile);
+    }
+    Ok(())
+}
+
+/// One prepared agent-controlled process with output pipes that only its inner
+/// wrapper and command inherit.
+struct AgentSubprocess {
+    command: Command,
+    stdout: fs::File,
+    stderr: fs::File,
+}
+
+/// Preserve program output, but never expose Bubblewrap diagnostics. The
+/// private wrapper independently frames the two dedicated pipes after entering
+/// the mount namespace; Bubblewrap stdout and stderr are not inputs here.
 fn collected_agent_output(
     stdout: String,
     stderr: String,
-    sandboxed: bool,
     interrupted: bool,
 ) -> Result<String, ToolError> {
-    let stdout = if sandboxed {
-        match crate::sandbox::strip_sandbox_ready_marker(&stdout) {
-            Ok(stdout) => stdout,
-            // Timeout or cancellation can kill the launcher before it is
-            // ready. Raw stdout/stderr must remain hidden because neither
-            // came from the agent command.
-            Err(_) if interrupted => return Ok(String::new()),
-            Err(reason) => return Err(ToolError::SandboxUnavailable(reason)),
+    let (stdout, stderr) = match (
+        crate::sandbox::strip_sandbox_stdout_ready_marker(&stdout),
+        crate::sandbox::strip_sandbox_stderr_ready_marker(&stderr),
+    ) {
+        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        // Timeout or cancellation can kill the launcher before its inner
+        // wrapper is ready. Unframed pipe bytes are never agent output.
+        (Err(_), _) | (_, Err(_)) if interrupted => return Ok(String::new()),
+        (Err(reason), _) | (_, Err(reason)) => {
+            return Err(ToolError::SandboxUnavailable(reason));
         }
-    } else {
-        &stdout
     };
     Ok(format!("{stdout}{stderr}"))
 }
@@ -931,15 +1888,15 @@ fn collected_agent_output(
 /// launcher details. An I/O failure while launching or supervising it is
 /// therefore reported as the same concise enforcement failure as a missing
 /// readiness marker.
-fn normalize_sandbox_subprocess_error(sandboxed: bool, error: ToolError) -> ToolError {
-    if sandboxed && matches!(&error, ToolError::Io(_)) {
+fn normalize_sandbox_subprocess_error(error: ToolError) -> ToolError {
+    if matches!(&error, ToolError::Io(_)) {
         ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
     } else {
         error
     }
 }
 
-const DISPLAY_PATH_MAX_CHARS: usize = 256;
+const DISPLAY_PATH_MAX_CHARS: usize = 200;
 
 /// Sanitize a model-supplied path for inclusion in an error message or a
 /// permission-prompt reason: replace control characters and cap the length so
@@ -1012,11 +1969,62 @@ fn optional_usize(input: &Value, key: &'static str) -> Result<Option<usize>, Too
         .map_err(|_| ToolError::InvalidField(key))
 }
 
+fn shell_timeout_ms(input: &Value) -> Result<u64, ToolError> {
+    let Some(value) = optional_positive_usize(input, "timeout_ms")? else {
+        return Ok(DEFAULT_SHELL_TIMEOUT_MS);
+    };
+    let value = value as u64;
+    if value > MAX_SHELL_TIMEOUT_MS {
+        return Err(ToolError::InvalidField("timeout_ms"));
+    }
+    Ok(value)
+}
+
+fn shell_termination(termination: ProcessTermination, timeout_ms: u64) -> (i32, String, bool) {
+    match termination {
+        ProcessTermination::Exited(status) => (status, format!("exit {status}"), false),
+        ProcessTermination::TimedOut => (
+            -1,
+            format!(
+                "command timed out after {timeout_ms} ms and its process group was killed; \
+pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs"
+            ),
+            false,
+        ),
+        ProcessTermination::Cancelled => (
+            -1,
+            "command cancelled and its process group was killed".to_owned(),
+            true,
+        ),
+        ProcessTermination::Signaled { signal } => {
+            (-1, format!("command terminated by signal {signal}"), false)
+        }
+        ProcessTermination::AbnormalTermination => (
+            -1,
+            "command terminated abnormally without a normal process status".to_owned(),
+            false,
+        ),
+        ProcessTermination::SupervisionFailed => (
+            -1,
+            "command supervision failed after launch and its process group was killed".to_owned(),
+            false,
+        ),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProcessTermination {
     Exited(i32),
     TimedOut,
     Cancelled,
+    Signaled {
+        signal: i32,
+    },
+    AbnormalTermination,
+    /// The child was successfully spawned, but Euler could no longer
+    /// supervise its pipes or exit state. The process group has been killed
+    /// and post-command observation is still mandatory.
+    SupervisionFailed,
 }
 
 struct ShellOutcome {
@@ -1028,34 +2036,194 @@ struct ShellOutcome {
 struct SupervisedProcess {
     handle: std::process::Child,
     pid: i32,
-    stdout: std::process::ChildStdout,
-    stderr: std::process::ChildStderr,
+    stdout: ProcessPipe,
+    stderr: ProcessPipe,
 }
 
-fn spawn_supervised_process(mut child: Command) -> Result<SupervisedProcess, ToolError> {
+struct RunningProcess {
+    handle: std::process::Child,
+    pid: i32,
+    stdout: ProcessPipe,
+    stderr: ProcessPipe,
+    stdout_open: bool,
+    stderr_open: bool,
+    stdout_bytes: Vec<u8>,
+    stderr_bytes: Vec<u8>,
+}
+
+enum ProcessPipe {
+    ChildStdout(std::process::ChildStdout),
+    ChildStderr(std::process::ChildStderr),
+    AgentOutput(fs::File),
+}
+
+impl std::io::Read for ProcessPipe {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::ChildStdout(stream) => stream.read(buffer),
+            Self::ChildStderr(stream) => stream.read(buffer),
+            Self::AgentOutput(stream) => stream.read(buffer),
+        }
+    }
+}
+
+impl std::os::fd::AsRawFd for ProcessPipe {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::ChildStdout(stream) => stream.as_raw_fd(),
+            Self::ChildStderr(stream) => stream.as_raw_fd(),
+            Self::AgentOutput(stream) => stream.as_raw_fd(),
+        }
+    }
+}
+
+impl RunningProcess {
+    fn start(process: SupervisedProcess) -> Result<Self, ShellOutcome> {
+        let SupervisedProcess {
+            mut handle,
+            pid,
+            stdout,
+            stderr,
+        } = process;
+        if set_nonblocking(&stdout)
+            .and_then(|()| set_nonblocking(&stderr))
+            .is_err()
+        {
+            kill_process_group(pid);
+            let _ = handle.wait();
+            return Err(ShellOutcome {
+                termination: ProcessTermination::SupervisionFailed,
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+        Ok(Self {
+            handle,
+            pid,
+            stdout,
+            stderr,
+            stdout_open: true,
+            stderr_open: true,
+            stdout_bytes: Vec::new(),
+            stderr_bytes: Vec::new(),
+        })
+    }
+
+    fn poll_termination(
+        &mut self,
+        cancellation: &CancellationToken,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<ProcessTermination> {
+        if self.drain().is_err() {
+            return Some(self.kill(ProcessTermination::SupervisionFailed, false));
+        }
+        if cancellation.is_cancelled() {
+            return Some(self.kill(ProcessTermination::Cancelled, true));
+        }
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Some(self.kill(ProcessTermination::TimedOut, true));
+        }
+        if self.stdout_open || self.stderr_open {
+            return None;
+        }
+        match self.handle.try_wait() {
+            Ok(Some(status)) => Some(process_termination_from_status(status)),
+            Ok(None) => None,
+            Err(_) => Some(self.kill(ProcessTermination::SupervisionFailed, false)),
+        }
+    }
+
+    fn drain(&mut self) -> std::io::Result<()> {
+        drain_process_pipe(
+            &mut self.stdout,
+            &mut self.stdout_open,
+            &mut self.stdout_bytes,
+            PROCESS_PIPE_DRAIN_BUDGET,
+        )?;
+        drain_process_pipe(
+            &mut self.stderr,
+            &mut self.stderr_open,
+            &mut self.stderr_bytes,
+            PROCESS_PIPE_DRAIN_BUDGET,
+        )
+    }
+
+    fn kill(&mut self, termination: ProcessTermination, drain: bool) -> ProcessTermination {
+        kill_process_group(self.pid);
+        let _ = self.handle.wait();
+        if drain {
+            drain_immediately_available(
+                &mut self.stdout,
+                &mut self.stdout_open,
+                &mut self.stdout_bytes,
+                &mut self.stderr,
+                &mut self.stderr_open,
+                &mut self.stderr_bytes,
+            );
+        }
+        termination
+    }
+
+    fn into_outcome(self, termination: ProcessTermination) -> ShellOutcome {
+        ShellOutcome {
+            termination,
+            stdout: String::from_utf8_lossy(&self.stdout_bytes).into_owned(),
+            stderr: String::from_utf8_lossy(&self.stderr_bytes).into_owned(),
+        }
+    }
+}
+
+fn process_termination_from_status(status: std::process::ExitStatus) -> ProcessTermination {
+    if let Some(code) = status.code() {
+        return ProcessTermination::Exited(code);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        if let Some(signal) = status.signal() {
+            return ProcessTermination::Signaled { signal };
+        }
+    }
+    ProcessTermination::AbnormalTermination
+}
+
+fn spawn_supervised_process(
+    mut child: Command,
+    agent_output: Option<(fs::File, fs::File)>,
+) -> Result<SupervisedProcess, ToolError> {
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
 
-    child
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+    child.stdin(Stdio::null()).process_group(0);
+    if agent_output.is_some() {
+        // Bubblewrap owns these channels. Its diagnostics are private and can
+        // never share the dedicated pipes inherited by the inner command.
+        child.stdout(Stdio::null()).stderr(Stdio::null());
+    } else {
+        child.stdout(Stdio::piped()).stderr(Stdio::piped());
+    }
     let mut handle = child.spawn()?;
     let pid = handle.id() as i32;
-    let stdout = handle
-        .stdout
-        .take()
-        .expect("stdout was configured as a pipe");
-    let stderr = handle
-        .stderr
-        .take()
-        .expect("stderr was configured as a pipe");
-    if let Err(error) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
-        kill_process_group(pid);
-        let _ = handle.wait();
-        return Err(error.into());
-    }
+    let (stdout, stderr) = match agent_output {
+        Some((stdout, stderr)) => (
+            ProcessPipe::AgentOutput(stdout),
+            ProcessPipe::AgentOutput(stderr),
+        ),
+        None => (
+            ProcessPipe::ChildStdout(
+                handle
+                    .stdout
+                    .take()
+                    .expect("stdout was configured as a pipe"),
+            ),
+            ProcessPipe::ChildStderr(
+                handle
+                    .stderr
+                    .take()
+                    .expect("stderr was configured as a pipe"),
+            ),
+        ),
+    };
     Ok(SupervisedProcess {
         handle,
         pid,
@@ -1070,8 +2238,31 @@ fn spawn_supervised_process(mut child: Command) -> Result<SupervisedProcess, Too
 /// the leader and ordinary descendants that remain in the group; a descendant
 /// that deliberately moves itself into another process group is outside this
 /// ownership guarantee.
+#[cfg(test)]
 fn run_process(
     child: Command,
+    timeout_ms: Option<u64>,
+    cancellation: &CancellationToken,
+) -> Result<ShellOutcome, ToolError> {
+    run_process_with_output(child, None, timeout_ms, cancellation)
+}
+
+fn run_agent_process(
+    child: AgentSubprocess,
+    timeout_ms: Option<u64>,
+    cancellation: &CancellationToken,
+) -> Result<ShellOutcome, ToolError> {
+    run_process_with_output(
+        child.command,
+        Some((child.stdout, child.stderr)),
+        timeout_ms,
+        cancellation,
+    )
+}
+
+fn run_process_with_output(
+    child: Command,
+    agent_output: Option<(fs::File, fs::File)>,
     timeout_ms: Option<u64>,
     cancellation: &CancellationToken,
 ) -> Result<ShellOutcome, ToolError> {
@@ -1080,88 +2271,22 @@ fn run_process(
     if cancellation.is_cancelled() {
         return Err(ToolError::Cancelled);
     }
-    let SupervisedProcess {
-        mut handle,
-        pid,
-        mut stdout,
-        mut stderr,
-    } = spawn_supervised_process(child)?;
-    let mut stdout_open = true;
-    let mut stderr_open = true;
-    let mut stdout_bytes = Vec::new();
-    let mut stderr_bytes = Vec::new();
-
+    let process = spawn_supervised_process(child, agent_output)?;
+    let mut process = match RunningProcess::start(process) {
+        Ok(process) => process,
+        Err(outcome) => return Ok(outcome),
+    };
     let deadline = timeout_ms.map(|timeout_ms| Instant::now() + Duration::from_millis(timeout_ms));
     let termination = loop {
-        if let Err(error) = drain_process_pipe(
-            &mut stdout,
-            &mut stdout_open,
-            &mut stdout_bytes,
-            PROCESS_PIPE_DRAIN_BUDGET,
-        )
-        .and_then(|()| {
-            drain_process_pipe(
-                &mut stderr,
-                &mut stderr_open,
-                &mut stderr_bytes,
-                PROCESS_PIPE_DRAIN_BUDGET,
-            )
-        }) {
-            kill_process_group(pid);
-            let _ = handle.wait();
-            return Err(error.into());
+        if let Some(termination) = process.poll_termination(cancellation, deadline) {
+            break termination;
         }
-
-        if cancellation.is_cancelled() {
-            kill_process_group(pid);
-            let _ = handle.wait();
-            drain_immediately_available(
-                &mut stdout,
-                &mut stdout_open,
-                &mut stdout_bytes,
-                &mut stderr,
-                &mut stderr_open,
-                &mut stderr_bytes,
-            );
-            break ProcessTermination::Cancelled;
-        }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            kill_process_group(pid);
-            let _ = handle.wait();
-            drain_immediately_available(
-                &mut stdout,
-                &mut stdout_open,
-                &mut stdout_bytes,
-                &mut stderr,
-                &mut stderr_open,
-                &mut stderr_bytes,
-            );
-            break ProcessTermination::TimedOut;
-        }
-
-        // Do not reap (or even `try_wait`) while a descendant can still own a
-        // pipe. Keeping the leader unreaped pins its pid/process-group id, so
-        // a later cancellation cannot signal an unrelated reused group.
-        if !stdout_open && !stderr_open {
-            match handle.try_wait() {
-                Ok(Some(status)) => {
-                    break ProcessTermination::Exited(status.code().unwrap_or(-1));
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    kill_process_group(pid);
-                    let _ = handle.wait();
-                    return Err(error.into());
-                }
-            }
-        }
+        // Do not reap while a descendant can still own a pipe. Keeping the
+        // leader unreaped pins its pid/group id, so later cancellation cannot
+        // signal an unrelated reused group.
         std::thread::sleep(Duration::from_millis(25));
     };
-    Ok(ShellOutcome {
-        termination,
-        stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
-    })
+    Ok(process.into_outcome(termination))
 }
 
 const PROCESS_PIPE_DRAIN_BUDGET: usize = 256 * 1024;
@@ -1475,11 +2600,12 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
     index
 }
 
-fn coding_tool_definitions() -> Vec<ToolDefinition> {
+fn coding_tool_definitions(attached_writable_roots: &[PathBuf]) -> Vec<ToolDefinition> {
+    let path_contract = structured_path_contract(attached_writable_roots);
     vec![
         ToolDefinition {
             name: "read_file".to_owned(),
-            description: "Read a UTF-8 file under the workspace root, optionally starting at a 1-indexed line offset for windowed reads. The path must be relative to the workspace root; absolute and parent-traversal paths are rejected.".to_owned(),
+            description: format!("Read a UTF-8 file under workspace authority, optionally starting at a 1-indexed line offset for windowed reads. {path_contract}"),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1494,7 +2620,7 @@ fn coding_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "edit_file".to_owned(),
-            description: "Replace exactly one text occurrence in a UTF-8 file under the workspace root. The path must be relative to the workspace root; absolute and parent-traversal paths are rejected.".to_owned(),
+            description: format!("Replace exactly one text occurrence in a UTF-8 file under workspace authority. {path_contract}"),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1506,10 +2632,10 @@ fn coding_tool_definitions() -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
-        write_file_definition(),
+        write_file_definition(&path_contract),
         ToolDefinition {
             name: "apply_patch".to_owned(),
-            description: "Apply one structured patch envelope to add or update one UTF-8 file under the workspace root. Prefer this over shell commands for code and text edits. File paths inside the patch must be relative to the workspace root; absolute paths (for example /tmp/name.py) and parent-traversal paths are rejected. Updates may contain multiple hunks for the same file. V0 rejects delete, rename, and multi-file patches.".to_owned(),
+            description: format!("Apply one structured patch envelope to add or update one UTF-8 file under workspace authority. Prefer this over shell commands for code and text edits. {path_contract} Updates may contain multiple hunks for the same file. V0 rejects delete, rename, and multi-file patches."),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -1521,8 +2647,7 @@ fn coding_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "run_shell".to_owned(),
-            description: "Run a shell command in the workspace root. Commands time out \
-after 120000 ms by default; pass timeout_ms (up to 600000) for longer runs."
+            description: "Run a shell command from the primary workspace root inside the enforced workspace authority boundary. Attached roots are writable at their canonical absolute paths; configured runtime roots are read-only. Network and the host home are unavailable. Commands time out after 120000 ms by default; pass timeout_ms (up to 600000) for longer runs."
                 .to_owned(),
             parameters: json!({
                 "type": "object",
@@ -1552,16 +2677,31 @@ after 120000 ms by default; pass timeout_ms (up to 600000) for longer runs."
     ]
 }
 
-fn write_file_definition() -> ToolDefinition {
+fn structured_path_contract(attached_writable_roots: &[PathBuf]) -> String {
+    if attached_writable_roots.is_empty() {
+        "Paths must be relative to the primary workspace root; absolute paths and paths that resolve outside that root are rejected.".to_owned()
+    } else {
+        format!(
+            "Use relative paths for the primary workspace. Attached roots use canonical absolute paths under exactly: {}. Other absolute paths and escapes are rejected.",
+            attached_writable_roots
+                .iter()
+                .map(|root| root.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn write_file_definition(path_contract: &str) -> ToolDefinition {
     ToolDefinition {
         name: "write_file".to_owned(),
-        description: "Create a new UTF-8 file at `path` (relative to the workspace root) with exactly `content`. Fails if the file already exists — use edit_file or apply_patch to modify an existing file — and if the parent directory is missing. Absolute and parent-traversal paths are rejected. For creating whole files this is more direct than apply_patch: plain JSON fields, no patch syntax.".to_owned(),
+        description: format!("Create a new UTF-8 file at `path` with exactly `content`. Fails if the file already exists — use edit_file or apply_patch to modify an existing file — and if the parent directory is missing. {path_contract} For creating whole files this is more direct than apply_patch: plain JSON fields, no patch syntax."),
         parameters: json!({
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative path of the file to create; the parent directory must already exist."
+                    "description": "Path under workspace authority; use a relative path for the primary root or a canonical absolute path for an attached root. The parent directory must already exist."
                 },
                 "content": {
                     "type": "string",
@@ -1664,6 +2804,7 @@ fn tool_result_get(
         output_preview_budget: None,
         project_context_snapshot_digest: project_context_snapshot_digest.map(str::to_owned),
         exit_code: None,
+        failure: None,
         patch: None,
         file_changes: Vec::new(),
     })
