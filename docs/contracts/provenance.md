@@ -88,11 +88,15 @@ identity but cannot prove that an earlier rename survived a failed directory
 sync.
 
 Streamed root-assistant text uses ordinary durable
-`assistant.response.chunk` appends. If a checkpoint append becomes ambiguous,
-its text is not forwarded to the live UI and the writer fences unrelated
-activity; lifecycle reopen is the recovery boundary. A physically complete
-checkpoint is then accepted once and the open call receives an interrupted
-recovery terminal. Chunk content above the blob threshold is content-addressed
+`assistant.response.chunk` appends. Root response ownership lasts until its
+canonical terminal is durably accepted. An unresolved checkpoint, reasoning,
+or terminal append before that boundary fences unrelated live-session activity;
+lifecycle reopen is the recovery boundary. A checkpoint failure stops further
+stream forwarding. Reopen accepts a physically complete checkpoint or terminal
+once, preserves any recorded terminal outcome, and gives a still-open call an
+interrupted recovery terminal. After an accepted canonical terminal, later
+appends retain their ordinary exact-batch reconciliation rules. Chunk content
+above the blob threshold is content-addressed
 and rehydrated for replay. Secret scrub rewrites chunk and terminal
 `retained_content_bytes` together so the scrubbed stream remains
 protocol-valid; immutable `observed_output_bytes` remains the original local

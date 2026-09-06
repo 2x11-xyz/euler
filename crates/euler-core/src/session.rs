@@ -470,9 +470,10 @@ pub struct Session<D> {
     /// matching retry reuses its id and timestamp; every unrelated admission
     /// is fenced until the owning writer confirms this candidate.
     pending_admission: Option<PendingAdmission>,
-    /// A shadow worker was detached without an accepted terminal child for
-    /// its `model.call`. Further authoritative writes fail closed until the
-    /// durable log is reopened and its recovery closure is appended.
+    /// Root response ownership ended with unresolved persistence, or a shadow
+    /// worker detached without an accepted terminal child. Further
+    /// authoritative writes fail closed until lifecycle reopen reconciles
+    /// the durable prefix and closes any interrupted calls.
     terminalization_failed: bool,
     /// Shared edge-triggered request from an interactive surface. The active
     /// driver consumes it only at a round boundary, where a fixed shadow
@@ -700,8 +701,13 @@ where
         model_call_id: String,
         observed_output_bytes: Option<u64>,
     ) -> Result<String, SessionError> {
-        self.session
-            .emit_provider_error_with_response(error, model_call_id, observed_output_bytes)
+        let id = self.session.emit_provider_error_with_response(
+            error,
+            model_call_id,
+            observed_output_bytes,
+        )?;
+        self.response_checkpoint = None;
+        Ok(id)
     }
 
     fn emit_model_call_cancelled(
@@ -716,8 +722,11 @@ where
             observed_output_bytes,
             AssistantResponseStatus::Cancelled,
         );
-        self.session
-            .emit_with_parent(EventKind::ERROR, payload, Some(model_call_id))
+        let id = self
+            .session
+            .emit_with_parent(EventKind::ERROR, payload, Some(model_call_id))?;
+        self.response_checkpoint = None;
+        Ok(id)
     }
 
     fn flush_response_checkpoints(
@@ -792,6 +801,7 @@ where
             },
             observed_output_bytes,
         )?;
+        self.response_checkpoint = None;
         self.sink.flush(self.session.bus.events());
         self.session.record_latest_usage(data.usage.as_ref());
         self.session.service_compaction_request()?;
@@ -1348,11 +1358,12 @@ impl<D> Session<D> {
                 .is_some_and(|queue| queue.has_unresolved_admission())
     }
 
-    /// Whether a fresh user turn can be admitted before the active target's
-    /// context latch. TUI auto-flush must leave queued work untouched when
-    /// this is false.
+    /// Whether a fresh user turn can be admitted under the active target's
+    /// context latch and the response-persistence reopen fence. TUI auto-flush
+    /// must leave queued work untouched when this is false.
     pub fn can_accept_turn(&self) -> bool {
-        self.context_limit_emitted.as_ref() != Some(&self.active_target)
+        !self.terminalization_failed
+            && self.context_limit_emitted.as_ref() != Some(&self.active_target)
     }
 
     /// Wire the interactive surface's edge-triggered manual-compaction
@@ -2324,6 +2335,7 @@ impl<D: PermissionDecider> Session<D> {
     where
         F: FnMut(&EventEnvelope),
     {
+        self.ensure_terminalization_intact()?;
         if self.context_limit_emitted.as_ref() == Some(&self.active_target) {
             return Ok(Vec::new());
         }
@@ -2413,6 +2425,21 @@ impl<D: PermissionDecider> Session<D> {
             },
         )
         .run(&cancellation);
+        // A successful semantic terminal releases the checkpoint. If the
+        // round exits earlier, retrying an accepted backlog cannot restore
+        // response ownership. Fence checkpoint/reasoning/terminal failures;
+        // a terminal in the bus may still be unsynced.
+        // A queued user admission retains its own exact retry owner instead.
+        if result.is_err()
+            && io.response_checkpoint.is_some()
+            && io.session.pending_admission.is_none()
+            && io.session.provenance.as_ref().is_some_and(|writer| {
+                writer.has_unresolved_append()
+                    || io.session.persisted_events < io.session.bus.events().len()
+            })
+        {
+            io.session.terminalization_failed = true;
+        }
         if matches!(&result, Err(SessionError::Cancelled)) {
             io.session.interrupt_compaction("turn interrupted")?;
             io.sink.flush(io.session.bus.events());
@@ -3619,7 +3646,7 @@ fn pending_admission_error() -> SessionError {
 fn terminalization_failed_error() -> SessionError {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
-        "a detached model call has no accepted terminal event; reopen the session to recover it",
+        "model response persistence is unresolved; reopen the session to recover it",
     )
     .into()
 }

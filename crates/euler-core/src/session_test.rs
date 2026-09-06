@@ -33,7 +33,7 @@ use euler_sdk::{
     HostAgentTask, HostApi, SpawnAgentTask,
 };
 use serde_json::Map;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[test]
@@ -96,12 +96,14 @@ fn ambiguous_checkpoint_append_is_not_shown_or_reused_until_reopen() {
     let log = temp.path().join("events.jsonl");
     let mut session = Session::new(
         SessionConfig::new(temp.path()),
-        ScriptedProvider::new(vec![FixtureResponse::Assistant(
-            "visible only if durable".to_owned(),
-        )]),
+        ScriptedProvider::new(vec![
+            FixtureResponse::Assistant("visible only if durable".to_owned()),
+            FixtureResponse::Assistant("must not dispatch a follow-up".to_owned()),
+        ]),
         ScriptedDecider::new(Vec::new()),
     )
     .with_provenance(ProvenanceWriter::new(log.clone()).expect("writer"));
+    let dispatches = count_response_fault_dispatches(&mut session);
     let matched_log = log.clone();
     let guard = arm_matching(Op::FileSync, move |path| {
         path == matched_log
@@ -126,12 +128,7 @@ fn ambiguous_checkpoint_append_is_not_shown_or_reused_until_reopen() {
         .iter()
         .any(|kind| kind == EventKind::ASSISTANT_RESPONSE_CHUNK));
     drop(guard);
-    assert!(
-        session
-            .run_turn("cannot continue on fenced writer")
-            .is_err(),
-        "a new run must not reinterpret the unresolved checkpoint append"
-    );
+    assert_response_persistence_fenced(&mut session, &dispatches, &log);
     drop(session);
 
     let resumed = crate::resume_session(
@@ -154,29 +151,83 @@ fn ambiguous_checkpoint_append_is_not_shown_or_reused_until_reopen() {
         })
         .expect("interrupted response closure");
     assert_eq!(closure.payload["observed_output_bytes"], json!(23));
+    assert!(resumed.can_accept_turn());
+}
+
+fn count_response_fault_dispatches(session: &mut Session<ScriptedDecider>) -> Arc<AtomicUsize> {
+    let dispatches = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&dispatches);
+    session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+        if matches!(
+            event,
+            ProviderRuntimeEvent::Attempt {
+                target: crate::ProviderRuntimeTarget {
+                    scope: ProviderRuntimeScope::Root,
+                    ..
+                },
+                event: euler_provider::ProviderAttemptEvent::Started { .. },
+            }
+        ) {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    dispatches
+}
+
+fn assert_response_persistence_fenced(
+    session: &mut Session<ScriptedDecider>,
+    dispatches: &AtomicUsize,
+    log: &std::path::Path,
+) {
+    let event_count = session.events().len();
+    let bytes = std::fs::read(log).expect("physical response prefix");
+    assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    assert!(!session.can_accept_turn());
+    for result in [
+        session
+            .run_turn("cannot continue on fenced writer")
+            .map(|_| ()),
+        session
+            .rename_session("cannot rename fenced writer")
+            .map(|_| ()),
+        session.begin_compaction().map(|_| ()),
+    ] {
+        assert!(matches!(
+            result,
+            Err(SessionError::Io(ref error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+    }
+    assert!(!session.has_unresolved_admission());
+    assert_eq!(session.events().len(), event_count);
+    assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+    assert_eq!(std::fs::read(log).expect("fenced log"), bytes);
 }
 
 #[test]
 fn reasoning_append_failure_cannot_lose_a_visible_checkpoint_suffix() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
-    let provider = ScriptedProvider::new(vec![FixtureResponse::Stream(vec![
-        ScriptedStreamStep::Event(ModelStreamEvent::ReasoningDelta(ReasoningChunk::summary(
-            "final rationale",
-        ))),
-        ScriptedStreamStep::Event(ModelStreamEvent::TextDelta("durable".to_owned())),
-        ScriptedStreamStep::Event(ModelStreamEvent::TextDelta(" pending".to_owned())),
-        ScriptedStreamStep::Event(ModelStreamEvent::Finished {
-            stop_reason: StopReason::Completed,
-            usage: None,
-        }),
-    ])]);
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::Stream(vec![
+            ScriptedStreamStep::Event(ModelStreamEvent::ReasoningDelta(ReasoningChunk::summary(
+                "final rationale",
+            ))),
+            ScriptedStreamStep::Event(ModelStreamEvent::TextDelta("durable".to_owned())),
+            ScriptedStreamStep::Event(ModelStreamEvent::TextDelta(" pending".to_owned())),
+            ScriptedStreamStep::Event(ModelStreamEvent::Finished {
+                stop_reason: StopReason::Completed,
+                usage: None,
+            }),
+        ]),
+        FixtureResponse::Assistant("must not dispatch a follow-up".to_owned()),
+    ]);
     let mut session = Session::new(
         SessionConfig::new(temp.path()),
         provider,
         ScriptedDecider::new(Vec::new()),
     )
     .with_provenance(ProvenanceWriter::new(log.clone()).expect("writer"));
+    let dispatches = count_response_fault_dispatches(&mut session);
     let matched_log = log.clone();
     let guard = arm_matching(Op::FileSync, move |path| {
         path == matched_log
@@ -193,6 +244,7 @@ fn reasoning_append_failure_cannot_lose_a_visible_checkpoint_suffix() {
     assert!(matches!(error, SessionError::Io(_)));
     assert!(guard.fired(), "reasoning sync fault must fire");
     drop(guard);
+    assert_response_persistence_fenced(&mut session, &dispatches, &log);
     drop(session);
 
     let resumed = crate::resume_session(
@@ -207,6 +259,207 @@ fn reasoning_append_failure_cannot_lose_a_visible_checkpoint_suffix() {
     let response = projected.values().next().expect("interrupted response");
     assert_eq!(response.status, AssistantResponseStatus::Interrupted);
     assert_eq!(response.content, "durable pending");
+}
+
+#[test]
+fn response_flush_and_terminal_sync_failures_require_reopen() {
+    for (kind, finished, cancelled, status) in [
+        (
+            EventKind::ASSISTANT_RESPONSE_CHUNK,
+            true,
+            false,
+            AssistantResponseStatus::Interrupted,
+        ),
+        (
+            EventKind::MODEL_RESULT,
+            true,
+            false,
+            AssistantResponseStatus::Completed,
+        ),
+        (
+            EventKind::ERROR,
+            false,
+            false,
+            AssistantResponseStatus::Failed,
+        ),
+        (
+            EventKind::ERROR,
+            true,
+            true,
+            AssistantResponseStatus::Cancelled,
+        ),
+    ] {
+        assert_response_finalization_recovers(kind, finished, cancelled, status);
+    }
+}
+
+fn assert_response_finalization_recovers(
+    kind: &'static str,
+    finished: bool,
+    cancelled: bool,
+    status: AssistantResponseStatus,
+) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let mut steps = vec![
+        ScriptedStreamStep::Event(ModelStreamEvent::TextDelta("durable".to_owned())),
+        ScriptedStreamStep::Event(ModelStreamEvent::TextDelta(" pending".to_owned())),
+    ];
+    if finished {
+        steps.push(ScriptedStreamStep::Event(ModelStreamEvent::Finished {
+            stop_reason: StopReason::Completed,
+            usage: None,
+        }));
+    }
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(vec![
+            FixtureResponse::Stream(steps),
+            FixtureResponse::Assistant("must not dispatch a follow-up".to_owned()),
+        ]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("writer"));
+    let dispatches = count_response_fault_dispatches(&mut session);
+    let matched_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| {
+        path == matched_log
+            && std::fs::read_to_string(path).is_ok_and(|raw| {
+                raw.lines().last().is_some_and(|line| {
+                    line.contains(kind)
+                        && (kind != EventKind::ASSISTANT_RESPONSE_CHUNK
+                            || line.contains("\"sequence\":1"))
+                })
+            })
+    });
+    let cancel = Arc::new(AtomicBool::new(false));
+    let sink_cancel = Arc::clone(&cancel);
+    let mut deltas = 0;
+    let error = session
+        .run_turn_with_sink("answer", cancel, |event| {
+            if event.kind.as_str() == EventKind::MODEL_DELTA {
+                deltas += 1;
+                if cancelled && deltas == 2 {
+                    sink_cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        })
+        .expect_err("response append sync is ambiguous");
+    assert!(matches!(error, SessionError::Io(_)), "{kind}: {error}");
+    assert!(guard.fired(), "{kind} sync fault must fire");
+    drop(guard);
+    assert_response_persistence_fenced(&mut session, &dispatches, &log);
+    drop(session);
+
+    let resumed = crate::resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("reopen physical response prefix");
+    let projected = crate::project_assistant_response_terminals(resumed.events())
+        .expect("valid recovered response protocol");
+    assert_eq!(projected.len(), 1, "{kind}: exactly one response terminal");
+    let response = projected.values().next().expect("recovered response");
+    assert_eq!(response.status, status, "{kind}");
+    assert_eq!(response.content, "durable pending", "{kind}");
+    assert!(resumed.can_accept_turn());
+}
+
+#[test]
+fn durable_provider_failure_releases_response_ownership_for_follow_up() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(vec![
+            FixtureResponse::Stream(vec![ScriptedStreamStep::Event(
+                ModelStreamEvent::TextDelta("partial response".to_owned()),
+            )]),
+            FixtureResponse::Assistant("follow-up succeeds".to_owned()),
+        ]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(log).expect("writer"));
+    let dispatches = count_response_fault_dispatches(&mut session);
+    let error = session.run_turn("first").expect_err("provider truncation");
+    assert!(matches!(error, SessionError::Provider(_)));
+    assert!(session.can_accept_turn());
+    session
+        .run_turn("follow-up")
+        .expect("durable failure permits another turn");
+    assert_eq!(dispatches.load(Ordering::SeqCst), 2);
+    let projected = crate::project_assistant_response_terminals(session.events())
+        .expect("valid response terminals");
+    assert_eq!(projected.len(), 2);
+    assert!(projected
+        .values()
+        .any(|response| response.status == AssistantResponseStatus::Failed));
+    assert!(projected
+        .values()
+        .any(|response| response.status == AssistantResponseStatus::Completed));
+}
+
+#[test]
+fn durable_model_terminal_preserves_later_append_retry_ownership() {
+    for kind in [EventKind::ASSISTANT_MESSAGE, EventKind::TOOL_RESULT] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log = temp.path().join("events.jsonl");
+        std::fs::write(temp.path().join("note.txt"), "note").expect("fixture");
+        let first = if kind == EventKind::TOOL_RESULT {
+            FixtureResponse::ToolCalls(vec![euler_provider::ToolCall {
+                id: "read-note".to_owned(),
+                name: "read_file".to_owned(),
+                input: json!({"path": "note.txt"}),
+            }])
+        } else {
+            FixtureResponse::Assistant("completed response".to_owned())
+        };
+        let mut session = Session::new(
+            SessionConfig::new(temp.path()),
+            ScriptedProvider::new(vec![
+                first,
+                FixtureResponse::Assistant("follow-up succeeds".to_owned()),
+            ]),
+            ScriptedDecider::new(Vec::new()),
+        )
+        .with_provenance(ProvenanceWriter::new(log.clone()).expect("writer"));
+        let dispatches = count_response_fault_dispatches(&mut session);
+        let matched_log = log.clone();
+        let guard = arm_matching(Op::FileSync, move |path| {
+            path == matched_log
+                && std::fs::read_to_string(path)
+                    .is_ok_and(|raw| raw.lines().last().is_some_and(|line| line.contains(kind)))
+        });
+        let error = session
+            .run_turn("first")
+            .expect_err("post-terminal sync fault");
+        assert!(matches!(error, SessionError::Io(_)), "{kind}: {error}");
+        assert!(guard.fired(), "{kind} sync fault must fire");
+        drop(guard);
+        assert!(
+            session.can_accept_turn(),
+            "{kind}: response already terminal"
+        );
+        session
+            .run_turn("follow-up")
+            .expect("accepted backlog may reconcile");
+        assert_eq!(dispatches.load(Ordering::SeqCst), 2);
+        let durable = crate::read_resume_prefix(&log).expect("valid durable log");
+        assert_eq!(
+            durable
+                .iter()
+                .filter(|event| event.kind.as_str() == kind)
+                .count(),
+            session
+                .events()
+                .iter()
+                .filter(|event| event.kind.as_str() == kind)
+                .count(),
+            "{kind}: exact retry does not duplicate the accepted event"
+        );
+    }
 }
 
 #[test]
