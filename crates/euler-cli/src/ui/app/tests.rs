@@ -2177,15 +2177,16 @@ fn queued_steer_preview_is_visual_only() {
 
 #[test]
 fn active_skill_command_queues_through_the_steering_path() {
-    let mut core = core();
-    let (_tx, worker_rx) = mpsc::channel();
-    core.state = AppState::TurnInFlight {
-        worker_rx,
-        interrupt_flag: Arc::new(AtomicBool::new(false)),
-        started_at: Instant::now(),
-    };
-    core.in_flight_label = Some(MODEL_TURN_IN_FLIGHT_LABEL.to_owned());
+    // Park a real model turn so the queue has an admitted active run and the
+    // turn is steering-ready, exactly like ordinary mid-turn submission.
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "start");
+    wait_for_model_call(&mut core);
+    assert!(core.model_turn_steering_ready);
 
+    // A running model turn that accepts steering opens the same explicit
+    // steer-versus-follow-up chooser as ordinary composer submission; the
+    // skill command is the chooser's content.
     assert_eq!(
         core.handle_command_action(CommandAction::ActivateSkill {
             name: "review".to_owned(),
@@ -2193,9 +2194,25 @@ fn active_skill_command_queues_through_the_steering_path() {
         }),
         CoreEffect::Render
     );
+    let Some(Modal::QueueMode(modal)) = &core.modal else {
+        panic!("skill activation during a steering-ready turn must open the queue-mode chooser");
+    };
+    assert_eq!(&*modal.content, "/skill:review check tests");
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('s'))),
+        CoreEffect::Render
+    );
     wait_for_queue_mutation(&mut core);
 
     assert_eq!(core.queued_inputs.snapshot(), ["/skill:review check tests"]);
+    assert_eq!(
+        core.queued_inputs.metadata_snapshot().rows()[0].mode(),
+        euler_core::QueueMode::Steering
+    );
+
+    gate.open();
+    wait_for_idle(&mut core);
 }
 
 #[test]

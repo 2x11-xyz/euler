@@ -58,9 +58,9 @@ use euler_core::{
     resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, CompactionStatus,
     EulerHome, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
     ProjectContextBootstrap, ProvenanceWriter, ProviderRuntimeEvent, ProviderRuntimeObserver,
-    QueueError, QueueLifecycleTransition, QueueMode, QueuePosition, QueuedInput,
-    QueuedInputMetadata, ReasoningEffort, RecoverableQueueInput, RunTerminalStatus, ScopePattern,
-    Session, SessionError, SessionStore, SkillCatalogEntry, SteeringQueueSnapshot,
+    QueueError, QueueLifecycleTransition, QueueMode, QueuePosition, ReasoningEffort,
+    RecoverableQueueInput, RunTerminalStatus, ScopePattern, Session, SessionError, SessionStore,
+    SkillCatalogEntry,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -3124,6 +3124,15 @@ impl AppCore {
         if prompt.trim().is_empty() {
             return CoreEffect::None;
         }
+        self.queue_input_during_turn(prompt)
+    }
+
+    /// Queue input submitted while a turn is running: open the
+    /// steer-versus-follow-up chooser when the running model turn accepts
+    /// steering, otherwise enqueue a follow-up. Composer submission and
+    /// explicit skill activation share this path so both obey the same
+    /// admission and chooser rules.
+    fn queue_input_during_turn(&mut self, prompt: String) -> CoreEffect {
         if self.model_turn_waiting_for_admission() {
             self.notice = Some(TURN_STARTING_NOTICE.to_owned());
             return CoreEffect::Render;
@@ -3539,13 +3548,8 @@ impl AppCore {
             |arguments| format!("/skill:{name} {arguments}"),
         );
         if !matches!(self.state, AppState::Idle { .. }) {
-            let content: Arc<str> = Arc::from(prompt);
             self.notice = None;
-            return self.start_queue_enqueue(
-                QueuePosition::Back,
-                Arc::clone(&content),
-                QueueMutationIntent::ComposerSubmit { original: content },
-            );
+            return self.queue_input_during_turn(prompt);
         }
         self.visual_scroll_offset = 0;
         self.queued_inputs.set_paused(false);
