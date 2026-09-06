@@ -56,6 +56,8 @@ pub enum PlanUpdateView {
     },
 }
 
+/// Ephemeral UI projection. Durable replay reconstructs these items from
+/// provenance events; this enum is never a persistence schema.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptItem {
     Banner {
@@ -155,6 +157,7 @@ pub enum TranscriptItem {
         content_changed: bool,
         sources: Vec<String>,
         skipped_count: usize,
+        compatibility_warning_count: usize,
         skill_count: usize,
         load_selected: bool,
     },

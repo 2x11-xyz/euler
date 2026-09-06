@@ -268,8 +268,10 @@ pub(crate) struct AcknowledgmentCardView<'a> {
     pub(crate) content_changed: bool,
     /// The accepted `EULER.md` source identities, general to specific.
     pub(crate) sources: &'a [String],
-    /// How many discovered files were skipped (shown only when non-zero).
+    /// How many project-context candidates were omitted (shown when non-zero).
     pub(crate) skipped_count: usize,
+    /// How many admitted project skills carry a compatibility warning.
+    pub(crate) compatibility_warning_count: usize,
     /// How many project skills the acknowledgment covers (shown when
     /// non-zero — the card must disclose every repository-authored input).
     pub(crate) skill_count: usize,
@@ -348,6 +350,7 @@ pub(crate) fn render_acknowledgment_card(
             view.skipped_count
         )));
     }
+    push_compatibility_warning(&mut rows, view.compatibility_warning_count);
     rows.push(PermissionPanelRow::body(String::new()));
     let load = "y  Load it (won't ask again unless it changes)";
     let skip = "n  Skip for now";
@@ -356,6 +359,21 @@ pub(crate) fn render_acknowledgment_card(
     let mut lines = Vec::new();
     push_bordered_permission_panel(&mut lines, &rows, theme, width);
     lines
+}
+
+fn push_compatibility_warning(rows: &mut Vec<PermissionPanelRow>, warning_count: usize) {
+    if warning_count == 0 {
+        return;
+    }
+    rows.push(PermissionPanelRow::body(String::new()));
+    let skills = if warning_count == 1 {
+        "skill"
+    } else {
+        "skills"
+    };
+    rows.push(PermissionPanelRow::metadata(format!(
+        "{warning_count} project {skills} will load with a name compatibility warning."
+    )));
 }
 
 /// The resume relocation-consent card (ADR 0017 phase 3, project-context
@@ -593,6 +611,7 @@ mod acknowledgment_card_tests {
             content_changed: false,
             sources: &sources,
             skipped_count: 2,
+            compatibility_warning_count: 0,
             skill_count: 0,
             load_selected: false,
         };
@@ -617,12 +636,29 @@ mod acknowledgment_card_tests {
             content_changed: true,
             sources: &sources,
             skipped_count: 0,
+            compatibility_warning_count: 0,
             skill_count: 0,
             load_selected: true,
         };
         let rendered = text(&render_acknowledgment_card(&view, &Theme::default(), 96));
         assert!(rendered.contains("This project's guidance changed. Load it?"));
         assert!(rendered.contains("changed since you last loaded it"));
+    }
+
+    #[test]
+    fn acknowledgment_card_distinguishes_loaded_warnings_from_skips() {
+        let view = AcknowledgmentCardView {
+            folder_label: "euler",
+            content_changed: false,
+            sources: &[],
+            skipped_count: 1,
+            compatibility_warning_count: 2,
+            skill_count: 2,
+            load_selected: false,
+        };
+        let rendered = text(&render_acknowledgment_card(&view, &Theme::default(), 96));
+        assert!(rendered.contains("1 file here couldn't be read and was skipped"));
+        assert!(rendered.contains("2 project skills will load with a name compatibility warning"));
     }
 
     #[test]

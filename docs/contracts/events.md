@@ -585,10 +585,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   and request assembly.
 - `project.context.diagnostic` (current schema version 2): `schema_version`,
   `snapshot_event_id`, `reason` (stable content-free code), optional bounded
-  `path` (normalized relative identity), optional numeric `observed`. Never
-  carries excerpts, raw parser errors, outside-workspace paths, or exception
-  strings derived from a candidate. Its schema version must exactly match its
-  owning snapshot; v1 diagnostics remain valid only in a v1 bootstrap.
+  `path` (normalized relative identity), optional numeric `observed`. Reasons
+  normally record omissions. `skill_name_directory_mismatch` is a non-fatal
+  advisory emitted only for an admitted skill. The older
+  `skill_name_mismatch` reason remains an omission, so replay never
+  reinterprets an existing event. The event never carries excerpts, raw parser
+  errors, outside-workspace paths, or exception strings derived from a
+  candidate. Its schema version must exactly match its owning snapshot; v1
+  diagnostics remain valid only in a v1 bootstrap.
 - `canvas.snapshot`: `selected_event_ids`, `counts`, retention telemetry
   `retained_items`, `retained_bytes`, `demoted_items`, `automatic`, `stubs`,
   `tier`, `budget_bytes`,

@@ -292,10 +292,11 @@ heuristic for unknown secret formats, as documented by the secrets contract.
 Candidate, per-source, rendered-context, and workspace-identity digests have
 separate versioned domains; the blob address covers the exact blob bytes.
 
-Typed `project.context.diagnostic` events record omissions without embedding
-unsafe content. `session.start` records a compact policy/count/digest summary,
-and every root-driver `model.call` records the digest of the exact rendered
-project context included in that request.
+Typed `project.context.diagnostic` events record omissions and accepted
+compatibility advisories without embedding unsafe content. `session.start`
+records a compact policy/count/digest summary, and every root-driver
+`model.call` records the digest of the exact rendered project context included
+in that request.
 
 The durable startup order is `session.start`, one snapshot, then the declared
 diagnostic events. The entire bootstrap must persist before provider dispatch;
@@ -402,16 +403,25 @@ consent for another worktree merely because both share a Git object database.
 
 ### 10. Discover skills with progressive disclosure
 
-Euler recursively discovers exact `SKILL.md` files beneath each selected
-`.agents/skills/` root, without following directory links. A valid first-release
-skill requires:
+Euler recursively discovers exact `SKILL.md` files beneath each selected skill
+root, without following directory links. A valid skill requires:
 
-- a `name` frontmatter field using 1–64 ASCII lowercase letters, digits, and
-  hyphens, with no leading, trailing, or consecutive hyphens;
-- a parent directory basename exactly equal to `name`;
-- a non-empty `description` of at most 1,024 UTF-8 bytes;
+- an effective name using 1–64 ASCII lowercase letters, digits, and hyphens,
+  with no leading, trailing, or consecutive hyphens;
+- a missing or YAML null `name` to derive from a parent directory basename that
+  satisfies that grammar, while a present valid `name` remains authoritative;
+- a non-empty `description` of at most 1,024 Unicode scalar values after YAML
+  decoding;
 - parseable frontmatter and a bounded UTF-8 body;
 - a safely opened regular `SKILL.md` contained beneath its skills root.
+
+A valid explicit name that differs from its parent directory is admitted for
+cross-agent compatibility and receives the non-fatal
+`skill_name_directory_mismatch` diagnostic. The diagnostic is emitted only
+after final catalog admission, so a skill excluded by collision or a resource
+bound is never reported as loaded with a warning. Matching the directory
+remains the portable authoring recommendation. An invalid explicit name is
+rejected and never replaced by the directory basename.
 
 Known cross-agent fields such as `license`, `compatibility`, `metadata`, and
 `allowed-tools` may be accepted for interoperability, but only `name` and
@@ -672,7 +682,8 @@ The implementation is not complete without tests covering:
 - symlink/reparse escape, linked directories, non-regular files, FIFOs, loops,
   containment, concurrent mutation, invalid UTF-8, and every numeric boundary;
 - deterministic ordering independent of directory iteration;
-- malformed frontmatter, name grammar, basename mismatch, duplicate names,
+- malformed frontmatter, missing-name fallback, explicit-name mismatch
+  admission and warning, invalid explicit and derived names, duplicate names,
   case variants, and Unicode-confusable rejection through the ASCII grammar;
 - adversarial source text containing fake core framing markers;
 - provider request capture proving `ModelRequest.instructions` is unchanged by
@@ -731,8 +742,19 @@ trust and acknowledgment:
 
 The implementation bounds one `SKILL.md` at 64 KiB, all admitted skill bodies
 at 1 MiB, accepted skills at 64, traversed skill directories at 512, traversal
-depth at 6, normalized names at 64 bytes, descriptions at 1 KiB, and the
-always-on catalog at 16 KiB. These are safety limits, not permission grants.
+depth at 6, normalized names at 64 ASCII bytes, descriptions at 1,024 Unicode
+scalar values after YAML decoding, and the always-on catalog at 16 KiB. These
+are safety limits, not permission grants.
+
+### 2026-07-31 interoperability amendment: lenient authoring boundary
+
+This amendment supersedes the original requirement that every skill declare a
+name equal to its parent directory and that description length be measured in
+UTF-8 bytes. Euler derives a missing or YAML null name from a valid parent
+basename and admits a valid explicit mismatch with a content-free compatibility
+advisory. Canonical name grammar, immutable snapshots, duplicate exclusion,
+containment, and permission behavior do not change. Description length is
+measured in Unicode scalar values after YAML decoding.
 
 ## Consequences
 

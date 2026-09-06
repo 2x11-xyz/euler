@@ -41,10 +41,14 @@ Use this skill when preparing a Git commit.
 Do not push unless the user asks.
 ```
 
-The directory name and frontmatter `name` must match exactly. Names may contain
-lowercase ASCII letters, digits, and hyphens. A hyphen cannot be first, last,
-or repeated. `description` must be present, and the file must contain valid
-UTF-8 Markdown with YAML frontmatter.
+Names may contain lowercase ASCII letters, digits, and hyphens. A hyphen cannot
+be first, last, or repeated. The `name` field may be omitted or set to YAML
+`null` when the parent directory has a valid name. A valid explicit name may
+differ from the directory and Euler will load it with a compatibility warning,
+but matching them is the most portable choice across agents. An invalid
+explicit name is rejected rather than replaced by the directory name.
+`description` must be present and contain at most 1,024 Unicode scalar values.
+The file must contain valid UTF-8 Markdown with YAML frontmatter.
 
 To make the same skill project-specific, use
 `.euler/skills/commit-writing/SKILL.md` instead. A user skill and project skill
@@ -69,6 +73,6 @@ remain subject to normal filesystem tools and permissions.
 
 ## If the skill does not appear
 
-Check the path, exact `SKILL.md` capitalization, frontmatter delimiters,
-directory and skill name match, duplicate names, and whether the session was
-created after the latest edit.
+Check the path, exact `SKILL.md` capitalization, frontmatter delimiters, name
+grammar, duplicate names, and whether the session was created after the latest
+edit.

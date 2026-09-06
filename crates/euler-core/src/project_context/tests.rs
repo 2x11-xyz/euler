@@ -1033,7 +1033,7 @@ fn diagnostic_flood_collapses_to_a_disabled_manifest_with_typed_reason() {
     let flood = super::discovery::DiscoveryOutcome {
         sources: vec![],
         skills: vec![],
-        diagnostics: (0..MAX_MANIFEST_DIAGNOSTICS + 1)
+        diagnostics: (0..MAX_MANIFEST_OMISSION_DIAGNOSTICS + 1)
             .map(|_| {
                 super::discovery::diagnostic(
                     super::discovery::DiagnosticReason::CaseMismatch,
@@ -1053,7 +1053,7 @@ fn diagnostic_flood_collapses_to_a_disabled_manifest_with_typed_reason() {
     assert_eq!(manifest.diagnostics[0].reason, "diagnostic_overflow");
     assert_eq!(
         manifest.diagnostics[0].observed,
-        Some(MAX_MANIFEST_DIAGNOSTICS as u64 + 1)
+        Some(MAX_MANIFEST_OMISSION_DIAGNOSTICS as u64 + 1)
     );
     manifest.validate().expect("collapsed manifest is valid");
 
@@ -1061,7 +1061,7 @@ fn diagnostic_flood_collapses_to_a_disabled_manifest_with_typed_reason() {
     let at_bound = super::discovery::DiscoveryOutcome {
         sources: vec![],
         skills: vec![],
-        diagnostics: (0..MAX_MANIFEST_DIAGNOSTICS)
+        diagnostics: (0..MAX_MANIFEST_OMISSION_DIAGNOSTICS)
             .map(|_| {
                 super::discovery::diagnostic(
                     super::discovery::DiagnosticReason::CaseMismatch,
@@ -1073,7 +1073,80 @@ fn diagnostic_flood_collapses_to_a_disabled_manifest_with_typed_reason() {
     };
     let (manifest, collapsed) = super::sanitize_preflight(at_bound);
     assert!(!collapsed);
-    assert_eq!(manifest.diagnostics.len(), MAX_MANIFEST_DIAGNOSTICS);
+    assert_eq!(
+        manifest.diagnostics.len(),
+        MAX_MANIFEST_OMISSION_DIAGNOSTICS
+    );
+}
+
+#[test]
+fn accepted_advisories_do_not_consume_the_omission_diagnostic_budget() {
+    let skills: Vec<_> = (0..MAX_SKILLS)
+        .map(|index| {
+            let name = format!("skill-{index:02}");
+            let path = format!(".euler/skills/folder-{index:02}/SKILL.md");
+            let body = "body\n".to_owned();
+            super::manifest::ManifestSkill {
+                name: name.clone(),
+                description: "A focused skill.".to_owned(),
+                scope: super::manifest::SkillScope::Project,
+                path: path.clone(),
+                body_len: body.len() as u64,
+                body_digest: super::digest::skill_digest_v1(
+                    super::manifest::SkillScope::Project,
+                    &name,
+                    &path,
+                    &body,
+                ),
+                body,
+            }
+        })
+        .collect();
+    let mut diagnostics: Vec<_> = (0..MAX_MANIFEST_OMISSION_DIAGNOSTICS)
+        .map(|_| {
+            super::discovery::diagnostic(
+                super::discovery::DiagnosticReason::CaseMismatch,
+                Some("euler.md".to_owned()),
+                None,
+            )
+        })
+        .collect();
+    diagnostics.extend(
+        skills
+            .iter()
+            .map(|skill| super::manifest::ManifestDiagnostic {
+                reason: super::manifest::SKILL_NAME_DIRECTORY_MISMATCH_REASON.to_owned(),
+                path: Some(skill.path.clone()),
+                observed: None,
+            }),
+    );
+
+    let (manifest, collapsed) = super::sanitize_preflight(super::discovery::DiscoveryOutcome {
+        sources: vec![],
+        skills,
+        diagnostics,
+    });
+
+    assert!(!collapsed);
+    assert_eq!(
+        manifest
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| !diagnostic.is_advisory())
+            .count(),
+        MAX_MANIFEST_OMISSION_DIAGNOSTICS
+    );
+    assert_eq!(
+        manifest
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.is_advisory())
+            .count(),
+        MAX_MANIFEST_ADVISORY_DIAGNOSTICS
+    );
+    manifest
+        .validate()
+        .expect("independent budgets remain valid");
 }
 
 /// Blocker 2: even the admitted (test-hook) path resolves disabled when the
@@ -1896,6 +1969,302 @@ fn project_skills_are_discovered_from_euler_skills_and_require_acknowledgment() 
         }
         _ => panic!("project skill should require acknowledgment"),
     }
+}
+
+#[test]
+fn missing_skill_name_uses_the_valid_parent_directory_name() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    let user_skills = temp.path().join("home/skills");
+    write(
+        &user_skills.join("commit-writing/SKILL.md"),
+        "---\ndescription: Write focused commits.\n---\nKeep commits focused.\n",
+    );
+
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+        &root,
+        Some(&user_skills),
+        &redactor(),
+    )
+    .expect("preflight");
+
+    assert_eq!(manifest_skill_names(&bootstrap), vec!["commit-writing"]);
+    assert!(!reasons(&bootstrap).contains(&"skill_name_directory_mismatch".to_owned()));
+}
+
+#[test]
+fn yaml_null_skill_name_uses_the_valid_parent_directory_name() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    let user_skills = temp.path().join("home/skills");
+    write(
+        &user_skills.join("commit-writing/SKILL.md"),
+        "---\nname: null\ndescription: Write focused commits.\n---\nKeep commits focused.\n",
+    );
+
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+        &root,
+        Some(&user_skills),
+        &redactor(),
+    )
+    .expect("preflight");
+
+    assert_eq!(manifest_skill_names(&bootstrap), vec!["commit-writing"]);
+    assert!(!reasons(&bootstrap).contains(&"skill_name_directory_mismatch".to_owned()));
+}
+
+#[test]
+fn valid_explicit_skill_name_directory_mismatch_is_admitted_with_one_warning() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write(
+        &root.join(".euler/skills/shared-folder/SKILL.md"),
+        "---\nname: commit-writing\ndescription: Write focused commits.\n---\nKeep commits focused.\n",
+    );
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let consent = temp.path().join("consent");
+    let pending = match ProjectContextBootstrap::resolve_with_user_skills(
+        &canonical,
+        None,
+        &redactor(),
+        ProjectContextResolveOptions {
+            policy: ProjectContextPolicy::Auto,
+            session_kind: SessionKind::Interactive,
+            trusted_local: false,
+        },
+        Some(&consent),
+        generous_budget(),
+    )
+    .expect("resolve")
+    {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => pending,
+        _ => panic!("project skill should require acknowledgment"),
+    };
+
+    assert_eq!(pending.skill_count(), 1);
+    assert_eq!(pending.skipped_count(), 0);
+    assert_eq!(pending.compatibility_warning_count(), 1);
+    let bootstrap = pending.accept().expect("accept");
+    assert_eq!(manifest_skill_names(&bootstrap), vec!["commit-writing"]);
+    assert_eq!(
+        bootstrap
+            .diagnostics
+            .iter()
+            .filter(|record| record.reason == "skill_name_directory_mismatch")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn legacy_skill_name_mismatch_counts_as_an_omission_not_a_warning() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write(&root.join("EULER.md"), "project guidance\n");
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let consent = temp.path().join("consent");
+    let mut pending = match ProjectContextBootstrap::resolve_with_user_skills(
+        &canonical,
+        None,
+        &redactor(),
+        ProjectContextResolveOptions {
+            policy: ProjectContextPolicy::Auto,
+            session_kind: SessionKind::Interactive,
+            trusted_local: false,
+        },
+        Some(&consent),
+        generous_budget(),
+    )
+    .expect("resolve")
+    {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => pending,
+        _ => panic!("project guidance should require acknowledgment"),
+    };
+    // Simulate the stable reason recorded by the stricter pre-compatibility
+    // loader. The display methods must preserve its omission semantics.
+    pending.preflight.diagnostics = vec![super::manifest::ManifestDiagnostic {
+        reason: "skill_name_mismatch".to_owned(),
+        path: Some(".euler/skills/legacy/SKILL.md".to_owned()),
+        observed: None,
+    }];
+
+    assert_eq!(pending.skipped_count(), 1);
+    assert_eq!(pending.compatibility_warning_count(), 0);
+}
+
+#[test]
+fn invalid_explicit_or_derived_skill_names_remain_rejected() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    let user_skills = temp.path().join("home/skills");
+    write(
+        &user_skills.join("valid-folder/SKILL.md"),
+        "---\nname: Invalid Name\ndescription: Invalid explicit name.\n---\nbody\n",
+    );
+    write(
+        &user_skills.join("Invalid-Folder/SKILL.md"),
+        "---\ndescription: Invalid derived name.\n---\nbody\n",
+    );
+
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+        &root,
+        Some(&user_skills),
+        &redactor(),
+    )
+    .expect("preflight");
+
+    assert!(manifest_skill_names(&bootstrap).is_empty());
+    assert_eq!(
+        reasons(&bootstrap)
+            .iter()
+            .filter(|reason| reason.as_str() == "skill_name_invalid")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn derived_and_mismatched_explicit_names_share_the_existing_collision_policy() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    let user_skills = temp.path().join("home/skills");
+    write(
+        &user_skills.join("commit-writing/SKILL.md"),
+        "---\ndescription: Derived name.\n---\nderived body\n",
+    );
+    write(
+        &user_skills.join("shared-folder/SKILL.md"),
+        "---\nname: commit-writing\ndescription: Explicit name.\n---\nexplicit body\n",
+    );
+
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+        &root,
+        Some(&user_skills),
+        &redactor(),
+    )
+    .expect("preflight");
+
+    assert!(manifest_skill_names(&bootstrap).is_empty());
+    assert_eq!(
+        reasons(&bootstrap)
+            .iter()
+            .filter(|reason| reason.as_str() == "skill_name_ambiguous")
+            .count(),
+        2
+    );
+    assert!(!reasons(&bootstrap).contains(&"skill_name_directory_mismatch".to_owned()));
+}
+
+#[test]
+fn catalog_rejection_suppresses_a_name_mismatch_warning() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    let user_skills = temp.path().join("home/skills");
+    for index in 0..30 {
+        let name = format!("skill-{index:02}");
+        write_skill(&user_skills, &name, &"description ".repeat(75), "body\n");
+    }
+    write(
+        &user_skills.join("shared-folder/SKILL.md"),
+        format!(
+            "---\nname: zzzz-skill\ndescription: {}\n---\nbody\n",
+            "description ".repeat(75)
+        ),
+    );
+
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+        &root,
+        Some(&user_skills),
+        &redactor(),
+    )
+    .expect("preflight");
+
+    assert!(!manifest_skill_names(&bootstrap).contains(&"zzzz-skill".to_owned()));
+    assert!(bootstrap.diagnostics.iter().any(|record| {
+        record.reason == "skill_catalog_limit_exceeded"
+            && record.path.as_deref() == Some("user/skills/shared-folder/SKILL.md")
+    }));
+    assert!(!bootstrap.diagnostics.iter().any(|record| {
+        record.reason == "skill_name_directory_mismatch"
+            && record.path.as_deref() == Some("user/skills/shared-folder/SKILL.md")
+    }));
+}
+
+#[test]
+fn user_skill_mismatch_does_not_enter_project_acknowledgment_counts() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write(&root.join("EULER.md"), "project rules\n");
+    let user_skills = temp.path().join("home/skills");
+    write(
+        &user_skills.join("shared-folder/SKILL.md"),
+        "---\nname: commit-writing\ndescription: Write focused commits.\n---\nbody\n",
+    );
+    let canonical = fs::canonicalize(&root).expect("canonical");
+    let consent = temp.path().join("consent");
+    let pending = match ProjectContextBootstrap::resolve_with_user_skills(
+        &canonical,
+        Some(&user_skills),
+        &redactor(),
+        ProjectContextResolveOptions {
+            policy: ProjectContextPolicy::Auto,
+            session_kind: SessionKind::Interactive,
+            trusted_local: false,
+        },
+        Some(&consent),
+        generous_budget(),
+    )
+    .expect("resolve")
+    {
+        ProjectContextResolution::NeedsAcknowledgment(pending) => pending,
+        _ => panic!("project instructions should require acknowledgment"),
+    };
+
+    assert_eq!(pending.skipped_count(), 0);
+    assert_eq!(pending.compatibility_warning_count(), 0);
+    let bootstrap = pending.accept().expect("accept");
+    assert_eq!(manifest_skill_names(&bootstrap), vec!["commit-writing"]);
+    assert!(bootstrap.diagnostics.iter().any(|record| {
+        record.reason == "skill_name_directory_mismatch"
+            && record.path.as_deref() == Some("user/skills/shared-folder/SKILL.md")
+    }));
+}
+
+#[test]
+fn skill_description_limit_counts_unicode_scalar_values_after_yaml_decoding() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    let user_skills = temp.path().join("home/skills");
+    let accepted = "é".repeat(MAX_SKILL_DESCRIPTION_CHARS);
+    let rejected = "é".repeat(MAX_SKILL_DESCRIPTION_CHARS + 1);
+    write_skill(&user_skills, "accepted", &accepted, "accepted body\n");
+    write_skill(&user_skills, "rejected", &rejected, "rejected body\n");
+
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+        &root,
+        Some(&user_skills),
+        &redactor(),
+    )
+    .expect("preflight");
+
+    assert!(accepted.len() > MAX_SKILL_DESCRIPTION_CHARS);
+    assert_eq!(manifest_skill_names(&bootstrap), vec!["accepted"]);
+    assert_eq!(
+        reasons(&bootstrap)
+            .iter()
+            .filter(|reason| reason.as_str() == "skill_description_invalid")
+            .count(),
+        1
+    );
 }
 
 #[test]
