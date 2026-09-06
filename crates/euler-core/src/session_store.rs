@@ -1131,21 +1131,6 @@ fn status_from_events(
         return SessionStatus::Active;
     }
     if let Some(status) = lifecycle.latest_terminal_status() {
-        // A session-level terminal event (no run attribution) recorded after
-        // the latest run terminal still decides the listing status. A captured
-        // error that belongs to a terminalized run was settled by its terminal.
-        let after_terminal = events
-            .iter()
-            .rposition(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
-            .map_or(events.len(), |index| index + 1);
-        if let Some(late) = events[after_terminal..]
-            .iter()
-            .rev()
-            .filter(|event| event.run.is_none())
-            .find_map(status_from_terminal_event)
-        {
-            return late;
-        }
         return match status {
             RunTerminalStatus::Failed => SessionStatus::Failed,
             RunTerminalStatus::Completed
