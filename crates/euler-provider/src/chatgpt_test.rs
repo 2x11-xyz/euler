@@ -525,11 +525,13 @@ fn request_forwards_reasoning_effort_compat_level() {
     };
     let default_body = request_body(&base);
     assert_eq!(default_body["reasoning"]["effort"], "medium");
+    assert_eq!(default_body["reasoning"]["summary"], "auto");
 
     let mut xlarge = base;
     xlarge.reasoning_effort = crate::ReasoningEffort::XLarge;
     let body = request_body(&xlarge);
     assert_eq!(body["reasoning"]["effort"], "xhigh");
+    assert_eq!(body["reasoning"]["summary"], "auto");
 
     for model in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
         let mut max = xlarge.clone();
@@ -537,6 +539,26 @@ fn request_forwards_reasoning_effort_compat_level() {
         max.reasoning_effort = crate::ReasoningEffort::Max;
         let body = request_body(&max);
         assert_eq!(body["reasoning"]["effort"], "max", "model {model}");
+    }
+}
+
+#[test]
+fn request_always_asks_for_reasoning_summaries() {
+    // Reasoning summary deltas are the only semantic events the SSE parser
+    // emits during a reasoning phase. Requesting them keeps a long think from
+    // tripping the semantic-idle deadline and being replayed (re-billed).
+    for effort in [
+        crate::ReasoningEffort::Small,
+        crate::ReasoningEffort::Medium,
+        crate::ReasoningEffort::XLarge,
+    ] {
+        let request = ModelRequest {
+            reasoning_effort: effort,
+            ..minimal_request()
+        };
+        let body = request_body(&request);
+        assert_eq!(body["reasoning"]["summary"], "auto", "effort {effort:?}");
+        assert!(body["reasoning"]["effort"].is_string(), "effort {effort:?}");
     }
 }
 

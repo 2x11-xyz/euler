@@ -3,7 +3,7 @@ use crate::{ProviderRuntimeObserver, ProviderRuntimeScope};
 use euler_event::{object, EventEnvelope, JsonObject};
 use euler_provider::{
     ModelRequest, ModelStreamEvent, ProviderError, ProviderErrorCategory, ProviderStream,
-    ReasoningChunk, StopReason, ToolCall, Usage,
+    ProviderTimeoutStage, ReasoningChunk, StopReason, ToolCall, Usage,
 };
 use euler_sdk::CancellationToken;
 use euler_sdk::Capability;
@@ -96,8 +96,9 @@ pub(crate) struct RoundLoopConfig {
     /// (and cancellation), not an arbitrary ceiling.
     pub(crate) max_rounds: Option<usize>,
     /// Extra attempts after a transient transport or rate-limit provider
-    /// failure before provider-neutral progress. Other failures and rounds
-    /// with readable/visible output, tool calls, or completion are not retried.
+    /// failure before provider-neutral progress. Other failures, rounds with
+    /// readable/visible output, tool calls, or completion, and `semantic_idle`
+    /// timeouts (the provider was already working) are not retried.
     pub(crate) provider_retries: usize,
     /// Backoff before each retry; the last entry repeats if retries exceed it.
     pub(crate) provider_retry_backoff_ms: Vec<u64>,
@@ -291,12 +292,12 @@ where
                 Err(AttemptFailure::Session(error)) => return Err(error),
                 Err(AttemptFailure::Provider(error)) => error,
             };
-            let category = error.category();
-            let retryable = matches!(
-                category,
-                ProviderErrorCategory::Transport | ProviderErrorCategory::RateLimit
-            ) && !provider_neutral_progress
-                && attempt < self.config.provider_retries;
+            let retryable = provider_failure_is_retryable(
+                &error,
+                provider_neutral_progress,
+                attempt,
+                self.config.provider_retries,
+            );
             if !retryable {
                 self.io
                     .emit_provider_error(&error, model_call_id.to_owned())?;
@@ -419,12 +420,83 @@ fn collect_stream_event(event: ModelStreamEvent, data: &mut ModelRoundData) {
     }
 }
 
+/// Whether a failed provider attempt may be replayed automatically.
+///
+/// Transport and rate-limit failures retry while the round has seen no
+/// provider-neutral progress and the retry budget remains. A `semantic_idle`
+/// inactivity timeout is the exception: it can only fire after the first
+/// response byte, so the provider had accepted and was working the request
+/// (for example a long silent reasoning phase). Replaying it would bill the
+/// user again for an attempt that already ran. `response_headers` and
+/// `first_byte` timeouts stay retryable because nothing was received.
+fn provider_failure_is_retryable(
+    error: &ProviderError,
+    provider_neutral_progress: bool,
+    attempt: usize,
+    provider_retries: usize,
+) -> bool {
+    if error.timeout_stage() == Some(ProviderTimeoutStage::SemanticIdle) {
+        return false;
+    }
+    matches!(
+        error.category(),
+        ProviderErrorCategory::Transport | ProviderErrorCategory::RateLimit
+    ) && !provider_neutral_progress
+        && attempt < provider_retries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use euler_provider::{ReasoningEffort, ToolCall};
     use euler_sdk::CancellationSource;
     use serde_json::json;
+    use std::time::Duration;
+
+    #[test]
+    fn semantic_idle_timeout_is_never_retried() {
+        // A `semantic_idle` timeout can only fire after the first response
+        // byte, so the provider had accepted and was working the request.
+        // Replaying it would bill the user again for the abandoned attempt,
+        // even though no provider-neutral progress reached the round.
+        let error = ProviderError::timeout(ProviderTimeoutStage::SemanticIdle, Duration::ZERO);
+        assert_eq!(error.category(), ProviderErrorCategory::Transport);
+        assert!(!provider_failure_is_retryable(&error, false, 0, 2));
+        assert!(!provider_failure_is_retryable(&error, true, 0, 2));
+    }
+
+    #[test]
+    fn pre_first_byte_timeouts_stay_retryable_without_progress() {
+        for stage in [
+            ProviderTimeoutStage::ResponseHeaders,
+            ProviderTimeoutStage::FirstByte,
+        ] {
+            let error = ProviderError::timeout(stage, Duration::ZERO);
+            assert!(
+                provider_failure_is_retryable(&error, false, 0, 2),
+                "{stage:?} should retry before any byte"
+            );
+            assert!(
+                !provider_failure_is_retryable(&error, false, 2, 2),
+                "{stage:?} must respect the retry budget"
+            );
+            assert!(
+                !provider_failure_is_retryable(&error, true, 0, 2),
+                "{stage:?} must not replay after provider-neutral progress"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_transport_and_rate_limit_failures_follow_the_progress_rule() {
+        let transport = ProviderError::transport("connection reset");
+        let rate_limit = ProviderError::rate_limit("slow down");
+        let rejected = ProviderError::rejected("bad request");
+        assert!(provider_failure_is_retryable(&transport, false, 0, 1));
+        assert!(provider_failure_is_retryable(&rate_limit, false, 0, 1));
+        assert!(!provider_failure_is_retryable(&transport, true, 0, 1));
+        assert!(!provider_failure_is_retryable(&rejected, false, 0, 1));
+    }
 
     struct CancelAfterCompletedRound {
         cancellation: CancellationSource,

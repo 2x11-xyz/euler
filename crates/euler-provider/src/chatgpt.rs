@@ -276,7 +276,15 @@ fn request_body(request: &ModelRequest) -> Value {
         "input": request.input.iter().filter_map(input_item).collect::<Vec<_>>(),
         "stream": true,
         "store": false,
-        "reasoning": { "effort": request.reasoning_effort.compat_level() },
+        // `summary: auto` makes the Responses API stream
+        // `response.reasoning_summary*.delta` events during the reasoning
+        // phase. Without it a long silent think produces zero semantic
+        // events, the semantic-idle liveness deadline fires, and the round
+        // is abandoned even though the provider was working.
+        "reasoning": {
+            "effort": request.reasoning_effort.compat_level(),
+            "summary": "auto",
+        },
     });
     if !request.tools.is_empty() {
         body["tools"] = json!(request

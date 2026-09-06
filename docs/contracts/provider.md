@@ -143,6 +143,22 @@ or a finished record has entered the round, the request is never replayed
 automatically because its remote outcome and emitted prefix cannot be
 duplicated safely. Empty deltas, provider-opaque artifacts, and transport
 control observations do not suppress an otherwise safe pre-semantic retry.
+
+Inactivity timeouts retry by stage, not by category alone:
+
+- `response_headers` and `first_byte` timeouts are retryable (subject to the
+  progress rule and the retry budget): nothing was received, so the attempt
+  is treated like any other transport failure.
+- `semantic_idle` timeouts are never retried, even when no provider-neutral
+  progress reached the round. The stage can only fire after the first
+  response byte, so the provider had accepted and was working the request
+  (for example a long reasoning phase with no readable summary). Replaying it
+  would bill the caller again for an attempt that already ran; the round
+  fails with the timeout error instead.
+
+Adapters must therefore make the reasoning phase observable where the API
+allows it (the ChatGPT Responses adapter requests `reasoning.summary: auto`)
+so that legitimate long thinking resets semantic idle rather than tripping it.
 Each retry is separately observed and its backoff is recorded in diagnostics.
 
 ## Diagnostics and provenance
