@@ -45,6 +45,8 @@ rather than being backfilled or reused.
 | [0015](0015-extension-distribution.md) | Extension distribution | Accepted 2026-07-18 |
 | [0016](0016-github-provider-catalog.md) | GitHub provider catalog distribution | Accepted 2026-07-18 |
 | [0017](0017-project-context-and-agent-skills.md) | Repository project context and shareable agent skills | Accepted 2026-07-21 |
+| [0018](0018-extension-model-tools-and-idle-contributions.md) | Extension model tools and idle contributions | Accepted 2026-07-27 |
+| [0019](0019-extension-request-tick.md) | Extension request tick | Accepted 2026-08-01 |
 | [0020](0020-durable-run-and-queue-lifecycle.md) | Durable run and queue lifecycle | Accepted 2026-09-05 |
 
 Next number: **0021**.

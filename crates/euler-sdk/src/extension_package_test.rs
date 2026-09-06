@@ -491,6 +491,7 @@ fn linked_extension(
             }],
             observer: None,
             idle_contribution: None,
+            request_tick: None,
         },
         broken_reason,
     }
@@ -572,7 +573,7 @@ fn manifest_parses_observer_declaration_and_rejects_unknown_commands() {
 }
 
 #[test]
-fn manifest_parses_model_tool_and_idle_contribution() {
+fn manifest_parses_model_tool_idle_and_request_tick_contributions() {
     let manifest = json!({
         "version": 1,
         "id": "workflow-example",
@@ -609,7 +610,8 @@ fn manifest_parses_model_tool_and_idle_contribution() {
             "required_capabilities": [],
             "invocation": "agent-only"
         }],
-        "idle_contribution": {"command": "idle"}
+        "idle_contribution": {"command": "idle"},
+        "request_tick": {"command": "update"}
     });
 
     let descriptor =
@@ -628,6 +630,12 @@ fn manifest_parses_model_tool_and_idle_contribution() {
         descriptor.idle_contribution,
         Some(crate::IdleContributionDescriptor {
             command: "idle".to_owned()
+        })
+    );
+    assert_eq!(
+        descriptor.request_tick,
+        Some(crate::RequestTickDescriptor {
+            command: "update".to_owned()
         })
     );
 }
@@ -689,4 +697,40 @@ fn manifest_rejects_user_model_tools_and_invalid_idle_commands() {
     assert!(error
         .to_string()
         .contains("idle_contribution command `update` must be agent-only"));
+}
+
+#[test]
+fn manifest_rejects_missing_or_user_request_tick_commands() {
+    let base = json!({
+        "version": 1,
+        "id": "workflow-example",
+        "display_name": "Workflow example",
+        "extension_version": "0.1.0",
+        "runtime_kind": "native-rust",
+        "capabilities": [],
+        "commands": [{
+            "name": "update",
+            "display_name": "Update",
+            "summary": "Update extension-owned state.",
+            "required_capabilities": []
+        }]
+    });
+    let mut missing = base.clone();
+    missing["request_tick"] = json!({"command": "missing"});
+    let error = parse_extension_manifest_bytes(
+        &serde_json::to_vec(&missing).expect("missing command manifest"),
+    )
+    .expect_err("missing request tick command");
+    assert!(error
+        .to_string()
+        .contains("request_tick command `missing` is not registered"));
+
+    let mut user = base;
+    user["request_tick"] = json!({"command": "update"});
+    let error =
+        parse_extension_manifest_bytes(&serde_json::to_vec(&user).expect("user command manifest"))
+            .expect_err("user request tick command");
+    assert!(error
+        .to_string()
+        .contains("request_tick command `update` must be agent-only"));
 }

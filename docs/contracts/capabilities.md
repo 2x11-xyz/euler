@@ -131,6 +131,15 @@ open this operation prompt. Every required capability must be
 before its command starts; the rejected stop is recorded without an `error`
 event. Explicit model tools retain the ordinary operation-level prompt above.
 
+Root request ticks (ADR 0019) use the same standing-authority rule and never
+open an operation prompt. Missing authority latches only that tick contributor
+for the remainder of the live Session; later contributors and the root request
+continue. During an authorized tick, the ordinary command descriptor remains
+the sole capability source. The request boundary's injected provenance cutoff
+narrows an already-authorized `provenance-read` query; it grants no capability
+and cannot be changed by the extension. Cancellation and mandatory permission
+or command provenance failures retain their ordinary session-wide semantics.
+
 ## Install consent (extension distribution)
 
 Installing an extension involves three distinct consents that must never be

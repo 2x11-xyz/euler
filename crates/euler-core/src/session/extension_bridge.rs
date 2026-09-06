@@ -25,6 +25,34 @@ use std::time::Instant;
 /// spend even when an extension's input validation fails to.
 pub const MAX_SPAWNS_PER_COMMAND: usize = 16;
 
+pub(super) struct ExtensionCommandBoundary<'a> {
+    extension_id: Option<&'a str>,
+    provenance_cutoff: Option<&'a str>,
+    cancellation: &'a CancellationToken,
+}
+
+impl<'a> ExtensionCommandBoundary<'a> {
+    pub(super) fn ordinary(cancellation: &'a CancellationToken) -> Self {
+        Self {
+            extension_id: None,
+            provenance_cutoff: None,
+            cancellation,
+        }
+    }
+
+    pub(super) fn at_cutoff(
+        extension_id: &'a str,
+        cutoff: &'a str,
+        cancellation: &'a CancellationToken,
+    ) -> Self {
+        Self {
+            extension_id: Some(extension_id),
+            provenance_cutoff: Some(cutoff),
+            cancellation,
+        }
+    }
+}
+
 impl ExtensionExecutionError {
     pub(super) fn from_host_error(error: ExtensionHostError) -> Self {
         match error {
@@ -40,12 +68,12 @@ impl ExtensionExecutionError {
                 Self::Session(SessionError::ExtensionEmissionDegraded)
             }
             ExtensionHostError::ExtensionDisabled(_) => Self::CommandFailed,
+            ExtensionHostError::RegistrationPanic(_) => Self::RegistrationPanicked,
             ExtensionHostError::InvalidExtensionId(_)
             | ExtensionHostError::InvalidCommandName(_)
             | ExtensionHostError::DuplicateExtensionId(_)
             | ExtensionHostError::DuplicateCommandName(_)
             | ExtensionHostError::RegistrationFailed(_, _)
-            | ExtensionHostError::RegistrationPanic(_)
             | ExtensionHostError::MissingCommand(_) => Self::RegistrationFailed,
         }
     }
@@ -187,6 +215,14 @@ impl<D> Session<D> {
         &mut self,
         granted: impl IntoIterator<Item = Capability>,
     ) -> Result<(ExtensionHost, Arc<QueuedExtensionEvents>), SessionError> {
+        self.extension_host_with_event_queue_at_cutoff(granted, None)
+    }
+
+    fn extension_host_with_event_queue_at_cutoff(
+        &mut self,
+        granted: impl IntoIterator<Item = Capability>,
+        provenance_cutoff: Option<&str>,
+    ) -> Result<(ExtensionHost, Arc<QueuedExtensionEvents>), SessionError> {
         if self.extension_emission_degraded {
             return Err(SessionError::ExtensionEmissionDegraded);
         }
@@ -205,11 +241,13 @@ impl<D> Session<D> {
         // Session-registered secret values (auth file, runtime-resolved)
         // must cover extension host-API emissions too, not only the
         // shape-only default (secrets contract).
-        Ok((
-            host.with_run_id(self.active_run.clone())
-                .with_redactor(self.redactor.clone()),
-            queue,
-        ))
+        let mut host = host
+            .with_run_id(self.active_run.clone())
+            .with_redactor(self.redactor.clone());
+        if let Some(cutoff) = provenance_cutoff {
+            host = host.with_provenance_cutoff(cutoff.to_owned());
+        }
+        Ok((host, queue))
     }
 
     pub fn publish_queued_extension_events(
@@ -499,29 +537,62 @@ impl<D> Session<D> {
     where
         D: PermissionDecider,
     {
-        if cancellation.is_cancelled() {
+        self.execute_extension_command_at_boundary(
+            extension,
+            command,
+            input,
+            granted,
+            ExtensionCommandBoundary::ordinary(cancellation),
+        )
+    }
+
+    pub(super) fn execute_extension_command_at_boundary(
+        &mut self,
+        extension: &dyn Extension,
+        command: &str,
+        input: Value,
+        granted: impl IntoIterator<Item = Capability>,
+        boundary: ExtensionCommandBoundary<'_>,
+    ) -> Result<Value, ExtensionExecutionError>
+    where
+        D: PermissionDecider,
+    {
+        if boundary.cancellation.is_cancelled() {
             return Err(ExtensionExecutionError::Cancelled);
         }
-        let extension_id = extension.manifest().id;
+        let extension_id = match boundary.extension_id {
+            Some(extension_id) => extension_id.to_owned(),
+            None => crate::extensions::extension_identity(extension)
+                .map_err(ExtensionExecutionError::from_host_error)?,
+        };
         if !self.extension_enabled(&extension_id) {
             return Err(ExtensionExecutionError::Disabled { id: extension_id });
         }
         let started = Instant::now();
-        let (mut host, queue) = self.extension_host_with_event_queue(granted)?;
+        let (mut host, queue) =
+            self.extension_host_with_event_queue_at_cutoff(granted, boundary.provenance_cutoff)?;
         let result = {
             let spawner = SessionSpawner {
                 session: RefCell::new(&mut *self),
                 queue: Arc::clone(&queue),
                 spawned: Cell::new(0),
-                cancellation: cancellation.clone(),
+                cancellation: boundary.cancellation.clone(),
             };
-            host.register_extension_for_command(extension, command)
+            let registration = match boundary.extension_id {
+                Some(_) => host.register_extension_for_command_with_identity(
+                    extension,
+                    &extension_id,
+                    command,
+                ),
+                None => host.register_extension_for_command(extension, command),
+            };
+            registration
                 .and_then(|()| {
                     host.execute_command_with_spawner_cancellable(
                         command,
                         input,
                         Some(&spawner),
-                        cancellation,
+                        boundary.cancellation,
                     )
                 })
                 .map_err(ExtensionExecutionError::from_host_error)

@@ -3,7 +3,8 @@
 Extensions register tools, commands, context slots, and workflows through a stable host API. Observer and companion agents are not a core registration category; they are extension compositions of core primitives (agent spawn/result, bounded event subscription, inter-agent message channels).
 
 Implementation status: commands, explicitly declared model tools, one
-terminal-idle contribution per root session, the bounded event feed, bounded
+terminal-idle contribution per root session, deterministic root request ticks,
+the bounded event feed, bounded
 diagnostics reads, artifact writes, agent task records, checkpoints, context
 slot updates, typed plan presentation, the local wake primitive, and a generic
 managed-process adapter exist today.
@@ -37,6 +38,10 @@ push stream, background runtime, wakeup mechanism, lease, or backpressure API.
 Cursor semantics:
 
 - `after_event_id` is a stable event-id cursor in global accepted-prefix order.
+- Optional `through_event_id` is an inclusive accepted-prefix upper bound. It
+  is independent of filters and must remain unchanged across every page of one
+  stable historical view. No event after it may be scanned, returned, or named
+  as a watermark.
 - Cursors are independent of filters. A cursor means "strictly after this
   session event", not "after this matching event".
 - Pages are ordered exactly as events appear in the accepted durable prefix.
@@ -48,6 +53,9 @@ Cursor semantics:
   the input cursor when the caller is already at the durable head.
 - `next_after_event_id` is present only on truncated pages and equals the
   cursor the caller should use to continue the same feed.
+- A missing `after_event_id` or `through_event_id` is a typed failure. A bound
+  that occurs before the cursor is a typed invalid range. Equal cursor and
+  bound returns an empty, untruncated page whose watermark is that id.
 
 Malformed accepted-prefix events are deterministic storage-corruption failures.
 They are not empty-feed results. Blob payloads are not expanded unless the
@@ -347,11 +355,13 @@ capabilities.
 - Root sessions alone receive extension model tools. Companions and spawned
   agents retain their bounded core tool palettes.
 - Root-session contribution wiring is fixed at launch/resume in v0. Disabling
-  a wired extension hides its model tool and idle hook immediately, and
+  a wired extension hides its model tool, idle hook, and request tick
+  immediately, and
   re-enabling that same wired extension restores them. Enabling or installing
   a package that was not wired when the session started updates live
-  enablement, but its model tool and idle hook appear only after restart or
-  resume; the TUI names that limitation instead of implying a hot load.
+  enablement, but its model tool, idle hook, and request tick appear only after
+  restart or resume; the TUI names that limitation instead of implying a hot
+  load.
 
 Native and managed-process extensions use the same descriptor and execution
 path. Managed manifests place `model_tool` on the declaring command.
@@ -421,6 +431,72 @@ it; disablement prevents only new contributions.
 Immediate cancellation of an already-running command is governed by the
 generic extension-command cancellation seam; the idle API does not define a
 second mechanism.
+
+## Root Request Tick v0
+
+`Extension::request_tick()` may nominate one registered `agent-only` command.
+Managed manifests declare the same shape at top level:
+
+```json
+{"request_tick":{"command":"command-id"}}
+```
+
+After all compaction decisions and immediately before each logical root-driver
+model request, core runs every enabled tick in stable extension-id order. It
+persists the current accepted prefix once and supplies every contributor the
+same exact closed input:
+
+```json
+{"through_event_id":"<accepted durable tail event id>"}
+```
+
+Core discovers one immutable snapshot of tick entries and owner ids for the
+request, then reuses that exact snapshot for both admission and execution.
+Dynamic or failed registration cannot nominate an owner to gain admission and
+then avoid its execution/failure outcome. The ordinary full canvas first gets
+all configured compaction handling. If it still exceeds the byte budget, a
+provisional pre-tick view may omit only the snapshotted owners' durable slots
+so they can refresh, clear, or latch. The provisional view is never a
+`canvas.snapshot` and never reaches a provider. The authoritative post-tick
+assembly restores successful/no-op owners, suppresses failed owners, and must
+pass every ordinary final budget check. Its request-growth comparison retains
+the settled full pre-tick request as the compatibility baseline.
+
+During that invocation every `HostApi::query_provenance` call is pinned to the
+shared inclusive cutoff. Omitting `through_event_id` injects it; supplying the
+same id is accepted; supplying any other id fails the query. A contributor
+therefore cannot observe permission decisions or other durable side effects
+emitted by an earlier tick in the same boundary. It must keep the same bound
+while paging.
+
+The returned value must be a JSON object, but core otherwise ignores it. Tick
+results, raw provenance, and extension reasoning never enter transcript or
+model canvas. Extensions use existing capability-gated context slots for
+bounded model-facing state and typed plan presentation for UI state. After the
+tick sequence, core assembles the final canvas and emits its ordinary
+purpose-free `canvas.snapshot`; no high-volume tick/heartbeat event is added.
+
+Ticks are root-only. Shadow compaction, companions, reviewers, and background
+work do not run them. They are implicit lifecycle work and never prompt:
+required capabilities need standing authority under the same rule as terminal
+idle. Registration, missing authority, ordinary command, or result-shape
+failure records exactly one canonical `error` with fixed host text and
+`failure: "command_error"` or `failure: "panic"`, disables that contributor
+for the remainder of the live Session, and does not suppress later
+contributors or the root request. The latch applies only to the request tick;
+otherwise valid model tools and terminal-idle work from that extension remain
+available. Live root request assembly does withhold that contributor's durable
+context slots after the latch: a contributor that cannot refresh or clear its
+state cannot leave stale state model-facing. This suppression does not delete
+slot events. Resume retries contributors with a fresh process-local failure
+latch and restores normal latest-slot projection so a successful resumed tick
+can refresh it before provider invocation. A command error or panic already
+recorded by the ordinary command host is not duplicated by the tick latch.
+Cancellation stops the boundary.
+Authoritative provenance failure retains the ordinary fatal writer fence. If
+no live writer or durable tail is available, the optional tick point is
+skipped before its contributor discovery rather than making the root request
+depend on observer read I/O.
 
 ## Managed Process Runtime v0
 

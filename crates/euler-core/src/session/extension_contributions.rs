@@ -1,8 +1,14 @@
 //! Product-neutral root-session contributions from enabled extensions:
-//! explicit model tools and one terminal-idle command.
+//! explicit model tools, deterministic request ticks, and one terminal-idle
+//! command.
 
-use super::{elapsed_ms, EventSink, ExtensionExecutionError, Session, SessionError};
-use crate::extensions::{extension_declaration, ExtensionDeclaration};
+use super::{
+    elapsed_ms, EventSink, ExtensionExecutionError, RequestTickFailureLatch, Session, SessionError,
+};
+use crate::extensions::{
+    extension_declaration, extension_request_tick, ExtensionDeclaration, ExtensionFailureKind,
+    ExtensionHostError,
+};
 use crate::permissions::PermissionDecider;
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{ToolCall, ToolDefinition};
@@ -55,6 +61,54 @@ struct IdleContributor {
     extension: Arc<dyn Extension>,
 }
 
+#[derive(Clone)]
+struct RequestTickContributor {
+    extension_id: String,
+    command: String,
+    required_capabilities: Vec<Capability>,
+    extension: Arc<dyn Extension>,
+}
+
+enum RequestTickEntry {
+    Contributor(RequestTickContributor),
+    RegistrationFailure {
+        extension_id: String,
+        failure: ExtensionFailureKind,
+    },
+}
+
+impl RequestTickEntry {
+    fn extension_id(&self) -> &str {
+        match self {
+            Self::Contributor(contributor) => &contributor.extension_id,
+            Self::RegistrationFailure { extension_id, .. } => extension_id,
+        }
+    }
+}
+
+/// One immutable view of the request-tick boundary. Discovery is untrusted
+/// extension code, so pre-tick admission and later execution must share this
+/// exact snapshot rather than asking an extension to nominate itself twice.
+#[derive(Default)]
+pub(super) struct RequestTickSnapshot {
+    entries: Vec<RequestTickEntry>,
+    owner_ids: BTreeSet<String>,
+}
+
+impl RequestTickSnapshot {
+    pub(super) fn owner_ids(&self) -> &BTreeSet<String> {
+        &self.owner_ids
+    }
+}
+
+fn registration_failure_kind(error: &ExtensionHostError) -> ExtensionFailureKind {
+    if matches!(error, ExtensionHostError::RegistrationPanic(_)) {
+        ExtensionFailureKind::Panic
+    } else {
+        ExtensionFailureKind::CommandError
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum IdleBoundary {
     Stop,
@@ -86,6 +140,258 @@ impl<D: PermissionDecider> Session<D> {
         self.extensions
             .insert(declaration.id, Arc::clone(&extension));
         Ok(())
+    }
+
+    /// Discover the enabled contributors once for a logical root request.
+    /// Without a writer no durable cutoff can exist, so preserve the legacy
+    /// no-work path and do not re-enter untrusted extension code.
+    pub(super) fn snapshot_request_ticks(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<RequestTickSnapshot, SessionError> {
+        if cancellation.is_cancelled() {
+            return Err(SessionError::Cancelled);
+        }
+        if self.provenance.is_none() {
+            return Ok(RequestTickSnapshot::default());
+        }
+        let entries = self.request_tick_entries();
+        let owner_ids = entries
+            .iter()
+            .map(RequestTickEntry::extension_id)
+            .map(str::to_owned)
+            .collect();
+        Ok(RequestTickSnapshot { entries, owner_ids })
+    }
+
+    /// Execute exactly the request snapshot used by pre-tick admission.
+    pub(super) fn run_request_tick_snapshot<F>(
+        &mut self,
+        snapshot: RequestTickSnapshot,
+        cancellation: &CancellationToken,
+        sink: &mut EventSink<'_, F>,
+    ) -> Result<bool, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        if cancellation.is_cancelled() {
+            return Err(SessionError::Cancelled);
+        }
+        if snapshot.entries.is_empty() || self.provenance.is_none() {
+            return Ok(false);
+        }
+
+        // The cutoff is chosen before any tick-phase diagnostic or command
+        // side effect. Every contributor therefore observes the same durable
+        // history regardless of what earlier contributors append.
+        self.persist_new_events()?;
+        let Some(cutoff) = self
+            .provenance
+            .as_ref()
+            .and_then(|writer| writer.durable_tail())
+        else {
+            return Ok(false);
+        };
+
+        for entry in snapshot.entries {
+            if cancellation.is_cancelled() {
+                return Err(SessionError::Cancelled);
+            }
+            match entry {
+                RequestTickEntry::RegistrationFailure {
+                    extension_id,
+                    failure,
+                } => {
+                    let event_start = self.bus.events().len();
+                    self.latch_request_tick_failure(
+                        &extension_id,
+                        None,
+                        failure,
+                        true,
+                        event_start,
+                    )?;
+                }
+                RequestTickEntry::Contributor(contributor) => {
+                    self.run_request_tick_contributor(&contributor, &cutoff, cancellation)?;
+                }
+            }
+            sink.flush(self.bus.events());
+            // A cooperative command may observe cancellation, finish its
+            // bounded cleanup, and still return a valid object. Cancellation
+            // owns the whole request boundary, including the final entry.
+            if cancellation.is_cancelled() {
+                return Err(SessionError::Cancelled);
+            }
+        }
+        Ok(true)
+    }
+
+    fn request_tick_entries(&self) -> Vec<RequestTickEntry> {
+        self.extensions
+            .iter()
+            .filter(|(id, _)| {
+                self.extension_enabled(id) && !self.request_tick_failures.contains_key(*id)
+            })
+            .filter_map(|(wired_id, extension)| {
+                match extension_request_tick(extension.as_ref()) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return None,
+                    Err(error) => {
+                        return Some(RequestTickEntry::RegistrationFailure {
+                            extension_id: wired_id.clone(),
+                            failure: registration_failure_kind(&error),
+                        });
+                    }
+                }
+                let declaration = match extension_declaration(extension.as_ref()) {
+                    Ok(declaration) if declaration.id == *wired_id => declaration,
+                    Err(error) => {
+                        return Some(RequestTickEntry::RegistrationFailure {
+                            extension_id: wired_id.clone(),
+                            failure: registration_failure_kind(&error),
+                        });
+                    }
+                    Ok(_) => {
+                        return Some(RequestTickEntry::RegistrationFailure {
+                            extension_id: wired_id.clone(),
+                            failure: ExtensionFailureKind::CommandError,
+                        });
+                    }
+                };
+                let Some(tick) = declaration.request_tick else {
+                    return Some(RequestTickEntry::RegistrationFailure {
+                        extension_id: wired_id.clone(),
+                        failure: ExtensionFailureKind::CommandError,
+                    });
+                };
+                let command = declaration
+                    .commands
+                    .get(&tick.command)
+                    .expect("declaration validates request tick command");
+                Some(RequestTickEntry::Contributor(RequestTickContributor {
+                    extension_id: wired_id.clone(),
+                    command: tick.command,
+                    required_capabilities: command.required_capabilities.clone(),
+                    extension: Arc::clone(extension),
+                }))
+            })
+            .collect()
+    }
+
+    fn run_request_tick_contributor(
+        &mut self,
+        contributor: &RequestTickContributor,
+        cutoff: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SessionError> {
+        if !self.implicit_capabilities_preauthorized(
+            &contributor.extension_id,
+            &contributor.command,
+            &contributor.required_capabilities,
+        ) {
+            let event_start = self.bus.events().len();
+            return self.latch_request_tick_failure(
+                &contributor.extension_id,
+                Some(&contributor.command),
+                ExtensionFailureKind::CommandError,
+                false,
+                event_start,
+            );
+        }
+        let event_start = self.bus.events().len();
+        let input = Value::Object(object([("through_event_id", cutoff.into())]));
+        let result = self.execute_extension_command_at_boundary(
+            contributor.extension.as_ref(),
+            &contributor.command,
+            input,
+            contributor.required_capabilities.iter().copied(),
+            super::extension_bridge::ExtensionCommandBoundary::at_cutoff(
+                &contributor.extension_id,
+                cutoff,
+                cancellation,
+            ),
+        );
+        match result {
+            Ok(Value::Object(_)) => Ok(()),
+            Ok(_) => self.latch_request_tick_failure(
+                &contributor.extension_id,
+                Some(&contributor.command),
+                ExtensionFailureKind::CommandError,
+                false,
+                event_start,
+            ),
+            Err(ExtensionExecutionError::Cancelled) => Err(SessionError::Cancelled),
+            Err(ExtensionExecutionError::Session(error)) => Err(error),
+            Err(ExtensionExecutionError::RegistrationPanicked) => self.latch_request_tick_failure(
+                &contributor.extension_id,
+                Some(&contributor.command),
+                ExtensionFailureKind::Panic,
+                true,
+                event_start,
+            ),
+            Err(ExtensionExecutionError::CommandPanicked) => self.latch_request_tick_failure(
+                &contributor.extension_id,
+                Some(&contributor.command),
+                ExtensionFailureKind::Panic,
+                false,
+                event_start,
+            ),
+            Err(ExtensionExecutionError::RegistrationFailed) => self.latch_request_tick_failure(
+                &contributor.extension_id,
+                Some(&contributor.command),
+                ExtensionFailureKind::CommandError,
+                true,
+                event_start,
+            ),
+            Err(_) => self.latch_request_tick_failure(
+                &contributor.extension_id,
+                Some(&contributor.command),
+                ExtensionFailureKind::CommandError,
+                false,
+                event_start,
+            ),
+        }
+    }
+
+    fn latch_request_tick_failure(
+        &mut self,
+        extension_id: &str,
+        command: Option<&str>,
+        failure: ExtensionFailureKind,
+        registration_fault: bool,
+        event_start: usize,
+    ) -> Result<(), SessionError> {
+        self.request_tick_failures.insert(
+            extension_id.to_owned(),
+            RequestTickFailureLatch { registration_fault },
+        );
+        if self.bus.events()[event_start..].iter().any(|event| {
+            event.kind.as_str() == EventKind::ERROR
+                && event.payload.get("source").and_then(Value::as_str) == Some("extension")
+                && event.payload.get("extension_id").and_then(Value::as_str) == Some(extension_id)
+                && event.payload.get("command").and_then(Value::as_str) == command
+                && event.payload.get("failure").and_then(Value::as_str) == Some(failure.as_str())
+        }) {
+            return Ok(());
+        }
+        let mut payload = object([
+            ("source", "extension".into()),
+            ("message", failure.message().into()),
+            ("category", "internal".into()),
+            ("extension_id", extension_id.into()),
+            ("failure", failure.as_str().into()),
+        ]);
+        if let Some(command) = command {
+            payload.insert("command".to_owned(), command.into());
+        }
+        self.emit(EventKind::ERROR, payload)?;
+        Ok(())
+    }
+
+    fn request_tick_registration_fault_latched(&self, extension_id: &str) -> bool {
+        self.request_tick_failures
+            .get(extension_id)
+            .is_some_and(|latch| latch.registration_fault)
     }
 
     fn validate_new_declaration(
@@ -232,6 +538,17 @@ impl<D: PermissionDecider> Session<D> {
         snapshot: &ExtensionToolCatalogSnapshot,
     ) {
         for diagnostic in &snapshot.diagnostics {
+            // Request-tick registration discovery owns one canonical failure
+            // for the contributor it latched. A speculative model-tool
+            // catalog may have observed that same dynamic registration fault
+            // earlier in this request; do not publish it twice. Execution,
+            // result, and authority failures do not suppress catalog errors.
+            if diagnostic.failure == "registration"
+                && diagnostic.command.is_none()
+                && self.request_tick_registration_fault_latched(&diagnostic.extension_id)
+            {
+                continue;
+            }
             self.emit_contribution_error(
                 &diagnostic.extension_id,
                 diagnostic.command.as_deref(),
@@ -432,7 +749,11 @@ impl<D: PermissionDecider> Session<D> {
             sink.flush(self.bus.events());
             return Ok(IdleBoundary::Stop);
         };
-        if !self.idle_capabilities_preauthorized(&contributor) {
+        if !self.implicit_capabilities_preauthorized(
+            &contributor.extension_id,
+            &contributor.command,
+            &contributor.required_capabilities,
+        ) {
             self.emit_idle_contribution(
                 &contributor,
                 "stop",
@@ -564,12 +885,14 @@ impl<D: PermissionDecider> Session<D> {
     /// Terminal-idle work is implicit lifecycle work: it may consume standing
     /// authority but must never ask the user for new authority. Explicit model
     /// tools keep using the ordinary operation-scoped permission braid.
-    fn idle_capabilities_preauthorized(&self, contributor: &IdleContributor) -> bool {
-        let operation = format!(
-            "extension {}.{}",
-            contributor.extension_id, contributor.command
-        );
-        contributor.required_capabilities.iter().all(|&capability| {
+    fn implicit_capabilities_preauthorized(
+        &self,
+        extension_id: &str,
+        command: &str,
+        required_capabilities: &[Capability],
+    ) -> bool {
+        let operation = format!("extension {extension_id}.{command}");
+        required_capabilities.iter().all(|&capability| {
             match self.permissions.configured_mode(capability) {
                 Some(crate::permissions::ApprovalMode::SessionAllow) => true,
                 Some(crate::permissions::ApprovalMode::AlwaysDeny) => false,
@@ -594,7 +917,13 @@ impl<D: PermissionDecider> Session<D> {
             let declaration = match extension_declaration(extension.as_ref()) {
                 Ok(declaration) if declaration.id == wired_id => declaration,
                 _ => {
-                    self.emit_contribution_error(&wired_id, None, "registration");
+                    // A tick registration fault may recur while discovering
+                    // idle work. Its canonical tick error already owns that
+                    // fault; execution/result/authority latches do not hide a
+                    // distinct idle-registration diagnostic.
+                    if !self.request_tick_registration_fault_latched(&wired_id) {
+                        self.emit_contribution_error(&wired_id, None, "registration");
+                    }
                     continue;
                 }
             };
@@ -773,6 +1102,9 @@ fn safe_execution_error(error: &ExtensionExecutionError) -> String {
         }
         ExtensionExecutionError::InvalidInput(message) => message.clone(),
         ExtensionExecutionError::RegistrationFailed => "extension registration failed".to_owned(),
+        ExtensionExecutionError::RegistrationPanicked => {
+            "extension registration panicked".to_owned()
+        }
         ExtensionExecutionError::CommandFailed => "extension command failed".to_owned(),
         ExtensionExecutionError::CommandPanicked => "extension command panicked".to_owned(),
         ExtensionExecutionError::Cancelled => "extension command cancelled".to_owned(),
@@ -786,6 +1118,7 @@ fn contribution_failure(error: &ExtensionExecutionError) -> &'static str {
         ExtensionExecutionError::CapabilityDenied { .. } => "capability-denied",
         ExtensionExecutionError::InvalidInput(_) => "invalid-input",
         ExtensionExecutionError::RegistrationFailed => "registration",
+        ExtensionExecutionError::RegistrationPanicked => "panic",
         ExtensionExecutionError::CommandFailed => "command",
         ExtensionExecutionError::CommandPanicked => "panic",
         ExtensionExecutionError::Cancelled => "cancelled",

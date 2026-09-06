@@ -280,6 +280,7 @@ fn map_execution_error(error: ExtensionExecutionError) -> ReviewToolFailure {
         // the field the caller has to fix.
         ExtensionExecutionError::InvalidInput(message) => ReviewToolFailure::Honest(message),
         ExtensionExecutionError::RegistrationFailed
+        | ExtensionExecutionError::RegistrationPanicked
         | ExtensionExecutionError::CommandFailed
         | ExtensionExecutionError::CommandPanicked => ReviewToolFailure::Honest(
             "code-swarm review failed inside the extension; the session ledger records the \

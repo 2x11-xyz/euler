@@ -7,6 +7,7 @@ use euler_managed_process::ManagedProcessExtension;
 use euler_sdk::{
     CancellationToken, CommandContext, CommandDescriptor, CommandRegistrar, Extension,
     ExtensionCommand, ExtensionError, ExtensionManifest, HostApi, IdleContributionDescriptor,
+    RequestTickDescriptor,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub(crate) fn live_linked_extension_arc(id: &str) -> Result<Option<Arc<dyn Exten
         manifest_sha256: linked.manifest_sha256,
         manifest: extension.manifest(),
         idle_contribution: extension.idle_contribution(),
+        request_tick: extension.request_tick(),
     })))
 }
 
@@ -41,6 +43,7 @@ pub(crate) fn live_linked_session_extension_arc(id: &str) -> Result<Option<Arc<d
     };
     let package = load_linked_process_for_action(&linked, "run")?;
     let contributes = package.descriptor.idle_contribution.is_some()
+        || package.descriptor.request_tick.is_some()
         || package
             .descriptor
             .commands
@@ -56,6 +59,7 @@ pub(crate) fn live_linked_session_extension_arc(id: &str) -> Result<Option<Arc<d
         manifest_sha256: linked.manifest_sha256,
         manifest: extension.manifest(),
         idle_contribution: extension.idle_contribution(),
+        request_tick: extension.request_tick(),
     })))
 }
 
@@ -65,6 +69,7 @@ struct RevalidatedLinkedExtension {
     manifest_sha256: String,
     manifest: ExtensionManifest,
     idle_contribution: Option<IdleContributionDescriptor>,
+    request_tick: Option<RequestTickDescriptor>,
 }
 
 impl Extension for RevalidatedLinkedExtension {
@@ -91,6 +96,10 @@ impl Extension for RevalidatedLinkedExtension {
 
     fn idle_contribution(&self) -> Option<IdleContributionDescriptor> {
         self.idle_contribution.clone()
+    }
+
+    fn request_tick(&self) -> Option<RequestTickDescriptor> {
+        self.request_tick.clone()
     }
 }
 

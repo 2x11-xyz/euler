@@ -430,6 +430,10 @@ pub enum ExtensionExecutionError {
     /// live-session surface.
     #[error("extension registration failed")]
     RegistrationFailed,
+    /// The extension panicked while the host revalidated its registration.
+    /// Panic payloads remain isolated and are never surfaced.
+    #[error("extension registration panicked")]
+    RegistrationPanicked,
     /// The selected command attempted a capability not granted for this call.
     #[error("extension capability denied")]
     CapabilityDenied { capability: Capability },
@@ -453,6 +457,20 @@ pub enum ExtensionExecutionError {
     /// publishing already-durable queued extension events into the live bus.
     #[error(transparent)]
     Session(#[from] SessionError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RequestTickFailureLatch {
+    registration_fault: bool,
+}
+
+struct DriverCanvasAdmission {
+    canvas: Vec<CanvasItem>,
+    pinned: Option<crate::project_context::PinnedProjectContext>,
+    /// The settled ordinary canvas when pre-tick byte admission had to omit
+    /// snapshotted tick owners. It remains the compatibility baseline and is
+    /// never the provider-facing final selection.
+    full_tick_baseline: Option<Vec<CanvasItem>>,
 }
 
 pub struct Session<D> {
@@ -509,6 +527,9 @@ pub struct Session<D> {
     /// request. Dispatch consults this map so an unadvertised or stale name
     /// cannot enter the extension path.
     active_extension_tools: BTreeMap<String, extension_contributions::ActiveExtensionTool>,
+    /// Process-local fail-open latch for request-tick contributors. Resume
+    /// deliberately retries them against the newly opened durable session.
+    request_tick_failures: BTreeMap<String, RequestTickFailureLatch>,
     /// Shared mid-turn steering queue (issue #146); drained at round
     /// boundaries into canonical `user.message` events. `None` (headless,
     /// companions) means no steering.
@@ -1266,6 +1287,7 @@ impl<D> Session<D> {
             provider_runtime_observer: ProviderRuntimeObserver::default(),
             extensions: BTreeMap::new(),
             active_extension_tools: BTreeMap::new(),
+            request_tick_failures: BTreeMap::new(),
             steering: None,
             queued_dispatch: None,
             pending_admission: None,
@@ -1758,6 +1780,20 @@ impl<D> Session<D> {
         &self.config.extensions_enabled
     }
 
+    /// Enabled extension owners whose durable context slots are safe to put
+    /// back in a live root request. A failed request tick cannot refresh or
+    /// clear its prior slots, so its process-local latch also withholds those
+    /// model-facing projections until resume retries the contributor. This
+    /// does not disable the extension's model tools or terminal-idle hook.
+    fn model_facing_context_slot_owners(&self) -> BTreeSet<String> {
+        self.config
+            .extensions_enabled
+            .iter()
+            .filter(|id| !self.request_tick_failures.contains_key(*id))
+            .cloned()
+            .collect()
+    }
+
     /// Enable or disable an extension for the remainder of this live session.
     /// Does not persist to the user registry — callers own registry writes.
     pub fn set_extension_enabled(&mut self, id: impl Into<String>, enabled: bool) {
@@ -1780,11 +1816,12 @@ impl<D> Session<D> {
             4, // min_lines
         );
         let policy = self.effective_stub_policy();
+        let context_slot_owners = self.model_facing_context_slot_owners();
         let canvas = assemble_canvas_with_compaction_for_extensions(
             self.bus.events(),
             &policy,
             &candidates,
-            &self.config.extensions_enabled,
+            &context_slot_owners,
         );
         let actually_compacted = canvas
             .iter()
@@ -1896,12 +1933,13 @@ impl<D> Session<D> {
             full_swap_payload(candidate),
         ));
         let post_swap_policy = self.config.auto_compaction;
+        let context_slot_owners = self.model_facing_context_slot_owners();
         let proposed_canvas = assemble_canvas_prefolded(
             &proposed_events,
             &post_swap_policy,
             &BTreeSet::new(),
             pinned,
-            Some(&self.config.extensions_enabled),
+            Some(&context_slot_owners),
         );
         if canvas_bytes(&proposed_canvas) > post_swap_policy.budget_bytes {
             return Err("proposed canvas exceeds the configured byte budget".to_owned());
@@ -1911,7 +1949,7 @@ impl<D> Session<D> {
             &post_swap_policy,
             &BTreeSet::new(),
             pinned,
-            Some(&self.config.extensions_enabled),
+            Some(&context_slot_owners),
         );
         let current_request =
             self.driver_model_request(&self.active_target, &current_canvas, tool_catalog);
@@ -2839,6 +2877,7 @@ impl<D> Session<D> {
             provider_runtime_observer: ProviderRuntimeObserver::default(),
             extensions: BTreeMap::new(),
             active_extension_tools: BTreeMap::new(),
+            request_tick_failures: BTreeMap::new(),
             steering: None,
             queued_dispatch: None,
             pending_admission: None,
@@ -3671,24 +3710,47 @@ impl<D: PermissionDecider> Session<D> {
         // snapshot is used by speculative compaction accounting, final
         // admission, and live binding publication.
         let tool_catalog = self.extension_tool_catalog_snapshot();
+        // Request-tick discovery is untrusted and may be dynamic. One
+        // immutable snapshot owns both provisional slot admission and later
+        // execution, so an extension cannot toggle between those boundaries.
+        let tick_snapshot = self.snapshot_request_ticks(cancellation)?;
         self.service_compaction_request_with_catalog(&tool_catalog)?;
         sink.flush(self.bus.events());
         let policy = self.effective_stub_policy();
-        let admitted = self.admit_driver_canvas(policy, cancellation, &tool_catalog);
+        let admitted = self.admit_driver_canvas(
+            policy,
+            cancellation,
+            &tool_catalog,
+            tick_snapshot.owner_ids(),
+        );
         // Admission can settle or cancel a shadow call. Publish those
         // canonical events before propagating its terminal result.
         sink.flush(self.bus.events());
-        let (canvas, pinned) = admitted?;
+        // Admission above owns every compaction decision. Request ticks run
+        // only after that frontier is final. Preserve the already-admitted
+        // selection on the dominant no-contributor path; a real tick boundary
+        // can append ordinary context-slot/plan side effects and therefore
+        // requires one fresh pure assembly and budget check.
+        let admitted = admitted?;
+        let pre_tick_request = self.driver_model_request(
+            target,
+            admitted
+                .full_tick_baseline
+                .as_deref()
+                .unwrap_or(&admitted.canvas),
+            &tool_catalog,
+        );
+        let (canvas, pinned, tick_boundary_ran) =
+            self.apply_request_tick_snapshot(policy, admitted, tick_snapshot, cancellation, sink)?;
         let request = self.driver_model_request(target, &canvas, &tool_catalog);
-        if let Some(pinned) = &pinned {
-            if let Some(error) = self.pinned_context_budget_error(pinned, &request, policy) {
-                self.emit_session_error(&error)?;
-                sink.flush(self.bus.events());
-                return Err(error);
-            }
-        } else if let Some(error) =
-            self.extension_tool_context_budget_error(&request, &tool_catalog)
-        {
+        let tick_baseline = tick_boundary_ran.then_some(&pre_tick_request);
+        if let Some(error) = self.driver_request_budget_error(
+            pinned.as_ref(),
+            &request,
+            policy,
+            tick_baseline,
+            &tool_catalog,
+        ) {
             self.emit_session_error(&error)?;
             sink.flush(self.bus.events());
             return Err(error);
@@ -3749,18 +3811,56 @@ impl<D: PermissionDecider> Session<D> {
         Ok((model_call_id, request))
     }
 
+    /// Execute the tick snapshot after compaction and replace any provisional
+    /// admission with the authoritative full post-tick canvas.
+    fn apply_request_tick_snapshot<F>(
+        &mut self,
+        policy: AutoCompactionPolicy,
+        admission: DriverCanvasAdmission,
+        tick_snapshot: extension_contributions::RequestTickSnapshot,
+        cancellation: &CancellationToken,
+        sink: &mut EventSink<'_, F>,
+    ) -> Result<
+        (
+            Vec<CanvasItem>,
+            Option<crate::project_context::PinnedProjectContext>,
+            bool,
+        ),
+        SessionError,
+    >
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let DriverCanvasAdmission {
+            mut canvas,
+            mut pinned,
+            full_tick_baseline,
+        } = admission;
+        let provisional_admission = full_tick_baseline.is_some();
+        let tick_boundary_ran =
+            self.run_request_tick_snapshot(tick_snapshot, cancellation, sink)?;
+        sink.flush(self.bus.events());
+        // A provisional canvas exists only to let its snapshotted owners run.
+        // It can never become provider-facing, including the defensive case
+        // where no durable cutoff is available after discovery.
+        if tick_boundary_ran || provisional_admission {
+            (canvas, pinned) = self.assemble_driver_canvas(policy)?;
+            if let Some(error) = context_budget_exhausted(policy, &canvas) {
+                self.emit_session_error(&error)?;
+                sink.flush(self.bus.events());
+                return Err(error);
+            }
+        }
+        Ok((canvas, pinned, tick_boundary_ran))
+    }
+
     fn admit_driver_canvas(
         &mut self,
         policy: AutoCompactionPolicy,
         cancellation: &CancellationToken,
         tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
-    ) -> Result<
-        (
-            Vec<CanvasItem>,
-            Option<crate::project_context::PinnedProjectContext>,
-        ),
-        SessionError,
-    > {
+        tick_owner_ids: &BTreeSet<String>,
+    ) -> Result<DriverCanvasAdmission, SessionError> {
         let mut assembled = self.assemble_driver_canvas(policy)?;
         // Threshold compaction stays speculative and nonblocking. Byte
         // pressure is the final admission boundary before provider dispatch:
@@ -3772,11 +3872,35 @@ impl<D: PermissionDecider> Session<D> {
             self.settle_shadow_for_byte_pressure(cancellation, tool_catalog)?;
             assembled = self.assemble_driver_canvas(policy)?;
         }
-        if let Some(error) = context_budget_exhausted(policy, &assembled.0) {
+        let Some(full_error) = context_budget_exhausted(policy, &assembled.0) else {
+            return Ok(DriverCanvasAdmission {
+                canvas: assembled.0,
+                pinned: assembled.1,
+                full_tick_baseline: None,
+            });
+        };
+        if tick_owner_ids.is_empty() {
+            self.emit_session_error(&full_error)?;
+            return Err(full_error);
+        }
+
+        // Compaction had the first opportunity to admit the ordinary full
+        // canvas. If tick-owned durable slots still prevent the boundary that
+        // must refresh or suppress them, admit one provisional view without
+        // only the owners captured in this request's immutable tick snapshot.
+        let mut provisional_owners = self.model_facing_context_slot_owners();
+        provisional_owners.retain(|id| !tick_owner_ids.contains(id));
+        let provisional =
+            self.assemble_driver_canvas_for_slot_owners(policy, &provisional_owners)?;
+        if let Some(error) = context_budget_exhausted(policy, &provisional.0) {
             self.emit_session_error(&error)?;
             return Err(error);
         }
-        Ok(assembled)
+        Ok(DriverCanvasAdmission {
+            canvas: provisional.0,
+            pinned: provisional.1,
+            full_tick_baseline: Some(assembled.0),
+        })
     }
 
     /// Assemble the exact root-driver canvas, folding pinned project context
@@ -3785,6 +3909,21 @@ impl<D: PermissionDecider> Session<D> {
     fn assemble_driver_canvas(
         &mut self,
         policy: AutoCompactionPolicy,
+    ) -> Result<
+        (
+            Vec<CanvasItem>,
+            Option<crate::project_context::PinnedProjectContext>,
+        ),
+        SessionError,
+    > {
+        let context_slot_owners = self.model_facing_context_slot_owners();
+        self.assemble_driver_canvas_for_slot_owners(policy, &context_slot_owners)
+    }
+
+    fn assemble_driver_canvas_for_slot_owners(
+        &mut self,
+        policy: AutoCompactionPolicy,
+        context_slot_owners: &BTreeSet<String>,
     ) -> Result<
         (
             Vec<CanvasItem>,
@@ -3813,7 +3952,7 @@ impl<D: PermissionDecider> Session<D> {
             &policy,
             &BTreeSet::new(),
             pinned.as_ref(),
-            Some(&self.config.extensions_enabled),
+            Some(context_slot_owners),
         );
         Ok((canvas, pinned))
     }
@@ -3842,26 +3981,33 @@ impl<D: PermissionDecider> Session<D> {
         Ok(())
     }
 
+    fn driver_request_budget_error(
+        &self,
+        pinned: Option<&crate::project_context::PinnedProjectContext>,
+        request: &ModelRequest,
+        policy: AutoCompactionPolicy,
+        tick_baseline: Option<&ModelRequest>,
+        tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
+    ) -> Option<SessionError> {
+        if let Some(pinned) = pinned {
+            return self.pinned_context_budget_error(pinned, request, policy);
+        }
+        if let Some(error) = self.extension_tool_context_budget_error(request, tool_catalog) {
+            return Some(error);
+        }
+        // Preserve the legacy admission decision for a request already above
+        // the exact proxy before an optional tick. A tick still may not grow
+        // an otherwise fitting request past the known context window.
+        tick_baseline
+            .and_then(|baseline| self.request_context_growth_budget_error(baseline, request))
+    }
+
     fn extension_tool_context_budget_error(
         &self,
         request: &ModelRequest,
         tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
     ) -> Option<SessionError> {
         if tool_catalog.definitions().is_empty() {
-            return None;
-        }
-        let limit_tokens = self
-            .config
-            .context_limit
-            .map(|limit| limit.limit_tokens())?;
-        let output_reserve = self
-            .config
-            .max_output_tokens
-            .unwrap_or(self.config.compaction_reserve_tokens as u64);
-        let required_tokens =
-            crate::project_context::request_required_tokens(request, output_reserve)
-                .unwrap_or(u64::MAX);
-        if crate::project_context::fits_context_limit(required_tokens, limit_tokens) {
             return None;
         }
         // Preserve the existing usage-driven hard-margin behavior for a
@@ -3878,12 +4024,54 @@ impl<D: PermissionDecider> Session<D> {
         without_extension_tools
             .tools
             .retain(|tool| !extension_names.contains(tool.name.as_str()));
-        let baseline_required = crate::project_context::request_required_tokens(
-            &without_extension_tools,
-            output_reserve,
-        )
-        .unwrap_or(u64::MAX);
-        crate::project_context::fits_context_limit(baseline_required, limit_tokens).then_some(
+        self.request_context_growth_budget_error(&without_extension_tools, request)
+    }
+
+    /// Reject only when the exact baseline request fits and the exact final
+    /// request does not. This preserves preexisting compatibility admission
+    /// for a baseline already above the proxy while preventing an optional
+    /// request-time contribution from crossing the known context window.
+    fn request_context_growth_budget_error(
+        &self,
+        baseline: &ModelRequest,
+        request: &ModelRequest,
+    ) -> Option<SessionError> {
+        let error = self.request_context_budget_error(request)?;
+        let SessionError::RequestOverTokenBudget {
+            required_tokens: _,
+            limit_tokens,
+        } = &error
+        else {
+            unreachable!("request budget owner returns request token errors")
+        };
+        let output_reserve = self
+            .config
+            .max_output_tokens
+            .unwrap_or(self.config.compaction_reserve_tokens as u64);
+        let baseline_required =
+            crate::project_context::request_required_tokens(baseline, output_reserve)
+                .unwrap_or(u64::MAX);
+        crate::project_context::fits_context_limit(baseline_required, *limit_tokens)
+            .then_some(error)
+    }
+
+    /// Exact provider-neutral request admission for a known model context
+    /// window. This is the single owner for the checked byte-to-token proxy;
+    /// callers decide whether their boundary requires strict admission or a
+    /// compatibility comparison against a baseline request.
+    fn request_context_budget_error(&self, request: &ModelRequest) -> Option<SessionError> {
+        let limit_tokens = self
+            .config
+            .context_limit
+            .map(|limit| limit.limit_tokens())?;
+        let output_reserve = self
+            .config
+            .max_output_tokens
+            .unwrap_or(self.config.compaction_reserve_tokens as u64);
+        let required_tokens =
+            crate::project_context::request_required_tokens(request, output_reserve)
+                .unwrap_or(u64::MAX);
+        (!crate::project_context::fits_context_limit(required_tokens, limit_tokens)).then_some(
             SessionError::RequestOverTokenBudget {
                 required_tokens,
                 limit_tokens,
@@ -4108,11 +4296,12 @@ impl<D: PermissionDecider> Session<D> {
             select_layer1_candidates(self.bus.events(), self.config.compaction_keep_recent, 4);
         if self.config.auto_compaction.stubs_enabled() {
             let policy = self.effective_stub_policy();
+            let context_slot_owners = self.model_facing_context_slot_owners();
             let compacted = assemble_canvas_with_compaction_for_extensions(
                 self.bus.events(),
                 &policy,
                 &candidates,
-                &self.config.extensions_enabled,
+                &context_slot_owners,
             );
             let compacted_ids = compacted
                 .iter()
@@ -4194,12 +4383,13 @@ impl<D: PermissionDecider> Session<D> {
         let project_context = crate::project_context::fold_project_context(self.bus.events())
             .map_err(|error| SessionError::ProjectContextInvalid(error.to_string()))?;
         let policy = self.effective_stub_policy();
+        let context_slot_owners = self.model_facing_context_slot_owners();
         let canvas = assemble_canvas_prefolded(
             self.bus.events(),
             &policy,
             &BTreeSet::new(),
             project_context.admitted(),
-            Some(&self.config.extensions_enabled),
+            Some(&context_slot_owners),
         );
         let canvas = shadow_compaction_canvas(canvas);
         let mut snapshot = canvas_snapshot_payload(
@@ -5745,7 +5935,12 @@ fn shadow_model_request(
 fn shadow_compaction_canvas(canvas: Vec<CanvasItem>) -> Vec<CanvasItem> {
     canvas
         .into_iter()
-        .filter(|item| !matches!(item, CanvasItem::ExtensionContribution { .. }))
+        .filter(|item| {
+            !matches!(
+                item,
+                CanvasItem::ExtensionContribution { .. } | CanvasItem::Slot { .. }
+            )
+        })
         .collect()
 }
 

@@ -13,7 +13,7 @@ use euler_sdk::{
     valid_checkpoint_name, validate_model_tool_descriptor, validate_plan_presentation,
     EventFeedCheckpoint, EventFeedCheckpointError, IdleContributionDescriptor, Invocation,
     PlanItemStatus, PlanPresentation, PlanPresentationItem, PlanPresentationStatus,
-    MAX_EVENT_FEED_CHECKPOINT_BYTES,
+    RequestTickDescriptor, MAX_EVENT_FEED_CHECKPOINT_BYTES,
 };
 use euler_sdk::{AgentOutcome, SpawnAgentTask};
 use euler_sdk::{ArtifactRecord, ArtifactWrite, Capability, CommandContext, CommandRegistrar};
@@ -78,6 +78,10 @@ pub struct ExtensionHost {
     artifact_recorder: Option<ArtifactRecorder>,
     extensions: BTreeMap<String, ExtensionRecord>,
     commands: BTreeMap<String, CommandRecord>,
+    /// Optional request-bound accepted-prefix cutoff. When set, every
+    /// provenance query made by this command sees exactly this historical
+    /// view even if earlier contributors append events meanwhile.
+    provenance_cutoff: Option<String>,
     /// Secret redaction for host-API emissions that inject external text
     /// into the ledger or canvas (context slots and plan presentation). Hosts
     /// constructed without an explicit redactor still get the token-shape
@@ -119,6 +123,7 @@ pub(crate) struct ExtensionDeclaration {
     pub(crate) id: String,
     pub(crate) commands: BTreeMap<String, CommandDescriptor>,
     pub(crate) idle_contribution: Option<IdleContributionDescriptor>,
+    pub(crate) request_tick: Option<RequestTickDescriptor>,
 }
 
 impl ExtensionHost {
@@ -132,6 +137,7 @@ impl ExtensionHost {
             artifact_recorder: None,
             extensions: BTreeMap::new(),
             commands: BTreeMap::new(),
+            provenance_cutoff: None,
             redactor: crate::redaction::SecretRedactor::default(),
         }
     }
@@ -156,6 +162,7 @@ impl ExtensionHost {
             }),
             extensions: BTreeMap::new(),
             commands: BTreeMap::new(),
+            provenance_cutoff: None,
             redactor: crate::redaction::SecretRedactor::default(),
         }
     }
@@ -180,6 +187,7 @@ impl ExtensionHost {
             }),
             extensions: BTreeMap::new(),
             commands: BTreeMap::new(),
+            provenance_cutoff: None,
             redactor: crate::redaction::SecretRedactor::default(),
         };
         (host, queue)
@@ -189,6 +197,11 @@ impl ExtensionHost {
         if let Some(recorder) = &mut self.artifact_recorder {
             recorder.run_id = run_id;
         }
+        self
+    }
+
+    pub(crate) fn with_provenance_cutoff(mut self, event_id: String) -> Self {
+        self.provenance_cutoff = Some(event_id);
         self
     }
 
@@ -259,7 +272,35 @@ impl ExtensionHost {
         extension: &dyn Extension,
         command_name: &str,
     ) -> Result<(), ExtensionHostError> {
+        self.register_extension_for_command_inner(extension, None, command_name)
+    }
+
+    pub(crate) fn register_extension_for_command_with_identity(
+        &mut self,
+        extension: &dyn Extension,
+        extension_id: &str,
+        command_name: &str,
+    ) -> Result<(), ExtensionHostError> {
+        self.register_extension_for_command_inner(extension, Some(extension_id), command_name)
+    }
+
+    fn register_extension_for_command_inner(
+        &mut self,
+        extension: &dyn Extension,
+        expected_extension_id: Option<&str>,
+        command_name: &str,
+    ) -> Result<(), ExtensionHostError> {
         let (id, capabilities, registrar) = self.register_pending_extension(extension)?;
+        if let Some(expected) = expected_extension_id {
+            if expected != id {
+                return Err(ExtensionHostError::RegistrationFailed(
+                    expected.to_owned(),
+                    ExtensionError::Message(
+                        "extension identity changed during command registration".to_owned(),
+                    ),
+                ));
+            }
+        }
         if self.extensions.contains_key(&id) {
             return Err(ExtensionHostError::DuplicateExtensionId(id));
         }
@@ -381,6 +422,7 @@ impl ExtensionHost {
             artifact_recorder: self.artifact_recorder.clone(),
             denied_capabilities: Mutex::new(BTreeSet::new()),
             provenance_failure: Mutex::new(None),
+            provenance_cutoff: self.provenance_cutoff.clone(),
             spawner,
             redactor: self.redactor.clone(),
         };
@@ -518,21 +560,21 @@ impl Drop for ExtensionPanicSuppressionGuard {
     }
 }
 
-#[derive(Clone, Copy)]
-enum ExtensionFailureKind {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExtensionFailureKind {
     CommandError,
     Panic,
 }
 
 impl ExtensionFailureKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::CommandError => "command_error",
             Self::Panic => "panic",
         }
     }
 
-    fn message(self) -> &'static str {
+    pub(crate) fn message(self) -> &'static str {
         match self {
             Self::CommandError => "extension command failed",
             Self::Panic => "extension command panicked",
@@ -563,6 +605,7 @@ struct CommandHost<'a> {
     artifact_recorder: Option<ArtifactRecorder>,
     denied_capabilities: Mutex<BTreeSet<Capability>>,
     provenance_failure: Mutex<Option<String>>,
+    provenance_cutoff: Option<String>,
     spawner: Option<&'a dyn ExtensionSpawner>,
     redactor: crate::redaction::SecretRedactor,
 }
@@ -615,12 +658,24 @@ impl HostApi for CommandHost<'_> {
 
     fn query_provenance(
         &self,
-        query: euler_sdk::ProvenanceQuery,
+        mut query: euler_sdk::ProvenanceQuery,
     ) -> Result<euler_sdk::ProvenancePage, ExtensionError> {
         let _guard = ExtensionPanicSuppressionGuard::suspend_for_host_api();
         self.require_capability(Capability::ProvenanceRead)?;
+        if let Some(cutoff) = &self.provenance_cutoff {
+            match &query.through_event_id {
+                None => query.through_event_id = Some(cutoff.clone()),
+                Some(requested) if requested == cutoff => {}
+                Some(_) => {
+                    return Err(ExtensionError::QueryFailed(
+                        "provenance query cutoff does not match request-tick boundary".to_owned(),
+                    ));
+                }
+            }
+        }
         let core_query = ProvenanceQuery {
             after_event_id: query.after_event_id,
+            through_event_id: query.through_event_id,
             kinds: query.kinds,
             limit: query.limit,
             scan_limit: query.scan_limit,
@@ -1099,6 +1154,7 @@ fn current_context_slots(
             log_path,
             ProvenanceQuery {
                 after_event_id: after_event_id.clone(),
+                through_event_id: None,
                 kinds: vec![EventKind::CONTEXT_SLOT_UPDATED.to_owned()],
                 limit: 256,
                 scan_limit: 1024,
@@ -1161,6 +1217,7 @@ fn latest_extension_plan_presentation(
             log_path,
             ProvenanceQuery {
                 after_event_id: after_event_id.clone(),
+                through_event_id: None,
                 kinds: vec![EventKind::PLAN_UPDATE.to_owned()],
                 limit: 256,
                 scan_limit: 1024,
@@ -1725,11 +1782,52 @@ pub(crate) fn extension_declaration(
             ));
         }
     }
+    let request_tick = catch_extension_unwind(|| extension.request_tick())
+        .map_err(|_| ExtensionHostError::RegistrationPanic(Some(id.clone())))?;
+    if let Some(tick) = &request_tick {
+        let Some(command) = commands.get(&tick.command) else {
+            return Err(registration_message(
+                &id,
+                format!("request tick command `{}` is not registered", tick.command),
+            ));
+        };
+        if !command.invocation.is_agent_only() {
+            return Err(registration_message(
+                &id,
+                format!("request tick command `{}` must be agent-only", tick.command),
+            ));
+        }
+    }
     Ok(ExtensionDeclaration {
         id,
         commands,
         idle_contribution,
+        request_tick,
     })
+}
+
+/// Read and validate only the extension identity behind the same panic fence
+/// as full declaration discovery. Callers with an already validated identity
+/// should retain it instead of re-entering untrusted manifest code.
+pub(crate) fn extension_identity(extension: &dyn Extension) -> Result<String, ExtensionHostError> {
+    let id = catch_extension_unwind(|| extension.manifest().id)
+        .map_err(|_| ExtensionHostError::RegistrationPanic(None))?;
+    if valid_identifier(&id) {
+        Ok(id)
+    } else {
+        Err(ExtensionHostError::InvalidExtensionId(id))
+    }
+}
+
+/// Read only the optional request-tick nomination before doing full command
+/// registration. This lets the request boundary ignore unrelated command-only
+/// extensions whose declarations are currently invalid, while preserving the
+/// host's panic isolation for extensions that claim the boundary.
+pub(crate) fn extension_request_tick(
+    extension: &dyn Extension,
+) -> Result<Option<RequestTickDescriptor>, ExtensionHostError> {
+    catch_extension_unwind(|| extension.request_tick())
+        .map_err(|_| ExtensionHostError::RegistrationPanic(None))
 }
 
 fn registration_message(extension_id: &str, message: String) -> ExtensionHostError {

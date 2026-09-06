@@ -862,6 +862,9 @@ pub struct ProvenanceQuery {
     /// Stream-position cursor. Writer-created `EventEnvelope` ids are unique;
     /// this query does not build an unbounded duplicate-id index.
     pub after_event_id: Option<String>,
+    /// Inclusive accepted-prefix upper bound. Reuse it on every page to keep
+    /// a stable historical view while the live log continues to grow.
+    pub through_event_id: Option<String>,
     pub kinds: Vec<String>,
     pub limit: usize,
     pub scan_limit: usize,
@@ -873,6 +876,7 @@ impl ProvenanceQuery {
     pub fn new(limit: usize) -> Self {
         Self {
             after_event_id: None,
+            through_event_id: None,
             kinds: Vec::new(),
             limit,
             scan_limit: DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT,
@@ -893,17 +897,41 @@ pub struct ProvenancePage {
     pub truncated: bool,
 }
 
+#[derive(Clone, Copy)]
+struct AppliedQueryLimits {
+    events: usize,
+    scanned: usize,
+}
+
+struct QueryScanState {
+    events: Vec<EventEnvelope>,
+    scanned_events: usize,
+    watermark_event_id: Option<String>,
+    cursor_seen: bool,
+    through_seen: bool,
+    truncated: bool,
+    next_after_event_id: Option<String>,
+}
+
+impl QueryScanState {
+    fn new(query: &ProvenanceQuery) -> Self {
+        Self {
+            events: Vec::new(),
+            scanned_events: 0,
+            watermark_event_id: None,
+            cursor_seen: query.after_event_id.is_none(),
+            through_seen: query.through_event_id.is_none(),
+            truncated: false,
+            next_after_event_id: None,
+        }
+    }
+}
+
 pub fn query_provenance(
     path: impl AsRef<Path>,
     query: ProvenanceQuery,
 ) -> Result<ProvenancePage, ProvenanceQueryError> {
-    if query.limit == 0 {
-        return Err(ProvenanceQueryError::InvalidLimit);
-    }
-    if query.scan_limit == 0 {
-        return Err(ProvenanceQueryError::InvalidScanLimit);
-    }
-
+    let limits = applied_query_limits(&query)?;
     let path = path.as_ref();
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
@@ -912,20 +940,14 @@ pub fn query_provenance(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("blobs");
-    let applied_limit = query.limit.min(DEFAULT_PROVENANCE_QUERY_EVENT_LIMIT);
-    let applied_scan_limit = query.scan_limit.min(DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT);
-    let mut events = Vec::new();
-    let mut scanned_events = 0;
-    let mut watermark_event_id = None;
-    let mut cursor_seen = query.after_event_id.is_none();
+    let mut state = QueryScanState::new(&query);
     let mut blob_budget = BlobExpansionBudget::capped(query.blob_byte_limit);
     let cursor = query.after_event_id.as_deref();
-    let mut truncated = false;
-    let mut next_after_event_id = None;
+    let through = query.through_event_id.as_deref();
     let mut line_number = 0usize;
     let mut file_offset = 0usize;
 
-    while let Some((line, consumed)) = next_accepted_query_line(&mut reader, &mut line)? {
+    'events: while let Some((line, consumed)) = next_accepted_query_line(&mut reader, &mut line)? {
         line_number += 1;
         let line_offset = file_offset;
         file_offset += consumed;
@@ -933,52 +955,101 @@ pub fn query_provenance(
             continue;
         }
         let event = parse_accepted_query_line(line, line_number, line_offset)?;
-        if !cursor_seen {
+        if !state.cursor_seen {
             if Some(event.id.as_str()) == cursor {
-                cursor_seen = true;
-                watermark_event_id = Some(event.id);
+                state.cursor_seen = true;
+                state.watermark_event_id = Some(event.id);
+                if cursor == through {
+                    state.through_seen = true;
+                    break 'events;
+                }
+                continue;
+            }
+            if Some(event.id.as_str()) == through {
+                // The bound defines the physical query domain. Reaching it
+                // before the requested cursor makes the range invalid whether
+                // the cursor is absent or occurs in the suffix; never inspect
+                // bytes beyond the bound to distinguish those cases.
+                return Err(ProvenanceQueryError::InvalidRange {
+                    after_event_id: query.after_event_id.clone().expect("cursor was requested"),
+                    through_event_id: query.through_event_id.clone().expect("bound was requested"),
+                });
             }
             continue;
         }
-        if scanned_events == applied_scan_limit {
-            truncated = true;
-            next_after_event_id.clone_from(&watermark_event_id);
+        if state.scanned_events == limits.scanned {
+            state.truncated = true;
+            state
+                .next_after_event_id
+                .clone_from(&state.watermark_event_id);
             break;
         }
         let matches_kind = query.matches_kind(event.kind.as_str());
-        if matches_kind && events.len() == applied_limit {
-            truncated = true;
-            next_after_event_id.clone_from(&watermark_event_id);
+        if matches_kind && state.events.len() == limits.events {
+            state.truncated = true;
+            state
+                .next_after_event_id
+                .clone_from(&state.watermark_event_id);
             break;
         }
         let event_id = event.id.clone();
-        scanned_events += 1;
-        watermark_event_id = Some(event_id);
-        if !matches_kind {
-            continue;
+        state.scanned_events += 1;
+        state.watermark_event_id = Some(event_id.clone());
+        if matches_kind {
+            let event = if query.include_blob_fields {
+                expand_blobs(event, &blob_dir, &mut blob_budget)?
+            } else {
+                event
+            };
+            state.events.push(event);
         }
-
-        let event = if query.include_blob_fields {
-            expand_blobs(event, &blob_dir, &mut blob_budget)?
-        } else {
-            event
-        };
-        events.push(event);
+        if Some(event_id.as_str()) == through {
+            state.through_seen = true;
+            break 'events;
+        }
     }
+    finish_provenance_query(query, limits, state)
+}
 
-    if !cursor_seen {
+fn applied_query_limits(
+    query: &ProvenanceQuery,
+) -> Result<AppliedQueryLimits, ProvenanceQueryError> {
+    if query.limit == 0 {
+        return Err(ProvenanceQueryError::InvalidLimit);
+    }
+    if query.scan_limit == 0 {
+        return Err(ProvenanceQueryError::InvalidScanLimit);
+    }
+    Ok(AppliedQueryLimits {
+        events: query.limit.min(DEFAULT_PROVENANCE_QUERY_EVENT_LIMIT),
+        scanned: query.scan_limit.min(DEFAULT_PROVENANCE_QUERY_SCAN_LIMIT),
+    })
+}
+
+fn finish_provenance_query(
+    query: ProvenanceQuery,
+    limits: AppliedQueryLimits,
+    state: QueryScanState,
+) -> Result<ProvenancePage, ProvenanceQueryError> {
+    if !state.cursor_seen {
         let event_id = query.after_event_id.expect("cursor was requested");
         return Err(ProvenanceQueryError::CursorNotFound { event_id });
     }
-
+    if !state.truncated && !state.through_seen {
+        let event_id = query.through_event_id.expect("upper bound was requested");
+        return Err(ProvenanceQueryError::ThroughEventNotFound { event_id });
+    }
     Ok(ProvenancePage {
-        events,
-        applied_limit,
-        applied_scan_limit,
-        scanned_events,
-        watermark_event_id,
-        next_after_event_id: truncated.then_some(next_after_event_id).flatten(),
-        truncated,
+        events: state.events,
+        applied_limit: limits.events,
+        applied_scan_limit: limits.scanned,
+        scanned_events: state.scanned_events,
+        watermark_event_id: state.watermark_event_id,
+        next_after_event_id: state
+            .truncated
+            .then_some(state.next_after_event_id)
+            .flatten(),
+        truncated: state.truncated,
     })
 }
 
@@ -1632,6 +1703,15 @@ pub enum ProvenanceQueryError {
     InvalidScanLimit,
     #[error("provenance query cursor event id was not found in accepted prefix: {event_id}")]
     CursorNotFound { event_id: String },
+    #[error("provenance query through event id was not found in accepted prefix: {event_id}")]
+    ThroughEventNotFound { event_id: String },
+    #[error(
+        "provenance query cursor {after_event_id} occurs after through event {through_event_id}"
+    )]
+    InvalidRange {
+        after_event_id: String,
+        through_event_id: String,
+    },
     #[error("invalid provenance line: {source}")]
     InvalidLine {
         #[source]

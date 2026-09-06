@@ -9,8 +9,8 @@ use euler_sdk::{
     CommandRegistrar, DiagnosticsPage, DiagnosticsQuery, EventFeedCheckpoint, Extension,
     ExtensionCommand, ExtensionError, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
     IdleContributionDescriptor, ManagedProcessEntrypoint, ModelToolDescriptor, PlanPresentation,
-    ProvenancePage, ProvenanceQuery, SpawnAgentTask, StaticCommandDescriptor,
-    StaticExtensionDescriptor,
+    ProvenancePage, ProvenanceQuery, RequestTickDescriptor, SpawnAgentTask,
+    StaticCommandDescriptor, StaticExtensionDescriptor,
 };
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -35,6 +35,9 @@ fn managed_adapter_preserves_session_contribution_descriptors() {
     };
     let idle = IdleContributionDescriptor {
         command: "idle".to_owned(),
+    };
+    let request_tick = RequestTickDescriptor {
+        command: "update".to_owned(),
     };
     let descriptor = StaticExtensionDescriptor {
         id: "python-proof".to_owned(),
@@ -62,6 +65,7 @@ fn managed_adapter_preserves_session_contribution_descriptors() {
         ],
         observer: None,
         idle_contribution: Some(idle.clone()),
+        request_tick: Some(request_tick.clone()),
     };
 
     let extension = ManagedProcessExtension::new(
@@ -80,6 +84,7 @@ fn managed_adapter_preserves_session_contribution_descriptors() {
         Some(&model_tool)
     );
     assert_eq!(extension.idle_contribution(), Some(idle));
+    assert_eq!(extension.request_tick(), Some(request_tick));
 }
 
 #[test]
@@ -96,7 +101,8 @@ import base64
 def exercise(peer, _input):
     peer.progress("starting", 0.1)
     page = peer.request("euler/host/query-provenance", {
-        "after_event_id": None, "kinds": [], "limit": 2, "scan_limit": 4,
+        "after_event_id": None, "through_event_id": "stable-cutoff",
+        "kinds": [], "limit": 2, "scan_limit": 4,
         "include_blob_fields": False, "blob_byte_limit": 1024,
     })
     diagnostics = peer.request(
@@ -170,6 +176,10 @@ serve({"exercise": exercise})
     assert_eq!(output["plan_result"], json!({}));
     assert_eq!(output["spawned"], json!("child-live"));
     assert_eq!(output["spawned_many"], json!(["child-live-many"]));
+    assert_eq!(
+        host.queries.borrow()[0].through_event_id.as_deref(),
+        Some("stable-cutoff")
+    );
 
     let artifacts = host.artifacts.borrow();
     assert_eq!(artifacts.len(), 1);
@@ -1076,6 +1086,7 @@ fn extension(
         }],
         observer: None,
         idle_contribution: None,
+        request_tick: None,
     };
     ManagedProcessExtension::new(
         package_dir,
@@ -1185,10 +1196,12 @@ struct FakeHost {
     deny_artifact: bool,
     diagnostics_line: String,
     query_delay: Option<Duration>,
+    queries: RefCell<Vec<ProvenanceQuery>>,
 }
 
 impl HostApi for FakeHost {
-    fn query_provenance(&self, _query: ProvenanceQuery) -> Result<ProvenancePage, ExtensionError> {
+    fn query_provenance(&self, query: ProvenanceQuery) -> Result<ProvenancePage, ExtensionError> {
+        self.queries.borrow_mut().push(query);
         if let Some(delay) = self.query_delay {
             std::thread::sleep(delay);
         }
