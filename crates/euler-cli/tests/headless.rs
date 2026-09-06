@@ -6035,7 +6035,15 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
     tui.write("a");
     assert!(
         tui.wait_for_screen("thirty lines of output captured"),
-        "turn did not finish:\n{}",
+        "answer did not start streaming:\n{}",
+        tui.screen_text()
+    );
+    // The first visible answer fragment can precede durable completion.
+    // Finish the turn before testing fold geometry, while retaining the
+    // immediate resize -> toggle sequence below.
+    assert!(
+        tui.wait_for_home_session_event_count(temp.path(), EventKind::ASSISTANT_MESSAGE, 1),
+        "assistant message was not persisted:\n{}",
         tui.screen_text()
     );
     assert!(
