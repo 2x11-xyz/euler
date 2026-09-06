@@ -2860,10 +2860,13 @@ impl AppCore {
             |arguments| format!("/skill:{name} {arguments}"),
         );
         if !matches!(self.state, AppState::Idle { .. }) {
-            self.push_queued_input_back(prompt);
-            self.queued_selection = self.queued_inputs.len().checked_sub(1);
+            let content: Arc<str> = Arc::from(prompt);
             self.notice = None;
-            return CoreEffect::Render;
+            return self.start_queue_enqueue(
+                QueuePosition::Back,
+                Arc::clone(&content),
+                QueueMutationIntent::ComposerSubmit { original: content },
+            );
         }
         self.visual_scroll_offset = 0;
         self.queued_inputs.set_paused(false);

@@ -34,10 +34,10 @@ use euler_sdk::{
     HostAgentTask, HostApi, SpawnAgentTask,
 };
 use serde_json::Map;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-#[test]
 #[test]
 fn explicit_skill_command_parser_reserves_only_the_byte_zero_prefix() {
     assert_eq!(
@@ -65,7 +65,6 @@ fn explicit_skill_command_parser_reserves_only_the_byte_zero_prefix() {
         Err(SessionError::InvalidSkillCommand)
     ));
 }
-
 
 #[test]
 fn lifecycle_getter_reconciles_a_concurrent_durable_enqueue() {
@@ -1925,6 +1924,7 @@ fn scrub_audit_append_failure_masks_live_state_with_or_without_a_queue() {
     }
 }
 
+#[test]
 fn max_output_tokens_propagates_to_model_request_and_model_call() {
     let temp = tempfile::tempdir().expect("temp dir");
     let captured = Arc::new(Mutex::new(None));
@@ -6023,10 +6023,24 @@ mod project_context_seam {
         let root = repo_with_skill(&temp, "review", "Review changes.", "Frozen body.");
         let (mut session, captured) = captured_session(admitted_config(&root));
         let queue = Arc::new(SteeringQueue::default());
-        session.set_steering_queue(Arc::clone(&queue));
-        queue.push_steering_back("/skill:review check tests".to_owned());
-
-        let events = session.run_turn("start").expect("steered skill turn");
+        session
+            .set_steering_queue(Arc::clone(&queue))
+            .expect("bind queue");
+        let steering_queue = Arc::clone(&queue);
+        let steered = Cell::new(false);
+        let events = session
+            .run_turn_with_sink("start", Arc::new(AtomicBool::new(false)), move |event| {
+                if !steered.get() && event.kind.as_str() == EventKind::USER_MESSAGE {
+                    if let Some(run_id) = &event.run {
+                        steering_queue.activate_turn(run_id);
+                        steering_queue
+                            .push_steering_back("/skill:review check tests".to_owned())
+                            .expect("queue steering row");
+                        steered.set(true);
+                    }
+                }
+            })
+            .expect("steered skill turn");
 
         let user_events = events
             .iter()
@@ -6053,20 +6067,40 @@ mod project_context_seam {
         let root = repo_with_skill(&temp, "review", "Review changes.", "Frozen body.");
         let (mut session, _captured) = captured_session(admitted_config(&root));
         let queue = Arc::new(SteeringQueue::default());
-        session.set_steering_queue(Arc::clone(&queue));
-        queue.push_steering_back("/skill:missing".to_owned());
-
+        session
+            .set_steering_queue(Arc::clone(&queue))
+            .expect("bind queue");
+        let steering_queue = Arc::clone(&queue);
+        let steered = Cell::new(false);
         let error = session
-            .run_turn("start")
+            .run_turn_with_sink("start", Arc::new(AtomicBool::new(false)), move |event| {
+                if !steered.get() && event.kind.as_str() == EventKind::USER_MESSAGE {
+                    if let Some(run_id) = &event.run {
+                        steering_queue.activate_turn(run_id);
+                        steering_queue
+                            .push_steering_back("/skill:missing".to_owned())
+                            .expect("queue steering row");
+                        steered.set(true);
+                    }
+                }
+            })
             .expect_err("unknown steered skill must fail before admission");
 
         assert!(matches!(
             error,
             SessionError::SkillUnavailable { ref name } if name == "missing"
         ));
-        assert_eq!(queue.snapshot(), ["/skill:missing"]);
+        // Parsing and catalog lookup fail before any pending admission is
+        // installed, so the rejection is deterministic rather than an
+        // ambiguous durability failure: nothing is retained as an unresolved
+        // admission on either the queue or the session. The failed run's
+        // terminal boundary then releases the volatile steering row (a
+        // writer-backed queue would keep it as a recoverable row instead).
         assert!(!queue.has_unresolved_admission());
-        assert_eq!(queue.remove(0).as_deref(), Some("/skill:missing"));
+        assert!(session.pending_admission.is_none());
+        assert!(!session.has_unresolved_admission());
+        assert!(queue.is_empty());
+        assert!(session.can_accept_turn());
     }
 
     #[derive(Debug)]

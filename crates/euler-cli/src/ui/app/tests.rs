@@ -1909,6 +1909,7 @@ fn active_skill_command_queues_through_the_steering_path() {
         }),
         CoreEffect::Render
     );
+    wait_for_queue_mutation(&mut core);
 
     assert_eq!(core.queued_inputs.snapshot(), ["/skill:review check tests"]);
 }
