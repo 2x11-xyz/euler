@@ -13,8 +13,8 @@ use crate::auth::{AuthFile, ChatGptCredentials};
 use crate::chatgpt_websocket::{self, ConnectError};
 use crate::sse::SseParser;
 use crate::{
-    ModelInputItem, ModelProvider, ModelRequest, ModelStreamEvent, ProviderError, ProviderStream,
-    ToolDefinition,
+    observed_http_agent, ModelInputItem, ModelProvider, ModelRequest, ModelStreamEvent,
+    ProviderError, ProviderStream, ProviderTransportObserver, ToolDefinition, TransportReader,
 };
 
 const DEFAULT_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -95,6 +95,24 @@ impl ModelProvider for ChatGptProvider {
     }
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.invoke_inner(request, None)
+    }
+
+    fn invoke_observed(
+        &self,
+        request: ModelRequest,
+        observer: ProviderTransportObserver,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.invoke_inner(request, Some(observer))
+    }
+}
+
+impl ChatGptProvider {
+    fn invoke_inner(
+        &self,
+        request: ModelRequest,
+        observer: Option<ProviderTransportObserver>,
+    ) -> Result<ProviderStream, ProviderError> {
         if !crate::catalog::model_supports_reasoning_effort(
             crate::catalog::CHATGPT_PROVIDER_ID,
             &request.model,
@@ -115,10 +133,11 @@ impl ModelProvider for ChatGptProvider {
                 credentials.access_token.expose(),
                 credentials.account_id.expose(),
                 credentials.redaction_values.clone(),
+                observer,
             )
             .map_err(|error| websocket_provider_error(error, &credentials));
         }
-        let agent = ureq::builder().redirects(0).build();
+        let agent = observed_http_agent(observer.as_ref());
         let response = agent
             .post(&self.endpoint)
             .set(
@@ -160,7 +179,10 @@ impl ModelProvider for ChatGptProvider {
             }
         };
 
-        Ok(Box::new(ChatGptStream::new(response.into_reader())))
+        Ok(Box::new(ChatGptStream::new(TransportReader::new(
+            response.into_reader(),
+            observer,
+        ))))
     }
 }
 
@@ -254,7 +276,15 @@ fn request_body(request: &ModelRequest) -> Value {
         "input": request.input.iter().filter_map(input_item).collect::<Vec<_>>(),
         "stream": true,
         "store": false,
-        "reasoning": { "effort": request.reasoning_effort.compat_level() },
+        // `summary: auto` makes the Responses API stream
+        // `response.reasoning_summary*.delta` events during the reasoning
+        // phase. Without it a long silent think produces zero semantic
+        // events, the semantic-idle liveness deadline fires, and the round
+        // is abandoned even though the provider was working.
+        "reasoning": {
+            "effort": request.reasoning_effort.compat_level(),
+            "summary": "auto",
+        },
     });
     if !request.tools.is_empty() {
         body["tools"] = json!(request

@@ -23,11 +23,14 @@ passive background runtime, timeout system, wakeup mechanism, or recovery
 lease. Interactive synchronous companion and parallel-review calls do accept
 the host's read-only cancellation token and still record terminal
 `agent.result` events before returning cancellation. This does not add
-cancellation to detached background handles. A synchronous provider adapter
-may still have an OS or network call running on its adapter thread after the
-parent stops waiting; cancellation detaches that call from the live session
-and rejects its late events rather than claiming physical I/O preemption. A
-stream with `agent.spawn` and no `agent.result` is a valid incomplete
+cancellation to detached background handles. Interactive companion and
+parallel-review provider calls use the same inactivity/cancellation boundary as
+the root driver. Built-in HTTP and WebSocket adapters bound connected socket
+I/O and stop after detachment; OS name resolution and a compatibility provider
+that does not implement that transport contract may still have work running on
+an adapter thread. In every case cancellation rejects late events rather than
+letting them re-enter the live session. A stream with `agent.spawn` and no
+`agent.result` is a valid incomplete
 historical record after resume; core does not reconstruct live child state in
 v0, and that historical incomplete spawn cannot be completed through
 `record_agent_result` after resume.

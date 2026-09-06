@@ -80,6 +80,9 @@ impl AppCore {
                     self.refresh_patch_modal_preview();
                 }
             }
+            TurnEvent::ProviderRuntime(event) => {
+                self.activity.observe_provider_runtime(&event, Utc::now());
+            }
             TurnEvent::TurnDone { outcome, session } => {
                 let elapsed = self.working_elapsed();
                 let auto_flush = outcome == TurnOutcome::Complete;

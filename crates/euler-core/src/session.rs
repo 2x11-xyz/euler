@@ -16,6 +16,9 @@ use crate::guardian::PermissionReviewer;
 use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, PermissionGate};
 use crate::project_context::ProjectContextBootstrap;
 use crate::provenance::ProvenanceWriter;
+use crate::provider_runtime::{
+    ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope, ProviderRuntimeTarget,
+};
 use crate::redaction::SecretRedactor;
 use crate::runtime_identity::RuntimeIdentity;
 use crate::sandbox::SubprocessSandbox;
@@ -27,9 +30,9 @@ use crate::EventBus;
 use euler_agents::{generated_agent_id, AgentError, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{
-    ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent, ProviderError,
-    ProviderSet, ProviderStream, ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason,
-    ToolCall, Usage,
+    ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent,
+    ProviderAttemptObserver, ProviderError, ProviderLivenessConfig, ProviderSet, ProviderStream,
+    ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason, ToolCall, Usage,
 };
 use euler_sdk::{
     CancellationSource, CancellationToken, Capability, EventWakeError, EventWakeRegistration,
@@ -191,6 +194,9 @@ pub struct SessionConfig {
     /// 3s). The transport-named fields are retained for source compatibility.
     pub provider_transport_retries: usize,
     pub provider_transport_retry_backoff_ms: Vec<u64>,
+    /// Per-attempt inactivity boundaries. Productive semantic streams have no
+    /// total-duration cap; raw transport does not reset semantic idleness.
+    pub provider_liveness: ProviderLivenessConfig,
     /// Canvas retention policy (ADR canvas-retention-and-auto-compaction):
     /// byte-budget retention with visible stub demotion. There is no
     /// item-count window; every tool round stays in canvas.
@@ -256,6 +262,7 @@ impl SessionConfig {
             max_tool_rounds: None,
             provider_transport_retries: 2,
             provider_transport_retry_backoff_ms: vec![1000, 3000],
+            provider_liveness: ProviderLivenessConfig::default(),
             auto_compaction: AutoCompactionPolicy::default(),
             max_output_tokens: None,
             context_limit: None,
@@ -435,6 +442,9 @@ pub struct Session<D> {
     context_limit_emitted: Option<ModelTarget>,
     open_agent_spawns: BTreeMap<String, String>,
     observer_extension: Option<Arc<dyn Extension>>,
+    /// Process-local, content-free provider lifecycle attachment for hosts.
+    /// It is neither persisted nor projected into transcript/model context.
+    provider_runtime_observer: ProviderRuntimeObserver,
     /// Generic root-session extensions. These are launch-time handles only:
     /// wiring starts no process and grants no capability.
     extensions: BTreeMap<String, Arc<dyn Extension>>,
@@ -525,6 +535,80 @@ pub(super) fn provider_cancellation(
     euler_provider::CancellationCheck::new(move || cancellation.is_cancelled())
 }
 
+pub(super) struct ProviderRuntimeContext<'a> {
+    session_id: &'a str,
+    target: &'a ModelTarget,
+    scope: ProviderRuntimeScope,
+    observer: &'a ProviderRuntimeObserver,
+}
+
+impl<'a> ProviderRuntimeContext<'a> {
+    pub(super) fn new(
+        session_id: &'a str,
+        target: &'a ModelTarget,
+        scope: ProviderRuntimeScope,
+        observer: &'a ProviderRuntimeObserver,
+    ) -> Self {
+        Self {
+            session_id,
+            target,
+            scope,
+            observer,
+        }
+    }
+
+    pub(super) fn attempt_observer(&self) -> ProviderAttemptObserver {
+        let session_id = self.session_id.to_owned();
+        let provider = self.target.provider.clone();
+        let model = self.target.model.clone();
+        let scope = self.scope;
+        let runtime_observer = self.observer.clone();
+        ProviderAttemptObserver::new(move |event| {
+            crate::diagnostics::provider_attempt(&session_id, &provider, &model, &event);
+            runtime_observer.emit(ProviderRuntimeEvent::Attempt {
+                target: ProviderRuntimeTarget::new(scope, &provider, &model),
+                event,
+            });
+        })
+    }
+
+    pub(super) fn retry_scheduled(
+        &self,
+        error: &ProviderError,
+        retry_ordinal: u64,
+        backoff_ms: u64,
+    ) {
+        crate::diagnostics::provider_retry(
+            self.session_id,
+            error.category(),
+            error.attempt_id(),
+            retry_ordinal,
+            backoff_ms,
+        );
+        self.observer.emit(ProviderRuntimeEvent::RetryScheduled {
+            target: ProviderRuntimeTarget::new(
+                self.scope,
+                &self.target.provider,
+                &self.target.model,
+            ),
+            failed_attempt_id: error.attempt_id().map(str::to_owned),
+            category: error.category(),
+            retry_ordinal,
+            backoff_ms,
+        });
+    }
+}
+
+pub(super) fn add_provider_error_metadata(payload: &mut JsonObject, error: &ProviderError) {
+    payload.insert("category".to_owned(), error.category().as_str().into());
+    if let Some(attempt_id) = error.attempt_id() {
+        payload.insert("provider_attempt_id".to_owned(), attempt_id.into());
+    }
+    if let Some(stage) = error.timeout_stage() {
+        payload.insert("timeout_stage".to_owned(), stage.as_str().into());
+    }
+}
+
 impl<F, D> RoundLoopIo for SessionRoundIo<'_, '_, F, D>
 where
     F: FnMut(&EventEnvelope),
@@ -538,6 +622,14 @@ where
 
     fn target(&self) -> ModelTarget {
         self.session.active_target.clone()
+    }
+
+    fn provider_runtime_observer(&self) -> &ProviderRuntimeObserver {
+        &self.session.provider_runtime_observer
+    }
+
+    fn provider_runtime_scope(&self) -> ProviderRuntimeScope {
+        ProviderRuntimeScope::Root
     }
 
     fn prepare_model_request(
@@ -554,10 +646,19 @@ where
         target: &ModelTarget,
         request: ModelRequest,
     ) -> Result<ProviderStream, ProviderError> {
+        let observer = ProviderRuntimeContext::new(
+            &self.session.config.session_id,
+            target,
+            ProviderRuntimeScope::Root,
+            &self.session.provider_runtime_observer,
+        )
+        .attempt_observer();
         self.session.providers.invoke_interruptibly(
             &target.provider,
             request,
             provider_cancellation(self.cancellation.clone()),
+            self.session.config.provider_liveness,
+            observer,
         )
     }
 
@@ -960,6 +1061,7 @@ impl<D> Session<D> {
             context_limit_emitted: None,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            provider_runtime_observer: ProviderRuntimeObserver::default(),
             extensions: BTreeMap::new(),
             active_extension_tools: BTreeMap::new(),
             steering: None,
@@ -1058,6 +1160,7 @@ impl<D> Session<D> {
         let active_target = self.active_target;
         let code_swarm_extension = self.code_swarm_extension;
         let extensions = self.extensions;
+        let provider_runtime_observer = self.provider_runtime_observer;
         let redactor = self.redactor;
         let mut config = self.config;
         config.session_id = session_id.into();
@@ -1077,6 +1180,7 @@ impl<D> Session<D> {
         // and the transitional CodeSwarm review-gate tool.
         fresh.code_swarm_extension = code_swarm_extension;
         fresh.extensions = extensions;
+        fresh.provider_runtime_observer = provider_runtime_observer;
         Ok(fresh)
     }
 
@@ -1089,6 +1193,12 @@ impl<D> Session<D> {
     /// observer executes; config without extension (or vice versa) is inert.
     pub fn set_observer_extension(&mut self, extension: Arc<dyn Extension>) {
         self.observer_extension = Some(extension);
+    }
+
+    /// Attach a process-local consumer for content-free provider attempt and
+    /// retry transitions. Replacing it has no durable session effect.
+    pub fn set_provider_runtime_observer(&mut self, observer: ProviderRuntimeObserver) {
+        self.provider_runtime_observer = observer;
     }
 
     /// Wire the shared mid-turn steering queue and arm it for the next turn
@@ -1729,6 +1839,7 @@ impl<D> Session<D> {
             context_limit_emitted,
             open_agent_spawns: BTreeMap::new(),
             observer_extension: None,
+            provider_runtime_observer: ProviderRuntimeObserver::default(),
             extensions: BTreeMap::new(),
             active_extension_tools: BTreeMap::new(),
             steering: None,
@@ -2758,8 +2869,13 @@ impl<D: PermissionDecider> Session<D> {
             self.providers.clone(),
             target.clone(),
             request,
-            self.config.provider_transport_retries,
-            self.config.provider_transport_retry_backoff_ms.clone(),
+            compaction_worker::ProviderRunConfig {
+                session_id: self.config.session_id.clone(),
+                retries: self.config.provider_transport_retries,
+                retry_backoff_ms: self.config.provider_transport_retry_backoff_ms.clone(),
+                liveness: self.config.provider_liveness,
+                runtime_observer: self.provider_runtime_observer.clone(),
+            },
         );
         self.shadow_compaction = Some(ShadowCompaction {
             candidate,
@@ -2904,8 +3020,7 @@ impl<D: PermissionDecider> Session<D> {
             let shadow = self.shadow_compaction.take().expect("shadow checked above");
             return self.finish_detached_shadow(shadow, outcome, disposition, tool_catalog);
         }
-        shadow.worker.cancel();
-        let outcome = shadow.worker.recv_timeout(COMPACTION_CANCEL_GRACE);
+        let outcome = shadow.worker.cancel_and_recv(COMPACTION_CANCEL_GRACE);
         let shadow = self.shadow_compaction.take().expect("shadow checked above");
         if let Some(outcome) = outcome {
             return self.finish_detached_shadow(shadow, outcome, disposition, tool_catalog);
@@ -2996,16 +3111,13 @@ impl<D: PermissionDecider> Session<D> {
         let data = match result {
             Ok(data) => data,
             Err(error) => {
-                self.emit_with_parent(
-                    EventKind::ERROR,
-                    object([
-                        ("source", "provider".into()),
-                        ("purpose", COMPACTION_PURPOSE.into()),
-                        ("category", error.category().as_str().into()),
-                        ("message", self.redactor.redact(error.message()).into()),
-                    ]),
-                    Some(shadow.model_call_id),
-                )?;
+                let mut payload = object([
+                    ("source", "provider".into()),
+                    ("purpose", COMPACTION_PURPOSE.into()),
+                    ("message", self.redactor.redact(error.message()).into()),
+                ]);
+                add_provider_error_metadata(&mut payload, &error);
+                self.emit_with_parent(EventKind::ERROR, payload, Some(shadow.model_call_id))?;
                 self.discard_shadow_candidate("compaction provider failed")?;
                 return Ok(CompactionStatus::Failed);
             }
@@ -3199,7 +3311,7 @@ impl<D: PermissionDecider> Session<D> {
             ("source", "provider".into()),
             ("message", self.redactor.redact(&error.to_string()).into()),
         ]);
-        payload.insert("category".to_owned(), error.category().as_str().into());
+        add_provider_error_metadata(&mut payload, error);
         self.emit_with_parent(EventKind::ERROR, payload, Some(model_call_id))
     }
 

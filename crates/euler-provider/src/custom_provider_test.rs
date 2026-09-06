@@ -7,8 +7,13 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+
+const CUSTOM_PROVIDER_ID: &str = "custom-openai-chat-completions";
 
 #[test]
 fn custom_provider_posts_openai_chat_completions_request() {
@@ -636,6 +641,173 @@ fn custom_provider_stream_errors_include_custom_label() {
     assert!(error
         .message()
         .contains("custom provider `local-openai` provider emitted malformed stream JSON"));
+}
+
+#[test]
+fn observed_custom_provider_times_out_when_server_never_sends_headers() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _request = read_http_request(&mut stream);
+        thread::sleep(Duration::from_millis(150));
+    });
+    let provider = CustomOpenAiProvider::from_config(custom_config(&base_url, None, []))
+        .expect("custom provider");
+    let providers = ProviderSet::single(provider);
+    let started = Instant::now();
+    let mut stream = providers
+        .invoke_interruptibly(
+            CUSTOM_PROVIDER_ID,
+            model_request("custom-model"),
+            CancellationCheck::new(|| false),
+            ProviderLivenessConfig {
+                response_header_timeout: Duration::from_millis(40),
+                first_byte_timeout: Duration::from_secs(1),
+                semantic_idle_timeout: Duration::from_secs(1),
+            },
+            ProviderAttemptObserver::default(),
+        )
+        .expect("provider worker");
+
+    let error = stream.next().expect("timeout").expect_err("header timeout");
+
+    assert_eq!(
+        error.timeout_stage(),
+        Some(ProviderTimeoutStage::ResponseHeaders)
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+    server.join().expect("server");
+}
+
+#[test]
+fn observed_custom_provider_heartbeats_are_transport_not_semantic_progress() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _request = read_http_request(&mut stream);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .expect("write headers");
+        for _ in 0..30 {
+            if stream.write_all(b": keepalive\n\n").is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let provider = CustomOpenAiProvider::from_config(custom_config(&base_url, None, []))
+        .expect("custom provider");
+    let providers = ProviderSet::single(provider);
+    let attempt_events = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&attempt_events);
+    let mut stream = providers
+        .invoke_interruptibly(
+            CUSTOM_PROVIDER_ID,
+            model_request("custom-model"),
+            CancellationCheck::new(|| false),
+            ProviderLivenessConfig {
+                response_header_timeout: Duration::from_millis(500),
+                first_byte_timeout: Duration::from_millis(500),
+                semantic_idle_timeout: Duration::from_millis(60),
+            },
+            ProviderAttemptObserver::new(move |event| {
+                observed.lock().expect("attempt events").push(event);
+            }),
+        )
+        .expect("provider worker");
+
+    let error = stream
+        .next()
+        .expect("timeout")
+        .expect_err("semantic timeout");
+
+    assert_eq!(
+        error.timeout_stage(),
+        Some(ProviderTimeoutStage::SemanticIdle)
+    );
+    let events = attempt_events.lock().expect("attempt events");
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, ProviderAttemptEvent::FirstByte { .. })));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ProviderAttemptEvent::FirstSemantic { .. })));
+    drop(events);
+    server.join().expect("server");
+}
+
+#[test]
+fn cancelling_observed_custom_provider_closes_the_stream_socket() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let base_url = format!("http://{}/v1", listener.local_addr().expect("addr"));
+    let (headers_tx, headers_rx) = mpsc::channel();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _request = read_http_request(&mut stream);
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )
+            .expect("write headers");
+        headers_tx.send(()).expect("headers sent");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("server read timeout");
+        let mut byte = [0_u8; 1];
+        let closed = match stream.read(&mut byte) {
+            Ok(0) => true,
+            Err(error)
+                if !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                true
+            }
+            Ok(_) | Err(_) => false,
+        };
+        closed_tx.send(closed).expect("closed result");
+    });
+    let provider = CustomOpenAiProvider::from_config(custom_config(&base_url, None, []))
+        .expect("custom provider");
+    let providers = ProviderSet::single(provider);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancellation_probe = Arc::clone(&cancelled);
+    let mut stream = providers
+        .invoke_interruptibly(
+            CUSTOM_PROVIDER_ID,
+            model_request("custom-model"),
+            CancellationCheck::new(move || cancellation_probe.load(Ordering::Acquire)),
+            ProviderLivenessConfig {
+                response_header_timeout: Duration::from_millis(200),
+                first_byte_timeout: Duration::from_secs(1),
+                semantic_idle_timeout: Duration::from_secs(1),
+            },
+            ProviderAttemptObserver::default(),
+        )
+        .expect("provider worker");
+    headers_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("response headers");
+    let cancel_flag = Arc::clone(&cancelled);
+    let cancel = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        cancel_flag.store(true, Ordering::Release);
+    });
+    let started = Instant::now();
+
+    assert!(stream.next().is_none());
+    assert!(started.elapsed() < Duration::from_millis(150));
+    assert!(closed_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("server observes close"));
+    cancel.join().expect("cancel thread");
+    server.join().expect("server");
 }
 
 fn custom_config<'a>(

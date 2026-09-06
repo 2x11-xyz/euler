@@ -52,8 +52,8 @@ use euler_core::{
     event_is_runtime_only, fold_session, load_extension_package, read_resume_prefix,
     resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, CompactionStatus,
     EulerHome, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
-    ProjectContextBootstrap, ProvenanceWriter, QueuedInput, ReasoningEffort, ScopePattern, Session,
-    SessionStore,
+    ProjectContextBootstrap, ProvenanceWriter, ProviderRuntimeEvent, ProviderRuntimeObserver,
+    QueuedInput, ReasoningEffort, ScopePattern, Session, SessionStore,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -331,6 +331,10 @@ enum AppState {
 
 enum TurnEvent {
     Event(EventEnvelope),
+    /// Process-local, content-free control input for the live Activity HUD.
+    /// Unlike `Event`, this is never inserted into transcript, provenance, or
+    /// model context.
+    ProviderRuntime(ProviderRuntimeEvent),
     TurnDone {
         outcome: TurnOutcome,
         session: Box<Session<TuiDecider>>,
@@ -2267,6 +2271,10 @@ impl AppCore {
         }
         session.set_compaction_request(Arc::clone(&self.compaction_request));
         let (worker_tx, worker_rx) = mpsc::channel();
+        let runtime_tx = worker_tx.clone();
+        session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+            let _ = runtime_tx.send(TurnEvent::ProviderRuntime(event));
+        }));
         let interrupt_flag = Arc::new(AtomicBool::new(false));
         let worker_interrupt = Arc::clone(&interrupt_flag);
         std::thread::spawn(move || {

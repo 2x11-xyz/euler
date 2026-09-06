@@ -2,7 +2,10 @@
 
 use crate::auth::SecretString;
 use crate::provider_config::{ApiFamily, CustomProviderConfig};
-use crate::{ModelProvider, ModelRequest, ProviderError, ProviderStream, ResolvedSecretSink};
+use crate::{
+    ModelProvider, ModelRequest, ProviderError, ProviderStream, ProviderTransportObserver,
+    ResolvedSecretSink,
+};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::process::Command;
@@ -87,6 +90,24 @@ impl ModelProvider for CustomOpenAiProvider {
     }
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.invoke_inner(request, None)
+    }
+
+    fn invoke_observed(
+        &self,
+        request: ModelRequest,
+        observer: ProviderTransportObserver,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.invoke_inner(request, Some(observer))
+    }
+}
+
+impl CustomOpenAiProvider {
+    fn invoke_inner(
+        &self,
+        request: ModelRequest,
+        observer: Option<ProviderTransportObserver>,
+    ) -> Result<ProviderStream, ProviderError> {
         let resolved = self.resolve_headers()?;
         let options = self.chat_completions_options(&request.model);
         let body = crate::chat_completions::request_body_with_options(&request, &options);
@@ -97,13 +118,16 @@ impl ModelProvider for CustomOpenAiProvider {
             .headers
             .iter()
             .map(|(name, value)| (name.as_str(), value.expose()));
-        use crate::chat_completions_provider::SendFailure;
+        use crate::chat_completions_provider::{ChatCompletionsCall, SendFailure};
         crate::chat_completions_provider::send_chat_completions(
             &self.endpoint,
             headers,
-            body,
-            self.label.clone(),
-            options,
+            ChatCompletionsCall {
+                body,
+                stream_label: self.label.clone(),
+                options,
+                observer,
+            },
             |failure| match failure {
                 // custom does not read the body — the response is dropped unread.
                 SendFailure::Rejection { status, .. } => classify_http_error(&self.label, status),

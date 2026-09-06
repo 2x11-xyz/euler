@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use crate::auth::{ApiKeyAuth, EnvApiKeyAuth, SecretString};
 use crate::{
-    ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent, ProviderError,
-    ProviderStream, ReasoningChunk, ReasoningEffort, ReasoningFidelity, StopReason, ToolCall,
-    ToolDefinition, Usage,
+    observed_http_agent, ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent,
+    ProviderError, ProviderStream, ProviderTransportObserver, ReasoningChunk, ReasoningEffort,
+    ReasoningFidelity, StopReason, ToolCall, ToolDefinition, TransportReader, Usage,
 };
 
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
@@ -54,9 +54,27 @@ impl ModelProvider for AnthropicProvider {
     }
 
     fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.invoke_inner(request, None)
+    }
+
+    fn invoke_observed(
+        &self,
+        request: ModelRequest,
+        observer: ProviderTransportObserver,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.invoke_inner(request, Some(observer))
+    }
+}
+
+impl AnthropicProvider {
+    fn invoke_inner(
+        &self,
+        request: ModelRequest,
+        observer: Option<ProviderTransportObserver>,
+    ) -> Result<ProviderStream, ProviderError> {
         let api_key = self.load_api_key()?;
         let body = request_body(&request);
-        let agent = ureq::builder().redirects(0).build();
+        let agent = observed_http_agent(observer.as_ref());
         let response = agent
             .post(&self.endpoint)
             .set("x-api-key", api_key.expose())
@@ -79,7 +97,10 @@ impl ModelProvider for AnthropicProvider {
             }
         };
 
-        Ok(Box::new(AnthropicStream::new(response.into_reader())))
+        Ok(Box::new(AnthropicStream::new(TransportReader::new(
+            response.into_reader(),
+            observer,
+        ))))
     }
 }
 

@@ -7,7 +7,9 @@
 
 use super::turn_recap::{shell_exit_code, TurnRecapAccumulator};
 use chrono::{DateTime, Utc};
+use euler_core::ProviderRuntimeEvent;
 use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
+use euler_provider::{ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTimeoutStage};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -20,6 +22,15 @@ pub(super) enum ActivityPhase {
     Starting,
     PreparingContext,
     WaitingForModel,
+    WaitingForResponseHeaders,
+    WaitingForFirstByte,
+    WaitingForSemanticOutput,
+    RetryingModel {
+        retry_ordinal: u64,
+        backoff_ms: u64,
+    },
+    ProviderTimedOut(ProviderTimeoutStage),
+    ProviderCancelled,
     ReceivingResponse,
     Inspecting(usize),
     Editing(usize),
@@ -44,6 +55,15 @@ impl ActivityPhase {
             Self::Starting => "Starting run".to_owned(),
             Self::PreparingContext => "Preparing model context".to_owned(),
             Self::WaitingForModel => "Waiting for model".to_owned(),
+            Self::WaitingForResponseHeaders => "Waiting for response headers".to_owned(),
+            Self::WaitingForFirstByte => "Waiting for first response byte".to_owned(),
+            Self::WaitingForSemanticOutput => "Waiting for meaningful model output".to_owned(),
+            Self::RetryingModel {
+                retry_ordinal,
+                backoff_ms,
+            } => retry_label(*retry_ordinal, *backoff_ms),
+            Self::ProviderTimedOut(stage) => provider_timeout_label(*stage).to_owned(),
+            Self::ProviderCancelled => "Model request cancelled".to_owned(),
             Self::ReceivingResponse => "Receiving model response".to_owned(),
             Self::Inspecting(count) => {
                 counted("Inspecting workspace", "Inspecting", *count, "files")
@@ -72,7 +92,29 @@ impl ActivityPhase {
                 | Self::Failed
                 | Self::Cancelled
                 | Self::Interrupted
+                | Self::ProviderTimedOut(_)
+                | Self::ProviderCancelled
         )
+    }
+}
+
+fn retry_label(retry_ordinal: u64, backoff_ms: u64) -> String {
+    if backoff_ms == 0 {
+        return format!("Retrying model request (retry {retry_ordinal})");
+    }
+    let delay = if backoff_ms.is_multiple_of(1_000) {
+        format!("{}s", backoff_ms / 1_000)
+    } else {
+        format!("{backoff_ms}ms")
+    };
+    format!("Retrying model request (retry {retry_ordinal} in {delay})")
+}
+
+fn provider_timeout_label(stage: ProviderTimeoutStage) -> &'static str {
+    match stage {
+        ProviderTimeoutStage::ResponseHeaders => "Model request timed out waiting for headers",
+        ProviderTimeoutStage::FirstByte => "Model request timed out waiting for first byte",
+        ProviderTimeoutStage::SemanticIdle => "Model response timed out without meaningful output",
     }
 }
 
@@ -225,6 +267,62 @@ impl RunActivityProjection {
             }
         }
         meaningful
+    }
+
+    /// Apply one live provider control transition without turning it into a
+    /// canonical event. Only the root scope may refine the foreground HUD;
+    /// every transition updates liveness at most and never meaningful
+    /// progress, recap state, or the latest completed milestone.
+    pub(super) fn observe_provider_runtime(
+        &mut self,
+        event: &ProviderRuntimeEvent,
+        at: DateTime<Utc>,
+    ) {
+        let phase = match event {
+            ProviderRuntimeEvent::Attempt { target, .. }
+            | ProviderRuntimeEvent::RetryScheduled { target, .. }
+                if !target.scope.is_foreground() =>
+            {
+                return;
+            }
+            ProviderRuntimeEvent::Attempt { event, .. } => match event {
+                ProviderAttemptEvent::Started { .. } => {
+                    Some(ActivityPhase::WaitingForResponseHeaders)
+                }
+                ProviderAttemptEvent::ResponseHeaders { .. } => {
+                    Some(ActivityPhase::WaitingForFirstByte)
+                }
+                ProviderAttemptEvent::FirstByte { .. } => {
+                    Some(ActivityPhase::WaitingForSemanticOutput)
+                }
+                ProviderAttemptEvent::FirstSemantic { .. } => {
+                    Some(ActivityPhase::ReceivingResponse)
+                }
+                ProviderAttemptEvent::Ended(summary) => match summary.outcome {
+                    ProviderAttemptOutcome::TimedOut(stage) => {
+                        Some(ActivityPhase::ProviderTimedOut(stage))
+                    }
+                    ProviderAttemptOutcome::Cancelled => Some(ActivityPhase::ProviderCancelled),
+                    ProviderAttemptOutcome::Completed
+                    | ProviderAttemptOutcome::Failed
+                    | ProviderAttemptOutcome::StreamEnded
+                    | ProviderAttemptOutcome::Abandoned => None,
+                },
+            },
+            ProviderRuntimeEvent::RetryScheduled {
+                retry_ordinal,
+                backoff_ms,
+                ..
+            } => Some(ActivityPhase::RetryingModel {
+                retry_ordinal: *retry_ordinal,
+                backoff_ms: *backoff_ms,
+            }),
+        };
+        let at = self.monotonic_time(at);
+        self.last_event_at = Some(at);
+        if let Some(phase) = phase.filter(|_| self.active_tools.is_empty()) {
+            self.set_phase(phase, Some(at), true);
+        }
     }
 
     fn observe_kind(&mut self, event: &EventEnvelope, at: Option<DateTime<Utc>>) -> bool {
@@ -735,7 +833,9 @@ pub(super) fn format_age(duration: Duration) -> String {
 mod tests {
     use super::*;
     use crate::ui::test_support::event_at;
+    use euler_core::{ProviderRuntimeScope, ProviderRuntimeTarget};
     use euler_event::object;
+    use euler_provider::{ProviderAttemptSummary, ProviderErrorCategory};
     use serde_json::json;
 
     const T0: &str = "2026-07-31T12:00:00Z";
@@ -771,6 +871,47 @@ mod tests {
             lines.push(format!("  {detail}"));
         }
         lines.join("\n")
+    }
+
+    fn provider_attempt(
+        scope: ProviderRuntimeScope,
+        event: ProviderAttemptEvent,
+    ) -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::Attempt {
+            target: ProviderRuntimeTarget {
+                scope,
+                provider: "fixture".to_owned(),
+                model: "echo".to_owned(),
+            },
+            event,
+        }
+    }
+
+    fn provider_retry(scope: ProviderRuntimeScope) -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::RetryScheduled {
+            target: ProviderRuntimeTarget {
+                scope,
+                provider: "fixture".to_owned(),
+                model: "echo".to_owned(),
+            },
+            failed_attempt_id: Some("attempt-1".to_owned()),
+            category: ProviderErrorCategory::Transport,
+            retry_ordinal: 1,
+            backoff_ms: 250,
+        }
+    }
+
+    fn provider_ended(outcome: ProviderAttemptOutcome) -> ProviderAttemptEvent {
+        ProviderAttemptEvent::Ended(ProviderAttemptSummary {
+            attempt_id: "attempt-1".to_owned(),
+            outcome,
+            elapsed_ms: 1,
+            response_headers_ms: Some(0),
+            first_byte_ms: Some(0),
+            first_semantic_ms: None,
+            last_transport_activity_ms: Some(0),
+            last_semantic_activity_ms: None,
+        })
     }
 
     #[test]
@@ -1077,6 +1218,179 @@ mod tests {
         assert_eq!(snapshot.progress_age, Some(Duration::from_secs(30)));
         assert_eq!(snapshot.last_event_age, Some(Duration::from_secs(10)));
         assert!(snapshot.stalled);
+    }
+
+    #[test]
+    fn provider_control_updates_liveness_without_resetting_progress() {
+        let mut projection = RunActivityProjection::default();
+        projection.begin_at(at(0));
+        observed(
+            &mut projection,
+            EventKind::MODEL_DELTA,
+            object([("kind", "text".into()), ("delta", "visible".into())]),
+            5,
+        );
+
+        projection.observe_provider_runtime(
+            &provider_attempt(
+                ProviderRuntimeScope::Root,
+                ProviderAttemptEvent::ResponseHeaders {
+                    attempt_id: "attempt-1".to_owned(),
+                    elapsed_ms: 20,
+                },
+            ),
+            at(25),
+        );
+
+        let snapshot = projection.snapshot_at(at(35));
+        assert_eq!(snapshot.phase, ActivityPhase::WaitingForFirstByte);
+        assert_eq!(snapshot.progress_age, Some(Duration::from_secs(30)));
+        assert_eq!(snapshot.last_event_age, Some(Duration::from_secs(10)));
+        assert!(snapshot.stalled);
+    }
+
+    #[test]
+    fn provider_attempt_timeout_retry_and_cancellation_are_visible() {
+        let mut projection = RunActivityProjection::default();
+        projection.begin_at(at(0));
+        observed(
+            &mut projection,
+            EventKind::TOOL_CALL,
+            object([
+                ("id", "cargo-check".into()),
+                ("name", "run_shell".into()),
+                ("input", json!({"command":"cargo check"})),
+            ]),
+            1,
+        );
+        observed(
+            &mut projection,
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", "cargo-check".into()),
+                ("name", "run_shell".into()),
+                ("ok", false.into()),
+                ("exit_code", 101.into()),
+            ]),
+            2,
+        );
+
+        projection.observe_provider_runtime(
+            &provider_attempt(
+                ProviderRuntimeScope::Root,
+                ProviderAttemptEvent::Started {
+                    attempt_id: "attempt-1".to_owned(),
+                },
+            ),
+            at(3),
+        );
+        assert_eq!(
+            projection.phase(),
+            &ActivityPhase::WaitingForResponseHeaders
+        );
+        projection.observe_provider_runtime(
+            &provider_attempt(
+                ProviderRuntimeScope::Root,
+                ProviderAttemptEvent::ResponseHeaders {
+                    attempt_id: "attempt-1".to_owned(),
+                    elapsed_ms: 1,
+                },
+            ),
+            at(4),
+        );
+        assert_eq!(projection.phase(), &ActivityPhase::WaitingForFirstByte);
+        projection.observe_provider_runtime(
+            &provider_attempt(
+                ProviderRuntimeScope::Root,
+                ProviderAttemptEvent::FirstByte {
+                    attempt_id: "attempt-1".to_owned(),
+                    elapsed_ms: 2,
+                },
+            ),
+            at(5),
+        );
+        assert_eq!(projection.phase(), &ActivityPhase::WaitingForSemanticOutput);
+        projection.observe_provider_runtime(
+            &provider_attempt(
+                ProviderRuntimeScope::Root,
+                ProviderAttemptEvent::FirstSemantic {
+                    attempt_id: "attempt-1".to_owned(),
+                    elapsed_ms: 3,
+                },
+            ),
+            at(6),
+        );
+        assert_eq!(projection.phase(), &ActivityPhase::ReceivingResponse);
+        projection.observe_provider_runtime(
+            &provider_attempt(
+                ProviderRuntimeScope::Root,
+                provider_ended(ProviderAttemptOutcome::TimedOut(
+                    ProviderTimeoutStage::SemanticIdle,
+                )),
+            ),
+            at(35),
+        );
+        assert_eq!(
+            projection.snapshot_at(at(35)).verb(),
+            "Model response timed out without meaningful output"
+        );
+
+        projection.observe_provider_runtime(&provider_retry(ProviderRuntimeScope::Root), at(36));
+        let retry = projection.snapshot_at(at(36));
+        assert_eq!(
+            retry.verb(),
+            "Stalled: Retrying model request (retry 1 in 250ms)"
+        );
+        assert_eq!(
+            retry.latest_milestone.as_deref(),
+            Some("cargo check failed (exit 101)")
+        );
+        assert_eq!(retry.progress_age, Some(Duration::from_secs(34)));
+
+        projection.observe_provider_runtime(
+            &provider_attempt(
+                ProviderRuntimeScope::Root,
+                provider_ended(ProviderAttemptOutcome::Cancelled),
+            ),
+            at(37),
+        );
+        assert_eq!(projection.phase(), &ActivityPhase::ProviderCancelled);
+        assert_eq!(
+            projection.snapshot_at(at(37)).latest_milestone,
+            retry.latest_milestone
+        );
+    }
+
+    #[test]
+    fn nonroot_provider_control_is_ignored_completely() {
+        let mut projection = RunActivityProjection::default();
+        projection.begin_at(at(0));
+        observed(
+            &mut projection,
+            EventKind::MODEL_CALL,
+            object([("provider", "fixture".into()), ("model", "echo".into())]),
+            1,
+        );
+        let expected = projection.clone();
+
+        for scope in [
+            ProviderRuntimeScope::Companion,
+            ProviderRuntimeScope::ParallelReviewer,
+            ProviderRuntimeScope::Compaction,
+        ] {
+            projection.observe_provider_runtime(
+                &provider_attempt(
+                    scope,
+                    ProviderAttemptEvent::Started {
+                        attempt_id: "child-attempt".to_owned(),
+                    },
+                ),
+                at(20),
+            );
+            projection.observe_provider_runtime(&provider_retry(scope), at(21));
+        }
+
+        assert_eq!(projection, expected);
     }
 
     #[test]

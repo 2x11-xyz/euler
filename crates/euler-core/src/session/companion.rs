@@ -1,15 +1,17 @@
 //! Live companion loop built from session services, not a nested `Session`.
 
 use super::{
-    approval_mode_str, canvas_snapshot_payload, context_budget_exhausted, elapsed_ms,
-    file_change_payload, file_diff_payload, maybe_store_pre_image, model_input_item,
-    permission_decision_payload, permission_request_for_tool, tool_cancelled_payload,
-    tool_result_payload, validate_model_target_shape, ModelRoundData, ModelTarget, RoundLoop,
+    add_provider_error_metadata, approval_mode_str, canvas_snapshot_payload,
+    context_budget_exhausted, elapsed_ms, file_change_payload, file_diff_payload,
+    maybe_store_pre_image, model_input_item, permission_decision_payload,
+    permission_request_for_tool, tool_cancelled_payload, tool_result_payload,
+    validate_model_target_shape, ModelRoundData, ModelTarget, ProviderRuntimeContext, RoundLoop,
     RoundLoopConfig, RoundLoopIo, RoundOutcome, Session, SessionError, TurnState,
     SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
+use crate::{ProviderRuntimeObserver, ProviderRuntimeScope};
 use euler_agents::{generated_agent_id, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, tool_result_succeeded, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{
@@ -54,6 +56,8 @@ struct CompanionLoop<'a, D> {
     session_max_output_tokens: Option<u64>,
     provider_retries: usize,
     provider_retry_backoff_ms: Vec<u64>,
+    provider_liveness: euler_provider::ProviderLivenessConfig,
+    provider_runtime_observer: ProviderRuntimeObserver,
     providers: &'a euler_provider::ProviderSet,
     tools: &'a crate::tools::ToolRegistry,
     writer: Arc<crate::provenance::ProvenanceWriter>,
@@ -254,6 +258,8 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             session_max_output_tokens: session.config.max_output_tokens,
             provider_retries: session.config.provider_transport_retries,
             provider_retry_backoff_ms: session.config.provider_transport_retry_backoff_ms.clone(),
+            provider_liveness: session.config.provider_liveness,
+            provider_runtime_observer: session.provider_runtime_observer.clone(),
             providers: &session.providers,
             tools: &session.tools,
             writer,
@@ -880,6 +886,14 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         self.target.clone()
     }
 
+    fn provider_runtime_observer(&self) -> &ProviderRuntimeObserver {
+        &self.provider_runtime_observer
+    }
+
+    fn provider_runtime_scope(&self) -> ProviderRuntimeScope {
+        ProviderRuntimeScope::Companion
+    }
+
     fn prepare_model_request(
         &mut self,
         target: &ModelTarget,
@@ -965,10 +979,19 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
         target: &ModelTarget,
         request: ModelRequest,
     ) -> Result<ProviderStream, ProviderError> {
+        let observer = ProviderRuntimeContext::new(
+            &self.session_id,
+            target,
+            ProviderRuntimeScope::Companion,
+            &self.provider_runtime_observer,
+        )
+        .attempt_observer();
         self.providers.invoke_interruptibly(
             &target.provider,
             request,
             super::provider_cancellation(self.cancellation.clone()),
+            self.provider_liveness,
+            observer,
         )
     }
 
@@ -983,7 +1006,7 @@ impl<D: PermissionDecider> RoundLoopIo for CompanionLoop<'_, D> {
             ("source", "provider".into()),
             ("message", self.redactor.redact(&error.to_string()).into()),
         ]);
-        payload.insert("category".to_owned(), error.category().as_str().into());
+        add_provider_error_metadata(&mut payload, error);
         Ok(self
             .append(EventKind::ERROR, payload, Some(model_call_id))?
             .id)
