@@ -248,6 +248,120 @@ fn append_parented_retries_an_exact_complete_suffix_once() {
 }
 
 #[test]
+fn accepted_event_feed_publishes_only_confirmed_persisted_events() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log).expect("provenance writer");
+    let before_attach = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_RENAMED,
+        object([("name", "before feed".into())]),
+    );
+    writer
+        .append(std::slice::from_ref(&before_attach))
+        .expect("append before feed");
+
+    let feed = writer
+        .attach_accepted_event_feed()
+        .expect("attach single feed");
+    assert!(feed.drain().is_empty(), "feed never replays old history");
+    assert!(matches!(
+        writer.attach_accepted_event_feed(),
+        Err(AcceptedEventFeedError::AlreadyAttached)
+    ));
+
+    let runtime = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::MODEL_DELTA,
+        object([("delta", "live only".into())]),
+    );
+    let durable = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "durable".into())]),
+    );
+    writer
+        .append(&[runtime, durable.clone()])
+        .expect("append mixed batch");
+    assert_eq!(feed.drain(), [durable]);
+
+    drop(feed);
+    let replacement = writer
+        .attach_accepted_event_feed()
+        .expect("dropped owner permits one replacement");
+    assert!(replacement.drain().is_empty());
+}
+
+#[test]
+fn accepted_event_feed_publishes_an_exact_retry_once_after_durability_is_confirmed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log.clone()).expect("provenance writer");
+    let feed = writer
+        .attach_accepted_event_feed()
+        .expect("accepted-event feed");
+    let candidate = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::QUEUE_ENQUEUED,
+        object([("content", "survives retry".into())]),
+    );
+    let log_for_match = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == log_for_match);
+
+    writer
+        .append_parented(|_| vec![candidate.clone()])
+        .expect_err("injected sync ambiguity");
+    assert!(guard.fired());
+    assert!(feed.drain().is_empty(), "ambiguous bytes are not accepted");
+    drop(guard);
+
+    writer
+        .append_parented(|_| vec![candidate.clone()])
+        .expect("exact retry confirms the suffix");
+    assert_eq!(feed.drain(), [candidate]);
+    assert!(feed.drain().is_empty(), "confirmed retry publishes once");
+}
+
+#[test]
+fn accepted_event_feed_generation_buffer_preserves_canonical_order() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let writer = ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer");
+    let feed = writer
+        .attach_accepted_event_feed()
+        .expect("accepted-event feed");
+    let first = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "first".into())]),
+    );
+    let second = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "second".into())]),
+    );
+
+    // Production append paths publish under the writer lock. Keep the
+    // generation buffer defensive against a future internal producer that
+    // hands it committed generations out of order.
+    writer.publish_accepted(Some(2), vec![second.clone()]);
+    assert!(feed.drain().is_empty());
+    writer.publish_accepted(Some(1), vec![first.clone()]);
+    assert_eq!(feed.drain(), [first, second]);
+}
+
+#[test]
 fn absent_unresolved_suffix_rewrites_only_the_exact_batch() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
@@ -268,6 +382,7 @@ fn absent_unresolved_suffix_rewrites_only_the_exact_batch() {
         logical_sha256: hash_bytes(&serialized),
         batch_event_ids: vec![event.id.clone()],
         new_tail: event.id.clone(),
+        new_parent_frontier: Some(event.id.clone()),
         event_count: 1,
         session_id: event.session.clone(),
     };
@@ -461,6 +576,46 @@ fn scrub_rewrite_refreshes_durable_length_before_appending_audit() {
 }
 
 #[test]
+fn scrub_rewrites_private_pending_queue_content_without_changing_identity() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log.clone()).expect("writer");
+    let run_id = ulid::Ulid::new().to_string();
+    let queue_id = ulid::Ulid::new().to_string();
+    let secret = "queue-secret-value".to_owned();
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::QUEUE_ENQUEUED,
+        object([
+            ("queue_id", queue_id.clone().into()),
+            ("mode", "follow_up".into()),
+            ("position", "back".into()),
+            ("content", format!("continue with {secret}").into()),
+        ]),
+    )
+    .with_run(run_id.clone());
+    writer
+        .append(std::slice::from_ref(&event))
+        .expect("append queue row");
+
+    writer
+        .scrub_and_audit(std::slice::from_ref(&secret), None, "session", "agent")
+        .expect("scrub queue content");
+
+    let events = read_provenance(&log).expect("read scrubbed log");
+    let scrubbed = &events[0];
+    assert_eq!(scrubbed.id, event.id);
+    assert_eq!(scrubbed.run.as_deref(), Some(run_id.as_str()));
+    assert_eq!(scrubbed.payload["queue_id"], queue_id);
+    assert!(!scrubbed.payload["content"]
+        .as_str()
+        .expect("content")
+        .contains(&secret));
+}
+
+#[test]
 fn pending_resume_marker_covers_parented_writer_clients() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
@@ -505,6 +660,68 @@ fn pending_resume_marker_covers_parented_writer_clients() {
     assert_eq!(logged[0], seed);
     assert_eq!(logged[1], marker);
     assert_eq!(logged[2], continued[0]);
+}
+
+#[test]
+fn reopen_after_a_complete_marker_and_absent_activity_uses_the_logical_frontier() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let seed = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::SESSION_START,
+        JsonObject::new(),
+    );
+    let marker = EventEnvelope::new(
+        "session",
+        "root",
+        Some(seed.id.clone()),
+        EventKind::SESSION_RESUMED,
+        object([("events_folded", 1.into())]),
+    );
+    fs::write(
+        &log,
+        format!(
+            "{}\n{}\n",
+            seed.to_json_line().expect("seed json"),
+            marker.to_json_line().expect("marker json")
+        ),
+    )
+    .expect("marker-complete prefix");
+
+    let writer = ProvenanceWriter::new(log.clone()).expect("reopen writer");
+    assert_eq!(writer.durable_tail().as_deref(), Some(marker.id.as_str()));
+    let run_id = ulid::Ulid::new().to_string();
+    let started = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::RUN_STARTED,
+        object([("trigger", "direct".into())]),
+    )
+    .with_run(run_id.clone());
+    let message = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "continued after recovered marker".into())]),
+    )
+    .with_run(run_id);
+    let mut admission = [started, message];
+    writer
+        .append_ordered(&mut admission)
+        .expect("continued admission");
+
+    assert_eq!(admission[0].parent.as_deref(), Some(seed.id.as_str()));
+    assert_eq!(
+        admission[1].parent.as_deref(),
+        Some(admission[0].id.as_str())
+    );
+    let events = read_provenance(&log).expect("continued prefix");
+    crate::session::run_lifecycle::fold_run_lifecycle(&events)
+        .expect("marker leaf does not corrupt lifecycle frontier");
 }
 
 #[test]

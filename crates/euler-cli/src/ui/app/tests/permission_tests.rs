@@ -23,6 +23,26 @@ fn cancelled_active_permission_modal_closes_without_reply() {
 }
 
 #[test]
+fn cancelled_permission_preserves_modal_text_once_without_a_stashed_draft() {
+    let mut core = core();
+    let cancellation = euler_sdk::CancellationSource::new();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.open_permission_envelope(PermissionPromptEnvelope {
+        prompt: PermissionPrompt::Request(PermissionRequest::new(Capability::FsWrite, "edit file")),
+        cancellation: cancellation.token(),
+        reply_tx,
+    });
+    type_text(&mut core, "keep once");
+
+    cancellation.cancel();
+    assert!(core.drain_permissions());
+
+    assert!(core.modal.is_none());
+    assert_eq!(core.bottom.composer().submit_text(), "keep once");
+    assert!(reply_rx.try_recv().is_err());
+}
+
+#[test]
 fn permission_prompt_renders_inline_with_command_body() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core();
@@ -434,6 +454,7 @@ fn typed_permission_instruction_does_not_fire_hotkeys() {
     ));
 
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    wait_for_queue_mutation(&mut core);
     assert_eq!(
         reply_rx.recv().expect("reply"),
         PermissionReply::DenyWithInstruction("wait".into())
@@ -503,6 +524,7 @@ fn instruction_typed_inside_the_panel_denies_and_restores_the_stash() {
         );
     }
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    wait_for_queue_mutation(&mut core);
 
     assert_eq!(
         reply_rx.recv().expect("reply"),
@@ -636,6 +658,7 @@ fn user_rule_option_absent_without_user_store() {
         Err(mpsc::RecvTimeoutError::Timeout)
     ));
     assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    wait_for_queue_mutation(&mut core);
     assert_eq!(
         reply_rx.recv().expect("reply"),
         PermissionReply::DenyWithInstruction("u".into())

@@ -23,6 +23,7 @@ use crate::canvas::assemble_canvas;
 use crate::provenance::ProvenanceWriterError;
 use crate::read_provenance;
 use crate::{probe_workspace_sandbox, SandboxProfile, SubprocessSandbox};
+use euler_agents::AgentBudget;
 use euler_provider::{
     FixtureResponse, ModelInputItem, ModelProvider, ModelRequest, ModelRole, ModelStreamEvent,
     ProviderError, ProviderStream, ScriptedProvider, ScriptedStreamStep, StopReason, Usage,
@@ -33,6 +34,7 @@ use euler_sdk::{
     HostAgentTask, HostApi, SpawnAgentTask,
 };
 use serde_json::Map;
+use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -62,6 +64,1864 @@ fn explicit_skill_command_parser_reserves_only_the_byte_zero_prefix() {
         parse_skill_command("/skill:/skill:review"),
         Err(SessionError::InvalidSkillCommand)
     ));
+}
+
+#[test]
+fn lifecycle_getter_reconciles_a_concurrent_durable_enqueue() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("live-lifecycle-getter.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+
+    let queue_id = queue
+        .push_follow_up_back("durable follow-up".to_owned())
+        .expect("concurrent queue append");
+
+    let pending = session
+        .pending_queue_inputs()
+        .expect("getter reconciles accepted feed");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].queue_id(), queue_id);
+    assert_eq!(pending[0].content(), "durable follow-up");
+}
+
+#[test]
+fn invalid_accepted_feed_is_transactional_and_fails_closed_until_reopen() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("invalid-accepted-feed.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    let writer = Arc::clone(session.provenance.as_ref().expect("session writer"));
+    let before_events = session.events().to_vec();
+    let before_persisted = session.persisted_events;
+    let before_lifecycle = session.run_lifecycle.clone();
+    let bad_run = Ulid::new().to_string();
+    let mut invalid = EventEnvelope::new(
+        session.session_id(),
+        "root",
+        None,
+        EventKind::RUN_TERMINAL,
+        object([("status", "failed".into())]),
+    )
+    .with_run(bad_run);
+    writer
+        .append_ordered(std::slice::from_mut(&mut invalid))
+        .expect("writer accepts malformed lifecycle candidate");
+
+    assert!(matches!(
+        session.pending_queue_inputs(),
+        Err(SessionError::RunLifecycle(_))
+    ));
+    assert_eq!(session.events(), before_events.as_slice());
+    assert_eq!(session.persisted_events, before_persisted);
+    assert_eq!(session.run_lifecycle, before_lifecycle);
+    assert!(session.accepted_state_invalid);
+    assert!(matches!(
+        session.pending_queue_inputs(),
+        Err(SessionError::InvalidAcceptedState)
+    ));
+    assert!(matches!(
+        queue.push_follow_up_back("must not append".to_owned()),
+        Err(QueueError::InvalidAcceptedState)
+    ));
+    assert!(matches!(
+        session.rename_session("must not append"),
+        Err(SessionError::InvalidAcceptedState)
+    ));
+}
+
+#[test]
+fn fresh_session_transition_cannot_overtake_an_in_flight_queue_append() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("new-enqueue-race.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    let bootstrap = resolution_bootstrap(
+        session
+            .prepare_fresh_project_context()
+            .expect("fresh-session preflight"),
+    );
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let thread_gate = Arc::clone(&gate);
+    let thread_queue = Arc::clone(&queue);
+    let expected_log = log.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let enqueue = std::thread::spawn(move || {
+        let guard = arm_matching(Op::FileSync, move |path| {
+            if path != expected_log {
+                return false;
+            }
+            started_tx.send(()).expect("announce blocked append");
+            let (lock, changed) = &*thread_gate;
+            let state = lock.lock().expect("append gate");
+            drop(
+                changed
+                    .wait_while(state, |released| !*released)
+                    .expect("append wait"),
+            );
+            false
+        });
+        let result = thread_queue.push_follow_up_back("racing follow-up".to_owned());
+        assert!(!guard.fired());
+        result
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("enqueue reached durable sync");
+
+    let (recovered, error) = match session.into_fresh_session(
+        "must-not-replace",
+        ScriptedDecider::new(Vec::new()),
+        bootstrap,
+    ) {
+        Ok(_) => panic!("fresh transition must not overtake queue append"),
+        Err(failure) => failure,
+    };
+    assert!(matches!(
+        error,
+        SessionError::UnresolvedAuthoritativeWriteTransition
+    ));
+
+    let (lock, changed) = &*gate;
+    *lock.lock().expect("release append") = true;
+    changed.notify_all();
+    enqueue
+        .join()
+        .expect("enqueue thread")
+        .expect("enqueue completes");
+    let mut session = *recovered;
+    assert_eq!(
+        session
+            .pending_queue_inputs()
+            .expect("reconcile completed queue append")[0]
+            .content(),
+        "racing follow-up"
+    );
+}
+
+#[test]
+fn ambiguous_run_terminal_retries_exact_batch_and_cleans_live_queue() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("terminal-ambiguity.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "terminal-ambiguity".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    session
+        .admit_user_message("start", None, true)
+        .expect("start run");
+    queue.activate_turn(session.active_run.as_deref().expect("active run"));
+    queue
+        .push_steering_back("pending steer".to_owned())
+        .expect("enqueue steering");
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+
+    let terminal = queue.with_terminal_boundary(|| {
+        session.terminalize_active_run_unfenced(RunTerminalStatus::Failed)
+    });
+
+    assert!(
+        matches!(terminal, Err(SessionError::Io(_))),
+        "unexpected terminal result: {terminal:?}"
+    );
+    assert!(guard.fired());
+    drop(guard);
+    assert_eq!(queue.snapshot(), ["pending steer"]);
+    assert!(queue.reserve_front_for_dispatch().is_none());
+    assert!(session.pending_run_terminal.is_some());
+    let unresolved_ids = session
+        .pending_run_terminal
+        .as_ref()
+        .expect("terminal batch retained")
+        .events
+        .iter()
+        .map(|event| event.id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        session
+            .events()
+            .iter()
+            .all(|event| !unresolved_ids.contains(event.id.as_str())),
+        "an ambiguous terminal batch is not live before exact reconciliation"
+    );
+
+    let accepted = session
+        .retry_unresolved_run_terminal()
+        .expect("retry exact terminal batch");
+
+    assert_eq!(accepted.kind.as_str(), EventKind::RUN_TERMINAL);
+    assert!(queue.is_empty());
+    assert!(session.active_run.is_none());
+    assert!(session.pending_run_terminal.is_none());
+    let recoverable = session
+        .recoverable_queue_inputs()
+        .expect("reconcile recovery projection");
+    assert_eq!(recoverable.len(), 1);
+    assert_eq!(recoverable[0].content(), "pending steer");
+    assert_eq!(recoverable[0].reason(), QueueCancellationReason::RunFailed);
+    let events = read_provenance(&log).expect("read durable events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::QUEUE_CANCELLED)
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
+            .count(),
+        1
+    );
+    assert_eq!(session.events(), events.as_slice());
+
+    session
+        .scrub_live(&["pending steer".to_owned()])
+        .expect("scrub private recovery content");
+    assert_eq!(
+        session
+            .recoverable_queue_inputs()
+            .expect("reconcile scrubbed recovery projection")[0]
+            .content(),
+        "[scrubbed]"
+    );
+    assert!(!std::fs::read(&log)
+        .expect("read scrubbed log")
+        .windows("pending steer".len())
+        .any(|window| window == b"pending steer"));
+}
+
+#[test]
+fn prewrite_terminal_failure_reserves_exact_batch_against_shared_writer_producers() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("prewrite-terminal-reservation.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "prewrite-terminal-reservation".to_owned();
+    config.agent_id = "root".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .admit_user_message("start", None, true)
+        .expect("start run");
+    assert!(
+        session.steering.is_none(),
+        "regression is queue-independent"
+    );
+    let (mut host, _extension_events) = session
+        .extension_host_with_event_queue([Capability::ContextSlot])
+        .expect("shared-writer extension host");
+    host.register_extension(&test_extension(
+        "reservation-ext",
+        vec![Capability::ContextSlot],
+        TestCommandBehavior::Slot {
+            slot: "main",
+            content: "must stay fenced",
+        },
+    ))
+    .expect("register extension before terminal failure");
+    let writer = Arc::clone(session.provenance.as_ref().expect("session writer"));
+    let bytes_before = std::fs::read(&log).expect("read prefix");
+    let prewrite_sync = temp
+        .path()
+        .parent()
+        .expect("temporary directory has a parent")
+        .to_path_buf();
+    let guard = arm_matching(Op::DirSync, move |path| path == prewrite_sync);
+
+    let failed = session.terminalize_active_run_unfenced(RunTerminalStatus::Failed);
+
+    assert!(matches!(failed, Err(SessionError::Io(_))));
+    assert!(guard.fired(), "pre-write directory sync fault must fire");
+    drop(guard);
+    assert_eq!(
+        std::fs::read(&log).expect("read known-absent terminal suffix"),
+        bytes_before,
+        "failure occurred before terminal bytes reached the log"
+    );
+    let retained = session
+        .pending_run_terminal
+        .as_ref()
+        .expect("exact terminal batch retained")
+        .events
+        .clone();
+    let retained_parents = retained
+        .iter()
+        .map(|event| event.parent.clone())
+        .collect::<Vec<_>>();
+
+    let host_error = host
+        .execute_command("write", json!(null))
+        .expect_err("shared extension producer must remain fenced");
+    assert!(matches!(host_error, ExtensionHostError::Provenance(_)));
+    let unrelated = EventEnvelope::new(
+        session.session_id(),
+        "root",
+        writer.durable_tail(),
+        EventKind::SESSION_RENAMED,
+        object([("name", "must not append".into())]),
+    );
+    assert_eq!(
+        writer
+            .append(std::slice::from_ref(&unrelated))
+            .expect_err("unrelated append remains fenced")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let marker = EventEnvelope::new(
+        session.session_id(),
+        "root",
+        writer.durable_tail(),
+        EventKind::SESSION_RESUMED,
+        object([("events_folded", 0.into())]),
+    );
+    assert_eq!(
+        writer
+            .arm_resume_marker(marker)
+            .expect_err("resume marker remains fenced")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        writer
+            .scrub_and_audit(
+                &["must stay fenced".to_owned()],
+                Some(temp.path()),
+                session.session_id(),
+                "root",
+            )
+            .expect_err("scrub remains fenced")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        session
+            .pending_run_terminal
+            .as_ref()
+            .expect("terminal owner survives unrelated attempts")
+            .events
+            .iter()
+            .map(|event| event.parent.clone())
+            .collect::<Vec<_>>(),
+        retained_parents,
+        "unrelated producers cannot reparent the retained batch"
+    );
+
+    session
+        .retry_unresolved_run_terminal()
+        .expect("exact retained terminal retry");
+    let durable = read_provenance(&log).expect("read recovered log");
+    let recovered = retained
+        .iter()
+        .map(|expected| {
+            durable
+                .iter()
+                .find(|event| event.id == expected.id)
+                .cloned()
+                .expect("retained event persisted")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(recovered, retained, "retry preserves every exact envelope");
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
+            .count(),
+        1
+    );
+    assert!(durable.iter().all(|event| {
+        event.payload.get("content").and_then(Value::as_str) != Some("must stay fenced")
+    }));
+}
+
+#[test]
+fn invalid_accepted_terminal_projection_cannot_append_a_second_headless_retry() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("invalid-terminal-projection.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "invalid-terminal-projection".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .admit_user_message("start", None, true)
+        .expect("start run");
+
+    // Simulate a producer-identity defect at the accepted-feed boundary. The
+    // terminal bytes are durable, but their lifecycle projection is invalid;
+    // retry must fail closed rather than append the retained batch again.
+    session.config.agent_id = "wrong-root".to_owned();
+    assert!(matches!(
+        session.terminalize_active_run_unfenced(RunTerminalStatus::Failed),
+        Err(SessionError::RunLifecycle(_))
+    ));
+    assert!(session.accepted_state_invalid);
+    assert!(session.pending_run_terminal.is_some());
+    let before = std::fs::read(&log).expect("read first terminal append");
+    assert_eq!(
+        read_provenance(&log)
+            .expect("read durable events")
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
+            .count(),
+        1
+    );
+
+    assert!(matches!(
+        session.retry_unresolved_run_terminal(),
+        Err(SessionError::InvalidAcceptedState)
+    ));
+    assert_eq!(
+        std::fs::read(&log).expect("read retry-fenced log"),
+        before,
+        "retry cannot duplicate a writer-accepted batch after projection failure"
+    );
+}
+
+#[test]
+fn terminal_intent_survives_an_ambiguous_cutoff_enqueue() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("terminal-cutoff-enqueue-ambiguity.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "terminal-cutoff-enqueue-ambiguity".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    session
+        .admit_user_message("start", None, true)
+        .expect("start run");
+    let run_id = session.active_run.clone().expect("active run");
+    queue.activate_turn(&run_id);
+
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+    let enqueue = queue.push_steering_back("cutoff steer".to_owned());
+    assert!(matches!(enqueue, Err(QueueError::Persistence(_))));
+    assert!(guard.fired());
+
+    let terminal = session.finish_run_result(Ok(Vec::new()));
+    assert!(matches!(terminal, Err(SessionError::Queue(_))));
+    assert_eq!(
+        session.deferred_run_terminal,
+        Some(RunTerminalStatus::Completed)
+    );
+    assert_eq!(session.active_run.as_deref(), Some(run_id.as_str()));
+    assert!(session.has_unresolved_authoritative_write_inner());
+    assert!(session.run_lifecycle.is_open(&run_id));
+
+    drop(guard);
+    assert!(queue
+        .retry_unresolved_enqueue()
+        .expect("retry exact cutoff enqueue")
+        .is_some());
+    assert!(
+        session
+            .has_unresolved_authoritative_write()
+            .expect("reconcile exact cutoff enqueue"),
+        "accepted enqueue must not erase the deferred terminal fence"
+    );
+    assert_eq!(session.active_run.as_deref(), Some(run_id.as_str()));
+
+    let accepted = session
+        .retry_unresolved_run_terminal()
+        .expect("retry deferred terminal intent");
+    assert_eq!(accepted.kind.as_str(), EventKind::RUN_TERMINAL);
+    assert!(session.active_run.is_none());
+    assert!(session.pending_run_terminal.is_none());
+    assert!(session.deferred_run_terminal.is_none());
+    assert!(queue.is_empty());
+    let recoverable = session
+        .recoverable_queue_inputs()
+        .expect("reconcile terminal recovery projection");
+    assert_eq!(recoverable.len(), 1);
+    assert_eq!(recoverable[0].content(), "cutoff steer");
+    assert_eq!(
+        recoverable[0].reason(),
+        QueueCancellationReason::RunCompleted
+    );
+
+    let events = read_provenance(&log).expect("read durable events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::QUEUE_CANCELLED)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn queue_wiring_does_not_attribute_control_events_to_an_unstarted_run() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("pre-admission-control.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "pre-admission-control".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("wire queue");
+    session.rename_session("before run").expect("rename");
+
+    let rename = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_RENAMED)
+        .cloned()
+        .expect("rename event");
+    assert_eq!(rename.run, None);
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::RUN_STARTED));
+
+    session.run_turn("start").expect("run");
+    let run_start = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::RUN_STARTED)
+        .expect("run start");
+    assert_ne!(rename.id, run_start.id);
+    assert_eq!(rename.run, None);
+}
+
+#[test]
+fn runless_background_origin_stays_runless_after_a_later_run_starts() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("runless-background-origin.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "runless-background-origin".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let (reported_tx, reported_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let task = AgentTask::new_inheriting_target("review", "background").expect("task");
+    let mut background = session
+        .spawn_background_agent_with_reporter(
+            task,
+            std::iter::empty::<Capability>(),
+            move |reporter| {
+                reporter
+                    .report(json!({"status": "ready"}))
+                    .expect("queue report");
+                reported_tx.send(()).expect("signal report");
+                release_rx.recv().expect("release worker");
+                AgentResult::success("finished", Option::<&str>::None).expect("result")
+            },
+        )
+        .expect("spawn runless background work");
+    reported_rx.recv().expect("report ready");
+
+    session
+        .admit_user_message("start later run", None, true)
+        .expect("admit later run");
+    let later_run = session.active_run.clone().expect("later run is active");
+    assert_eq!(session.active_run.as_deref(), Some(later_run.as_str()));
+    let message_id = match session
+        .drain_background_agent_report(&mut background)
+        .expect("drain captured report")
+    {
+        BackgroundAgentReportDrain::Drained { message_event_id } => message_event_id,
+        other => panic!("expected drained report, got {other:?}"),
+    };
+
+    release_tx.send(()).expect("release background work");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let result_id = loop {
+        match session
+            .poll_background_agent(&mut background)
+            .expect("poll background result")
+        {
+            BackgroundAgentPoll::Pending => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "background result did not arrive"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            BackgroundAgentPoll::Recorded { result_event_id }
+            | BackgroundAgentPoll::AlreadyRecorded { result_event_id } => break result_event_id,
+        }
+    };
+
+    for event_id in [&message_id, &result_id] {
+        let event = session
+            .events()
+            .iter()
+            .find(|event| &event.id == event_id)
+            .expect("late background event");
+        assert_eq!(
+            event.run, None,
+            "captured runless work must not inherit a later active run"
+        );
+    }
+    assert_eq!(
+        read_provenance(&log).expect("durable events"),
+        session.events(),
+        "durable and live attribution must match"
+    );
+}
+
+#[test]
+fn agent_result_early_persistence_failure_retries_the_exact_candidate() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("agent-result-early-failure.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let task = AgentTask::new_inheriting_target("review", "retry").expect("task");
+    let mut spawned = session
+        .spawn_agent(task, std::iter::empty::<Capability>())
+        .expect("spawn");
+    let result = AgentResult::success("complete", Some("bounded output")).expect("result");
+
+    let backup = temp.path().join("agent-result-early-failure.backup");
+    std::fs::rename(&log, &backup).expect("back up log");
+    std::fs::create_dir(&log).expect("replace log with directory");
+    assert!(matches!(
+        session.record_agent_result(&mut spawned, result.clone()),
+        Err(SessionError::Io(_))
+    ));
+    let reserved_id = session
+        .open_agent_spawns
+        .get(spawned.spawn_event_id())
+        .and_then(|open| open.pending_result.as_ref())
+        .map(|pending| pending.event.id.clone())
+        .expect("exact result candidate retained");
+
+    let mismatch = session
+        .record_agent_result(
+            &mut spawned,
+            AgentResult::failure("different", "different", Option::<&str>::None)
+                .expect("mismatched result"),
+        )
+        .expect_err("a different retry must remain fenced");
+    assert!(matches!(
+        mismatch,
+        SessionError::Agent(AgentError::ResultRetryMismatch { .. })
+    ));
+
+    std::fs::remove_dir(&log).expect("remove blocking directory");
+    std::fs::rename(&backup, &log).expect("restore log");
+    let accepted_id = session
+        .record_agent_result(&mut spawned, result)
+        .expect("retry exact result");
+    assert_eq!(accepted_id, reserved_id);
+    assert_eq!(
+        read_provenance(&log)
+            .expect("durable events")
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn agent_result_file_sync_ambiguity_retries_the_exact_candidate_once() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("agent-result-sync-failure.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "turn recovered".to_owned(),
+        )]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let task = AgentTask::new_inheriting_target("review", "retry").expect("task");
+    let mut spawned = session
+        .spawn_agent(task, std::iter::empty::<Capability>())
+        .expect("spawn");
+    let result = AgentResult::success("complete", Option::<&str>::None).expect("result");
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+
+    assert!(matches!(
+        session.record_agent_result(&mut spawned, result.clone()),
+        Err(SessionError::Io(_))
+    ));
+    assert!(guard.fired(), "result file-sync fault must fire");
+    let reserved_id = session
+        .open_agent_spawns
+        .get(spawned.spawn_event_id())
+        .and_then(|open| open.pending_result.as_ref())
+        .map(|pending| pending.event.id.clone())
+        .expect("ambiguous exact result retained");
+    drop(guard);
+
+    assert!(matches!(
+        session.run_turn("must wait for the result"),
+        Err(SessionError::UnresolvedAgentResult)
+    ));
+    assert!(
+        session.pending_admission.is_none(),
+        "a competing user admission must not be installed"
+    );
+
+    let accepted_id = session
+        .record_agent_result(&mut spawned, result)
+        .expect("retry exact result");
+    assert_eq!(accepted_id, reserved_id);
+    let results = read_provenance(&log)
+        .expect("durable events")
+        .into_iter()
+        .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, reserved_id);
+    session
+        .run_turn("admission recovers after the result")
+        .expect("new turn after exact result retry");
+}
+
+#[test]
+fn next_turn_retries_an_orphaned_agent_result_before_admission() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("orphaned-agent-result.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("continued".to_owned())]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let task = AgentTask::new_inheriting_target("review", "retry").expect("task");
+    let mut spawned = session
+        .spawn_agent(task, std::iter::empty::<Capability>())
+        .expect("spawn");
+    let result = AgentResult::failure(
+        "background worker could not start",
+        "background worker launch failed",
+        Option::<&str>::None,
+    )
+    .expect("fixed failure");
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+
+    assert!(matches!(
+        session.record_agent_result(&mut spawned, result),
+        Err(SessionError::Io(_))
+    ));
+    assert!(guard.fired(), "result file-sync fault must fire");
+    drop(guard);
+    let spawn_event_id = spawned.spawn_event_id().to_owned();
+    let reserved_id = session
+        .open_agent_spawns
+        .get(&spawn_event_id)
+        .and_then(|open| open.pending_result.as_ref())
+        .map(|pending| pending.event.id.clone())
+        .expect("exact result retained");
+    session.mark_pending_agent_result_orphaned(&spawn_event_id);
+    drop(spawned);
+
+    session
+        .run_turn("continue after launch failure")
+        .expect("turn retries orphaned result before admission");
+
+    let durable = read_provenance(&log).expect("durable events");
+    let results = durable
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, reserved_id);
+    let result_index = durable
+        .iter()
+        .position(|event| event.id == reserved_id)
+        .expect("result index");
+    let next_run_index = durable
+        .iter()
+        .position(|event| {
+            event.kind.as_str() == EventKind::USER_MESSAGE
+                && event.payload["content"] == json!("continue after launch failure")
+        })
+        .expect("new turn message");
+    assert!(result_index < next_run_index);
+}
+
+#[test]
+fn sequential_companion_result_failure_reconciles_before_root_terminal() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("companion-result-root-terminal.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .admit_user_message("active root run", None, true)
+        .expect("open root run");
+    let task = AgentTask::new_inheriting_target("review", "worker")
+        .expect("task")
+        .with_budget(AgentBudget::new(Some(1), None, Some(0)).expect("zero-output budget"));
+    let sync_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fault_count = Arc::clone(&sync_count);
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| {
+        path == expected_log && fault_count.fetch_add(1, Ordering::SeqCst) == 1
+    });
+
+    let companion_error = session
+        .spawn_companion(task)
+        .expect_err("agent.result sync fails after agent.spawn");
+    assert!(guard.fired(), "agent.result sync fault must fire");
+    assert!(session.open_agent_spawns.values().any(|open| {
+        open.pending_result
+            .as_ref()
+            .is_some_and(|pending| pending.orphaned)
+    }));
+    drop(guard);
+
+    assert!(matches!(
+        session.finish_run_result(Err(companion_error)),
+        Err(SessionError::Io(_))
+    ));
+    assert!(!session.has_pending_agent_result());
+    assert!(session.active_run.is_none());
+    assert!(session.deferred_run_terminal.is_none());
+
+    let durable = read_provenance(&log).expect("durable events");
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+            .count(),
+        1
+    );
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
+            .count(),
+        1
+    );
+    let result_index = durable
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .expect("agent result");
+    let terminal_index = durable
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
+        .expect("run terminal");
+    assert!(result_index < terminal_index);
+}
+
+#[test]
+fn deferred_terminal_retry_settles_the_orphaned_agent_result_it_waits_on() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("deferred-terminal-orphaned-result.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "admitted after terminal".to_owned(),
+        )]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .admit_user_message("active root run", None, true)
+        .expect("open root run");
+    let task = AgentTask::new_inheriting_target("review", "worker")
+        .expect("task")
+        .with_budget(AgentBudget::new(Some(1), None, Some(0)).expect("zero-output budget"));
+    let sync_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fault_count = Arc::clone(&sync_count);
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| {
+        path == expected_log && fault_count.fetch_add(1, Ordering::SeqCst) == 1
+    });
+
+    let companion_error = session
+        .spawn_companion(task)
+        .expect_err("agent.result sync fails after agent.spawn");
+    assert!(guard.fired(), "agent.result sync fault must fire");
+    assert!(session.has_pending_agent_result());
+    drop(guard);
+
+    // The orphan retry inside terminalization fails too: terminal intent is
+    // deferred behind the retained exact result.
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+    assert!(matches!(
+        session.finish_run_result(Err(companion_error)),
+        Err(SessionError::Io(_))
+    ));
+    assert!(guard.fired(), "orphaned result retry fault must fire");
+    drop(guard);
+    assert_eq!(
+        session.deferred_run_terminal,
+        Some(RunTerminalStatus::Failed)
+    );
+    assert!(session.has_pending_agent_result());
+    assert!(session.active_run.is_some());
+    assert!(matches!(
+        session.run_turn("fenced while the terminal is deferred"),
+        Err(SessionError::Queue(QueueError::UnresolvedTerminal))
+    ));
+
+    session
+        .retry_unresolved_run_terminal()
+        .expect("deferred terminal settles its own orphaned result first");
+
+    assert!(!session.has_pending_agent_result());
+    assert!(session.deferred_run_terminal.is_none());
+    assert!(session.pending_run_terminal.is_none());
+    assert!(session.active_run.is_none());
+    let durable = read_provenance(&log).expect("durable events");
+    let result_index = durable
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .expect("agent result");
+    let terminal_index = durable
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
+        .expect("run terminal");
+    assert!(result_index < terminal_index);
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    EventKind::AGENT_RESULT | EventKind::RUN_TERMINAL
+                )
+            })
+            .count(),
+        2
+    );
+
+    session
+        .run_turn("admission recovers after the deferred terminal")
+        .expect("new turn after the deferred terminal settles");
+}
+
+#[test]
+fn ambiguous_direct_admission_does_not_publish_an_active_run() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("direct-admission-ambiguity.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "direct-admission-ambiguity".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session.persist_new_events().expect("persist bootstrap");
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+
+    let failed = session.run_turn("start once");
+
+    assert!(matches!(failed, Err(SessionError::Io(_))));
+    assert!(guard.fired());
+    drop(guard);
+    assert!(
+        session.active_run.is_none(),
+        "an unconfirmed run.started event cannot become live authority"
+    );
+    let pending_run = session
+        .pending_admission
+        .as_ref()
+        .map(|pending| pending.run_id.clone())
+        .expect("exact admission retained");
+
+    session
+        .run_turn("start once")
+        .expect("reconcile exact admission");
+
+    let durable = read_provenance(&log).expect("durable events");
+    let starts = durable
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::RUN_STARTED)
+        .collect::<Vec<_>>();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].run.as_deref(), Some(pending_run.as_str()));
+}
+
+#[test]
+fn deferred_terminal_retry_clears_its_early_prebatch_failure_fence() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("deferred-terminal-prebatch.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "deferred-terminal-prebatch".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    session
+        .admit_user_message("start", None, true)
+        .expect("start run");
+    let run_id = session.active_run.clone().expect("active run");
+    queue.activate_turn(&run_id);
+    let pending_metadata = EventEnvelope::new(
+        session.session_id(),
+        "root",
+        session.previous_persisted_event_id(),
+        EventKind::SESSION_RENAMED,
+        object([("name", "accepted before terminal".into())]),
+    );
+    let pending_metadata_id = pending_metadata.id.clone();
+    session.bus.push(pending_metadata);
+    let bytes_before = std::fs::read(&log).expect("read prefix");
+    let prewrite_sync = temp
+        .path()
+        .parent()
+        .expect("temporary directory has a parent")
+        .to_path_buf();
+    let guard = arm_matching(Op::DirSync, move |path| path == prewrite_sync);
+
+    let failed = session.finish_run_result(Ok(Vec::new()));
+
+    assert!(matches!(failed, Err(SessionError::Io(_))));
+    assert!(guard.fired(), "pre-batch persistence fault must fire");
+    drop(guard);
+    assert!(session.pending_run_terminal.is_none());
+    assert_eq!(
+        session.deferred_run_terminal,
+        Some(RunTerminalStatus::Completed)
+    );
+    assert!(queue.has_unresolved_terminalization());
+    assert_eq!(
+        std::fs::read(&log).expect("read known-absent suffix"),
+        bytes_before
+    );
+
+    session
+        .retry_unresolved_run_terminal()
+        .expect("deferred intent retries through its existing queue fence");
+
+    assert!(session.pending_run_terminal.is_none());
+    assert!(session.deferred_run_terminal.is_none());
+    assert!(session.active_run.is_none());
+    assert!(!queue.has_unresolved_terminalization());
+    let durable = read_provenance(&log).expect("read recovered events");
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|event| event.id == pending_metadata_id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn live_scrub_rewrites_pending_queue_and_later_delivery() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("queue-scrub.jsonl");
+    let secret = "queue-secret-value".to_owned();
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "queue-scrub".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    queue
+        .push_follow_up_back(format!("continue with {secret}"))
+        .expect("durable follow-up");
+
+    session
+        .scrub_live(std::slice::from_ref(&secret))
+        .expect("scrub pending content");
+
+    assert_eq!(queue.snapshot(), ["continue with [scrubbed]"]);
+    assert_eq!(
+        session
+            .pending_queue_inputs()
+            .expect("reconcile pending queue projection")
+            .iter()
+            .map(PendingQueueInput::content)
+            .collect::<Vec<_>>(),
+        ["continue with [scrubbed]"]
+    );
+    session
+        .run_next_queued_follow_up(Arc::clone(&queue))
+        .expect("deliver scrubbed follow-up")
+        .expect("front follow-up");
+    assert!(queue.is_empty());
+
+    assert!(session.events().iter().all(|event| {
+        serde_json::to_string(event)
+            .expect("serialize event")
+            .find(&secret)
+            .is_none()
+    }));
+    let bytes = std::fs::read(&log).expect("read durable log");
+    assert!(!bytes
+        .windows(secret.len())
+        .any(|window| window == secret.as_bytes()));
+    let delivered = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .expect("delivered user message");
+    assert_eq!(delivered.payload["content"], "continue with [scrubbed]");
+}
+
+#[test]
+fn terminal_cancelled_steering_can_be_requeued_or_dismissed_durably() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("recoverable-queue-resolution.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "recoverable-queue-resolution".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+
+    session
+        .admit_user_message("first run", None, true)
+        .expect("open first run");
+    let first_run = session.active_run.clone().expect("first run id");
+    queue.activate_turn(&first_run);
+    queue
+        .enqueue(
+            QueueMode::Steering,
+            Some(&first_run),
+            QueuePosition::Back,
+            "recover this".to_owned(),
+        )
+        .expect("first steering");
+    queue
+        .with_terminal_boundary(|| {
+            session.terminalize_active_run_unfenced(RunTerminalStatus::Failed)
+        })
+        .expect("fail first run");
+    let first_recovery = session
+        .recoverable_queue_inputs()
+        .expect("first recovery projection")
+        .into_iter()
+        .next()
+        .expect("recoverable steering");
+    assert_eq!(first_recovery.reason(), QueueCancellationReason::RunFailed);
+    assert_eq!(
+        session
+            .run_terminal_status(&first_run)
+            .expect("terminal status"),
+        Some(RunTerminalStatus::Failed)
+    );
+
+    let replacement_id = session
+        .requeue_recoverable_queue_input(
+            Arc::clone(&queue),
+            first_recovery.queue_id(),
+            None,
+            QueuePosition::Back,
+            "edited recovery".to_owned(),
+        )
+        .expect("atomic recovery requeue");
+    assert!(session
+        .recoverable_queue_inputs()
+        .expect("resolved recovery projection")
+        .is_empty());
+    let pending = session.pending_queue_inputs().expect("replacement pending");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].queue_id(), replacement_id);
+    assert_eq!(pending[0].mode(), QueueMode::FollowUp);
+    assert_eq!(pending[0].content(), "edited recovery");
+
+    session
+        .admit_user_message("second run", None, true)
+        .expect("open second run");
+    let second_run = session.active_run.clone().expect("second run id");
+    queue.activate_turn(&second_run);
+    queue
+        .enqueue(
+            QueueMode::Steering,
+            Some(&second_run),
+            QueuePosition::Back,
+            "dismiss this".to_owned(),
+        )
+        .expect("second steering");
+    queue
+        .with_terminal_boundary(|| {
+            session.terminalize_active_run_unfenced(RunTerminalStatus::Cancelled)
+        })
+        .expect("cancel second run");
+    let second_recovery = session
+        .recoverable_queue_inputs()
+        .expect("second recovery projection")
+        .into_iter()
+        .next()
+        .expect("second recoverable steering");
+    session
+        .dismiss_recoverable_queue_input(Arc::clone(&queue), second_recovery.queue_id())
+        .expect("durable recovery dismissal");
+    assert!(session
+        .recoverable_queue_inputs()
+        .expect("dismissed recovery projection")
+        .is_empty());
+
+    let durable = read_provenance(&log).expect("durable events");
+    let recoveries = durable
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::QUEUE_RECOVERED)
+        .collect::<Vec<_>>();
+    assert_eq!(recoveries.len(), 2);
+    assert_eq!(recoveries[0].payload["action"], "requeued");
+    assert_eq!(
+        recoveries[0].payload["replacement_queue_id"],
+        replacement_id
+    );
+    assert_eq!(recoveries[1].payload["action"], "dismissed");
+    let folded = run_lifecycle::fold_run_lifecycle(&durable).expect("replay resolved recovery");
+    assert!(folded.recoverable().is_empty());
+    assert_eq!(folded.pending().len(), 1);
+    assert_eq!(folded.pending()[0].queue_id(), replacement_id);
+}
+
+#[test]
+fn lifecycle_scrub_preserves_protocol_and_scrubs_pending_and_recoverable_content() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("lifecycle-scrub.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "lifecycle-scrub".to_owned();
+    let resume_config = config.clone();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    session
+        .admit_user_message("start protocol run", None, true)
+        .expect("start run");
+    let source_run_id = session.active_run.clone().expect("active run");
+    queue.activate_turn(&source_run_id);
+    queue
+        .push_steering_back("private steering payload".to_owned())
+        .expect("durable steering");
+    queue
+        .push_follow_up_back("private follow_up payload".to_owned())
+        .expect("durable follow-up");
+
+    queue
+        .with_terminal_boundary(|| {
+            session.terminalize_active_run_unfenced(RunTerminalStatus::Failed)
+        })
+        .expect("terminalize source run");
+    let pending_before = session
+        .pending_queue_inputs()
+        .expect("reconcile pending projection");
+    let recoverable_before = session
+        .recoverable_queue_inputs()
+        .expect("reconcile recovery projection");
+    assert_eq!(pending_before.len(), 1);
+    assert_eq!(recoverable_before.len(), 1);
+    let protocol_values = vec![
+        pending_before[0].queue_id().to_owned(),
+        pending_before[0].run_id().to_owned(),
+        recoverable_before[0].queue_id().to_owned(),
+        source_run_id,
+        "direct".to_owned(),
+        "failed".to_owned(),
+        "steering".to_owned(),
+        "follow_up".to_owned(),
+        "back".to_owned(),
+        "run_failed".to_owned(),
+        "private".to_owned(),
+    ];
+
+    let report = session
+        .scrub_live(&protocol_values)
+        .expect("scrub lifecycle content");
+
+    assert!(report.anything_scrubbed());
+    let pending_after = session
+        .pending_queue_inputs()
+        .expect("reconcile scrubbed pending projection");
+    let recoverable_after = session
+        .recoverable_queue_inputs()
+        .expect("reconcile scrubbed recovery projection");
+    assert_eq!(pending_after[0].queue_id(), pending_before[0].queue_id());
+    assert_eq!(pending_after[0].run_id(), pending_before[0].run_id());
+    assert_eq!(
+        pending_after[0].source_run_id(),
+        pending_before[0].source_run_id()
+    );
+    assert_eq!(pending_after[0].mode(), QueueMode::FollowUp);
+    assert_eq!(pending_after[0].content(), "[scrubbed] [scrubbed] payload");
+    assert_eq!(
+        recoverable_after[0].queue_id(),
+        recoverable_before[0].queue_id()
+    );
+    assert_eq!(
+        recoverable_after[0].run_id(),
+        recoverable_before[0].run_id()
+    );
+    assert_eq!(
+        recoverable_after[0].source_run_id(),
+        recoverable_before[0].source_run_id()
+    );
+    assert_eq!(recoverable_after[0].mode(), QueueMode::Steering);
+    assert_eq!(
+        recoverable_after[0].reason(),
+        QueueCancellationReason::RunFailed
+    );
+    assert_eq!(
+        recoverable_after[0].content(),
+        "[scrubbed] [scrubbed] payload"
+    );
+
+    let durable = read_provenance(&log).expect("read scrubbed provenance");
+    assert_eq!(session.events(), durable.as_slice());
+    let folded = crate::resume::fold_session(&resume_config, durable).expect("fold scrubbed log");
+    let folded_lifecycle =
+        run_lifecycle::fold_run_lifecycle(&folded.events).expect("fold scrubbed lifecycle");
+    assert_eq!(folded_lifecycle.pending(), session.run_lifecycle.pending());
+    assert_eq!(
+        folded_lifecycle.recoverable(),
+        session.run_lifecycle.recoverable()
+    );
+    drop(session);
+    drop(queue);
+
+    let mut resumed = crate::resume::resume_session(
+        resume_config,
+        ProviderSet::single(ScriptedProvider::new(Vec::new())),
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("resume scrubbed lifecycle");
+    assert_eq!(
+        resumed
+            .pending_queue_inputs()
+            .expect("reconcile resumed pending projection"),
+        pending_after
+    );
+    assert_eq!(
+        resumed
+            .recoverable_queue_inputs()
+            .expect("reconcile resumed recovery projection"),
+        recoverable_after
+    );
+}
+
+#[test]
+fn queued_dispatch_reconstructs_scrubbed_content_from_durable_projection() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("queued-dispatch-scrub.jsonl");
+    let secret = "old-queue-secret".to_owned();
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "queued-dispatch-scrub".to_owned();
+    config.provider = "fixture".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    queue
+        .push_follow_up_back(format!("first {secret}"))
+        .expect("first follow-up");
+    queue
+        .push_follow_up_back("second safe row".to_owned())
+        .expect("second follow-up");
+    assert_eq!(
+        session
+            .pending_queue_inputs()
+            .expect("reconcile durable rows")
+            .len(),
+        2
+    );
+    let stale_input = queue
+        .reserve_front_for_dispatch()
+        .expect("reserve pre-scrub row");
+    assert_eq!(stale_input.content(), format!("first {secret}"));
+    let bound_input = session
+        .set_steering_queue_for_queued_input(Arc::clone(&queue), &stale_input)
+        .expect("bind canonical reservation before scrub");
+    assert_eq!(bound_input.content(), format!("first {secret}"));
+    session
+        .scrub_live(std::slice::from_ref(&secret))
+        .expect("scrub durable pending content");
+    assert_eq!(
+        stale_input.content(),
+        format!("first {secret}"),
+        "the already-cloned surface input demonstrates stale pre-scrub bytes"
+    );
+    assert_eq!(queue.snapshot(), ["first [scrubbed]", "second safe row"]);
+    session
+        .run_turn(stale_input.content())
+        .expect("core refreshes the bound dispatch and ignores stale caller text");
+
+    assert!(session.events().iter().all(|event| {
+        serde_json::to_string(event)
+            .expect("serialize event")
+            .find(&secret)
+            .is_none()
+    }));
+    assert!(!std::fs::read(&log)
+        .expect("read scrubbed log")
+        .windows(secret.len())
+        .any(|window| window == secret.as_bytes()));
+}
+
+#[test]
+fn one_live_session_rejects_a_second_queue_authority_before_binding_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("single-queue-authority.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "single-queue-authority".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let authoritative = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&authoritative))
+        .expect("bind authoritative queue");
+    authoritative
+        .push_follow_up_back("first authoritative row".to_owned())
+        .expect("first durable row");
+
+    let foreign = Arc::new(SteeringQueue::default());
+    foreign
+        .push_follow_up_back("foreign volatile row".to_owned())
+        .expect("foreign volatile row");
+    assert!(matches!(
+        session.set_steering_queue(Arc::clone(&foreign)),
+        Err(SessionError::Queue(QueueError::QueueAuthorityMismatch))
+    ));
+    assert_eq!(foreign.snapshot(), ["foreign volatile row"]);
+
+    authoritative
+        .push_follow_up_back("second authoritative row".to_owned())
+        .expect("second durable row");
+    let durable = read_provenance(&log).expect("durable queue rows");
+    assert!(durable.iter().any(|event| {
+        event.payload.get("content").and_then(Value::as_str) == Some("first authoritative row")
+    }));
+    assert!(durable.iter().any(|event| {
+        event.payload.get("content").and_then(Value::as_str) == Some("second authoritative row")
+    }));
+    assert!(durable.iter().all(|event| {
+        event.payload.get("content").and_then(Value::as_str) != Some("foreign volatile row")
+    }));
+}
+
+#[test]
+fn one_queue_arc_rejects_a_second_live_session_owner() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let first_log = temp.path().join("first-owner.jsonl");
+    let second_log = temp.path().join("second-owner.jsonl");
+    let mut first_config = SessionConfig::new(temp.path());
+    first_config.session_id = "first-owner".to_owned();
+    let mut first = Session::new(
+        first_config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&first_log).expect("first writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    first
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind first owner");
+
+    let mut second_config = SessionConfig::new(temp.path());
+    second_config.session_id = "second-owner".to_owned();
+    let mut second = Session::new(
+        second_config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&second_log).expect("second writer"));
+    assert!(matches!(
+        second.set_steering_queue(Arc::clone(&queue)),
+        Err(SessionError::Queue(QueueError::QueueAuthorityMismatch))
+    ));
+    assert!(second.steering.is_none());
+
+    queue
+        .push_follow_up_back("first owner remains authoritative".to_owned())
+        .expect("enqueue through first owner");
+    assert!(read_provenance(&first_log)
+        .expect("first events")
+        .iter()
+        .any(|event| {
+            event.kind.as_str() == EventKind::QUEUE_ENQUEUED
+                && event.payload.get("content")
+                    == Some(&Value::String(
+                        "first owner remains authoritative".to_owned(),
+                    ))
+        }));
+    assert!(read_provenance(&second_log)
+        .expect("second events")
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::QUEUE_ENQUEUED));
+}
+
+#[test]
+fn lifecycle_protocol_only_scrub_is_a_live_and_durable_noop() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("lifecycle-noop-scrub.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "lifecycle-noop-scrub".to_owned();
+    let fold_config = config.clone();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    session
+        .admit_user_message("start no-op run", None, true)
+        .expect("start run");
+    let source_run_id = session.active_run.clone().expect("active run");
+    queue.activate_turn(&source_run_id);
+    queue
+        .push_follow_up_back("opaque user input".to_owned())
+        .expect("durable follow-up");
+    queue
+        .with_terminal_boundary(|| {
+            session.terminalize_active_run_unfenced(RunTerminalStatus::Interrupted)
+        })
+        .expect("terminalize source run");
+    let pending = session
+        .pending_queue_inputs()
+        .expect("reconcile pending projection");
+    assert_eq!(pending.len(), 1);
+    let before_events = session.events().to_vec();
+    let before_bytes = std::fs::read(&log).expect("read original log");
+    let protocol_values = vec![
+        pending[0].queue_id().to_owned(),
+        pending[0].run_id().to_owned(),
+        source_run_id,
+        "follow_up".to_owned(),
+        "interrupted".to_owned(),
+    ];
+
+    let report = session
+        .scrub_live(&protocol_values)
+        .expect("protocol-only scrub");
+
+    assert!(!report.anything_scrubbed());
+    assert!(report.audit_event_id.is_none());
+    assert_eq!(session.events(), before_events.as_slice());
+    assert_eq!(
+        session
+            .pending_queue_inputs()
+            .expect("reconcile unchanged pending projection"),
+        pending
+    );
+    assert_eq!(std::fs::read(&log).expect("read no-op log"), before_bytes);
+    let durable = read_provenance(&log).expect("read durable no-op stream");
+    let folded = crate::resume::fold_session(&fold_config, durable).expect("fold no-op stream");
+    let folded_lifecycle =
+        run_lifecycle::fold_run_lifecycle(&folded.events).expect("fold no-op lifecycle");
+    assert_eq!(folded_lifecycle.pending(), session.run_lifecycle.pending());
+    assert_eq!(
+        folded_lifecycle.recoverable(),
+        session.run_lifecycle.recoverable()
+    );
+}
+
+#[test]
+fn scrub_audit_cutoff_keeps_later_shared_writer_event_byte_equivalent() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("scrub-cutoff.jsonl");
+    let secret = "scrub-cutoff-secret".to_owned();
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "scrub-cutoff".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let before_id = session
+        .emit(
+            EventKind::ERROR,
+            object([
+                ("source", "test".into()),
+                ("message", format!("before {secret}").into()),
+            ]),
+        )
+        .expect("pre-scrub event");
+    let writer = Arc::clone(session.provenance.as_ref().expect("session writer"));
+
+    let report = writer
+        .scrub_and_audit(std::slice::from_ref(&secret), None, "scrub-cutoff", "root")
+        .expect("durable scrub");
+    let audit_id = report.audit_event_id.expect("scrub audit");
+    // Deterministically place a non-queue shared-writer event after the audit
+    // but before Session applies the rewritten prefix.
+    let mut future = writer
+        .append_parented(|parent| {
+            vec![EventEnvelope::new(
+                "scrub-cutoff",
+                "root",
+                parent,
+                EventKind::ERROR,
+                object([
+                    ("source", "background-test".into()),
+                    ("message", format!("after {secret}").into()),
+                ]),
+            )]
+        })
+        .expect("post-audit writer event");
+    let future_id = future.pop().expect("future event").id;
+
+    session
+        .reconcile_live_scrub(&writer, std::slice::from_ref(&secret), Some(&audit_id))
+        .expect("cutoff reconciliation");
+
+    let durable = read_provenance(&log).expect("durable events");
+    assert_eq!(session.events(), durable.as_slice());
+    let before = session
+        .events()
+        .iter()
+        .find(|event| event.id == before_id)
+        .expect("pre-scrub event");
+    assert_eq!(before.payload["message"], "before [scrubbed]");
+    let after = session
+        .events()
+        .iter()
+        .find(|event| event.id == future_id)
+        .expect("post-audit event");
+    assert_eq!(after.payload["message"], format!("after {secret}"));
+}
+
+#[test]
+fn headless_post_scrub_reconciliation_failure_masks_bus_and_fails_closed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("headless-scrub-reconcile-failure.jsonl");
+    let secret = "headless-reconcile-secret".to_owned();
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "headless-scrub-reconcile".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .emit(
+            EventKind::ERROR,
+            object([
+                ("source", "test".into()),
+                ("message", format!("before {secret}").into()),
+            ]),
+        )
+        .expect("pre-scrub event");
+    let writer = Arc::clone(session.provenance.as_ref().expect("session writer"));
+    let report = writer
+        .scrub_and_audit(
+            std::slice::from_ref(&secret),
+            None,
+            "headless-scrub-reconcile",
+            "root",
+        )
+        .expect("durable scrub");
+    assert!(report.audit_event_id.is_some());
+
+    let error = session
+        .reconcile_live_scrub(
+            &writer,
+            std::slice::from_ref(&secret),
+            Some("missing-scrub-cutoff"),
+        )
+        .expect_err("post-durable cutoff mismatch");
+    assert!(matches!(
+        error,
+        SessionError::Io(_) | SessionError::Scrub(_)
+    ));
+    assert!(session.accepted_state_invalid);
+    assert!(session.events().iter().all(|event| {
+        serde_json::to_string(event)
+            .expect("serialize event")
+            .find(&secret)
+            .is_none()
+    }));
+    assert!(matches!(
+        session.rename_session("must stay fenced"),
+        Err(SessionError::InvalidAcceptedState)
+    ));
+}
+
+#[test]
+fn scrub_audit_append_failure_masks_live_state_with_or_without_a_queue() {
+    for with_queue in [false, true] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log = temp.path().join(if with_queue {
+            "queue-scrub-audit-failure.jsonl"
+        } else {
+            "headless-scrub-audit-failure.jsonl"
+        });
+        let secret = format!("scrub-audit-secret-{with_queue}");
+        let mut config = SessionConfig::new(temp.path());
+        config.session_id = format!("scrub-audit-failure-{with_queue}");
+        let mut session = Session::new(
+            config,
+            ScriptedProvider::new(Vec::new()),
+            ScriptedDecider::new(Vec::new()),
+        )
+        .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+        let queue = with_queue.then(|| {
+            let queue = Arc::new(SteeringQueue::default());
+            session
+                .set_steering_queue(Arc::clone(&queue))
+                .expect("bind queue");
+            queue
+                .push_follow_up_back(format!("queued {secret}"))
+                .expect("durable queued secret");
+            queue
+        });
+        session
+            .emit(
+                EventKind::ERROR,
+                object([
+                    ("source", "test".into()),
+                    ("message", format!("live {secret}").into()),
+                ]),
+            )
+            .expect("durable live secret");
+        session.scrub_candidates.push(secret.clone());
+
+        // The scrubbed log replacement uses its private temp file. Matching
+        // the canonical log path therefore fails the later audit append sync,
+        // after the secret-bearing log has already been replaced.
+        let expected_log = log.clone();
+        let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+        let error = session
+            .scrub_live(std::slice::from_ref(&secret))
+            .expect_err("audit sync must fail after the rewrite");
+        assert!(matches!(error, SessionError::Io(_)));
+        assert!(guard.fired(), "audit append sync fault must fire");
+        drop(guard);
+
+        assert!(session.accepted_state_invalid);
+        assert!(session
+            .scrub_candidates()
+            .iter()
+            .all(|candidate| { !candidate.contains(&secret) }));
+        assert!(session.events().iter().all(|event| {
+            !serde_json::to_string(event)
+                .expect("serialize live event")
+                .contains(&secret)
+        }));
+        assert!(matches!(
+            session.rename_session("must remain fenced"),
+            Err(SessionError::InvalidAcceptedState)
+        ));
+        if let Some(queue) = queue {
+            assert!(queue
+                .snapshot()
+                .iter()
+                .all(|content| !content.contains(&secret)));
+            assert!(queue
+                .push_follow_up_back("must remain fenced".to_owned())
+                .is_err());
+        }
+    }
 }
 
 #[test]
@@ -1398,6 +3258,36 @@ fn persisted_session_events_never_parent_to_runtime_only_model_delta() {
 }
 
 #[test]
+fn in_memory_session_chains_admission_onto_the_persisted_parent_spine() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("hello").expect("turn");
+
+    let durable = session
+        .events()
+        .iter()
+        .filter(|event| !crate::provenance::event_is_runtime_only(event.kind.as_str()))
+        .collect::<Vec<_>>();
+    let run_started = durable
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::RUN_STARTED)
+        .expect("run.started");
+    let [previous, started, message, next] = &durable[run_started - 1..=run_started + 2] else {
+        panic!("admission has its surrounding durable events");
+    };
+    assert_eq!(started.parent.as_deref(), Some(previous.id.as_str()));
+    assert_eq!(message.kind.as_str(), EventKind::USER_MESSAGE);
+    assert_eq!(message.parent.as_deref(), Some(started.id.as_str()));
+    assert_eq!(next.parent.as_deref(), Some(message.id.as_str()));
+}
+
+#[test]
 fn live_extension_artifacts_publish_to_session_and_log_once_in_order() {
     let (_temp, log, mut session) = live_session();
     let start_id = session.events()[0].id.clone();
@@ -2014,6 +3904,67 @@ fn gated_extension_run_asks_for_declared_capabilities() {
 }
 
 #[test]
+fn idle_extension_permissions_after_a_completed_run_are_live_and_resumable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("idle-extension-permission.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "idle-extension-permission".to_owned();
+    config.provider = "fixture".to_owned();
+    let resume_config = config.clone();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .admit_user_message("completed run", None, true)
+        .expect("admit run");
+    session
+        .terminalize_active_run_unfenced(RunTerminalStatus::Completed)
+        .expect("complete run");
+    session
+        .approve_extension_capabilities("idle-extension", "inspect", &[Capability::ArtifactWrite])
+        .expect("approve idle extension operation");
+
+    let permission_events = session
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                EventKind::PERMISSION_PROMPT | EventKind::PERMISSION_DECISION
+            ) && event.payload["extension_id"] == json!("idle-extension")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(permission_events.len(), 2);
+    assert!(permission_events.iter().all(|event| event.run.is_none()));
+    assert!(run_lifecycle::fold_run_lifecycle(session.events()).is_ok());
+
+    drop(session);
+    let resumed = crate::resume_session(
+        resume_config,
+        ProviderSet::single(ScriptedProvider::new(Vec::new())),
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("idle extension permission history resumes");
+    assert_eq!(
+        resumed
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    EventKind::PERMISSION_PROMPT | EventKind::PERMISSION_DECISION
+                ) && event.payload["extension_id"] == json!("idle-extension")
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn gated_extension_run_denial_blocks_execution() {
     let temp = tempfile::tempdir().expect("temp dir");
     let session_dir = temp.path().join("sessions").join("session-gated-deny");
@@ -2609,7 +4560,7 @@ fn live_extension_emission_requires_provenance_writer() {
 }
 
 #[test]
-fn live_extension_publish_rejects_unpersisted_interleaving_events() {
+fn live_extension_publish_places_confirmed_events_before_unpersisted_bus_suffix() {
     let (_temp, _log, mut session) = live_session();
     let (mut host, queue) = session
         .extension_host_with_event_queue([Capability::ArtifactWrite])
@@ -2626,21 +4577,30 @@ fn live_extension_publish_rejects_unpersisted_interleaving_events() {
 
     host.execute_command("write", json!(null))
         .expect("execute artifact");
-    session.bus.push(event(
+    let mut interleaving = event(
         EventKind::USER_MESSAGE,
         object([("content", "interleaving live event".into())]),
-    ));
+    );
+    interleaving.session = session.session_id().to_owned();
+    session.bus.push(interleaving);
 
-    let error = session
+    session
         .publish_queued_extension_events(&queue)
-        .expect_err("unpersisted live event should block queue publish");
-    assert!(matches!(error, SessionError::ExtensionEmissionOutOfOrder));
-    assert_eq!(extension_artifacts(session.events()).len(), 0);
+        .expect("accepted feed reconciles the durable extension event");
+    assert_eq!(extension_artifacts(session.events()).len(), 1);
+    assert_eq!(
+        session
+            .events()
+            .last()
+            .and_then(|event| event.payload.get("content")),
+        Some(&json!("interleaving live event")),
+        "the unconfirmed suffix remains after the writer-confirmed prefix"
+    );
 }
 
 #[test]
-fn live_extension_degraded_emission_recovers_after_reload() {
-    let (temp, log, mut session) = live_session();
+fn live_extension_interleaving_does_not_degrade_the_session() {
+    let (_temp, log, mut session) = live_session();
     let (mut host, queue) = session
         .extension_host_with_event_queue([Capability::ArtifactWrite])
         .expect("extension host");
@@ -2655,47 +4615,22 @@ fn live_extension_degraded_emission_recovers_after_reload() {
     .expect("register");
     host.execute_command("write", json!(null))
         .expect("execute artifact");
-    session.bus.push(event(
+    let mut interleaving = event(
         EventKind::USER_MESSAGE,
         object([("content", "interleaving live event".into())]),
-    ));
-    let error = session
+    );
+    interleaving.session = session.session_id().to_owned();
+    session.bus.push(interleaving);
+    session
         .publish_queued_extension_events(&queue)
-        .expect_err("unpersisted live event should block queue publish");
-    assert!(matches!(error, SessionError::ExtensionEmissionOutOfOrder));
-    let error = match session.extension_host_with_event_queue([Capability::ArtifactWrite]) {
-        Ok(_) => panic!("new hosts are rejected after degraded publication"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, SessionError::ExtensionEmissionDegraded));
-
-    let durable = read_provenance(&log).expect("durable events before reload");
-    drop(host);
-    drop(queue);
-    drop(session);
-    let writer = ProvenanceWriter::new(&log).expect("reopen writer after dropping session");
-    let mut config = SessionConfig::new(temp.path());
-    config.session_id = "session-live".to_owned();
-    config.agent_id = "agent-live".to_owned();
-    enable_test_extensions(&mut config, &["after-reload-ext"]);
-    let mut resumed = Session::from_resumed_events(
-        config,
-        ProviderSet::single(ScriptedProvider::new(Vec::new())),
-        ScriptedDecider::new(Vec::new()),
-        durable,
-        ModelTarget::new("fixture", "fixture"),
-        None,
-        None,
-    )
-    .with_provenance(writer);
-
-    resumed
+        .expect("interleaving is reconciled canonically");
+    session
         .execute_extension_command(
             &test_extension(
-                "after-reload-ext",
+                "third-ext",
                 vec![Capability::ArtifactWrite],
                 TestCommandBehavior::Write {
-                    chunks: vec![b"after reload".to_vec()],
+                    chunks: vec![b"after interleave".to_vec()],
                     after: AfterWrite::Ok,
                 },
             ),
@@ -2703,16 +4638,16 @@ fn live_extension_degraded_emission_recovers_after_reload() {
             json!(null),
             [Capability::ArtifactWrite],
         )
-        .expect("reloaded session can run extension command");
+        .expect("healthy session can run another extension command");
 
     assert_eq!(
-        extension_artifacts(&read_provenance(&log).expect("durable events after reload")).len(),
+        extension_artifacts(&read_provenance(&log).expect("durable events")).len(),
         2
     );
 }
 
 #[test]
-fn live_extension_publish_requires_durable_queue_order() {
+fn live_extension_queues_reconcile_in_writer_order_independent_of_drain_order() {
     let (_temp, log, mut session) = live_session();
     let (mut first_host, first_queue) = session
         .extension_host_with_event_queue([Capability::ArtifactWrite])
@@ -2748,45 +4683,10 @@ fn live_extension_publish_requires_durable_queue_order() {
         .execute_command("write", json!(null))
         .expect("execute second");
 
-    let error = session
+    session
         .publish_queued_extension_events(&second_queue)
-        .expect_err("second queue cannot publish before first queue");
-    assert!(matches!(error, SessionError::ExtensionEmissionOutOfOrder));
-    assert_eq!(second_queue.len(), 2);
-    let error = match session.extension_host_with_event_queue([Capability::ArtifactWrite]) {
-        Ok(_) => panic!("new hosts are rejected after degraded publication"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, SessionError::ExtensionEmissionDegraded));
-    assert!(matches!(
-        session
-            .execute_extension_command(
-                &test_extension(
-                    "third-ext",
-                    vec![Capability::ArtifactWrite],
-                    TestCommandBehavior::Write {
-                        chunks: vec![b"must not execute".to_vec()],
-                        after: AfterWrite::Ok,
-                    },
-                ),
-                "write",
-                json!(null),
-                [Capability::ArtifactWrite],
-            )
-            .expect_err("helper is rejected after degraded publication"),
-        ExtensionExecutionError::Session(SessionError::ExtensionEmissionDegraded)
-    ));
-    assert!(matches!(
-        session
-            .execute_extension_command(
-                &test_extension("noop-ext", vec![], TestCommandBehavior::Noop(json!(null))),
-                "write",
-                json!(null),
-                [],
-            )
-            .expect_err("degraded rejection is idempotent"),
-        ExtensionExecutionError::Session(SessionError::ExtensionEmissionDegraded)
-    ));
+        .expect("the feed publishes both writer-confirmed batches");
+    assert_eq!(second_queue.len(), 0);
 
     session
         .publish_queued_extension_events(&first_queue)
@@ -2814,14 +4714,12 @@ fn live_extension_publish_requires_durable_queue_order() {
         artifacts[1].parent.as_deref(),
         Some(decisions[1].id.as_str())
     );
-    let error = match session.extension_host_with_event_queue([Capability::ArtifactWrite]) {
-        Ok(_) => panic!("manual reconciliation does not clear degradation"),
-        Err(error) => error,
-    };
-    assert!(matches!(error, SessionError::ExtensionEmissionDegraded));
+    session
+        .extension_host_with_event_queue([Capability::ArtifactWrite])
+        .expect("out-of-order local draining does not degrade the session");
     assert!(
         assemble_canvas(session.events(), &AutoCompactionPolicy::default()).is_empty(),
-        "degraded extension emission must not inject extension events into canvas"
+        "extension provenance must not enter the model canvas"
     );
 }
 
@@ -3016,6 +4914,158 @@ fn try_compact_emits_discarded_event_for_invalid_candidate() {
         payload_string(discarded, "policy_version").as_deref(),
         Some("1")
     );
+}
+
+#[test]
+fn late_shadow_events_keep_the_run_captured_at_start() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let projection = WorkingStateProjection {
+        goal: "keep the captured run".to_owned(),
+        ..WorkingStateProjection::default()
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.compaction_keep_recent = 0;
+    config.auto_compaction.automatic = false;
+    config.auto_compaction.tier = crate::canvas::CompactionTier::Off;
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![FixtureResponse::Assistant(projection.to_json())]),
+        ScriptedDecider::new(Vec::new()),
+    );
+    session
+        .admit_user_message(&format!("run A {}", "x".repeat(20_000)), None, true)
+        .expect("admit origin run");
+    let origin_run = session.active_run.clone().expect("origin run");
+    assert_eq!(
+        session.begin_compaction().expect("begin shadow"),
+        CompactionStatus::InProgress
+    );
+    let model_call_id = session
+        .shadow_compaction
+        .as_ref()
+        .expect("shadow state")
+        .model_call_id
+        .clone();
+
+    session
+        .terminalize_active_run_unfenced(RunTerminalStatus::Completed)
+        .expect("terminalize origin");
+    session
+        .admit_user_message("run B", None, true)
+        .expect("admit later run");
+    let later_run = session.active_run.clone().expect("later run");
+    assert_ne!(later_run, origin_run);
+
+    let status = session.compact_and_wait().expect("settle shadow");
+    assert!(matches!(
+        status,
+        CompactionStatus::Applied | CompactionStatus::Failed
+    ));
+    assert_shadow_terminal_events_have_run(&session, &model_call_id, Some(&origin_run));
+}
+
+#[test]
+fn late_shadow_events_keep_a_captured_runless_origin() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("late-runless-shadow.jsonl");
+    let projection = WorkingStateProjection {
+        goal: "keep the runless origin".to_owned(),
+        ..WorkingStateProjection::default()
+    };
+    let mut config = SessionConfig::new(temp.path());
+    config.compaction_keep_recent = 0;
+    config.auto_compaction.automatic = false;
+    config.auto_compaction.tier = crate::canvas::CompactionTier::Off;
+    config.provider = "fixture".to_owned();
+    let resume_config = config.clone();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![FixtureResponse::Assistant(projection.to_json())]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .admit_user_message(&format!("seed {}", "x".repeat(20_000)), None, true)
+        .expect("admit seed run");
+    session
+        .terminalize_active_run_unfenced(RunTerminalStatus::Completed)
+        .expect("terminalize seed");
+    assert!(session.active_run.is_none());
+    assert_eq!(
+        session.begin_compaction().expect("begin runless shadow"),
+        CompactionStatus::InProgress
+    );
+    let model_call_id = session
+        .shadow_compaction
+        .as_ref()
+        .expect("shadow state")
+        .model_call_id
+        .clone();
+    session
+        .admit_user_message("later run", None, true)
+        .expect("admit later run");
+    assert!(session.active_run.is_some());
+
+    let status = session.compact_and_wait().expect("settle shadow");
+    assert!(matches!(
+        status,
+        CompactionStatus::Applied | CompactionStatus::Failed
+    ));
+    assert_shadow_terminal_events_have_run(&session, &model_call_id, None);
+
+    drop(session);
+    let resumed = crate::resume_session(
+        resume_config,
+        ProviderSet::single(ScriptedProvider::new(Vec::new())),
+        ScriptedDecider::new(Vec::new()),
+        &log,
+    )
+    .expect("late runless shadow remains resumable");
+    assert_shadow_terminal_events_have_run(&resumed, &model_call_id, None);
+}
+
+fn assert_shadow_terminal_events_have_run<D>(
+    session: &Session<D>,
+    model_call_id: &str,
+    expected_run: Option<&str>,
+) {
+    let model_call_index = session
+        .events()
+        .iter()
+        .position(|event| event.id == model_call_id)
+        .expect("shadow model call");
+    let late = session.events()[model_call_index + 1..]
+        .iter()
+        .filter(|event| {
+            (event.parent.as_deref() == Some(model_call_id)
+                && event.payload.get("purpose").and_then(Value::as_str) == Some(COMPACTION_PURPOSE))
+                || matches!(
+                    event.kind.as_str(),
+                    EventKind::CANVAS_SWAP | EventKind::CANVAS_CANDIDATE_DISCARDED
+                )
+        })
+        .collect::<Vec<_>>();
+    assert!(late.iter().any(|event| {
+        matches!(
+            event.kind.as_str(),
+            EventKind::MODEL_RESULT | EventKind::ERROR
+        )
+    }));
+    assert!(late.iter().any(|event| {
+        matches!(
+            event.kind.as_str(),
+            EventKind::CANVAS_SWAP | EventKind::CANVAS_CANDIDATE_DISCARDED
+        )
+    }));
+    for event in late {
+        assert_eq!(
+            event.run.as_deref(),
+            expected_run,
+            "late shadow event {} ({}) changed origin",
+            event.id,
+            event.kind
+        );
+    }
 }
 
 fn event(kind: &'static str, payload: JsonObject) -> EventEnvelope {
@@ -3973,10 +6023,24 @@ mod project_context_seam {
         let root = repo_with_skill(&temp, "review", "Review changes.", "Frozen body.");
         let (mut session, captured) = captured_session(admitted_config(&root));
         let queue = Arc::new(SteeringQueue::default());
-        session.set_steering_queue(Arc::clone(&queue));
-        queue.push_steering_back("/skill:review check tests".to_owned());
-
-        let events = session.run_turn("start").expect("steered skill turn");
+        session
+            .set_steering_queue(Arc::clone(&queue))
+            .expect("bind queue");
+        let steering_queue = Arc::clone(&queue);
+        let steered = Cell::new(false);
+        let events = session
+            .run_turn_with_sink("start", Arc::new(AtomicBool::new(false)), move |event| {
+                if !steered.get() && event.kind.as_str() == EventKind::USER_MESSAGE {
+                    if let Some(run_id) = &event.run {
+                        steering_queue.activate_turn(run_id);
+                        steering_queue
+                            .push_steering_back("/skill:review check tests".to_owned())
+                            .expect("queue steering row");
+                        steered.set(true);
+                    }
+                }
+            })
+            .expect("steered skill turn");
 
         let user_events = events
             .iter()
@@ -4003,20 +6067,40 @@ mod project_context_seam {
         let root = repo_with_skill(&temp, "review", "Review changes.", "Frozen body.");
         let (mut session, _captured) = captured_session(admitted_config(&root));
         let queue = Arc::new(SteeringQueue::default());
-        session.set_steering_queue(Arc::clone(&queue));
-        queue.push_steering_back("/skill:missing".to_owned());
-
+        session
+            .set_steering_queue(Arc::clone(&queue))
+            .expect("bind queue");
+        let steering_queue = Arc::clone(&queue);
+        let steered = Cell::new(false);
         let error = session
-            .run_turn("start")
+            .run_turn_with_sink("start", Arc::new(AtomicBool::new(false)), move |event| {
+                if !steered.get() && event.kind.as_str() == EventKind::USER_MESSAGE {
+                    if let Some(run_id) = &event.run {
+                        steering_queue.activate_turn(run_id);
+                        steering_queue
+                            .push_steering_back("/skill:missing".to_owned())
+                            .expect("queue steering row");
+                        steered.set(true);
+                    }
+                }
+            })
             .expect_err("unknown steered skill must fail before admission");
 
         assert!(matches!(
             error,
             SessionError::SkillUnavailable { ref name } if name == "missing"
         ));
-        assert_eq!(queue.snapshot(), ["/skill:missing"]);
+        // Parsing and catalog lookup fail before any pending admission is
+        // installed, so the rejection is deterministic rather than an
+        // ambiguous durability failure: nothing is retained as an unresolved
+        // admission on either the queue or the session. The failed run's
+        // terminal boundary then releases the volatile steering row (a
+        // writer-backed queue would keep it as a recoverable row instead).
         assert!(!queue.has_unresolved_admission());
-        assert_eq!(queue.remove(0).as_deref(), Some("/skill:missing"));
+        assert!(session.pending_admission.is_none());
+        assert!(!session.has_unresolved_admission());
+        assert!(queue.is_empty());
+        assert!(session.can_accept_turn());
     }
 
     #[derive(Debug)]
@@ -4068,13 +6152,14 @@ mod project_context_seam {
         let kinds: Vec<&str> = persisted
             .iter()
             .map(|event| event.kind.as_str())
-            .take(3)
+            .take(4)
             .collect();
         assert_eq!(
             kinds,
             vec![
                 EventKind::SESSION_START,
                 EventKind::PROJECT_CONTEXT_SNAPSHOT,
+                EventKind::RUN_STARTED,
                 EventKind::USER_MESSAGE
             ]
         );

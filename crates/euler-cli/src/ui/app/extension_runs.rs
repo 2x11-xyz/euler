@@ -251,6 +251,7 @@ impl AppCore {
         self.in_flight_label = Some(label);
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = true;
+        self.model_turn_steering_ready = false;
         self.last_working_elapsed_secs = None;
         self.activity.begin_at(Utc::now());
         self.stall_notified = false;

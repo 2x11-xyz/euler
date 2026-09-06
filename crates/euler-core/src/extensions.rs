@@ -70,6 +70,7 @@ pub enum ExtensionHostError {
     CommandFailed(String, ExtensionError),
     CommandCancelled(String),
     CommandPanic(String, String),
+    Provenance(String),
 }
 pub struct ExtensionHost {
     log_path: PathBuf,
@@ -88,6 +89,7 @@ pub struct ExtensionHost {
 struct ArtifactRecorder {
     session_id: String,
     agent_id: String,
+    run_id: Option<String>,
     writer: Arc<ProvenanceWriter>,
     queue: Option<Arc<QueuedExtensionEvents>>,
 }
@@ -98,21 +100,8 @@ pub struct QueuedExtensionEvents {
 }
 
 impl QueuedExtensionEvents {
-    pub(crate) fn drain_after(&self, expected_parent: Option<&str>) -> Option<Vec<EventEnvelope>> {
-        let mut events = recover_mutex(&self.events);
-        if events.is_empty() {
-            return Some(Vec::new());
-        }
-        if events.first()?.parent.as_deref() != expected_parent {
-            return None;
-        }
-        if events
-            .windows(2)
-            .any(|pair| pair[1].parent.as_deref() != Some(pair[0].id.as_str()))
-        {
-            return None;
-        }
-        Some(std::mem::take(&mut *events))
+    pub(crate) fn drain(&self) -> Vec<EventEnvelope> {
+        std::mem::take(&mut *recover_mutex(&self.events))
     }
 
     #[cfg(test)]
@@ -161,6 +150,7 @@ impl ExtensionHost {
             artifact_recorder: Some(ArtifactRecorder {
                 session_id: session_id.into(),
                 agent_id: agent_id.into(),
+                run_id: None,
                 writer,
                 queue: None,
             }),
@@ -184,6 +174,7 @@ impl ExtensionHost {
             artifact_recorder: Some(ArtifactRecorder {
                 session_id: session_id.into(),
                 agent_id: agent_id.into(),
+                run_id: None,
                 writer,
                 queue: Some(Arc::clone(&queue)),
             }),
@@ -192,6 +183,13 @@ impl ExtensionHost {
             redactor: crate::redaction::SecretRedactor::default(),
         };
         (host, queue)
+    }
+
+    pub(crate) fn with_run_id(mut self, run_id: Option<String>) -> Self {
+        if let Some(recorder) = &mut self.artifact_recorder {
+            recorder.run_id = run_id;
+        }
+        self
     }
 
     /// Attach the owning session's secret redactor so extension-authored
@@ -222,17 +220,17 @@ impl ExtensionHost {
                 &id,
                 None,
                 false,
-            );
+            )
+            .map_err(extension_provenance_error)?;
             return Err(ExtensionHostError::CapabilityDenied(id, first));
         }
         validate_pending_commands(&registrar.0, &self.commands)?;
-        self.extensions
-            .insert(id.clone(), ExtensionRecord { disabled: false });
+        let mut commands = Vec::with_capacity(registrar.0.len());
         for (name, runner) in registrar.0 {
             let descriptor = command_descriptor(&name, runner.as_ref());
             let command_capabilities =
                 command_capabilities(&id, &name, &descriptor, &capabilities)?;
-            self.commands.insert(
+            commands.push((
                 name,
                 (
                     id.clone(),
@@ -240,7 +238,7 @@ impl ExtensionHost {
                     command_capabilities,
                     Arc::from(runner),
                 ),
-            );
+            ));
         }
         record_capability_decisions(
             &self.artifact_recorder,
@@ -248,7 +246,11 @@ impl ExtensionHost {
             &id,
             None,
             true,
-        );
+        )
+        .map_err(extension_provenance_error)?;
+        self.extensions
+            .insert(id.clone(), ExtensionRecord { disabled: false });
+        self.commands.extend(commands);
         Ok(())
     }
 
@@ -283,26 +285,23 @@ impl ExtensionHost {
                 &id,
                 Some(&name),
                 false,
-            );
+            )
+            .map_err(extension_provenance_error)?;
             return Err(ExtensionHostError::CapabilityDenied(id, first));
         }
-        self.extensions
-            .insert(id.clone(), ExtensionRecord { disabled: false });
-        self.commands.insert(
-            name.clone(),
-            (
-                id.clone(),
-                descriptor,
-                command_capabilities.clone(),
-                Arc::from(runner),
-            ),
-        );
         record_capability_decisions(
             &self.artifact_recorder,
             command_capabilities.iter().copied(),
             &id,
             Some(&name),
             true,
+        )
+        .map_err(extension_provenance_error)?;
+        self.extensions
+            .insert(id.clone(), ExtensionRecord { disabled: false });
+        self.commands.insert(
+            name,
+            (id, descriptor, command_capabilities, Arc::from(runner)),
         );
         Ok(())
     }
@@ -381,35 +380,44 @@ impl ExtensionHost {
             capabilities: capabilities.clone(),
             artifact_recorder: self.artifact_recorder.clone(),
             denied_capabilities: Mutex::new(BTreeSet::new()),
+            provenance_failure: Mutex::new(None),
             spawner,
             redactor: self.redactor.clone(),
         };
-        match catch_extension_unwind(|| {
+        let outcome = catch_extension_unwind(|| {
             runner.execute_cancellable(CommandContext { input }, &host, cancellation)
-        }) {
-            Ok(Ok(output)) => Ok(output),
-            Ok(Err(ExtensionError::Cancelled)) => {
+        });
+        let provenance_failure = host.take_provenance_failure();
+        match (outcome, provenance_failure) {
+            (Err(_), failure) => {
+                if let Some(extension) = self.extensions.get_mut(&extension_id) {
+                    extension.disabled = true;
+                }
+                if let Some(error) = failure {
+                    return Err(ExtensionHostError::Provenance(error));
+                }
+                self.record_command_failure(&extension_id, command, ExtensionFailureKind::Panic)
+                    .map_err(extension_provenance_error)?;
+                Err(ExtensionHostError::CommandPanic(
+                    extension_id,
+                    command.to_owned(),
+                ))
+            }
+            (_, Some(error)) => Err(ExtensionHostError::Provenance(error)),
+            (Ok(Ok(output)), None) => Ok(output),
+            (Ok(Err(ExtensionError::Cancelled)), None) => {
                 Err(ExtensionHostError::CommandCancelled(command.to_owned()))
             }
-            Ok(Err(source)) => {
+            (Ok(Err(source)), None) => {
                 self.record_command_failure(
                     &extension_id,
                     command,
                     ExtensionFailureKind::CommandError,
-                );
+                )
+                .map_err(extension_provenance_error)?;
                 Err(ExtensionHostError::CommandFailed(
                     command.to_owned(),
                     source,
-                ))
-            }
-            Err(_) => {
-                if let Some(extension) = self.extensions.get_mut(&extension_id) {
-                    extension.disabled = true;
-                }
-                self.record_command_failure(&extension_id, command, ExtensionFailureKind::Panic);
-                Err(ExtensionHostError::CommandPanic(
-                    extension_id,
-                    command.to_owned(),
                 ))
             }
         }
@@ -420,15 +428,15 @@ impl ExtensionHost {
         extension_id: &str,
         command: &str,
         failure: ExtensionFailureKind,
-    ) {
+    ) -> io::Result<()> {
         let Some(recorder) = &self.artifact_recorder else {
-            return;
+            return Ok(());
         };
         let session_id = recorder.session_id.clone();
         let agent_id = recorder.agent_id.clone();
         let extension_id = extension_id.to_owned();
         let command = command.to_owned();
-        let _ = recorder.record_parented_events(|parent| {
+        recorder.record_parented_events(|parent| {
             let Some(parent) = parent else {
                 return Vec::new();
             };
@@ -446,7 +454,8 @@ impl ExtensionHost {
                     ("failure", failure.as_str().into()),
                 ]),
             )]
-        });
+        })?;
+        Ok(())
     }
 }
 
@@ -553,6 +562,7 @@ struct CommandHost<'a> {
     capabilities: BTreeSet<Capability>,
     artifact_recorder: Option<ArtifactRecorder>,
     denied_capabilities: Mutex<BTreeSet<Capability>>,
+    provenance_failure: Mutex<Option<String>>,
     spawner: Option<&'a dyn ExtensionSpawner>,
     redactor: crate::redaction::SecretRedactor,
 }
@@ -930,7 +940,16 @@ impl ArtifactRecorder {
         &self,
         build: impl FnOnce(Option<String>) -> Vec<EventEnvelope>,
     ) -> io::Result<Vec<EventEnvelope>> {
-        let events = self.writer.append_parented(build)?;
+        let run_id = self.run_id.clone();
+        let events = self.writer.append_parented(|parent| {
+            let mut events = build(parent);
+            for event in &mut events {
+                if event.run.is_none() {
+                    event.run.clone_from(&run_id);
+                }
+            }
+            events
+        })?;
         if let Some(queue) = &self.queue {
             recover_mutex(&queue.events).extend(events.iter().cloned());
         }
@@ -944,31 +963,24 @@ fn record_capability_decisions(
     extension_id: &str,
     command: Option<&str>,
     allowed: bool,
-) {
+) -> io::Result<()> {
     let Some(recorder) = recorder else {
-        return;
+        return Ok(());
     };
     if !recorder.has_durable_tail() {
-        return;
+        return Ok(());
     }
     let capabilities = capabilities.into_iter().collect::<Vec<_>>();
     if capabilities.is_empty() {
-        return;
+        return Ok(());
     }
     let decision = if allowed { "allowed" } else { "denied" };
-    for capability in &capabilities {
-        crate::diagnostics::permission_decision(
-            &recorder.session_id,
-            capability.as_str(),
-            "static-grant",
-            allowed,
-        );
-    }
+    let diagnostic_capabilities = capabilities.clone();
     let session_id = recorder.session_id.clone();
     let agent_id = recorder.agent_id.clone();
     let extension_id = extension_id.to_owned();
     let command = command.map(str::to_owned);
-    let _ = recorder.record_parented_events(|_| {
+    recorder.record_parented_events(|_| {
         capabilities
             .into_iter()
             .map(|capability| {
@@ -994,7 +1006,20 @@ fn record_capability_decisions(
                 )
             })
             .collect()
-    });
+    })?;
+    for capability in diagnostic_capabilities {
+        crate::diagnostics::permission_decision(
+            &recorder.session_id,
+            capability.as_str(),
+            "static-grant",
+            allowed,
+        );
+    }
+    Ok(())
+}
+
+fn extension_provenance_error(error: io::Error) -> ExtensionHostError {
+    ExtensionHostError::Provenance(error.to_string())
 }
 
 fn recover_mutex<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1458,6 +1483,10 @@ fn checkpoint_name_from_file(file_name: &str) -> Option<&str> {
 }
 
 impl CommandHost<'_> {
+    fn take_provenance_failure(&self) -> Option<String> {
+        recover_mutex(&self.provenance_failure).take()
+    }
+
     fn require_capability(&self, capability: Capability) -> Result<(), ExtensionError> {
         if self.capabilities.contains(&capability) {
             return Ok(());
@@ -1465,13 +1494,18 @@ impl CommandHost<'_> {
         let mut denied = recover_mutex(&self.denied_capabilities);
         if denied.insert(capability) {
             drop(denied);
-            record_capability_decisions(
+            if let Err(error) = record_capability_decisions(
                 &self.artifact_recorder,
                 std::iter::once(capability),
                 &self.extension_id,
                 Some(&self.command_name),
                 false,
-            );
+            ) {
+                *recover_mutex(&self.provenance_failure) = Some(error.to_string());
+                return Err(ExtensionError::Message(
+                    "extension permission provenance failed".to_owned(),
+                ));
+            }
         }
         Err(ExtensionError::CapabilityDenied { capability })
     }

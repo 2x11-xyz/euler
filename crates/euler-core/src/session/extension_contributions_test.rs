@@ -203,7 +203,9 @@ impl ExtensionCommand for TestCommand {
                     cancel.store(true, Ordering::SeqCst);
                 }
                 if let Some(queue) = &state.steer_after_idle {
-                    queue.push_steering_back("user wins after hook".to_owned());
+                    queue
+                        .push_steering_back("user wins after hook".to_owned())
+                        .expect("queue input");
                 }
                 Ok(state
                     .idle_outputs
@@ -366,7 +368,9 @@ impl ModelProvider for SteeringProvider {
             .unwrap_or_else(PoisonError::into_inner)
             .push(request.clone());
         if !self.steering_sent.swap(true, Ordering::SeqCst) {
-            self.queue.push_steering_back("user wins".to_owned());
+            self.queue
+                .push_steering_back("user wins".to_owned())
+                .expect("queue input");
         }
         self.scripted.invoke(request)
     }
@@ -1650,7 +1654,9 @@ fn assert_pending_user_input_wins_before_idle_command(idle_output: Value) {
     session
         .wire_extension(Arc::new(extension))
         .expect("wire extension");
-    session.set_steering_queue(Arc::clone(&queue));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
 
     session.run_turn("start").expect("turn");
 
@@ -1786,7 +1792,9 @@ fn assert_user_input_arriving_during_idle_wins(idle_output: Value, expected_acti
         Vec::new(),
     );
     session.config.max_tool_rounds = Some(2);
-    session.set_steering_queue(Arc::clone(&queue));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
 
     session.run_turn("start").expect("turn");
 

@@ -233,6 +233,70 @@ fn durable_partial_response_chunks_never_enter_model_canvas() {
     );
 }
 
+#[test]
+fn pending_queue_and_run_lifecycle_are_not_model_content() {
+    let run_id = ulid::Ulid::new().to_string();
+    let queue_id = ulid::Ulid::new().to_string();
+    let events = vec![
+        EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::QUEUE_ENQUEUED,
+            object([
+                ("queue_id", queue_id.clone().into()),
+                ("mode", "follow_up".into()),
+                ("position", "back".into()),
+                ("content", "private pending draft".into()),
+            ]),
+        )
+        .with_run(run_id.clone()),
+        EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::RUN_STARTED,
+            object([
+                ("trigger", "follow_up".into()),
+                ("queue_id", queue_id.clone().into()),
+            ]),
+        )
+        .with_run(run_id.clone()),
+        EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::QUEUE_DELIVERED,
+            object([("queue_id", queue_id.clone().into())]),
+        )
+        .with_run(run_id.clone()),
+        EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::QUEUE_RECOVERED,
+            object([
+                ("queue_id", queue_id.into()),
+                ("action", "dismissed".into()),
+            ]),
+        )
+        .with_run(run_id.clone()),
+        EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::USER_MESSAGE,
+            object([("content", "delivered request".into())]),
+        )
+        .with_run(run_id),
+    ];
+
+    let prompt = canvas_prompt(&assemble_canvas(&events, &off_policy(usize::MAX)));
+
+    assert_eq!(prompt, "user: delivered request");
+    assert!(!prompt.contains("private pending draft"));
+}
+
 fn demoted_outputs(canvas: &[CanvasItem]) -> Vec<&str> {
     canvas
         .iter()

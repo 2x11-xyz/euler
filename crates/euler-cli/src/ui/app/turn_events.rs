@@ -67,6 +67,14 @@ impl AppCore {
             self.in_flight_session_returned = true;
         }
         match event {
+            TurnEvent::RunAdmitted => {
+                if self.in_flight_label.as_deref() == Some(MODEL_TURN_IN_FLIGHT_LABEL) {
+                    self.model_turn_steering_ready = true;
+                    if self.notice.as_deref() == Some(TURN_STARTING_NOTICE) {
+                        self.notice = None;
+                    }
+                }
+            }
             TurnEvent::Event(event) => {
                 let is_tool_call = event.kind.as_str() == EventKind::TOOL_CALL;
                 if self.activity.observe(&event) {
@@ -159,16 +167,21 @@ impl AppCore {
             let events = session.events()[start..].to_vec();
             self.record_compaction_update(outcome, events, false);
         }
-        if let Some(request) = self.pending_runs.pop_front() {
-            match request {
-                PendingRunRequest::Extension(request) => self.spawn_extension_run(request, session),
-                PendingRunRequest::Companion(request) => self.spawn_companion_run(request, session),
+        if session.can_accept_turn() {
+            if let Some(request) = self.pending_runs.pop_front() {
+                match request {
+                    PendingRunRequest::Extension(request) => {
+                        self.spawn_extension_run(request, session)
+                    }
+                    PendingRunRequest::Companion(request) => {
+                        self.spawn_companion_run(request, session)
+                    }
+                }
+                return;
             }
-            return;
         }
         if auto_flush && !self.queued_inputs.paused() && session.can_accept_turn() {
             if let Some(input) = self.pop_next_queued_input() {
-                self.bottom.record_submission(input.content());
                 self.spawn_queued_turn(input, session);
                 return;
             }
@@ -181,6 +194,7 @@ impl AppCore {
         self.in_flight_label = None;
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = false;
+        self.model_turn_steering_ready = false;
         self.spinner_frame = 0;
         self.spinner_last_tick = None;
     }

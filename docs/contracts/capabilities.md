@@ -114,6 +114,16 @@ is the command protocol): there, explicitly invoking a named command grants
 its declared capabilities for that run, announced on stderr — visible, never
 silent.
 
+The extension host records each resolved registration grant or denial as a
+`static-grant` decision before it reports registration success or the ordinary
+capability-denied result. That provenance is mandatory: an append failure is
+an infrastructure failure, not an implicit grant or denial, and a failed
+allowed-decision append leaves no partially registered extension or command in
+the host. A command cannot catch an SDK-level denial/provenance error and turn
+that host failure into success; the host checks its own failure latch after
+the command returns. Diagnostics are emitted only after the decision append
+succeeds.
+
 Terminal-idle contributions are implicit lifecycle work and therefore never
 open this operation prompt. Every required capability must be
 `session-allow`, or be `ask`/unconfigured and covered by an existing grant.

@@ -777,6 +777,11 @@ fn background_agent_report_persistence_failure_retries_before_later_reports() {
     ));
     assert_eq!(agent_message_count(session.events()), 0);
 
+    assert!(matches!(
+        session.run_turn("must wait for retained report"),
+        Err(SessionError::UnresolvedAuthoritativeAppend)
+    ));
+
     fs::remove_dir(fixture.log()).expect("remove blocking directory");
     fs::rename(&backup, fixture.log()).expect("restore accepted log");
     let first_id = drain_until_drained(&mut session, &mut background);
@@ -800,6 +805,76 @@ fn background_agent_report_persistence_failure_retries_before_later_reports() {
 
     assert_eq!(steps, vec![1, 2]);
     assert_eq!(agent_message_count(session.events()), 2);
+}
+
+#[test]
+fn failed_report_then_result_retries_each_exact_envelope_in_writer_order() {
+    let fixture = Fixture::new();
+    let mut session = fixture.session();
+    let (reported_tx, reported_rx) = mpsc::channel();
+    let mut background = session
+        .spawn_background_agent_with_reporter(task([]), [Capability::FsRead], move |reporter| {
+            reporter.report(json!({"step": 1})).expect("report");
+            reported_tx.send(()).expect("signal queued report");
+            AgentResult::success("done", Option::<&str>::None).expect("result")
+        })
+        .expect("spawn background");
+    reported_rx.recv().expect("report queued");
+
+    let backup = fixture.root().join("report-result-order.backup.jsonl");
+    fs::rename(fixture.log(), &backup).expect("back up accepted log");
+    fs::create_dir(fixture.log()).expect("replace log with directory");
+    assert!(matches!(
+        session.drain_background_agent_report(&mut background),
+        Err(SessionError::Io(_))
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match session.poll_background_agent(&mut background) {
+            Err(SessionError::Io(_)) => break,
+            Ok(BackgroundAgentPoll::Pending) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            other => panic!("result must retain behind the earlier report reservation: {other:?}"),
+        }
+    }
+
+    fs::remove_dir(fixture.log()).expect("remove blocking directory");
+    fs::rename(&backup, fixture.log()).expect("restore accepted log");
+    let report_id = match session
+        .drain_background_agent_report(&mut background)
+        .expect("retry exact report")
+    {
+        BackgroundAgentReportDrain::Drained { message_event_id } => message_event_id,
+        other => panic!("expected retained report, got {other:?}"),
+    };
+    let result_id = match session
+        .poll_background_agent(&mut background)
+        .expect("retry exact result")
+    {
+        BackgroundAgentPoll::Recorded { result_event_id } => result_event_id,
+        other => panic!("expected retained result, got {other:?}"),
+    };
+
+    let durable = read_resume_prefix(fixture.log()).expect("read durable events");
+    let report_index = durable
+        .iter()
+        .position(|event| event.id == report_id)
+        .expect("report durable once");
+    let result_index = durable
+        .iter()
+        .position(|event| event.id == result_id)
+        .expect("result durable once");
+    assert!(report_index < result_index);
+    assert_eq!(agent_message_count(&durable), 1);
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+            .count(),
+        1
+    );
 }
 
 #[test]

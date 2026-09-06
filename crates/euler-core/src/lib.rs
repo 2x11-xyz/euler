@@ -125,9 +125,11 @@ pub use sandbox::{
 pub use session::{
     fold_model_target, fold_reasoning_effort, system_instruction_bytes, AgentReporter,
     AgentResultSummary, BackgroundAgent, BackgroundAgentPoll, BackgroundAgentReportDrain,
-    CompactionStatus, ContextLimitConfig, ExtensionExecutionError, ModelTarget, QueuedInput,
-    RoundObserverConfig, Session, SessionConfig, SessionError, SteeringQueue,
-    WorkspaceRestoreOutcome,
+    CompactionStatus, ContextLimitConfig, ExtensionExecutionError, ModelTarget, PendingQueueInput,
+    QueueCancellationReason, QueueError, QueueLifecycleTransition, QueueMode, QueuePosition,
+    QueuedInput, QueuedInputMetadata, RecoverableQueueInput, RoundObserverConfig,
+    RunLifecycleError, RunTerminalStatus, Session, SessionConfig, SessionError, SteeringQueue,
+    SteeringQueueSnapshot, WorkspaceRestoreOutcome,
 };
 pub use session_kind::SessionKind;
 pub use session_store::{SessionRecord, SessionStatus, SessionStore, SessionStoreError};
@@ -169,12 +171,15 @@ impl EventBus {
         count
     }
 
-    /// Align the live bus with a successful durable scrub. Full tool-result
-    /// payloads stay in memory (the writer externalizes only its clone), while
-    /// rewritten routing fields, response byte accounting, and
-    /// content-addressed pointers are copied from the log. The log-only resume
-    /// marker remains excluded.
+    /// Align the live bus with a successful durable scrub. The reread prefix
+    /// rehydrates externalized response, queue, and tool content, so copying
+    /// its payloads preserves the live full-result view while making rewritten
+    /// routing, accounting, and lifecycle fields authoritative. The log-only
+    /// resume marker remains excluded.
     pub(crate) fn reconcile_scrubbed_log(&mut self, durable: &[EventEnvelope], secrets: &[String]) {
+        // Runtime-only events have no durable counterpart, and every event at
+        // the scrub cutoff must stop carrying the removed value even if the
+        // durable reread below fails to contain a matching row.
         self.scrub_payloads(secrets);
         let durable_by_id = durable
             .iter()
@@ -184,28 +189,13 @@ impl EventBus {
             let Some(rewritten) = durable_by_id.get(event.id.as_str()) else {
                 continue;
             };
+            // The reread durable prefix is the exact post-scrub authority and
+            // has already rehydrated any externalized payload. Copying it
+            // keeps the success audit byte-equivalent too: that audit was
+            // appended after the rewrite and must not itself be scrubbed by a
+            // requested value that happens to occur in its fixed prose.
             event.blobs.clone_from(&rewritten.blobs);
-            match event.kind.as_str() {
-                euler_event::EventKind::EXTENSION_ARTIFACT => {
-                    event.payload.clone_from(&rewritten.payload);
-                }
-                euler_event::EventKind::ASSISTANT_RESPONSE_CHUNK => {
-                    event.payload.clone_from(&rewritten.payload);
-                }
-                euler_event::EventKind::MODEL_RESULT | euler_event::EventKind::ERROR
-                    if rewritten.payload.contains_key("response_id") =>
-                {
-                    event.payload.clone_from(&rewritten.payload);
-                }
-                euler_event::EventKind::FILE_CHANGE => {
-                    if let Some(hash) = rewritten.payload.get("pre_image_blob") {
-                        event
-                            .payload
-                            .insert("pre_image_blob".to_owned(), hash.clone());
-                    }
-                }
-                _ => {}
-            }
+            event.payload.clone_from(&rewritten.payload);
         }
         if let Some(audit) = durable
             .iter()

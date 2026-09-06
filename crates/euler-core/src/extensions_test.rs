@@ -347,6 +347,134 @@ fn extensions_registration_denial_records_every_missing_capability_before_error(
 }
 
 #[test]
+fn extension_registration_propagates_early_permission_provenance_failure() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-registration-provenance";
+    let log = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+    let writer = Arc::new(
+        ProvenanceWriter::with_threshold(log.clone(), blob_dir.clone(), 1).expect("writer"),
+    );
+    writer
+        .append(&[session_start_event(session_id)])
+        .expect("source append");
+    let mut host = ExtensionHost::with_artifact_writer(
+        &log,
+        session_id,
+        "agent-1",
+        Arc::clone(&writer),
+        [Capability::ProvenanceRead],
+    );
+    let blob_parent = blob_dir.parent().expect("blob parent").to_path_buf();
+    let guard = arm_matching(Op::DirSync, move |path| path == blob_parent);
+
+    let error = host
+        .register_extension(&extension(
+            "registration-provenance-ext",
+            vec![Capability::ProvenanceRead],
+            vec![("query", query_command)],
+        ))
+        .expect_err("permission decision persistence must fail registration");
+
+    assert!(guard.fired(), "blob preparation fault must fire");
+    assert!(matches!(error, ExtensionHostError::Provenance(_)));
+    assert_eq!(
+        permission_decisions(&read_provenance(&log).expect("events")).len(),
+        0
+    );
+    assert_eq!(
+        host.execute_command("query", json!({"limit": 1}))
+            .expect_err("failed registration must not install the command"),
+        ExtensionHostError::MissingCommand("query".to_owned())
+    );
+    assert!(writer.has_unresolved_append());
+}
+
+#[test]
+fn extension_command_failure_propagates_error_event_provenance_failure() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-command-provenance";
+    let log = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+    let writer = Arc::new(
+        ProvenanceWriter::with_threshold(log.clone(), blob_dir.clone(), 1).expect("writer"),
+    );
+    writer
+        .append(&[session_start_event(session_id)])
+        .expect("source append");
+    let mut host =
+        ExtensionHost::with_artifact_writer(&log, session_id, "agent-1", Arc::clone(&writer), []);
+    host.register_extension(&extension(
+        "command-provenance-ext",
+        vec![],
+        vec![("fail", error_command)],
+    ))
+    .expect("register");
+    let blob_parent = blob_dir.parent().expect("blob parent").to_path_buf();
+    let guard = arm_matching(Op::DirSync, move |path| path == blob_parent);
+
+    let error = host
+        .execute_command("fail", json!(null))
+        .expect_err("sanitized failure provenance must be mandatory");
+
+    assert!(guard.fired(), "blob preparation fault must fire");
+    assert!(matches!(error, ExtensionHostError::Provenance(_)));
+    assert_eq!(
+        events_of_kind(&read_provenance(&log).expect("events"), EventKind::ERROR).len(),
+        0
+    );
+    assert!(writer.has_unresolved_append());
+}
+
+#[test]
+fn extension_cannot_swallow_runtime_permission_provenance_failure() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_id = "session-runtime-permission-provenance";
+    let log = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+    let writer = Arc::new(
+        ProvenanceWriter::with_threshold(log.clone(), blob_dir.clone(), 1).expect("writer"),
+    );
+    writer
+        .append(&[session_start_event(session_id)])
+        .expect("source append");
+    let mut host = ExtensionHost::with_artifact_writer(
+        &log,
+        session_id,
+        "agent-1",
+        Arc::clone(&writer),
+        [Capability::ExtensionState],
+    );
+    host.register_extension(&extension(
+        "swallow-denial-ext",
+        vec![Capability::ExtensionState],
+        vec![("swallow", swallow_denied_command)],
+    ))
+    .expect("register");
+    let decisions_before = permission_decisions(&read_provenance(&log).expect("events")).len();
+    let blob_parent = blob_dir.parent().expect("blob parent").to_path_buf();
+    let guard = arm_matching(Op::DirSync, move |path| path == blob_parent);
+
+    let error = host
+        .execute_command("swallow", json!(null))
+        .expect_err("host infrastructure failure must outrank caught SDK error");
+
+    assert!(guard.fired(), "blob preparation fault must fire");
+    assert!(matches!(error, ExtensionHostError::Provenance(_)));
+    assert_eq!(
+        permission_decisions(&read_provenance(&log).expect("events")).len(),
+        decisions_before
+    );
+    assert!(writer.has_unresolved_append());
+}
+
+#[test]
 fn extensions_command_capabilities_must_be_declared_by_manifest() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");
@@ -1748,7 +1876,6 @@ fn extensions_plan_presentation_emits_canonical_attributed_live_event() {
     let log = temp.path().join("events.jsonl");
     let writer = Arc::new(ProvenanceWriter::new(&log).expect("writer"));
     let start = session_start_event(session_id);
-    let start_id = start.id.clone();
     writer.append(&[start]).expect("source append");
     let (mut host, queue) = ExtensionHost::with_queued_artifact_writer(
         session_id,
@@ -1801,9 +1928,7 @@ fn extensions_plan_presentation_emits_canonical_attributed_live_event() {
         json!("r3 · active · 1/3 completed")
     );
 
-    let queued = queue
-        .drain_after(Some(&start_id))
-        .expect("valid queued parent chain");
+    let queued = queue.drain();
     assert_eq!(queued.as_slice(), &durable[1..]);
 }
 
@@ -2884,6 +3009,7 @@ struct OkCommand;
 struct PanicCommand;
 struct ErrorCommand;
 struct DoubleDeniedCommand;
+struct SwallowDeniedCommand;
 
 impl ExtensionCommand for QueryCommand {
     fn descriptor(&self) -> CommandDescriptor {
@@ -3231,6 +3357,21 @@ impl ExtensionCommand for DoubleDeniedCommand {
     }
 }
 
+impl ExtensionCommand for SwallowDeniedCommand {
+    fn descriptor(&self) -> CommandDescriptor {
+        test_descriptor([])
+    }
+
+    fn execute(
+        &self,
+        _context: CommandContext,
+        host: &dyn HostApi,
+    ) -> Result<Value, ExtensionError> {
+        let _ = host.state_dir();
+        Ok(json!({"caught": true}))
+    }
+}
+
 struct UndeclaredStateCommand;
 
 impl ExtensionCommand for UndeclaredStateCommand {
@@ -3353,6 +3494,10 @@ fn error_command() -> Box<dyn ExtensionCommand> {
 
 fn double_denied_command() -> Box<dyn ExtensionCommand> {
     Box::new(DoubleDeniedCommand)
+}
+
+fn swallow_denied_command() -> Box<dyn ExtensionCommand> {
+    Box::new(SwallowDeniedCommand)
 }
 
 fn undeclared_state_command() -> Box<dyn ExtensionCommand> {

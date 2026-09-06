@@ -207,24 +207,61 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   working/interrupt copy; typing remains accepted. Mid-turn submits steer:
   they queue as one ordered steering group and the running model turn absorbs
   them exactly once at its next round boundary as canonical `user.message`
-  events (the model sees them in-turn; docs/contracts/events.md). A completed
+  events (the model sees them in-turn; docs/contracts/events.md). The surface
+  installs the worker as in-flight immediately, without waiting on provenance
+  I/O. Until the worker reports that the initial `run.started + user.message`
+  admission is durable and Core has atomically opened that exact run's queue
+  identity and group, the surface is explicitly not steering-capable and a
+  submit is refused with a clear notice while its text remains in the
+  composer. Processing that worker report opens the steering affordance
+  asynchronously, after which the user can submit the retained text as
+  steering. Render, Escape, and composer editing must remain available while
+  admission waits on compaction or fsync; no queue mode is guessed in the
+  startup window, and an explicitly selected steering enqueue is never
+  reinterpreted by Core.
+  A completed
   no-tool response is a boundary too: if steering arrived while its final
   text streamed, the worker stays active and dispatches the hydrated stack in
-  the next model request. Escape pauses absorption and preserves the whole
-  group. An explicit empty-submit continue dispatches its head and hydrates
-  the contiguous siblings FIFO before that replacement turn's first model
-  call. Dispatch reserves the head without removing it; only the durable
-  initial `user.message` acknowledges the reservation. An append failure or
-  an already-latched context stop leaves every queued row intact. After
-  provenance is repaired, retry reuses the retained event identity and accepts
-  the head exactly once on both the live bus and durable log, including when
-  the failed sync left a complete physical line behind. Row identity includes
-  the queue instance as well as the row sequence, so another queue's
-  same-shaped reservation cannot claim or acknowledge it. The pending owner is
+  the next model request. Escape pauses absorption while cancellation wins;
+  terminal admission then cancels every undelivered steering row for that
+  exact run before recording `run.terminal`. Cancelled steering is never
+  silently rebound as a follow-up or replacement run. An explicit empty-submit
+  continue dispatches only a pending follow-up head. Dispatch reserves the
+  head without removing it; only the durable
+  initial `user.message` acknowledges the reservation. An append failure
+  leaves that exact reserved follow-up row intact. A latched context stop does
+  not auto-flush pending follow-ups; terminal admission still cancels the
+  ended run's steering rows as described above. After provenance is repaired,
+  retry reuses the retained event identity and accepts the head exactly once
+  on both the live bus and durable log, including when
+  the failed sync left a complete physical line behind. A globally unique
+  queue-row ULID is the complete identity, so another queue's same-shaped row
+  has a different id and cannot claim or acknowledge it. The pending owner is
   installed before an older accepted backlog is flushed; a backlog failure
   therefore protects the same row as a candidate failure. While that admission
   remains unresolved, `/new`, `/resume`, and queue clear refuse to detach or
-  discard it. Mid-turn absorption uses the same admission transaction without
+  discard it. More generally, `/new` and `/resume` reconcile the accepted feed
+  and refuse while admission, enqueue, replace/cancel, terminal, or scrub
+  persistence is active, waiting for writer order, or retained for retry.
+  Invalid accepted lifecycle state is reopen-only and also blocks replacement.
+  An ambiguous child-authored companion/reviewer append is likewise
+  restart-only: auto-flush and deferred extension/companion dispatch leave
+  their queues untouched, and the UI must tell the user to stop and restart
+  Euler before reopening the session. In-process `/new` or `/resume` cannot
+  bypass that authoritative fence.
+  During an accepted replacement, cloned submitters remain fenced from the
+  old-session clear through the state swap and durable bind of the new session;
+  only then may input reopen. One live Session cannot install a second queue
+  object, and ordinary bind cannot move one queue to a different
+  writer/session/agent owner; only the lifecycle-transition guard authorizes
+  that owner swap. Bind and queued-dispatch canonicalization are transactional:
+  an authority mismatch or missing reserved row leaves the queue's entries,
+  reservation, and current authority unchanged. If bind fails before the app
+  swaps session state, dropping the transition reopens the still-current,
+  durably cleared old owner. If authority or app-state replacement may already
+  have occurred, failure stays closed rather than falling back to a detached
+  writer.
+  Mid-turn absorption uses the same admission transaction without
   holding the queue lock during persistence. The queue
   hydrates each accepted steering row at the next model-round boundary; it
   never waits for a later tool round when a boundary is already available.
@@ -443,6 +480,41 @@ the model canvas. A completed response follows the ordinary
 cross-actor, and child checkpoints render no assistant prose; transcript and
 resume share the same core-owned protocol fold.
 
+Pending queue state is a private projection of canonical `queue.*` events,
+not transcript history. `queue.enqueued` and `queue.replaced` content may be
+shown only in the dedicated queued-composer surface; `run.*` and `queue.*`
+events do not produce ledger rows or assistant/user prose. The content enters
+the ledger only through the `user.message` accepted in its delivery batch.
+Interactive enqueue and cancel persistence runs on one serialized background
+boundary, never on the terminal event loop. Rendering, composer editing, and
+Escape remain live while it saves. Distinct rapid submits stage in request
+order, leave the composer free for the next draft, and appear only as labelled
+`saving` rows until each append is reconciled. They are not acknowledged as
+durable queue rows. The visible queue applies staged positions to the last
+reconciled canonical snapshot, so a worker commit cannot duplicate a row or
+move a front insertion only after acknowledgment. A failed staged draft
+returns to its owning composer in request order; cancellation of an approval
+preserves an unaccepted denial draft, and a repeated cancellation of the same
+stable row is refused. Orderly shutdown waits within its cleanup bound for
+staged mutations. After a timeout it stays open; after a failed enqueue it
+keeps the typed error and refuses every shutdown attempt until the restored
+draft is resubmitted or explicitly cleared. It never discards process-private
+accepted input merely because quit was requested again.
+Session replacement waits for staged mutations as well as core queue writes,
+so an accepted worker command cannot cross into the replacement session.
+Unqueue, clear, and replace must persist their lifecycle events before changing
+the displayed queue. A persistence failure leaves the row and selection intact
+and surfaces the typed operation error; it must not create a hidden durable
+item or an optimistic edit that resume would reverse.
+
+Queued-turn dispatch canonicalizes the reserved row against the newly bound
+durable projection before using its text anywhere. Composer history, ledger
+projection, and the model prompt are populated only from that returned
+canonical row. Once that dispatch is installed, the Session core ignores any
+detached caller-supplied prompt and refreshes the reservation from queue
+authority again at admission. A scrub between binding and admission therefore
+cannot let a pre-scrub queue clone briefly reveal or submit stale content.
+
 ## Activity and thinking
 
 The pinned Activity block has one deterministic, replayable projection of the
@@ -528,7 +600,9 @@ reserved for the approval panel):
 Visible terminal activity is **not** automatically part of the next model
 canvas. The canvas assembler decides what matters for the next model action
 (ADR 0002). Queued input, denials, recaps, and UI toggles must not leak into
-canvas except through canonical events and canvas policy.
+canvas except through canonical events and canvas policy. In particular,
+pending `queue.enqueued`/`queue.replaced` content is excluded; only its
+delivered canonical `user.message` is eligible.
 
 ## Provider reasoning
 

@@ -30,7 +30,7 @@ impl ProvenanceWriter {
         agent: &str,
     ) -> io::Result<ScrubReport> {
         let mut append_state = recover_mutex(&self.append_lock);
-        if append_state.unresolved_append.is_some() {
+        if append_state.pending_append.is_some() {
             return Err(unresolved_append_fence());
         }
         let raw_len = match fs::metadata(&self.log_path) {
@@ -99,12 +99,14 @@ impl ProvenanceWriter {
         let audit = EventEnvelope::new(
             session_id,
             agent,
-            append_state.durable_tail.clone(),
+            append_state.parent_frontier.clone(),
             EventKind::new(EventKind::SECRET_SCRUBBED),
             scrub_audit_payload(secrets.len(), &pass.report),
         );
         pass.report.audit_event_id = Some(audit.id.clone());
-        self.append_locked(&mut append_state, std::slice::from_ref(&audit))?;
+        let generation = self.append_locked(&mut append_state, std::slice::from_ref(&audit))?;
+        self.publish_accepted(generation, vec![audit]);
+        drop(append_state);
         Ok(pass.report)
     }
 
@@ -131,6 +133,13 @@ impl ProvenanceWriter {
         if replacements > 0 {
             pass.report.replacements += replacements;
             changed = true;
+            // A redacted value may have appeared in a non-runtime `session.start`
+            // field (e.g. the recorded root). Keep the stored projection digest
+            // in sync with this writer-owned, audited rewrite so the session
+            // does not become permanently Invalid.
+            if event.kind.as_str() == EventKind::SESSION_START {
+                crate::runtime_identity::resync_session_start_projection_digest(&mut event.payload);
+            }
         }
 
         let mut response_content_bytes = if event.kind.as_str()

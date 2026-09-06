@@ -248,6 +248,9 @@ impl AppCore {
     /// detected in tool-call arguments this session (the ones the exposure
     /// warning flagged); an explicit value scrubs exactly that string.
     pub(super) fn scrub_current_session(&mut self, value: Option<String>) -> CoreEffect {
+        if self.queue_mutations.has_pending() {
+            return self.notice_item("scrub waits for the queued-input save to finish".to_owned());
+        }
         let secrets = match (&self.state, value) {
             (AppState::Idle { .. }, Some(value)) => vec![value],
             (AppState::Idle { session }, None) => session.scrub_candidates().to_vec(),

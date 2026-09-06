@@ -3,6 +3,7 @@ use euler_event::{object, EventEnvelope, EventKind};
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use ulid::Ulid;
 
 #[test]
 fn session_store_refresh_metadata_projects_failed_status_from_terminal_error() {
@@ -189,6 +190,83 @@ fn session_store_error_model_result_projects_failed_status() {
     assert_eq!(metadata_status(record.session_json_path()), Some("failed"));
 }
 
+#[test]
+fn canonical_failed_terminal_projects_failed_without_a_legacy_error() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    append_session_events(
+        record.events_path(),
+        &canonical_run(record.id(), "failed", &[]),
+    );
+
+    let refreshed = store
+        .refresh_session_metadata(record.id())
+        .expect("refresh metadata");
+    assert_eq!(refreshed.status(), SessionStatus::Failed);
+}
+
+#[test]
+fn canonical_cancelled_or_interrupted_terminal_clears_preceding_failure_noise() {
+    for status in ["cancelled", "interrupted"] {
+        let (_temp, store) = test_store();
+        let record = store.create_session().expect("session");
+        let error = run_error(record.id(), "provider stopped before terminal");
+        append_session_events(
+            record.events_path(),
+            &canonical_run(record.id(), status, &[error]),
+        );
+
+        let refreshed = store
+            .refresh_session_metadata(record.id())
+            .expect("refresh metadata");
+        assert_eq!(refreshed.status(), SessionStatus::Active, "{status}");
+    }
+}
+
+#[test]
+fn canonical_completed_terminal_ignores_a_late_captured_async_error() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let compaction_call = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::MODEL_CALL,
+        object([("purpose", "compaction".into())]),
+    );
+    let call_id = compaction_call.id.clone();
+    let events = canonical_run(record.id(), "completed", &[compaction_call]);
+    let origin_run = events[0].run.clone().expect("canonical run id");
+    let mut late_error = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::ERROR,
+        object([
+            ("source", "provider".into()),
+            ("purpose", "compaction".into()),
+            ("message", "late shadow failure".into()),
+        ]),
+    )
+    .with_run(origin_run);
+    late_error.parent = Some(call_id);
+    append_session_events(record.events_path(), &events);
+    ProvenanceWriter::new(record.events_path())
+        .expect("writer")
+        .append(std::slice::from_ref(&late_error))
+        .expect("append captured semantic completion");
+
+    let refreshed = store
+        .refresh_session_metadata(record.id())
+        .expect("refresh metadata");
+    assert_eq!(
+        refreshed.status(),
+        SessionStatus::Active,
+        "{}",
+        refreshed.invalid_reason().unwrap_or("no invalid reason")
+    );
+}
+
 fn test_store() -> (tempfile::TempDir, SessionStore) {
     let temp = tempfile::tempdir().expect("temp dir");
     let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
@@ -202,7 +280,56 @@ fn append_session_error(log: &Path, session_id: &str) {
 
 fn append_session_events(log: &Path, events: &[EventEnvelope]) {
     let writer = ProvenanceWriter::new(log).expect("writer");
-    writer.append(events).expect("append");
+    writer
+        .append_parented(|_| events.to_vec())
+        .expect("append writer-linear fixture");
+}
+
+fn canonical_run(session_id: &str, status: &str, between: &[EventEnvelope]) -> Vec<EventEnvelope> {
+    let run_id = Ulid::new().to_string();
+    let mut events = vec![
+        EventEnvelope::new(
+            session_id.to_owned(),
+            "store-agent",
+            None,
+            EventKind::RUN_STARTED,
+            object([("trigger", "direct".into())]),
+        )
+        .with_run(run_id.clone()),
+        EventEnvelope::new(
+            session_id.to_owned(),
+            "store-agent",
+            None,
+            EventKind::USER_MESSAGE,
+            object([("content", "run".into())]),
+        )
+        .with_run(run_id.clone()),
+    ];
+    events.extend(between.iter().cloned().map(|mut event| {
+        event.run = Some(run_id.clone());
+        event
+    }));
+    events.push(
+        EventEnvelope::new(
+            session_id.to_owned(),
+            "store-agent",
+            None,
+            EventKind::RUN_TERMINAL,
+            object([("status", status.into())]),
+        )
+        .with_run(run_id),
+    );
+    events
+}
+
+fn run_error(session_id: &str, message: &str) -> EventEnvelope {
+    EventEnvelope::new(
+        session_id.to_owned(),
+        "store-agent",
+        None,
+        EventKind::ERROR,
+        object([("source", "provider".into()), ("message", message.into())]),
+    )
 }
 
 fn session_error(session_id: &str) -> EventEnvelope {

@@ -285,6 +285,182 @@ fn core_gated() -> (AppCore, Gate) {
 }
 
 #[derive(Default)]
+struct RoundGateState {
+    calls_started: usize,
+    calls_released: usize,
+}
+
+#[derive(Clone, Default)]
+struct RoundGate {
+    state: Arc<(Mutex<RoundGateState>, Condvar)>,
+}
+
+impl RoundGate {
+    fn enter(&self) -> usize {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().expect("round gate lock");
+        state.calls_started += 1;
+        let call = state.calls_started;
+        changed.notify_all();
+        while state.calls_released < call {
+            state = changed.wait(state).expect("round gate wait");
+        }
+        call
+    }
+
+    fn wait_for_call(&self, call: usize) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().expect("round gate lock");
+        while state.calls_started < call {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(!remaining.is_zero(), "model call {call} never started");
+            let (next, timeout) = changed
+                .wait_timeout(state, remaining)
+                .expect("round gate wait");
+            state = next;
+            assert!(
+                !timeout.timed_out() || state.calls_started >= call,
+                "model call {call} never started"
+            );
+        }
+    }
+
+    fn release(&self, call: usize) {
+        let (state, changed) = &*self.state;
+        let mut state = state.lock().expect("round gate lock");
+        state.calls_released = state.calls_released.max(call);
+        changed.notify_all();
+    }
+}
+
+struct TwoRoundGateProvider {
+    gate: RoundGate,
+}
+
+impl ModelProvider for TwoRoundGateProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(&self, _request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        let call = self.gate.enter();
+        let events = if call == 1 {
+            vec![
+                Ok(ModelStreamEvent::ToolCall(ToolCall {
+                    id: "read-before-next-round".to_owned(),
+                    name: "read_file".to_owned(),
+                    input: json!({"path": "note.txt"}),
+                })),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::ToolUse,
+                    usage: None,
+                }),
+            ]
+        } else {
+            vec![
+                Ok(ModelStreamEvent::TextDelta("done".to_owned())),
+                Ok(ModelStreamEvent::Finished {
+                    stop_reason: StopReason::Completed,
+                    usage: None,
+                }),
+            ]
+        };
+        Ok(Box::new(events.into_iter()))
+    }
+}
+
+#[cfg(unix)]
+fn durable_fake_turn_core(temp: &Path) -> (AppCore, PathBuf, Sender<TurnEvent>, Arc<AtomicBool>) {
+    let events_path = temp.join("events.jsonl");
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(temp);
+    config.session_id = "queue-ui-persistence-test".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(&events_path).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    let queue = Arc::clone(&core.queued_inputs);
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("test session must start idle");
+    };
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind durable queue");
+    let seed = queue
+        .push_follow_up_back("seed ledger".to_owned())
+        .expect("seed provenance bytes");
+    queue.cancel(&seed).expect("clear seed row");
+
+    let (worker_tx, worker_rx) = mpsc::channel();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+    core.in_flight_label = Some("companion run".to_owned());
+    core.in_flight_cancellable = true;
+    (core, events_path, worker_tx, interrupt_flag)
+}
+
+#[cfg(unix)]
+fn replace_log_with_fifo(path: &Path) -> Vec<u8> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let original = std::fs::read(path).expect("read original ledger");
+    std::fs::remove_file(path).expect("remove ledger before fifo");
+    let path = CString::new(path.as_os_str().as_bytes()).expect("fifo path");
+    // SAFETY: `path` is a NUL-terminated copy of the test temp path and the
+    // mode contains only ordinary owner read/write bits.
+    let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+    assert_eq!(result, 0, "create provenance fifo");
+    original
+}
+
+#[cfg(unix)]
+fn wait_for_queue_write(core: &AppCore) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !core.queued_inputs.has_unresolved_authoritative_write() {
+        assert!(
+            Instant::now() < deadline,
+            "queue worker never entered provenance append"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(unix)]
+fn fail_fifo_append_and_restore(core: &mut AppCore, path: &Path, original: &[u8]) {
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .expect("release blocked fifo writer");
+    wait_for_queue_mutation(core);
+    drop(reader);
+    std::fs::remove_file(path).expect("remove fifo");
+    std::fs::write(path, original).expect("restore original ledger");
+}
+
+fn wait_for_model_call(core: &mut AppCore) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        core.drain_background();
+        if core
+            .transcript
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::MODEL_CALL)
+        {
+            return;
+        }
+        assert!(Instant::now() < deadline, "driver never reached model.call");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[derive(Default)]
 struct CompactionRaceFlags {
     shadow_started: bool,
     shadow_released: bool,
@@ -552,6 +728,19 @@ fn submit_text_and_wait(core: &mut AppCore, text: &str) {
 fn submit_without_wait(core: &mut AppCore, text: &str) {
     type_text(core, text);
     core.handle_input(key(KeyCode::Enter));
+    wait_for_queue_mutation(core);
+}
+
+fn wait_for_queue_mutation(core: &mut AppCore) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while core.queue_mutations.has_pending() {
+        core.drain_background();
+        assert!(
+            Instant::now() < deadline,
+            "queue persistence did not complete"
+        );
+        std::thread::yield_now();
+    }
 }
 
 fn user_messages(core: &AppCore) -> Vec<String> {
@@ -631,18 +820,653 @@ fn diff_preview(old: &str, new: &str) -> PatchPreview {
 }
 
 #[test]
-fn submit_starts_in_flight_and_second_submit_queues() {
-    let mut core = core();
+fn immediate_second_submit_is_retained_until_steering_is_ready() {
+    let (mut core, gate) = core_gated();
     core.handle_input(key(KeyCode::Char('h')));
     core.handle_input(key(KeyCode::Enter));
     assert!(core.turn_in_flight());
+    assert!(!core.model_turn_steering_ready);
 
     core.handle_input(key(KeyCode::Char('q')));
     core.handle_input(key(KeyCode::Enter));
 
+    assert_eq!(core.notice.as_deref(), Some(TURN_STARTING_NOTICE));
+    assert!(core.queued_inputs.is_empty());
+    assert_eq!(core.bottom.composer().submit_text(), "q");
+
+    wait_for_model_call(&mut core);
+    assert!(core.model_turn_steering_ready);
+    assert!(
+        core.notice.is_none(),
+        "durable admission clears the transient startup notice"
+    );
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_queue_mutation(&mut core);
+
     assert!(core.notice.is_none());
     assert_eq!(core.queued_inputs.snapshot(), ["q"]);
+    assert_eq!(
+        core.queued_inputs.metadata_snapshot().rows()[0].mode(),
+        euler_core::QueueMode::Steering,
+        "retained input becomes steering only after the durable admission marker is processed"
+    );
     assert_eq!(core.bottom.composer().submit_text(), "");
+    gate.open();
+    wait_for_idle(&mut core);
+    assert_eq!(user_messages(&core), ["h", "q"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn blocked_enqueue_keeps_render_edit_escape_and_exact_retry_live() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (mut core, events_path, _worker_tx, interrupt_flag) = durable_fake_turn_core(temp.path());
+    let original_log = replace_log_with_fifo(&events_path);
+
+    type_text(&mut core, "persist once");
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    wait_for_queue_write(&core);
+
+    assert!(core.queue_mutations.has_pending());
+    assert!(
+        core.queued_inputs.is_empty(),
+        "row is not hidden optimistically"
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "");
+    assert!(core
+        .queued_composer_lines()
+        .iter()
+        .any(|line| line.saving && line.text == "persist once"));
+    assert!(!core.visual_canvas_frame(80).active_frame_lines().is_empty());
+
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('!'))),
+        CoreEffect::Render
+    );
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert!(
+        core.queue_mutations.has_pending(),
+        "the distinct second draft is staged behind the blocked append"
+    );
+    assert_eq!(
+        core.queue_mutations
+            .pending_enqueues()
+            .into_iter()
+            .map(|pending| pending.content)
+            .collect::<Vec<_>>(),
+        ["persist once", "!"]
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "");
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+
+    fail_fifo_append_and_restore(&mut core, &events_path, &original_log);
+
+    assert!(core.queued_inputs.is_empty());
+    assert_eq!(core.bottom.composer().submit_text(), "persist once\n!");
+    assert!(!core.queue_mutations.has_pending());
+    assert!(core.queued_inputs.has_unresolved_authoritative_write());
+    assert!(core
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.starts_with("queue input failed:")));
+
+    core.queued_inputs
+        .retry_unresolved_enqueue()
+        .expect("retry exact enqueue")
+        .expect("failed enqueue retained");
+    assert_eq!(core.queued_inputs.snapshot(), ["persist once"]);
+    let events = read_resume_prefix(&events_path).expect("read restored provenance");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::QUEUE_ENQUEUED
+                    && event.payload.get("content") == Some(&json!("persist once"))
+            })
+            .count(),
+        1,
+        "the exact retry cannot duplicate the failed first append"
+    );
+    assert!(events.iter().all(|event| {
+        event.kind.as_str() != EventKind::QUEUE_ENQUEUED
+            || event.payload.get("content") != Some(&json!("!"))
+    }));
+}
+
+#[cfg(unix)]
+#[test]
+fn blocked_unqueue_keeps_row_and_cancels_the_original_stable_id() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (mut core, events_path, _worker_tx, _interrupt_flag) = durable_fake_turn_core(temp.path());
+    let target_id = core
+        .queued_inputs
+        .push_follow_up_back("target".to_owned())
+        .expect("target row");
+    let successor_id = core
+        .queued_inputs
+        .push_follow_up_back("successor".to_owned())
+        .expect("successor row");
+    core.queued_selection = Some(target_id.clone());
+    let original_log = replace_log_with_fifo(&events_path);
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    wait_for_queue_write(&core);
+    assert_eq!(core.queued_inputs.snapshot(), ["target", "successor"]);
+
+    assert_eq!(core.handle_input(key(KeyCode::Right)), CoreEffect::Render);
+    assert_eq!(
+        core.queued_selection.as_deref(),
+        Some(successor_id.as_str())
+    );
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('x'))),
+        CoreEffect::Render
+    );
+
+    fail_fifo_append_and_restore(&mut core, &events_path, &original_log);
+
+    assert_eq!(core.queued_inputs.snapshot(), ["target", "successor"]);
+    assert_eq!(
+        core.queued_selection.as_deref(),
+        Some(successor_id.as_str())
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "x");
+    assert!(!core.queue_mutations.has_pending());
+    assert!(core.queued_inputs.has_unresolved_authoritative_write());
+    assert!(core
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.starts_with("unqueue failed:")));
+
+    assert!(core
+        .queued_inputs
+        .retry_unresolved_change()
+        .expect("retry exact cancellation"));
+    let snapshot = core.queued_inputs.metadata_snapshot();
+    assert_eq!(snapshot.rows().len(), 1);
+    assert_eq!(snapshot.rows()[0].queue_id(), successor_id);
+    assert_eq!(snapshot.rows()[0].content(), "successor");
+    let events = read_resume_prefix(&events_path).expect("read restored provenance");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.kind.as_str() == EventKind::QUEUE_CANCELLED
+                    && event.payload.get("queue_id") == Some(&json!(target_id))
+            })
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn deny_instruction_waits_for_durable_enqueue_and_survives_failure() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (mut core, events_path, _worker_tx, _interrupt_flag) = durable_fake_turn_core(temp.path());
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.open_permission_modal(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    ));
+    type_text(&mut core, "wait");
+    let original_log = replace_log_with_fifo(&events_path);
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    wait_for_queue_write(&core);
+    assert!(reply_rx.try_recv().is_err(), "reply waits for persistence");
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+    assert_eq!(core.bottom.composer().submit_text(), "");
+    assert!(core
+        .queued_composer_lines()
+        .iter()
+        .any(|line| line.saving && line.text == "wait"));
+    assert!(core.queued_inputs.is_empty());
+
+    for _ in 0..4 {
+        assert_eq!(
+            core.handle_input(key(KeyCode::Backspace)),
+            CoreEffect::Render
+        );
+    }
+    assert_eq!(core.bottom.composer().submit_text(), "");
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('y'))),
+        CoreEffect::Render
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "y");
+    assert!(reply_rx.try_recv().is_err(), "allow hotkey stays fenced");
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    assert_eq!(core.notice.as_deref(), Some(DENY_INSTRUCTION_SAVING_NOTICE));
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert!(
+        reply_rx.try_recv().is_err(),
+        "duplicate escape cannot reply"
+    );
+
+    fail_fifo_append_and_restore(&mut core, &events_path, &original_log);
+
+    assert!(reply_rx.try_recv().is_err(), "failed enqueue cannot deny");
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+    assert_eq!(core.bottom.composer().submit_text(), "wait\ny");
+    assert!(core.queued_inputs.is_empty());
+    assert!(!core.queue_mutations.has_pending());
+    assert!(core.queued_inputs.has_unresolved_authoritative_write());
+
+    core.queued_inputs
+        .retry_unresolved_enqueue()
+        .expect("retry exact instruction")
+        .expect("failed instruction retained");
+    assert_eq!(core.queued_inputs.snapshot(), ["wait"]);
+    assert!(
+        reply_rx.try_recv().is_err(),
+        "recovery cannot invent a UI reply"
+    );
+}
+
+#[test]
+fn successful_enqueue_clears_only_the_unchanged_composer() {
+    let mut core = core();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.in_flight_label = Some("companion run".to_owned());
+
+    type_text(&mut core, "original");
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('!'))),
+        CoreEffect::Render
+    );
+    core.notice = Some("newer turn notice".to_owned());
+    wait_for_queue_mutation(&mut core);
+
+    assert_eq!(core.queued_inputs.snapshot(), ["original"]);
+    assert_eq!(core.bottom.composer().submit_text(), "!");
+    assert_eq!(core.notice.as_deref(), Some("newer turn notice"));
+}
+
+#[test]
+fn rapid_distinct_submits_stage_and_persist_in_request_order() {
+    let mut core = core();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.in_flight_label = Some("companion run".to_owned());
+
+    for text in ["one", "two", "three"] {
+        type_text(&mut core, text);
+        assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+        assert_eq!(core.bottom.composer().submit_text(), "");
+    }
+    assert_eq!(
+        core.queue_mutations
+            .pending_enqueues()
+            .into_iter()
+            .map(|pending| pending.content)
+            .collect::<Vec<_>>(),
+        ["one", "two", "three"]
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while core.queued_inputs.len() != 3 {
+        assert!(Instant::now() < deadline, "worker did not commit batch");
+        std::thread::yield_now();
+    }
+    let first = loop {
+        if let Some(completion) = core.queue_mutations.try_complete() {
+            break completion;
+        }
+        assert!(Instant::now() < deadline, "first result was not published");
+        std::thread::yield_now();
+    };
+    assert!(!core.finish_queue_mutation(first));
+    let projected = core.queued_composer_lines();
+    assert_eq!(
+        projected
+            .iter()
+            .map(|line| (line.text.as_str(), line.saving))
+            .collect::<Vec<_>>(),
+        [("one", false), ("two", true), ("three", true)],
+        "a reconciled prefix stays visible while later requests are saving"
+    );
+
+    wait_for_queue_mutation(&mut core);
+    assert_eq!(core.queued_inputs.snapshot(), ["one", "two", "three"]);
+}
+
+#[test]
+fn committed_front_enqueue_remains_one_saving_row_until_reconciled() {
+    let mut core = core();
+    core.queued_inputs
+        .push_follow_up_back("durable row".to_owned())
+        .expect("seed durable row");
+    let content: Arc<str> = Arc::from("front instruction");
+    core.start_queue_enqueue(
+        QueuePosition::Front,
+        Arc::clone(&content),
+        QueueMutationIntent::ComposerSubmit { original: content },
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while core.queued_inputs.len() != 2 {
+        assert!(Instant::now() < deadline, "worker did not commit enqueue");
+        std::thread::yield_now();
+    }
+    let lines = core.queued_composer_lines();
+    assert_eq!(lines.len(), 2, "committed pending row must not duplicate");
+    assert_eq!(lines[0].text, "front instruction");
+    assert!(lines[0].saving);
+    assert_eq!(lines[0].position, 1);
+    assert_eq!(lines[0].total, 2);
+    assert_eq!(lines[1].text, "durable row");
+    assert!(!lines[1].saving);
+
+    wait_for_queue_mutation(&mut core);
+    assert_eq!(
+        core.queued_inputs.snapshot(),
+        ["front instruction", "durable row"]
+    );
+}
+
+#[test]
+fn scrub_waits_until_the_ui_queue_projection_is_reconciled() {
+    let mut core = core();
+    let secret = "SECRET-pending-cancel";
+    let queue_id = core
+        .queued_inputs
+        .push_follow_up_back(format!("remove {secret}"))
+        .expect("seed row");
+    core.queued_selection = Some(queue_id);
+
+    core.unqueue_selected_input();
+    assert!(core.queue_mutations.has_pending());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !core.queued_inputs.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "worker did not commit the cancellation"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        core.queue_mutations.has_pending(),
+        "the cancellation result must remain unreconciled"
+    );
+    assert_eq!(
+        core.scrub_current_session(Some(secret.to_owned())),
+        CoreEffect::Render
+    );
+    assert!(drain_finalized_visual_text(&mut core, 80)
+        .contains("scrub waits for the queued-input save to finish"));
+
+    wait_for_queue_mutation(&mut core);
+}
+
+#[test]
+fn staged_queue_command_fences_session_replacement_before_worker_entry() {
+    let mut core = core();
+    let worker_queue = Arc::new(euler_core::SteeringQueue::default());
+    let content: Arc<str> = Arc::from("belongs to this session");
+    core.queue_mutations
+        .start(
+            worker_queue,
+            QueueMutation::Enqueue {
+                mode: QueueMode::FollowUp,
+                expected_run_id: None,
+                position: QueuePosition::Back,
+                content: Arc::clone(&content),
+            },
+            QueueMutationIntent::ComposerSubmit { original: content },
+        )
+        .expect("stage queue command");
+
+    assert!(
+        core.unresolved_authoritative_write_blocks_lifecycle()
+            .expect("inspect lifecycle fence"),
+        "the UI command is authoritative even before its worker enters the core queue"
+    );
+    wait_for_queue_mutation(&mut core);
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_refuses_to_discard_a_failed_staged_draft() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (mut core, events_path, _worker_tx, _interrupt_flag) = durable_fake_turn_core(temp.path());
+    let original_log = std::fs::read(&events_path).expect("read original ledger");
+    std::fs::remove_file(&events_path).expect("remove ledger");
+    std::fs::create_dir(&events_path).expect("replace ledger with directory");
+
+    type_text(&mut core, "must survive");
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert!(core.queue_mutations.has_pending());
+
+    assert!(
+        !core.prepare_for_shutdown(),
+        "failed persistence must keep the UI open"
+    );
+    assert!(!core.queue_mutations.has_pending());
+    assert_eq!(core.bottom.composer().submit_text(), "must survive");
+    assert!(core.queued_inputs.has_unresolved_authoritative_write());
+    assert!(core.queue_failure_recovery_required);
+    assert!(core
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.contains("draft restored")));
+    let typed_failure = core.notice.clone();
+    core.note_incomplete_shutdown();
+    assert_eq!(
+        core.notice, typed_failure,
+        "typed failure must not be hidden"
+    );
+
+    core.notice = Some("newer unrelated notice".to_owned());
+    assert!(
+        !core.prepare_for_shutdown(),
+        "a second quit attempt must not discard the restored draft"
+    );
+    core.note_incomplete_shutdown();
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("queue input was not saved · draft restored; resubmit it or clear it before quitting")
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "must survive");
+
+    std::fs::remove_dir(&events_path).expect("remove invalid ledger directory");
+    std::fs::write(&events_path, original_log).expect("restore original ledger");
+
+    core.bottom.replace_composer_text("");
+    core.state = AppState::Empty;
+    assert!(
+        core.prepare_for_shutdown(),
+        "clearing the restored draft explicitly abandons it"
+    );
+    assert!(!core.queue_failure_recovery_required);
+}
+
+#[cfg(unix)]
+#[test]
+fn permission_cancellation_preserves_a_failed_deny_instruction() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (mut core, events_path, _worker_tx, _interrupt_flag) = durable_fake_turn_core(temp.path());
+    let cancellation = euler_sdk::CancellationSource::new();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    type_text(&mut core, "pre-ask");
+    core.open_permission_envelope(PermissionPromptEnvelope {
+        prompt: PermissionPrompt::Request(PermissionRequest::new(
+            Capability::ShellExec,
+            "tool run_shell".to_owned(),
+        )),
+        cancellation: cancellation.token(),
+        reply_tx,
+    });
+    type_text(&mut core, "wait");
+    let original_log = replace_log_with_fifo(&events_path);
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    wait_for_queue_write(&core);
+    type_text(&mut core, "!");
+    fail_fifo_append_and_restore(&mut core, &events_path, &original_log);
+    assert_eq!(core.bottom.composer().submit_text(), "wait\n!");
+
+    cancellation.cancel();
+    assert!(core.drain_permissions());
+    assert!(core.modal.is_none());
+    assert_eq!(core.bottom.composer().submit_text(), "wait\n!\npre-ask");
+    assert!(
+        reply_rx.try_recv().is_err(),
+        "cancellation must not invent a denial reply"
+    );
+}
+
+#[test]
+fn successful_deny_instruction_preserves_edits_made_while_saving() {
+    let mut core = core();
+    let (reply_tx, reply_rx) = mpsc::channel();
+    core.reply_tx = reply_tx;
+    core.bottom.composer_mut().insert_text("pre-ask");
+    core.open_permission_modal(PermissionRequest::new(
+        Capability::ShellExec,
+        "tool run_shell".to_owned(),
+    ));
+    type_text(&mut core, "wait");
+
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('!'))),
+        CoreEffect::Render
+    );
+    wait_for_queue_mutation(&mut core);
+
+    assert_eq!(
+        reply_rx.recv().expect("deny reply"),
+        PermissionReply::DenyWithInstruction("wait".to_owned())
+    );
+    assert_eq!(core.queued_inputs.snapshot(), ["wait"]);
+    assert_eq!(core.bottom.composer().submit_text(), "pre-ask\n!");
+}
+
+#[test]
+fn delayed_deny_instruction_never_replies_to_a_replacement_prompt() {
+    let mut core = core();
+    let (original_tx, original_rx) = mpsc::channel();
+    core.reply_tx = original_tx;
+    core.open_permission_modal(PermissionRequest::new(
+        Capability::ShellExec,
+        "first prompt".to_owned(),
+    ));
+    type_text(&mut core, "wait");
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    assert!(core.queue_mutations.has_pending());
+
+    core.modal = None;
+    let (replacement_tx, replacement_rx) = mpsc::channel();
+    core.reply_tx = replacement_tx;
+    core.open_permission_modal(PermissionRequest::new(
+        Capability::ShellExec,
+        "replacement prompt".to_owned(),
+    ));
+    wait_for_queue_mutation(&mut core);
+
+    assert!(original_rx.try_recv().is_err());
+    assert!(replacement_rx.try_recv().is_err());
+    assert!(matches!(core.modal, Some(Modal::Permission(_))));
+    assert_eq!(core.queued_inputs.snapshot(), ["wait"]);
+}
+
+#[test]
+fn absorbed_selection_is_refreshed_without_unqueuing_its_successor() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join("note.txt"), "evidence\n").expect("write fixture");
+    let gate = RoundGate::default();
+    let provider = TwoRoundGateProvider { gate: gate.clone() };
+    let mut core = TestCore::builder()
+        .provider(provider)
+        .root(temp.path())
+        .build();
+    submit_without_wait(&mut core, "active");
+    wait_for_model_call(&mut core);
+    gate.wait_for_call(1);
+
+    let absorbed_id = core
+        .queued_inputs
+        .push_steering_back("absorb me".to_owned())
+        .expect("steering row");
+    let successor_id = core
+        .queued_inputs
+        .push_follow_up_back("keep successor".to_owned())
+        .expect("follow-up row");
+    core.queued_selection = Some(absorbed_id);
+
+    gate.release(1);
+    gate.wait_for_call(2);
+    assert_eq!(core.queued_inputs.snapshot(), ["keep successor"]);
+
+    assert_eq!(
+        core.handle_input(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+        CoreEffect::Render
+    );
+    assert!(!core.queue_mutations.has_pending());
+    assert_eq!(
+        core.queued_selection.as_deref(),
+        Some(successor_id.as_str())
+    );
+    assert_eq!(core.queued_inputs.snapshot(), ["keep successor"]);
+
+    core.handle_input(key(KeyCode::Esc));
+    gate.release(2);
+    wait_for_idle(&mut core);
+    assert_eq!(core.queued_inputs.snapshot(), ["keep successor"]);
+    core.queued_inputs
+        .cancel(&successor_id)
+        .expect("clean up successor");
+}
+
+#[test]
+fn pre_admission_worker_keeps_render_interrupt_and_composer_available() {
+    let mut core = core();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+    core.in_flight_label = Some(MODEL_TURN_IN_FLIGHT_LABEL.to_owned());
+    core.in_flight_cancellable = true;
+    core.model_turn_steering_ready = false;
+
+    type_text(&mut core, "retain while admission is slow");
+    assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    assert!(core.queued_inputs.is_empty());
+    assert_eq!(
+        core.bottom.composer().submit_text(),
+        "retain while admission is slow"
+    );
+    assert_eq!(core.notice.as_deref(), Some(TURN_STARTING_NOTICE));
+    assert!(!core.visual_canvas_frame(80).active_frame_lines().is_empty());
+    assert_eq!(core.handle_interrupt(), CoreEffect::Render);
+    assert!(interrupt_flag.load(Ordering::SeqCst));
 }
 
 #[test]
@@ -1043,14 +1867,12 @@ fn escape_clears_an_active_turn_compaction_request_without_starting_a_shadow() {
 #[test]
 fn queued_steer_preview_is_visual_only() {
     let full = "Right but don't mention anywhere in any doc that we're not mentioning other services or other products.";
-    let mut core = core();
-    let (_tx, worker_rx) = mpsc::channel();
-    core.state = AppState::TurnInFlight {
-        worker_rx,
-        interrupt_flag: Arc::new(AtomicBool::new(false)),
-        started_at: Instant::now(),
-    };
-    core.queued_inputs.push_steering_back(full.to_owned());
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "active");
+    wait_for_model_call(&mut core);
+    core.queued_inputs
+        .push_steering_back(full.to_owned())
+        .expect("queue steering preview");
 
     let queued_line = core
         .visual_canvas_frame(120)
@@ -1065,6 +1887,8 @@ fn queued_steer_preview_is_visual_only() {
         "▌ 1/1 Right but don't mention anywhere in any doc that we're not ..."
     );
     assert_eq!(core.queued_inputs.snapshot(), [full]);
+    gate.open();
+    wait_for_idle(&mut core);
 }
 
 #[test]
@@ -1085,6 +1909,7 @@ fn active_skill_command_queues_through_the_steering_path() {
         }),
         CoreEffect::Render
     );
+    wait_for_queue_mutation(&mut core);
 
     assert_eq!(core.queued_inputs.snapshot(), ["/skill:review check tests"]);
 }
@@ -1093,6 +1918,7 @@ fn active_skill_command_queues_through_the_steering_path() {
 fn queued_inputs_auto_flush_fifo_after_normal_completion() {
     let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "first");
+    wait_for_model_call(&mut core);
     submit_without_wait(&mut core, "second");
     submit_without_wait(&mut core, "third");
 
@@ -1116,8 +1942,12 @@ fn queued_leftovers_run_as_their_own_turns() {
     // spawns must never fold into that turn's request. Each must flush as its
     // own turn: user → its model.call, three times.
     let (mut core, gate) = core_gated();
-    core.queued_inputs.push_follow_up_back("second".to_owned());
-    core.queued_inputs.push_follow_up_back("third".to_owned());
+    core.queued_inputs
+        .push_follow_up_back("second".to_owned())
+        .expect("queue second turn");
+    core.queued_inputs
+        .push_follow_up_back("third".to_owned())
+        .expect("queue third turn");
     submit_without_wait(&mut core, "first");
 
     gate.open();
@@ -1151,7 +1981,7 @@ fn queued_leftovers_run_as_their_own_turns() {
 }
 
 #[test]
-fn context_stopped_turn_preserves_three_queued_inputs_without_auto_flush() {
+fn context_stopped_turn_cancels_three_pending_steers_without_auto_flush() {
     let response = FixtureResponse::Stream(vec![
         ScriptedStreamStep::SleepMs(500),
         ScriptedStreamStep::Event(ModelStreamEvent::TextDelta("at limit".to_owned())),
@@ -1202,24 +2032,33 @@ fn context_stopped_turn_preserves_three_queued_inputs_without_auto_flush() {
     submit_without_wait(&mut core, "queued one");
     submit_without_wait(&mut core, "queued two");
     submit_without_wait(&mut core, "queued three");
+    core.pending_runs
+        .push_back(PendingRunRequest::Companion(CompanionRunRequest {
+            task: AgentTask::new("deferred review", "reviewer", "fixture", "echo").expect("task"),
+        }));
     wait_for_idle(&mut core);
 
     assert_eq!(user_messages(&core), ["active"]);
-    assert_eq!(
-        core.queued_inputs.snapshot(),
-        ["queued one", "queued two", "queued three"],
-        "a context latch must not reserve or drain auto-flush work"
+    assert!(
+        core.queued_inputs.is_empty(),
+        "terminal steering must not survive its owning run or be rebound as follow-up work"
     );
     let AppState::Idle { session } = &core.state else {
         panic!("context-stopped worker must return its session");
     };
     assert!(!session.can_accept_turn());
+    assert_eq!(
+        core.pending_runs.len(),
+        1,
+        "authoritative dispatch fences must not consume deferred companion work"
+    );
 }
 
 #[test]
 fn composer_input_during_non_model_work_is_an_ordinary_follow_up() {
     let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "active");
+    wait_for_model_call(&mut core);
     // A companion/extension worker shares the TurnInFlight shell but is not
     // a steerable model turn. Its composer input must not inherit the active
     // model-turn group merely because the queue still remembers that group.
@@ -1234,9 +2073,10 @@ fn composer_input_during_non_model_work_is_an_ordinary_follow_up() {
 }
 
 #[test]
-fn interrupt_keeps_queue_until_user_continues() {
+fn interrupt_cancels_pending_steering_before_empty_submit() {
     let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "first");
+    wait_for_model_call(&mut core);
     submit_without_wait(&mut core, "queued");
 
     core.handle_input(key(KeyCode::Esc));
@@ -1245,26 +2085,22 @@ fn interrupt_keeps_queue_until_user_continues() {
     gate.open();
     wait_for_idle(&mut core);
 
-    assert_eq!(core.queued_inputs.snapshot(), ["queued"]);
+    assert!(core.queued_inputs.is_empty());
     assert_eq!(user_messages(&core), ["first"]);
 
     core.handle_input(key(KeyCode::Enter));
     wait_for_idle(&mut core);
 
-    assert_eq!(user_messages(&core), ["first", "queued"]);
+    assert_eq!(user_messages(&core), ["first"]);
 }
 
 #[test]
-fn interrupt_then_continue_hydrates_the_whole_pending_steer_stack() {
-    // The reported TUI session showed three numbered pending steers after an
-    // interrupt. Continuing popped only the first; the old steering
-    // generation then made the two siblings stale, so each waited for a later
-    // turn.
-    // An interrupt must preserve the stack, and the explicit continue must
-    // rebind that one stack to the replacement turn without touching ordinary
-    // follow-up entries.
+fn interrupt_cancels_the_whole_pending_steer_stack() {
+    // Steering belongs to one exact run. Once interruption terminalizes that
+    // run, none of its pending rows may be rebound as replacement turns.
     let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "active");
+    wait_for_model_call(&mut core);
     submit_without_wait(&mut core, "steer one");
     submit_without_wait(&mut core, "steer two");
     submit_without_wait(&mut core, "steer three");
@@ -1273,54 +2109,14 @@ fn interrupt_then_continue_hydrates_the_whole_pending_steer_stack() {
     gate.open();
     wait_for_idle(&mut core);
 
-    assert_eq!(
-        core.queued_inputs.snapshot(),
-        ["steer one", "steer two", "steer three"]
-    );
+    assert!(core.queued_inputs.is_empty());
     assert_eq!(user_messages(&core), ["active"]);
 
     core.handle_input(key(KeyCode::Enter));
     wait_for_idle(&mut core);
 
-    assert_eq!(
-        user_messages(&core),
-        ["active", "steer one", "steer two", "steer three"]
-    );
+    assert_eq!(user_messages(&core), ["active"]);
     assert!(core.queued_inputs.is_empty());
-    let user_and_calls: Vec<(&str, Option<&str>)> = core
-        .transcript
-        .events()
-        .iter()
-        .filter_map(|event| match event.kind.as_str() {
-            EventKind::MODEL_CALL => Some((EventKind::MODEL_CALL, None)),
-            EventKind::USER_MESSAGE => Some((
-                EventKind::USER_MESSAGE,
-                event
-                    .payload
-                    .get("content")
-                    .and_then(serde_json::Value::as_str),
-            )),
-            _ => None,
-        })
-        .collect();
-    // Depending on whether the worker crossed the durable request boundary
-    // before Escape, the cancelled turn may already have a model.call. The
-    // replacement invariant begins with the first preserved steer.
-    let replacement_turn = user_and_calls
-        .iter()
-        .position(|entry| *entry == (EventKind::USER_MESSAGE, Some("steer one")))
-        .map(|index| &user_and_calls[index..])
-        .expect("replacement turn contains the first preserved steer");
-    assert_eq!(
-        replacement_turn,
-        [
-            (EventKind::USER_MESSAGE, Some("steer one")),
-            (EventKind::USER_MESSAGE, Some("steer two")),
-            (EventKind::USER_MESSAGE, Some("steer three")),
-            (EventKind::MODEL_CALL, None),
-        ],
-        "the replacement turn must receive the preserved stack before its first model call"
-    );
 }
 
 #[test]
@@ -1332,16 +2128,20 @@ fn queued_input_recall_and_unqueue_use_selected_or_last() {
     // in-flight AppState and steering queue stable with no timing assumption.
     let (mut core, gate) = core_gated();
     submit_without_wait(&mut core, "active");
+    wait_for_model_call(&mut core);
     submit_without_wait(&mut core, "one");
     submit_without_wait(&mut core, "two");
 
     assert_eq!(core.handle_input(key(KeyCode::Up)), CoreEffect::Render);
+    wait_for_queue_mutation(&mut core);
     assert_eq!(core.bottom.composer().submit_text(), "two");
     assert_eq!(core.queued_inputs.snapshot(), ["one"]);
 
     core.handle_input(key(KeyCode::Enter));
+    wait_for_queue_mutation(&mut core);
     type_text(&mut core, "three");
     core.handle_input(key(KeyCode::Enter));
+    wait_for_queue_mutation(&mut core);
     assert_eq!(core.queued_inputs.snapshot(), ["one", "two", "three"]);
 
     core.handle_input(key(KeyCode::Left));
@@ -1349,6 +2149,7 @@ fn queued_input_recall_and_unqueue_use_selected_or_last() {
         core.handle_input(modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL)),
         CoreEffect::Render
     );
+    wait_for_queue_mutation(&mut core);
     assert_eq!(core.queued_inputs.snapshot(), ["one", "three"]);
 
     // Release the parked turn so the worker thread finishes rather than leaking.
@@ -2103,6 +2904,7 @@ fn composer_accepts_next_draft_edits_while_turn_is_in_flight() {
     assert_eq!(core.bottom.composer().submit_text(), "next\ndraft");
     assert!(core.turn_in_flight());
     assert_eq!(core.handle_input(key(KeyCode::Enter)), CoreEffect::Render);
+    wait_for_queue_mutation(&mut core);
     assert!(core.notice.is_none());
     assert_eq!(core.queued_inputs.snapshot(), ["next\ndraft"]);
     assert_eq!(core.bottom.composer().submit_text(), "");
@@ -3453,6 +4255,200 @@ fn new_session_reuses_target_and_purges_visual_history() {
         .line
         .plain_text()
         .ends_with("echo(medium) · ctx 0%"));
+
+    let new_session_id = session.session_id().to_owned();
+    core.queued_inputs
+        .push_follow_up_back("owned by new session".to_owned())
+        .expect("enqueue after /new");
+    let record = store
+        .find_session(&new_session_id)
+        .expect("find new session")
+        .expect("new session record");
+    assert!(euler_core::read_provenance(record.events_path())
+        .expect("new session events")
+        .iter()
+        .any(|event| {
+            event.kind.as_str() == EventKind::QUEUE_ENQUEUED
+                && event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("owned by new session")
+        }));
+}
+
+fn stored_core_with_pending_follow_up(
+    workspace: &std::path::Path,
+    store: &SessionStore,
+    content: &str,
+) -> (AppCore, String, PathBuf, String) {
+    let record = store.create_session().expect("session record");
+    let session_id = record.id().to_owned();
+    let events_path = record.events_path().to_path_buf();
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(workspace);
+    config.session_id = session_id.clone();
+    config.agent_id = "tui-test".to_owned();
+    config.model = "echo".to_owned();
+    let session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(&events_path).expect("writer"));
+    let mut core = AppCore::new(session, channels);
+    core.session_store = Some(store.clone());
+    let queue = Arc::clone(&core.queued_inputs);
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("stored test session must be idle");
+    };
+    session
+        .set_steering_queue(queue)
+        .expect("bind durable queue");
+    let queue_id = core
+        .queued_inputs
+        .push_follow_up_back(content.to_owned())
+        .expect("persist queued follow-up");
+    (core, session_id, events_path, queue_id)
+}
+
+fn create_stored_resume_target(
+    workspace: &std::path::Path,
+    store: &SessionStore,
+    pending_content: Option<&str>,
+) -> (String, Option<String>) {
+    let record = store.create_session().expect("resume target record");
+    let session_id = record.id().to_owned();
+    let (decider, _channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(workspace);
+    config.session_id = session_id.clone();
+    config.agent_id = "root".to_owned();
+    config.model = "echo".to_owned();
+    let mut session = Session::new(config, EchoProvider, decider).with_provenance(
+        ProvenanceWriter::new(record.events_path()).expect("resume target writer"),
+    );
+    let queue = Arc::new(euler_core::SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("persist resume target bootstrap");
+    let queue_id = pending_content.map(|content| {
+        queue
+            .push_follow_up_back(content.to_owned())
+            .expect("persist target follow-up")
+    });
+    (session_id, queue_id)
+}
+
+fn assert_user_queue_cancellation(events_path: &std::path::Path, queue_id: &str) {
+    let events = read_resume_prefix(events_path).expect("read old session events");
+    assert!(events.iter().any(|event| {
+        event.kind.as_str() == EventKind::QUEUE_CANCELLED
+            && event.payload.get("queue_id") == Some(&json!(queue_id))
+            && event.payload.get("reason") == Some(&json!("user"))
+    }));
+}
+
+#[test]
+fn new_session_durably_cancels_old_queue_before_replacement() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::new(EulerHome::from_root(temp.path().join(".euler")).expect("home"))
+        .expect("store");
+    let workspace = std::env::current_dir().expect("workspace");
+    let (mut core, old_session_id, old_events_path, queue_id) =
+        stored_core_with_pending_follow_up(&workspace, &store, "cancel before new");
+
+    assert_eq!(
+        core.start_new_session(),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("new session must be idle");
+    };
+    assert_ne!(session.session_id(), old_session_id);
+    assert!(core.queued_inputs.is_empty());
+    assert_user_queue_cancellation(&old_events_path, &queue_id);
+}
+
+#[test]
+fn new_session_clear_failure_keeps_old_session_and_queue_visible() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::new(EulerHome::from_root(temp.path().join(".euler")).expect("home"))
+        .expect("store");
+    let workspace = std::env::current_dir().expect("workspace");
+    let (mut core, old_session_id, old_events_path, _queue_id) =
+        stored_core_with_pending_follow_up(&workspace, &store, "preserve after failed new");
+    std::fs::remove_file(&old_events_path).expect("remove old ledger");
+    std::fs::create_dir(&old_events_path).expect("make append fail");
+
+    assert_eq!(core.start_new_session(), CoreEffect::Render);
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("failed new must keep the old session");
+    };
+    assert_eq!(session.session_id(), old_session_id);
+    assert_eq!(core.queued_inputs.snapshot(), ["preserve after failed new"]);
+    assert!(core.queued_inputs.has_unresolved_authoritative_write());
+    let text = drain_finalized_visual_text(&mut core, 120);
+    assert!(text.contains("new session failed: queued input persistence failed"));
+    assert!(!text.contains("new session ") || text.contains("new session failed:"));
+}
+
+#[test]
+fn resume_cancels_old_queue_then_rehydrates_target_rows_on_binding() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::new(EulerHome::from_root(temp.path().join(".euler")).expect("home"))
+        .expect("store");
+    let workspace = std::env::current_dir().expect("workspace");
+    let (mut core, _old_session_id, old_events_path, old_queue_id) =
+        stored_core_with_pending_follow_up(&workspace, &store, "cancel before resume");
+    let (target_session_id, target_queue_id) =
+        create_stored_resume_target(&workspace, &store, Some("target pending row"));
+
+    assert_eq!(
+        core.resume_session_from_picker(target_session_id.clone()),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+
+    assert_user_queue_cancellation(&old_events_path, &old_queue_id);
+    let AppState::Idle { session } = &core.state else {
+        panic!("resumed session must be idle");
+    };
+    assert_eq!(session.session_id(), target_session_id);
+    assert_eq!(core.queued_inputs.snapshot(), ["target pending row"]);
+    assert_eq!(
+        core.queued_inputs
+            .reserve_front_for_dispatch()
+            .expect("rehydrated target row")
+            .queue_id(),
+        target_queue_id.expect("target queue id")
+    );
+}
+
+#[test]
+fn resume_clear_failure_keeps_old_session_and_queue_visible() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let store = SessionStore::new(EulerHome::from_root(temp.path().join(".euler")).expect("home"))
+        .expect("store");
+    let workspace = std::env::current_dir().expect("workspace");
+    let (mut core, old_session_id, old_events_path, _queue_id) =
+        stored_core_with_pending_follow_up(&workspace, &store, "preserve after failed resume");
+    let (target_session_id, _) = create_stored_resume_target(&workspace, &store, None);
+    std::fs::remove_file(&old_events_path).expect("remove old ledger");
+    std::fs::create_dir(&old_events_path).expect("make append fail");
+
+    assert_eq!(
+        core.resume_session_from_picker(target_session_id),
+        CoreEffect::Render
+    );
+
+    let AppState::Idle { session } = &core.state else {
+        panic!("failed resume must keep the old session");
+    };
+    assert_eq!(session.session_id(), old_session_id);
+    assert_eq!(
+        core.queued_inputs.snapshot(),
+        ["preserve after failed resume"]
+    );
+    assert!(core.queued_inputs.has_unresolved_authoritative_write());
+    let text = drain_finalized_visual_text(&mut core, 120);
+    assert!(text.contains("resume failed: queued input persistence failed"));
 }
 
 #[test]
@@ -3470,16 +4466,23 @@ fn new_and_resume_refuse_to_orphan_an_unresolved_queued_admission() {
     let mut core = AppCore::new(session, channels);
     core.session_store = Some(store);
     let original_session_id = record.id().to_owned();
+    let queue = Arc::clone(&core.queued_inputs);
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("test session must be idle");
+    };
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind durable queue before enqueue");
 
     core.queued_inputs
-        .push_follow_up_back("must survive".to_owned());
+        .push_follow_up_back("must survive".to_owned())
+        .expect("queue retained turn");
     let input = core
         .queued_inputs
         .reserve_front_for_dispatch()
         .expect("queued row");
     std::fs::remove_file(&events_path).expect("remove provenance file");
     std::fs::create_dir(&events_path).expect("block provenance path");
-    let queue = Arc::clone(&core.queued_inputs);
     let AppState::Idle { session } = &mut core.state else {
         panic!("test session must be idle");
     };
@@ -3501,8 +4504,72 @@ fn new_and_resume_refuse_to_orphan_an_unresolved_queued_admission() {
     assert!(session.has_unresolved_admission());
     assert_eq!(core.queued_inputs.snapshot(), ["must survive"]);
     let text = drain_finalized_visual_text(&mut core, 100);
-    assert!(text.contains("new session waits for the unresolved queued input admission"));
-    assert!(text.contains("resume waits for the unresolved queued input admission"));
+    assert!(text.contains("new session waits for an unresolved authoritative session write"));
+    assert!(text.contains("resume waits for an unresolved authoritative session write"));
+}
+
+#[test]
+fn queued_dispatch_canonicalizes_scrubbed_content_before_history_or_model_use() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("queued-dispatch-scrub.jsonl");
+    let secret = "stale-ui-queue-secret".to_owned();
+    let mut config = euler_core::SessionConfig::new(temp.path());
+    config.session_id = "queued-dispatch-scrub".to_owned();
+    config.provider = "echo".to_owned();
+    let (decider, channels) = TuiDecider::new();
+    let mut session = Session::new(config, EchoProvider, decider)
+        .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(euler_core::SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    queue
+        .push_follow_up_back(format!("continue with {secret}"))
+        .expect("durable follow-up");
+    session
+        .pending_queue_inputs()
+        .expect("reconcile durable queue row");
+    let stale_input = queue
+        .reserve_front_for_dispatch()
+        .expect("reserve pre-scrub row");
+    session
+        .scrub_live(std::slice::from_ref(&secret))
+        .expect("scrub durable queue row");
+    assert_eq!(
+        stale_input.content(),
+        format!("continue with {secret}"),
+        "the already-cloned surface input demonstrates stale pre-scrub bytes"
+    );
+    assert_eq!(queue.snapshot(), ["continue with [scrubbed]"]);
+
+    let mut core = AppCore::new(session, channels);
+    core.queued_inputs = queue;
+    let session = core.take_idle_session();
+    core.spawn_queued_turn(stale_input, session);
+    wait_for_idle(&mut core);
+
+    core.handle_input(key(KeyCode::Up));
+    assert_eq!(
+        core.bottom.composer().submit_text(),
+        "continue with [scrubbed]",
+        "submission history is populated only after durable canonicalization"
+    );
+    assert!(core.transcript.events().iter().all(|event| {
+        !serde_json::to_string(event)
+            .expect("serialize transcript event")
+            .contains(&secret)
+    }));
+    let AppState::Idle { session } = &core.state else {
+        panic!("queued turn must finish");
+    };
+    assert!(session.events().iter().all(|event| {
+        !serde_json::to_string(event)
+            .expect("serialize session event")
+            .contains(&secret)
+    }));
+    let rendered = drain_finalized_visual_text(&mut core, 100);
+    assert!(!rendered.contains(&secret));
+    assert!(rendered.contains("continue with [scrubbed]"));
 }
 
 #[test]
@@ -4112,6 +5179,77 @@ fn accepting_resume_purges_prior_native_scrollback() {
         text.contains("1 events replayed · model context folded to stubs"),
         "text: {text}"
     );
+}
+
+#[test]
+fn accepting_resume_rebinds_queue_writer_before_submissions_reopen() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let old_log = temp.path().join("old.jsonl");
+    let new_log = temp.path().join("new.jsonl");
+    let (old_decider, old_channels) = TuiDecider::new();
+    let mut old_config = euler_core::SessionConfig::new(temp.path());
+    old_config.session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9A".to_owned();
+    old_config.model = "echo".to_owned();
+    let old_session = Session::new(old_config, EchoProvider, old_decider)
+        .with_provenance(ProvenanceWriter::new(&old_log).expect("old writer"));
+    let mut core = AppCore::new(old_session, old_channels);
+    let old_queue = Arc::clone(&core.queued_inputs);
+    let AppState::Idle { session } = &mut core.state else {
+        panic!("old session is idle");
+    };
+    session
+        .set_steering_queue(old_queue)
+        .expect("bind old queue owner");
+
+    let (new_decider, new_channels) = TuiDecider::new();
+    let new_session_id = "01KW3Q6NN5A9R6E2EWZ7M3QW9B".to_owned();
+    let mut new_config = euler_core::SessionConfig::new(temp.path());
+    new_config.session_id.clone_from(&new_session_id);
+    new_config.model = "echo".to_owned();
+    let new_session = Session::new(new_config, EchoProvider, new_decider)
+        .with_provenance(ProvenanceWriter::new(&new_log).expect("new writer"));
+    let new_events = new_session.events().to_vec();
+
+    assert_eq!(
+        core.accept_tui_resume(
+            new_session_id,
+            TuiResume {
+                session: new_session,
+                channels: new_channels,
+                events: new_events,
+                active_target: ModelTarget::new("fixture", "echo"),
+                display_label: "new owner".to_owned(),
+                session_name: None,
+                recovery_closure_appended: false,
+                warning_count: 0,
+                events_replayed: 1,
+            },
+        ),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    core.queued_inputs
+        .push_follow_up_back("new owner only".to_owned())
+        .expect("enqueue after resume");
+
+    assert!(euler_core::read_provenance(&old_log)
+        .expect("old events")
+        .iter()
+        .all(|event| event
+            .payload
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            != Some("new owner only")));
+    assert!(euler_core::read_provenance(&new_log)
+        .expect("new events")
+        .iter()
+        .any(|event| {
+            event.kind.as_str() == EventKind::QUEUE_ENQUEUED
+                && event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("new owner only")
+        }));
 }
 
 #[test]
@@ -5341,14 +6479,9 @@ fn interrupted_live_status_replaces_working_affordance() {
 
 #[test]
 fn interrupt_clears_queued_activities_but_preserves_user_input() {
-    let mut core = core();
-    let (_tx, worker_rx) = mpsc::channel();
-    let interrupt_flag = Arc::new(AtomicBool::new(false));
-    core.state = AppState::TurnInFlight {
-        worker_rx,
-        interrupt_flag: Arc::clone(&interrupt_flag),
-        started_at: Instant::now(),
-    };
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "active");
+    wait_for_model_call(&mut core);
     let request = CompanionRunRequest {
         task: AgentTask::new("review", "reviewer", "fixture", "echo").expect("task"),
     };
@@ -5357,10 +6490,14 @@ fn interrupt_clears_queued_activities_but_preserves_user_input() {
     core.pending_runs
         .push_back(PendingRunRequest::Companion(request));
     core.queued_inputs
-        .push_steering_back("keep this steer".to_owned());
+        .push_steering_back("keep this steer".to_owned())
+        .expect("queue retained steering");
 
     assert_eq!(core.handle_interrupt(), CoreEffect::Render);
 
+    let AppState::TurnInFlight { interrupt_flag, .. } = &core.state else {
+        panic!("gated model turn must remain in flight");
+    };
     assert!(interrupt_flag.load(Ordering::SeqCst));
     assert!(core.pending_runs.is_empty());
     assert_eq!(core.queued_inputs.snapshot(), ["keep this steer"]);
@@ -5369,6 +6506,8 @@ fn interrupt_clears_queued_activities_but_preserves_user_input() {
         finalized.contains("interrupt cleared 2 queued activities"),
         "{finalized}"
     );
+    gate.open();
+    wait_for_idle(&mut core);
 }
 
 #[test]

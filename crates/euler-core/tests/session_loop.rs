@@ -7,9 +7,9 @@ use euler_core::{
     assemble_canvas, fold_model_target, fold_reasoning_effort, runtime_identity_from_events,
     AutoCompactionPolicy, CanvasItem, CompactionTier, ContextLimitConfig, GrantScope, ModelTarget,
     ProvenanceWriter, ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope,
-    ReasoningEffort, RecordedRuntimeIdentity, RuntimeIdentity, ScopePattern, Session,
-    SessionConfig, SessionError, SteeringQueue, ToolRegistry, WorkingStateProjection,
-    RUNTIME_IDENTITY_SCHEMA_VERSION,
+    QueueCancellationReason, ReasoningEffort, RecordedRuntimeIdentity, RuntimeIdentity,
+    ScopePattern, Session, SessionConfig, SessionError, SteeringQueue, ToolRegistry,
+    WorkingStateProjection, RUNTIME_IDENTITY_SCHEMA_VERSION,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::{
@@ -5858,7 +5858,9 @@ struct SteeringOnAskDecider {
 
 impl PermissionDecider for SteeringOnAskDecider {
     fn decide(&mut self, _request: &PermissionRequest) -> DeciderVerdict {
-        self.queue.push_steering_back(self.content.to_owned());
+        self.queue
+            .push_steering_back(self.content.to_owned())
+            .expect("queue input");
         DeciderVerdict::Allow
     }
 }
@@ -5896,7 +5898,9 @@ fn steering_pushed_mid_round_lands_in_the_next_rounds_request() {
             content: "steer: summarize instead",
         },
     );
-    session.set_steering_queue(Arc::clone(&queue));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
 
     session.run_turn("run the sort").expect("turn");
 
@@ -5966,16 +5970,24 @@ fn stacked_steering_during_a_no_tool_response_continues_before_turn_completion()
         provider,
         ScriptedDecider::new(vec![]),
     );
-    session.set_steering_queue(Arc::clone(&queue));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
     let queued = AtomicBool::new(false);
 
     session
         .run_turn_with_sink("start", Arc::new(AtomicBool::new(false)), |event| {
             if event.kind.as_str() == EventKind::MODEL_DELTA && !queued.swap(true, Ordering::SeqCst)
             {
-                queue.push_steering_back("steer one".to_owned());
-                queue.push_steering_back("steer two".to_owned());
-                queue.push_steering_back("steer three".to_owned());
+                queue
+                    .push_steering_back("steer one".to_owned())
+                    .expect("queue input");
+                queue
+                    .push_steering_back("steer two".to_owned())
+                    .expect("queue input");
+                queue
+                    .push_steering_back("steer three".to_owned())
+                    .expect("queue input");
             }
         })
         .expect("steered turn");
@@ -6029,8 +6041,9 @@ fn stacked_steering_during_a_no_tool_response_continues_before_turn_completion()
 }
 
 #[test]
-fn terminal_round_limit_defers_steering_instead_of_persisting_unobservable_input() {
+fn terminal_round_limit_retains_unobservable_steering_for_recovery() {
     let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
     let requests = request_log();
     let provider = CapturingProvider::new(
         "fixture",
@@ -6040,15 +6053,20 @@ fn terminal_round_limit_defers_steering_instead_of_persisting_unobservable_input
     let queue = Arc::new(SteeringQueue::default());
     let mut config = SessionConfig::new(temp.path());
     config.max_tool_rounds = Some(1);
-    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
-    session.set_steering_queue(Arc::clone(&queue));
+    let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]))
+        .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
     let queued = AtomicBool::new(false);
 
     session
         .run_turn_with_sink("start", Arc::new(AtomicBool::new(false)), |event| {
             if event.kind.as_str() == EventKind::MODEL_DELTA && !queued.swap(true, Ordering::SeqCst)
             {
-                queue.push_steering_back("defer me".to_owned());
+                queue
+                    .push_steering_back("defer me".to_owned())
+                    .expect("queue input");
             }
         })
         .expect("terminal round");
@@ -6058,7 +6076,16 @@ fn terminal_round_limit_defers_steering_instead_of_persisting_unobservable_input
         1,
         "the explicit one-round budget allows exactly one request"
     );
-    assert_eq!(queue.snapshot(), ["defer me"]);
+    assert!(queue.is_empty());
+    let recoverable = session
+        .recoverable_queue_inputs()
+        .expect("reconcile recovery projection");
+    assert_eq!(recoverable.len(), 1);
+    assert_eq!(recoverable[0].content(), "defer me");
+    assert_eq!(
+        recoverable[0].reason(),
+        QueueCancellationReason::RunCompleted
+    );
     assert!(!session.events().iter().any(|event| {
         event.kind.as_str() == EventKind::USER_MESSAGE
             && payload_str(event, "content") == Some("defer me")
@@ -6091,13 +6118,21 @@ fn input_after_terminal_boundary_before_surface_done_is_a_follow_up() {
         provider,
         ScriptedDecider::new(vec![]),
     );
-    session.set_steering_queue(Arc::clone(&queue));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
     session.run_turn("first").expect("first turn");
 
     // Core has crossed the worker terminal transaction. In the TUI this is
-    // the window before the worker sends TurnDone back to the surface.
-    queue.push_steering_back("arrived before TurnDone".to_owned());
-    session.set_steering_queue(Arc::clone(&queue));
+    // the window before the worker sends TurnDone back to the surface. The
+    // host observes that cutoff and selects follow-up explicitly; core must
+    // not reinterpret a stale steering request after the race.
+    queue
+        .push_follow_up_back("arrived before TurnDone".to_owned())
+        .expect("queue input");
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
     session.run_turn("unrelated").expect("unrelated turn");
     assert_eq!(queue.snapshot(), ["arrived before TurnDone"]);
 
@@ -6119,8 +6154,9 @@ fn input_after_terminal_boundary_before_surface_done_is_a_follow_up() {
 }
 
 #[test]
-fn paused_steering_stays_queued_and_out_of_the_turn() {
+fn paused_steering_stays_out_of_the_turn_and_is_recoverable() {
     let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
     fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
     let requests = request_log();
     let provider = CapturingProvider::new(
@@ -6137,19 +6173,33 @@ fn paused_steering_stays_queued_and_out_of_the_turn() {
             queue: Arc::clone(&queue),
             content: "held for the next turn",
         },
-    );
-    session.set_steering_queue(Arc::clone(&queue));
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
 
     session.run_turn("run the sort").expect("turn");
 
-    // Paused: no mid-turn user.message, no request contamination, entry kept.
+    // Paused: no mid-turn user.message and no request contamination. The
+    // completed run's terminal transaction moves the input to explicit
+    // recovery state rather than leaving stale steering deliverable.
     assert!(!session.events().iter().any(|event| {
         event.kind.as_str() == EventKind::USER_MESSAGE
             && payload_str(event, "content") == Some("held for the next turn")
     }));
     let requests = request_log_guard(&requests);
     assert!(!requests[1].prompt_text().contains("held for the next turn"));
-    assert_eq!(queue.snapshot(), vec!["held for the next turn"]);
+    assert!(queue.is_empty());
+    let recoverable = session
+        .recoverable_queue_inputs()
+        .expect("reconcile recovery projection");
+    assert_eq!(recoverable.len(), 1);
+    assert_eq!(recoverable[0].content(), "held for the next turn");
+    assert_eq!(
+        recoverable[0].reason(),
+        QueueCancellationReason::RunCompleted
+    );
 }
 
 #[test]
@@ -6165,14 +6215,20 @@ fn steering_queued_before_the_turn_stays_out_of_it_for_its_own_turn() {
         requests.clone(),
     );
     let queue = Arc::new(SteeringQueue::default());
-    queue.push_follow_up_back("leftover b".to_owned());
-    queue.push_follow_up_back("leftover c".to_owned());
+    queue
+        .push_follow_up_back("leftover b".to_owned())
+        .expect("queue input");
+    queue
+        .push_follow_up_back("leftover c".to_owned())
+        .expect("queue input");
     let mut session = Session::new(
         SessionConfig::new(temp.path()),
         provider,
         ScriptedDecider::new(vec![]),
     );
-    session.set_steering_queue(Arc::clone(&queue));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
 
     session.run_turn("turn a").expect("turn a");
 
@@ -6215,18 +6271,20 @@ impl PermissionDecider for SteerThenCancelDecider {
         self.queue.set_paused(true);
         self.cancel_flag.store(true, Ordering::SeqCst);
         self.queue
-            .push_steering_back("typed just before escape".to_owned());
+            .push_steering_back("typed just before escape".to_owned())
+            .expect("queue input");
         DeciderVerdict::Allow
     }
 }
 
 #[test]
-fn interrupt_wins_over_absorption_and_keeps_steering_queued() {
+fn interrupt_wins_over_absorption_and_retains_recoverable_steering() {
     // Review blocker (PR #147): once cancellation is published, the round
     // loop must not absorb queued steering — interrupted input stays with
     // the user. The loop checks the flag before absorbing, and absorption
     // itself re-checks it.
     let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
     fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
     let requests = request_log();
     let provider = CapturingProvider::new(
@@ -6243,15 +6301,46 @@ fn interrupt_wins_over_absorption_and_keeps_steering_queued() {
             queue: Arc::clone(&queue),
             cancel_flag: Arc::clone(&cancel_flag),
         },
-    );
-    session.set_steering_queue(Arc::clone(&queue));
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("queue setup");
 
-    let result = session.run_turn_with_sink("run the sort", cancel_flag, |_| {});
+    let mut streamed_kinds = Vec::new();
+    let result = session.run_turn_with_sink("run the sort", cancel_flag, |event| {
+        streamed_kinds.push(event.kind.as_str().to_owned());
+    });
 
     assert!(matches!(result, Err(SessionError::Cancelled)));
-    // The steering entry was preserved for the user, never absorbed into
-    // the dying turn.
-    assert_eq!(queue.snapshot(), vec!["typed just before escape"]);
+    // The steering entry was never absorbed into the dying turn. The
+    // terminal transaction removes it from the deliverable queue and keeps
+    // it in the explicit recovery projection for the surface.
+    assert!(queue.is_empty());
+    let recoverable = session
+        .recoverable_queue_inputs()
+        .expect("reconcile recovery projection");
+    assert_eq!(recoverable.len(), 1);
+    assert_eq!(recoverable[0].content(), "typed just before escape");
+    assert_eq!(
+        recoverable[0].reason(),
+        QueueCancellationReason::RunCancelled
+    );
+    let terminal_boundary = streamed_kinds
+        .iter()
+        .filter(|kind| {
+            matches!(
+                kind.as_str(),
+                EventKind::QUEUE_CANCELLED | EventKind::RUN_TERMINAL
+            )
+        })
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal_boundary,
+        [EventKind::QUEUE_CANCELLED, EventKind::RUN_TERMINAL],
+        "the event sink observes the accepted cancellation boundary even though the turn errors"
+    );
     assert!(!session.events().iter().any(|event| {
         event.kind.as_str() == EventKind::USER_MESSAGE
             && payload_str(event, "content") == Some("typed just before escape")

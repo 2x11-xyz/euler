@@ -69,6 +69,20 @@ impl EventKind {
     pub const SESSION_RESUMED: &'static str = "session.resumed";
     pub const SESSION_RENAMED: &'static str = "session.renamed";
     pub const SESSION_SUMMARY: &'static str = "session.summary";
+    /// Starts one product-level user run. The run identity lives on the
+    /// envelope's `run` field; the payload records only how it was admitted.
+    pub const RUN_STARTED: &'static str = "run.started";
+    /// The sole terminal event for a product-level user run. Its closed
+    /// `status` payload distinguishes completion, failure, cancellation, and
+    /// interruption without multiplying lifecycle event kinds.
+    pub const RUN_TERMINAL: &'static str = "run.terminal";
+    pub const QUEUE_ENQUEUED: &'static str = "queue.enqueued";
+    pub const QUEUE_REPLACED: &'static str = "queue.replaced";
+    pub const QUEUE_CANCELLED: &'static str = "queue.cancelled";
+    pub const QUEUE_DELIVERED: &'static str = "queue.delivered";
+    /// Explicitly resolves a terminal-cancelled private queue record by
+    /// dismissing it or linking it to a newly enqueued follow-up.
+    pub const QUEUE_RECOVERED: &'static str = "queue.recovered";
     /// Durable, versioned record of the effective project context for a
     /// fresh session (ADR 0017; docs/contracts/project-context.md). An
     /// admitted snapshot carries the canonical manifest as one top-level
@@ -126,6 +140,13 @@ impl EventKind {
         Self::SESSION_RESUMED,
         Self::SESSION_RENAMED,
         Self::SESSION_SUMMARY,
+        Self::RUN_STARTED,
+        Self::RUN_TERMINAL,
+        Self::QUEUE_ENQUEUED,
+        Self::QUEUE_REPLACED,
+        Self::QUEUE_CANCELLED,
+        Self::QUEUE_DELIVERED,
+        Self::QUEUE_RECOVERED,
         Self::PROJECT_CONTEXT_SNAPSHOT,
         Self::PROJECT_CONTEXT_DIAGNOSTIC,
         Self::PROJECT_CONTEXT_RELOCATED,
@@ -166,6 +187,10 @@ pub struct EventEnvelope {
     pub ts: String,
     pub session: String,
     pub agent: String,
+    /// Product-level user run attribution. Legacy events omit this field and
+    /// decode conservatively as run-less; omission is preserved on re-encode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
     pub parent: Option<String>,
     pub kind: EventKind,
     pub payload: JsonObject,
@@ -186,6 +211,7 @@ impl EventEnvelope {
             ts: now_rfc3339_millis(),
             session: session.into(),
             agent: agent.into(),
+            run: None,
             parent,
             kind: kind.into(),
             payload,
@@ -195,6 +221,12 @@ impl EventEnvelope {
 
     pub fn to_json_line(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
+    }
+
+    /// Attribute this event to one product-level user run.
+    pub fn with_run(mut self, run: impl Into<String>) -> Self {
+        self.run = Some(run.into());
+        self
     }
 
     pub fn from_json_line(line: &str) -> serde_json::Result<Self> {
@@ -482,6 +514,47 @@ mod tests {
             object([("summary", "done".into())]),
         );
         assert_round_trip(
+            EventKind::RUN_STARTED,
+            object([("trigger", "direct".into())]),
+        );
+        assert_round_trip(
+            EventKind::RUN_TERMINAL,
+            object([("status", "completed".into())]),
+        );
+        assert_round_trip(
+            EventKind::QUEUE_ENQUEUED,
+            object([
+                ("queue_id", "queue-1".into()),
+                ("mode", "follow_up".into()),
+                ("position", "back".into()),
+                ("content", "continue".into()),
+            ]),
+        );
+        assert_round_trip(
+            EventKind::QUEUE_REPLACED,
+            object([
+                ("queue_id", "queue-1".into()),
+                ("replacement_queue_id", "queue-2".into()),
+                ("mode", "follow_up".into()),
+                ("content", "continue differently".into()),
+            ]),
+        );
+        assert_round_trip(
+            EventKind::QUEUE_CANCELLED,
+            object([("queue_id", "queue-2".into())]),
+        );
+        assert_round_trip(
+            EventKind::QUEUE_DELIVERED,
+            object([("queue_id", "queue-3".into())]),
+        );
+        assert_round_trip(
+            EventKind::QUEUE_RECOVERED,
+            object([
+                ("queue_id", "queue-2".into()),
+                ("action", "dismissed".into()),
+            ]),
+        );
+        assert_round_trip(
             EventKind::PROJECT_CONTEXT_SNAPSHOT,
             object([
                 ("schema_version", 1.into()),
@@ -554,6 +627,13 @@ mod tests {
             EventKind::SESSION_RESUMED,
             EventKind::SESSION_RENAMED,
             EventKind::SESSION_SUMMARY,
+            EventKind::RUN_STARTED,
+            EventKind::RUN_TERMINAL,
+            EventKind::QUEUE_ENQUEUED,
+            EventKind::QUEUE_REPLACED,
+            EventKind::QUEUE_CANCELLED,
+            EventKind::QUEUE_DELIVERED,
+            EventKind::QUEUE_RECOVERED,
             EventKind::PROJECT_CONTEXT_SNAPSHOT,
             EventKind::PROJECT_CONTEXT_DIAGNOSTIC,
             EventKind::PROJECT_CONTEXT_RELOCATED,
@@ -579,6 +659,39 @@ mod tests {
         let actual = EventEnvelope::from_json_line(&json).expect("deserialize event");
         assert_eq!(actual, event);
         assert_eq!(actual.kind.as_str(), "future.kind");
+    }
+
+    #[test]
+    fn run_attribution_is_optional_and_round_trips_without_changing_legacy_json() {
+        let attributed = EventEnvelope::new(
+            "session",
+            "agent",
+            None,
+            EventKind::RUN_STARTED,
+            object([("trigger", "direct".into())]),
+        )
+        .with_run("01J00000000000000000000042");
+        let json = attributed
+            .to_json_line()
+            .expect("serialize attributed event");
+        let decoded = EventEnvelope::from_json_line(&json).expect("decode attributed event");
+        assert_eq!(decoded.run.as_deref(), Some("01J00000000000000000000042"));
+
+        let legacy = EventEnvelope::new(
+            "session",
+            "agent",
+            None,
+            EventKind::USER_MESSAGE,
+            object([("content", "legacy".into())]),
+        );
+        let legacy_json = legacy.to_json_line().expect("serialize legacy event");
+        assert!(!legacy_json.contains("\"run\""));
+        let decoded = EventEnvelope::from_json_line(&legacy_json).expect("decode legacy event");
+        assert_eq!(decoded.run, None);
+        assert_eq!(
+            decoded.to_json_line().expect("re-encode legacy"),
+            legacy_json
+        );
     }
 
     #[test]
@@ -819,6 +932,22 @@ mod tests {
                 json!({"name": "research branch"}),
             ),
             base(EventKind::SESSION_SUMMARY, json!({"summary": "done"})),
+            base(EventKind::RUN_STARTED, json!({"trigger": "direct"})),
+            base(EventKind::RUN_TERMINAL, json!({"status": "completed"})),
+            base(
+                EventKind::QUEUE_ENQUEUED,
+                json!({"queue_id": "queue-1", "mode": "follow_up", "position": "back", "content": "continue"}),
+            ),
+            base(
+                EventKind::QUEUE_REPLACED,
+                json!({"queue_id": "queue-1", "replacement_queue_id": "queue-2", "mode": "follow_up", "content": "continue differently"}),
+            ),
+            base(EventKind::QUEUE_CANCELLED, json!({"queue_id": "queue-2"})),
+            base(EventKind::QUEUE_DELIVERED, json!({"queue_id": "queue-3"})),
+            base(
+                EventKind::QUEUE_RECOVERED,
+                json!({"queue_id": "queue-2", "action": "dismissed"}),
+            ),
             base(
                 EventKind::PROJECT_CONTEXT_SNAPSHOT,
                 json!({
@@ -998,6 +1127,14 @@ mod tests {
             }
             EventKind::SESSION_START => vec!["provider", "model"],
             EventKind::SESSION_RENAMED => vec!["name"],
+            EventKind::RUN_STARTED => vec!["trigger"],
+            EventKind::RUN_TERMINAL => vec!["status"],
+            EventKind::QUEUE_ENQUEUED => vec!["queue_id", "mode", "position", "content"],
+            EventKind::QUEUE_REPLACED => {
+                vec!["queue_id", "replacement_queue_id", "mode", "content"]
+            }
+            EventKind::QUEUE_CANCELLED | EventKind::QUEUE_DELIVERED => vec!["queue_id"],
+            EventKind::QUEUE_RECOVERED => vec!["queue_id", "action"],
             EventKind::ERROR => vec!["source", "message"],
             _ => Vec::new(),
         };

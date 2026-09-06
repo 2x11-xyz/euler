@@ -5,8 +5,13 @@ use crate::home::{
 };
 use crate::provenance::accepted_prefix_lines;
 #[cfg(test)]
+use crate::provenance::event_advances_parent_frontier;
+#[cfg(test)]
 use crate::resume::read_resume_prefix;
 use crate::resume::read_resume_prefix_with_identity;
+use crate::session::run_lifecycle::{
+    fold_run_lifecycle, RunLifecycleProjection, RunTerminalStatus,
+};
 use crate::session_kind::SessionKind;
 use crate::session_name::session_name_for_display;
 #[cfg(test)]
@@ -205,7 +210,7 @@ impl SessionStore {
         let parent = events
             .iter()
             .rev()
-            .find(|event| event.kind.as_str() != EventKind::MODEL_DELTA)
+            .find(|event| event_advances_parent_frontier(event.kind.as_str()))
             .map(|event| event.id.clone());
         let event = session_renamed_event(
             record.id().to_owned(),
@@ -1090,9 +1095,18 @@ fn session_projection_from_events_or_sidecar(
             }
         }
     };
+    let lifecycle = match fold_run_lifecycle(&prefix.events) {
+        Ok(lifecycle) => lifecycle,
+        Err(error) => {
+            return ProjectedSession {
+                projection: SessionProjection::invalid(format!("invalid run lifecycle: {error}")),
+                key: None,
+            }
+        }
+    };
     ProjectedSession {
         projection: SessionProjection {
-            status: status_from_events(&prefix.events),
+            status: status_from_events(&prefix.events, &lifecycle),
             name: name_from_events(&prefix.events)
                 .or_else(|| sidecar_name.and_then(|name| session_name_for_display(&name))),
             title: title_from_events(&prefix.events),
@@ -1107,7 +1121,21 @@ fn session_projection_from_events_or_sidecar(
     }
 }
 
-fn status_from_events(events: &[euler_event::EventEnvelope]) -> SessionStatus {
+fn status_from_events(
+    events: &[euler_event::EventEnvelope],
+    lifecycle: &RunLifecycleProjection,
+) -> SessionStatus {
+    if lifecycle.open_runs().next().is_some() {
+        return SessionStatus::Active;
+    }
+    if let Some(status) = lifecycle.latest_terminal_status() {
+        return match status {
+            RunTerminalStatus::Failed => SessionStatus::Failed,
+            RunTerminalStatus::Completed
+            | RunTerminalStatus::Cancelled
+            | RunTerminalStatus::Interrupted => SessionStatus::Active,
+        };
+    }
     events
         .iter()
         .rev()

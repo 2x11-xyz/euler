@@ -1,8 +1,14 @@
 use crate::canvas::{AutoCompactionPolicy, CompactionTier};
 use crate::permissions::{permission_prompt_capabilities, ApprovalMode};
-use crate::provenance::{nul_offset_in_line, numbered_accepted_prefix_lines, ProvenanceWriter};
+use crate::provenance::{
+    event_advances_parent_frontier, nul_offset_in_line, numbered_accepted_prefix_lines,
+    ProvenanceWriter,
+};
 use crate::runtime_identity::{
     runtime_identity_from_events, RecordedRuntimeIdentity, RuntimeIdentityError,
+};
+use crate::session::run_lifecycle::{
+    fold_run_lifecycle, QueueCancellationReason, RunLifecycleProjection, RunTerminalStatus,
 };
 use crate::session::{
     event_terminalizes_model_call, fold_model_target, fold_reasoning_effort, ModelTarget, Session,
@@ -72,6 +78,19 @@ pub enum ResumeError {
     #[error("resume incompatible: duplicate event id in accepted provenance prefix")]
     DuplicateEventId,
     #[error(
+        "resume identity mismatch: configured {configured_session}/{configured_agent}, recorded {recorded_session}/{recorded_agent}"
+    )]
+    IdentityMismatch {
+        configured_session: String,
+        configured_agent: String,
+        recorded_session: String,
+        recorded_agent: String,
+    },
+    #[error("resume incompatible: folded prefix tail does not match the durable writer tail")]
+    WriterTailMismatch,
+    #[error("resume incompatible: supplied folded events do not match the durable writer prefix")]
+    FoldedPrefixMismatch,
+    #[error(
         "resume incompatible: terminal event {event_id} for agent {agent} matches multiple open \
          model calls"
     )]
@@ -85,6 +104,8 @@ pub enum ResumeError {
         call_id: String,
         agent: String,
     },
+    #[error("resume incompatible: synthesized recovery did not close every recoverable operation")]
+    IncompleteRecoveryCandidate,
     #[error("resume incompatible: missing provenance blob {hash} at {}", path.display())]
     MissingBlob { hash: String, path: PathBuf },
     #[error("resume incompatible: provenance blob hash mismatch for {hash} at {}", path.display())]
@@ -116,6 +137,14 @@ pub enum ResumeError {
     RuntimeIdentity(#[from] RuntimeIdentityError),
     #[error(transparent)]
     AssistantResponse(#[from] crate::assistant_response::AssistantResponseProtocolError),
+    #[error(transparent)]
+    RunLifecycle(Box<crate::session::RunLifecycleError>),
+}
+
+impl From<crate::session::RunLifecycleError> for ResumeError {
+    fn from(error: crate::session::RunLifecycleError) -> Self {
+        Self::RunLifecycle(Box::new(error))
+    }
 }
 
 /// Fold persisted session events into live core session state.
@@ -610,8 +639,24 @@ pub fn resume_session_from_folded_prefix<D>(
     mut folded: FoldedSession,
 ) -> Result<ResumeOutcome<D>, ResumeError> {
     // This is the mutation boundary: even doc-hidden callers that bypass
-    // `fold_session` cannot append recovery events to an ambiguous prefix.
-    preflight_events(&folded.events)?;
+    // `fold_session` cannot append recovery events from caller-modified
+    // envelopes. Re-read under the writer's session lock and bind every byte,
+    // not merely the forgeable final event id, to the durable authority.
+    let durable_events = read_resume_prefix(writer.log_path())?;
+    if durable_events.last().map(|event| event.id.clone()) != writer.durable_tail() {
+        return Err(ResumeError::WriterTailMismatch);
+    }
+    if folded.events != durable_events {
+        return Err(ResumeError::FoldedPrefixMismatch);
+    }
+    preflight_resume_identity(&config, &durable_events)?;
+    // Every other field on `FoldedSession` is a public convenience projection,
+    // not authority. Recompute all of it from the exact writer-bound events at
+    // this mutation boundary so a stale or caller-modified target, permission
+    // grant, warning, usage latch, or compaction policy cannot enter the live
+    // session.
+    folded = fold_session(&config, durable_events)?;
+    let current_run_lifecycle = fold_run_lifecycle(&folded.events)?;
     let events_folded = folded.events.len();
     let active_target = folded.active_target.clone();
     let reasoning_effort = folded.reasoning_effort;
@@ -619,14 +664,31 @@ pub fn resume_session_from_folded_prefix<D>(
     let warnings = std::mem::take(&mut folded.warnings);
     let mut recovery_closure_appended = false;
 
-    let recovery_closures = recovery_closures(&folded.events)?;
-    if !recovery_closures.is_empty() {
+    // `FoldedSession::events` is public so callers can retain and inspect the
+    // verified prefix. Do not trust its private cached lifecycle projection
+    // across this mutation boundary: a caller may have incorporated a newer
+    // accepted tail after folding. Rebuild before deciding whether recovery
+    // writes are necessary, otherwise stale "open run" state can append a
+    // duplicate terminal before the final fold notices the disagreement.
+    let recovery_closures = recovery_closures(&folded.events, &current_run_lifecycle)?;
+    let run_lifecycle = if recovery_closures.is_empty() {
+        current_run_lifecycle
+    } else {
+        let mut candidate = folded.events.clone();
+        candidate.extend(recovery_closures.iter().cloned());
+        // Recovery is a mutation, so validate the exact post-append state
+        // before touching durable evidence. In particular, a call may be
+        // unmatched even though its run already terminated; attributing a
+        // synthesized model/tool terminal to that inactive run would corrupt
+        // an otherwise readable prefix and only fail at the later fold.
+        let recovered = preflight_recovery_candidate(&config, &candidate)?;
         writer
             .append(&recovery_closures)
             .map_err(ResumeError::Append)?;
-        folded.events.extend(recovery_closures);
+        folded.events = candidate;
         recovery_closure_appended = true;
-    }
+        recovered
+    };
     // Durable resume marker (issue #6): the marker is ARMED here but NOT
     // appended — the provenance writer emits it lazily to the LOG only (never
     // the bus) with the FIRST durable activity after resume. Consequences:
@@ -642,13 +704,17 @@ pub fn resume_session_from_folded_prefix<D>(
         &config.session_id,
         &config.agent_id,
         &active_target,
-        folded.events.last().map(|event| event.id.clone()),
+        logical_parent_frontier(&folded.events),
         events_folded,
     );
     writer
         .arm_resume_marker(resume_marker)
         .map_err(ResumeError::Append)?;
-    let events_len = folded.events.len();
+    let live_events_len = folded
+        .events
+        .iter()
+        .filter(|event| event.kind.as_str() != EventKind::SESSION_RESUMED)
+        .count();
     let mut config = config;
     config.reasoning_effort = reasoning_effort;
     config.auto_compaction = folded.auto_compaction;
@@ -660,18 +726,70 @@ pub fn resume_session_from_folded_prefix<D>(
         folded.active_target,
         folded.latest_model_usage_used_tokens,
         folded.context_limit_emitted,
+        run_lifecycle,
     )
     .with_provenance(writer);
     for capability in session_allowed {
         session.set_permission_mode(capability, ApprovalMode::SessionAllow);
     }
-    debug_assert_eq!(session.events().len(), events_len);
+    debug_assert_eq!(session.events().len(), live_events_len);
     Ok(ResumeOutcome {
         session,
         recovery_closure_appended,
         events_folded,
         active_target,
         warnings,
+    })
+}
+
+fn preflight_recovery_candidate(
+    config: &SessionConfig,
+    events: &[EventEnvelope],
+) -> Result<RunLifecycleProjection, ResumeError> {
+    let lifecycle = preflight_recovery_lifecycle(config, events)?;
+    if recovery_closures(events, &lifecycle)?.is_empty() {
+        Ok(lifecycle)
+    } else {
+        Err(ResumeError::IncompleteRecoveryCandidate)
+    }
+}
+
+fn preflight_resume_identity(
+    config: &SessionConfig,
+    events: &[EventEnvelope],
+) -> Result<(), ResumeError> {
+    let Some(first) = events.first() else {
+        return Ok(());
+    };
+    let recorded_agent = if first.kind.as_str() == EventKind::SESSION_START {
+        Some(first.agent.as_str())
+    } else {
+        events
+            .iter()
+            .find(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    EventKind::RUN_STARTED
+                        | EventKind::RUN_TERMINAL
+                        | EventKind::QUEUE_ENQUEUED
+                        | EventKind::QUEUE_REPLACED
+                        | EventKind::QUEUE_CANCELLED
+                        | EventKind::QUEUE_DELIVERED
+                        | EventKind::QUEUE_RECOVERED
+                )
+            })
+            .map(|event| event.agent.as_str())
+    };
+    if first.session == config.session_id
+        && recorded_agent.is_none_or(|recorded_agent| recorded_agent == config.agent_id)
+    {
+        return Ok(());
+    }
+    Err(ResumeError::IdentityMismatch {
+        configured_session: config.session_id.clone(),
+        configured_agent: config.agent_id.clone(),
+        recorded_session: first.session.clone(),
+        recorded_agent: recorded_agent.unwrap_or("<unknown legacy root>").to_owned(),
     })
 }
 
@@ -725,6 +843,15 @@ fn policy_from_object(
         },
         budget_bytes,
     }
+}
+
+fn preflight_recovery_lifecycle(
+    config: &SessionConfig,
+    events: &[EventEnvelope],
+) -> Result<RunLifecycleProjection, ResumeError> {
+    preflight_events(events)?;
+    preflight_project_context(config, events)?;
+    fold_run_lifecycle(events).map_err(ResumeError::from)
 }
 
 fn preflight_events(events: &[EventEnvelope]) -> Result<(), ResumeError> {
@@ -811,13 +938,36 @@ fn session_resumed_marker(
     )
 }
 
-fn recovery_closures(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, ResumeError> {
-    struct ModelCallState<'a> {
-        call: &'a EventEnvelope,
-        open: bool,
-    }
+struct ModelCallState<'a> {
+    call: &'a EventEnvelope,
+    open: bool,
+}
 
+fn recovery_closures(
+    events: &[EventEnvelope],
+    lifecycle: &RunLifecycleProjection,
+) -> Result<Vec<EventEnvelope>, ResumeError> {
+    let incomplete_child_agents = incomplete_child_agents(events);
     let open_drafts = open_response_draft_bytes(events)?;
+    let calls = unresolved_model_calls(events)?;
+    let mut closures = child_tool_recovery_closures(events, &incomplete_child_agents);
+    closures.extend(
+        calls
+            .into_iter()
+            .map(|call| model_recovery_closure(call, open_drafts.get(call.id.as_str()).copied())),
+    );
+    if let Some(closure) = tool_recovery_closure(events, &incomplete_child_agents) {
+        closures.push(closure);
+    }
+    let linear_parent = closures
+        .last()
+        .map(|event| event.id.clone())
+        .or_else(|| logical_parent_frontier(events));
+    closures.extend(run_recovery_closures(lifecycle, linear_parent));
+    Ok(closures)
+}
+
+fn unresolved_model_calls(events: &[EventEnvelope]) -> Result<Vec<&EventEnvelope>, ResumeError> {
     let mut calls = Vec::<ModelCallState<'_>>::new();
     for event in events {
         if event.kind.as_str() == EventKind::MODEL_CALL {
@@ -889,18 +1039,121 @@ fn recovery_closures(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, Res
             }
         }
     }
-
-    let mut closures = calls
+    Ok(calls
         .into_iter()
         .filter(|state| state.open)
-        .map(|state| {
-            model_recovery_closure(state.call, open_drafts.get(state.call.id.as_str()).copied())
+        .map(|state| state.call)
+        .collect())
+}
+
+fn incomplete_child_agents(events: &[EventEnvelope]) -> BTreeSet<String> {
+    let completed_spawns = events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .filter_map(|event| payload_str(event, "spawn_event_id"))
+        .collect::<BTreeSet<_>>();
+    events
+        .iter()
+        .filter(|event| {
+            event.kind.as_str() == EventKind::AGENT_SPAWN
+                && !completed_spawns.contains(event.id.as_str())
         })
-        .collect::<Vec<_>>();
-    if let Some(closure) = tool_recovery_closure(events) {
+        .filter_map(|event| payload_str(event, "child_agent_id").map(str::to_owned))
+        .collect()
+}
+
+fn child_tool_recovery_closures(
+    events: &[EventEnvelope],
+    incomplete_child_agents: &BTreeSet<String>,
+) -> Vec<EventEnvelope> {
+    events
+        .iter()
+        .filter(|call| {
+            call.kind.as_str() == EventKind::TOOL_CALL
+                && incomplete_child_agents.contains(&call.agent)
+                && !events.iter().any(|event| {
+                    event.kind.as_str() == EventKind::TOOL_RESULT
+                        && event.agent == call.agent
+                        && event.parent.as_deref() == Some(call.id.as_str())
+                })
+        })
+        .filter_map(child_tool_recovery_closure)
+        .collect()
+}
+
+fn child_tool_recovery_closure(call: &EventEnvelope) -> Option<EventEnvelope> {
+    let call_id = payload_str(call, "id")?;
+    let name = payload_str(call, "name")?;
+    let mut closure = EventEnvelope::new(
+        call.session.clone(),
+        call.agent.clone(),
+        Some(call.id.clone()),
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", call_id.into()),
+            ("name", name.into()),
+            ("ok", false.into()),
+            (
+                "error",
+                "accepted child prefix ended without a persisted result; execution and side effects are unknown"
+                    .into(),
+            ),
+            ("recovery_closure", true.into()),
+        ]),
+    );
+    closure.run.clone_from(&call.run);
+    Some(closure)
+}
+
+fn logical_parent_frontier(events: &[EventEnvelope]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event_advances_parent_frontier(event.kind.as_str()))
+        .map(|event| event.id.clone())
+}
+
+fn run_recovery_closures(
+    lifecycle: &RunLifecycleProjection,
+    mut linear_parent: Option<String>,
+) -> Vec<EventEnvelope> {
+    let mut closures = Vec::new();
+    for (run_id, session_id, agent_id) in lifecycle.open_runs() {
+        let terminal_status = lifecycle
+            .terminal_recovery_status(run_id)
+            .unwrap_or(RunTerminalStatus::Interrupted);
+        let cancellation_reason = QueueCancellationReason::for_terminal(terminal_status);
+        for item in lifecycle.pending_steering(run_id) {
+            let closure = EventEnvelope::new(
+                session_id,
+                agent_id,
+                linear_parent,
+                EventKind::QUEUE_CANCELLED,
+                object([
+                    ("queue_id", item.queue_id().to_owned().into()),
+                    ("reason", cancellation_reason.as_str().into()),
+                    ("recovery_closure", true.into()),
+                ]),
+            )
+            .with_run(run_id);
+            linear_parent = Some(closure.id.clone());
+            closures.push(closure);
+        }
+        let closure = EventEnvelope::new(
+            session_id,
+            agent_id,
+            linear_parent,
+            EventKind::RUN_TERMINAL,
+            object([
+                ("status", terminal_status.as_str().into()),
+                ("recovery_closure", true.into()),
+            ]),
+        )
+        .with_run(run_id);
+        linear_parent = Some(closure.id.clone());
         closures.push(closure);
     }
-    Ok(closures)
+    closures
 }
 
 fn open_response_draft_bytes(
@@ -972,18 +1225,26 @@ fn model_recovery_closure(
             retained_content_bytes.into(),
         );
     }
-    EventEnvelope::new(
+    let mut closure = EventEnvelope::new(
         call.session.clone(),
         call.agent.clone(),
         Some(call.id.clone()),
         EventKind::ERROR,
         payload,
-    )
+    );
+    closure.run.clone_from(&call.run);
+    closure
 }
 
-fn tool_recovery_closure(events: &[EventEnvelope]) -> Option<EventEnvelope> {
+fn tool_recovery_closure(
+    events: &[EventEnvelope],
+    incomplete_child_agents: &BTreeSet<String>,
+) -> Option<EventEnvelope> {
     let call_index = tail_unmatched_tool_call_index(events)?;
     let call = &events[call_index];
+    if incomplete_child_agents.contains(&call.agent) {
+        return None;
+    }
     let call_id = payload_str(call, "id")?;
     let name = payload_str(call, "name")?;
     let permission_undecided = permission_prompt_without_decision(&events[call_index + 1..]);
@@ -995,7 +1256,7 @@ fn tool_recovery_closure(events: &[EventEnvelope]) -> Option<EventEnvelope> {
          was interrupted, and side effects may have occurred"
     };
 
-    Some(EventEnvelope::new(
+    let mut closure = EventEnvelope::new(
         call.session.clone(),
         call.agent.clone(),
         Some(call.id.clone()),
@@ -1007,7 +1268,9 @@ fn tool_recovery_closure(events: &[EventEnvelope]) -> Option<EventEnvelope> {
             ("error", message.into()),
             ("recovery_closure", true.into()),
         ]),
-    ))
+    );
+    closure.run.clone_from(&call.run);
+    Some(closure)
 }
 
 fn tail_unmatched_tool_call_index(events: &[EventEnvelope]) -> Option<usize> {
@@ -1156,6 +1419,288 @@ fn hash_bytes(bytes: &[u8]) -> String {
 
 fn is_known_kind(kind: &str) -> bool {
     EventKind::ALL.contains(&kind)
+}
+
+#[cfg(test)]
+mod run_recovery_tests {
+    use super::*;
+    use ulid::Ulid;
+
+    fn attributed(
+        kind: &'static str,
+        run_id: &str,
+        payload: euler_event::JsonObject,
+    ) -> EventEnvelope {
+        EventEnvelope::new("session", "root", None, kind, payload).with_run(run_id)
+    }
+
+    fn chain_writer_spine(events: &mut [EventEnvelope]) {
+        for index in 1..events.len() {
+            events[index].parent = Some(events[index - 1].id.clone());
+        }
+    }
+
+    #[test]
+    fn recovery_interrupts_open_run_cancels_steering_and_preserves_follow_up() {
+        let active_run = Ulid::new().to_string();
+        let steer_id = Ulid::new().to_string();
+        let follow_run = Ulid::new().to_string();
+        let follow_id = Ulid::new().to_string();
+        let mut events = vec![
+            attributed(
+                EventKind::RUN_STARTED,
+                &active_run,
+                object([("trigger", "direct".into())]),
+            ),
+            attributed(
+                EventKind::USER_MESSAGE,
+                &active_run,
+                object([("content", "start".into())]),
+            ),
+            attributed(
+                EventKind::QUEUE_ENQUEUED,
+                &active_run,
+                object([
+                    ("queue_id", steer_id.clone().into()),
+                    ("mode", "steering".into()),
+                    ("position", "back".into()),
+                    ("content", "steer".into()),
+                ]),
+            ),
+            attributed(
+                EventKind::QUEUE_ENQUEUED,
+                &follow_run,
+                object([
+                    ("queue_id", follow_id.clone().into()),
+                    ("mode", "follow_up".into()),
+                    ("position", "back".into()),
+                    ("content", "later".into()),
+                ]),
+            ),
+        ];
+        chain_writer_spine(&mut events);
+        let lifecycle = fold_run_lifecycle(&events).expect("initial lifecycle");
+
+        let closures = recovery_closures(&events, &lifecycle).expect("recovery closures");
+
+        assert_eq!(closures.len(), 2);
+        assert_eq!(closures[0].kind.as_str(), EventKind::QUEUE_CANCELLED);
+        assert_eq!(closures[0].payload["queue_id"], steer_id);
+        assert_eq!(closures[0].payload["reason"], "run_interrupted");
+        assert_eq!(closures[1].kind.as_str(), EventKind::RUN_TERMINAL);
+        assert_eq!(closures[1].payload["status"], "interrupted");
+        events.extend(closures);
+        let recovered = fold_run_lifecycle(&events).expect("recovered lifecycle");
+        assert_eq!(recovered.open_runs().count(), 0);
+        assert_eq!(recovered.pending().len(), 1);
+        assert_eq!(recovered.pending()[0].queue_id(), follow_id);
+        assert_eq!(recovered.recoverable().len(), 1);
+        assert_eq!(recovered.recoverable()[0].queue_id(), steer_id);
+        assert_eq!(recovered.recoverable()[0].content(), "steer");
+        assert_eq!(
+            recovered.recoverable()[0].reason(),
+            QueueCancellationReason::RunInterrupted
+        );
+        assert!(
+            recovery_closures(&events, &recovered)
+                .expect("idempotent recovery")
+                .is_empty(),
+            "a second resume must not append another run terminal"
+        );
+    }
+
+    #[test]
+    fn recovery_replaces_a_partial_terminal_batch_with_an_interrupted_closure() {
+        let run_id = Ulid::new().to_string();
+        let first_id = Ulid::new().to_string();
+        let second_id = Ulid::new().to_string();
+        let mut events = vec![
+            attributed(
+                EventKind::RUN_STARTED,
+                &run_id,
+                object([("trigger", "direct".into())]),
+            ),
+            attributed(
+                EventKind::USER_MESSAGE,
+                &run_id,
+                object([("content", "start".into())]),
+            ),
+            attributed(
+                EventKind::QUEUE_ENQUEUED,
+                &run_id,
+                object([
+                    ("queue_id", first_id.clone().into()),
+                    ("mode", "steering".into()),
+                    ("position", "back".into()),
+                    ("content", "first".into()),
+                ]),
+            ),
+            attributed(
+                EventKind::QUEUE_ENQUEUED,
+                &run_id,
+                object([
+                    ("queue_id", second_id.clone().into()),
+                    ("mode", "steering".into()),
+                    ("position", "back".into()),
+                    ("content", "second".into()),
+                ]),
+            ),
+            attributed(
+                EventKind::QUEUE_CANCELLED,
+                &run_id,
+                object([
+                    ("queue_id", first_id.into()),
+                    ("reason", "run_failed".into()),
+                ]),
+            ),
+        ];
+        chain_writer_spine(&mut events);
+        let lifecycle = fold_run_lifecycle(&events).expect("partial terminal prefix");
+        assert!(lifecycle.recoverable().is_empty());
+        assert_eq!(lifecycle.pending_steering(&run_id).len(), 2);
+
+        let closures = recovery_closures(&events, &lifecycle).expect("recovery closures");
+        assert_eq!(closures.len(), 3);
+        assert_eq!(closures[0].payload["reason"], "run_interrupted");
+        assert_eq!(closures[1].payload["queue_id"], second_id);
+        assert_eq!(closures[1].payload["reason"], "run_interrupted");
+        assert_eq!(closures[2].payload["status"], "interrupted");
+        events.extend(closures);
+
+        let recovered = fold_run_lifecycle(&events).expect("completed terminal batch");
+        assert!(recovered.pending().is_empty());
+        assert_eq!(recovered.recoverable().len(), 2);
+        assert!(recovered
+            .recoverable()
+            .iter()
+            .all(|item| item.reason() == QueueCancellationReason::RunInterrupted));
+        assert_eq!(recovered.open_runs().count(), 0);
+    }
+
+    #[test]
+    fn recovery_closes_each_unmatched_incomplete_child_tool_call_by_event_parent() {
+        let root_call = EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::TOOL_CALL,
+            object([("id", "root-call".into()), ("name", "read_file".into())]),
+        );
+        let spawn = EventEnvelope::new(
+            "session",
+            "root",
+            None,
+            EventKind::AGENT_SPAWN,
+            object([("child_agent_id", "child".into())]),
+        );
+        let first_child_call = EventEnvelope::new(
+            "session",
+            "child",
+            None,
+            EventKind::TOOL_CALL,
+            object([
+                ("id", "provider-reused-id".into()),
+                ("name", "read_file".into()),
+            ]),
+        );
+        let first_child_result = EventEnvelope::new(
+            "session",
+            "child",
+            Some(first_child_call.id.clone()),
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", "provider-reused-id".into()),
+                ("name", "read_file".into()),
+                ("ok", true.into()),
+            ]),
+        );
+        let second_child_call = EventEnvelope::new(
+            "session",
+            "child",
+            None,
+            EventKind::TOOL_CALL,
+            object([
+                ("id", "provider-reused-id".into()),
+                ("name", "read_file".into()),
+            ]),
+        );
+        let mut events = vec![
+            root_call.clone(),
+            spawn,
+            first_child_call.clone(),
+            first_child_result.clone(),
+            second_child_call.clone(),
+        ];
+        let lifecycle = RunLifecycleProjection::default();
+
+        let closures = recovery_closures(&events, &lifecycle).expect("tool recovery closures");
+        assert_eq!(closures.len(), 2);
+        assert_eq!(closures[0].kind.as_str(), EventKind::TOOL_RESULT);
+        assert_eq!(
+            closures[0].parent.as_deref(),
+            Some(second_child_call.id.as_str())
+        );
+        assert_eq!(closures[0].agent, "child");
+        assert_eq!(closures[0].payload["recovery_closure"], true);
+        assert_eq!(closures[1].kind.as_str(), EventKind::TOOL_RESULT);
+        assert_eq!(closures[1].parent.as_deref(), Some(root_call.id.as_str()));
+        assert_eq!(closures[1].agent, "root");
+        assert_eq!(closures[1].payload["recovery_closure"], true);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.parent.as_deref() == Some(first_child_call.id.as_str()))
+                .count(),
+            1,
+            "the accepted first result remains the only child of its call"
+        );
+
+        events.extend(closures);
+        assert!(fold_run_lifecycle(&events).is_ok());
+        assert!(recovery_closures(&events, &lifecycle)
+            .expect("idempotent tool recovery")
+            .is_empty());
+        assert!(events
+            .iter()
+            .all(|event| event.kind.as_str() != EventKind::AGENT_RESULT));
+    }
+
+    #[test]
+    fn open_run_recovery_skips_a_stranded_resume_marker_leaf() {
+        let run_id = Ulid::new().to_string();
+        let mut events = vec![
+            attributed(
+                EventKind::RUN_STARTED,
+                &run_id,
+                object([("trigger", "direct".into())]),
+            ),
+            attributed(
+                EventKind::USER_MESSAGE,
+                &run_id,
+                object([("content", "start".into())]),
+            ),
+        ];
+        chain_writer_spine(&mut events);
+        let logical_frontier = events.last().expect("user message").id.clone();
+        events.push(EventEnvelope::new(
+            "session",
+            "root",
+            Some(logical_frontier.clone()),
+            EventKind::SESSION_RESUMED,
+            object([("resumed_from_event_id", logical_frontier.clone().into())]),
+        ));
+
+        let lifecycle = fold_run_lifecycle(&events).expect("marker-bearing open run");
+        let closures = recovery_closures(&events, &lifecycle).expect("recovery closures");
+        assert_eq!(closures.len(), 1);
+        assert_eq!(closures[0].kind.as_str(), EventKind::RUN_TERMINAL);
+        assert_eq!(
+            closures[0].parent.as_deref(),
+            Some(logical_frontier.as_str())
+        );
+        events.extend(closures);
+        assert!(fold_run_lifecycle(&events).is_ok());
+    }
 }
 
 #[cfg(test)]

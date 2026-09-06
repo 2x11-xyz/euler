@@ -104,6 +104,14 @@ Structured `plan.update` is a transcript/provenance presentation event and
 never enters the model canvas directly. Workflow state reaches the model only
 through an independently capability-gated, bounded context slot.
 
+Run and queue lifecycle events are control/provenance state, never model
+content. In particular, private pending `queue.enqueued` or `queue.replaced`
+content cannot enter the canvas. Delivery makes the text eligible exactly once
+through the canonical `user.message` in the same accepted admission batch;
+`queue.delivered` itself is not projected. The private content retained for a
+terminal-cancelled steering recovery is likewise excluded until an explicit
+future user action admits it as a new canonical input.
+
 An accepted terminal-idle continuation (`extension.contribution`, ADR 0018)
 is also canvas-eligible. It is rendered under the core-generated
 `[extension <extension-id>:<command> at turn-idle]` header with every content

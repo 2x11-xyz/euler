@@ -36,6 +36,9 @@ impl ExtensionExecutionError {
             ExtensionHostError::CommandFailed(_, _) => Self::CommandFailed,
             ExtensionHostError::CommandCancelled(_) => Self::Cancelled,
             ExtensionHostError::CommandPanic(_, _) => Self::CommandPanicked,
+            ExtensionHostError::Provenance(_) => {
+                Self::Session(SessionError::ExtensionEmissionDegraded)
+            }
             ExtensionHostError::ExtensionDisabled(_) => Self::CommandFailed,
             ExtensionHostError::InvalidExtensionId(_)
             | ExtensionHostError::InvalidCommandName(_)
@@ -202,7 +205,11 @@ impl<D> Session<D> {
         // Session-registered secret values (auth file, runtime-resolved)
         // must cover extension host-API emissions too, not only the
         // shape-only default (secrets contract).
-        Ok((host.with_redactor(self.redactor.clone()), queue))
+        Ok((
+            host.with_run_id(self.active_run.clone())
+                .with_redactor(self.redactor.clone()),
+            queue,
+        ))
     }
 
     pub fn publish_queued_extension_events(
@@ -217,22 +224,23 @@ impl<D> Session<D> {
         if self.provenance.is_none() {
             return Err(SessionError::ExtensionEmissionUnavailable);
         }
-        if self.persisted_events != self.bus.events().len() {
-            self.extension_emission_degraded = true;
-            return Err(SessionError::ExtensionEmissionOutOfOrder);
-        }
-        // Writer-owned parent assignment should make queued batches line up with the live tail.
-        // Keep this as a defensive assertion for writer invariant bugs and legacy corruption.
-        let events = queue
-            .drain_after(self.previous_persisted_event_id().as_deref())
-            .ok_or_else(|| {
+        self.reconcile_accepted_events()?;
+        // The accepted-event feed is the one canonical live mirror for every
+        // shared-writer producer. The extension-local queue now only proves
+        // that each event this host emitted reached that mirror, in its own
+        // emission order; unrelated producers may legitimately interleave.
+        let queued = queue.drain();
+        let mut after = 0;
+        for expected in queued {
+            let Some(relative) = self.bus.events()[after..]
+                .iter()
+                .position(|event| event == &expected)
+            else {
                 self.extension_emission_degraded = true;
-                SessionError::ExtensionEmissionOutOfOrder
-            })?;
-        for event in events {
-            self.bus.push(event);
+                return Err(SessionError::ExtensionEmissionOutOfOrder);
+            };
+            after += relative + 1;
         }
-        self.persisted_events = self.bus.events().len();
         Ok(())
     }
 
