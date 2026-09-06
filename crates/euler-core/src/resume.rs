@@ -1,6 +1,9 @@
 use crate::canvas::{AutoCompactionPolicy, CompactionTier};
 use crate::permissions::{permission_prompt_capabilities, ApprovalMode};
 use crate::provenance::{nul_offset_in_line, numbered_accepted_prefix_lines, ProvenanceWriter};
+use crate::runtime_identity::{
+    runtime_identity_from_events, RecordedRuntimeIdentity, RuntimeIdentityError,
+};
 use crate::session::{
     event_terminalizes_model_call, fold_model_target, fold_reasoning_effort, ModelTarget, Session,
     SessionConfig,
@@ -27,6 +30,9 @@ pub struct FoldedSession {
     pub latest_model_usage_used_tokens: Option<u64>,
     pub context_limit_emitted: Option<ModelTarget>,
     pub auto_compaction: AutoCompactionPolicy,
+    /// Exact originating runtime for current streams, or an explicit legacy
+    /// unknown when `session.start` predates runtime provenance.
+    pub runtime_identity: RecordedRuntimeIdentity,
     /// Capabilities granted for the session scope in the historical prefix
     /// (PERMISSION_DECISION with scope == "session", root agent only). Old
     /// logs without the scope field are never folded (ADR D7/A13).
@@ -40,6 +46,16 @@ pub struct ResumeOutcome<D> {
     pub events_folded: usize,
     pub active_target: ModelTarget,
     pub warnings: Vec<ResumeWarning>,
+}
+
+/// One verified, accepted provenance prefix together with its durable
+/// identity. The byte length stops at the final accepted newline, so a torn
+/// final fragment is deliberately outside this identity; `tail_event_id` is
+/// the last accepted envelope in that same prefix.
+pub(crate) struct ReadResumePrefix {
+    pub(crate) events: Vec<EventEnvelope>,
+    pub(crate) accepted_byte_len: u64,
+    pub(crate) tail_event_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -96,6 +112,8 @@ pub enum ResumeError {
     Session(#[from] crate::session::SessionError),
     #[error(transparent)]
     Writer(#[from] crate::provenance::ProvenanceWriterError),
+    #[error(transparent)]
+    RuntimeIdentity(#[from] RuntimeIdentityError),
 }
 
 /// Fold persisted session events into live core session state.
@@ -107,8 +125,7 @@ pub fn fold_session(
     config: &SessionConfig,
     events: Vec<EventEnvelope>,
 ) -> Result<FoldedSession, ResumeError> {
-    preflight_events(&events)?;
-    preflight_project_context(config, &events)?;
+    let runtime_identity = preflight_session(config, &events)?;
     let initial = ModelTarget::new(config.provider.clone(), config.model.clone());
     let mut target_at_event = initial;
     let mut reasoning_effort = config.reasoning_effort;
@@ -203,9 +220,19 @@ pub fn fold_session(
         latest_model_usage_used_tokens,
         context_limit_emitted,
         auto_compaction,
+        runtime_identity,
         session_allowed_capabilities,
         warnings,
     })
+}
+
+fn preflight_session(
+    config: &SessionConfig,
+    events: &[EventEnvelope],
+) -> Result<RecordedRuntimeIdentity, ResumeError> {
+    preflight_events(events)?;
+    preflight_project_context(config, events)?;
+    Ok(runtime_identity_from_events(events)?)
 }
 
 /// Project-context resume preflight (ADR 0017): fail closed on a missing,
@@ -458,8 +485,15 @@ fn warn_if_permission_prompt_unresolved(
 }
 
 pub fn read_resume_prefix(path: impl AsRef<Path>) -> Result<Vec<EventEnvelope>, ResumeError> {
+    Ok(read_resume_prefix_with_identity(path)?.events)
+}
+
+pub(crate) fn read_resume_prefix_with_identity(
+    path: impl AsRef<Path>,
+) -> Result<ReadResumePrefix, ResumeError> {
     let path = path.as_ref();
     let content = fs::read_to_string(path)?;
+    let accepted_byte_len = accepted_prefix_byte_len(&content)?;
     let blob_dir = path
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -487,7 +521,22 @@ pub fn read_resume_prefix(path: impl AsRef<Path>) -> Result<Vec<EventEnvelope>, 
     }
 
     preflight_events(&events)?;
-    Ok(events)
+    let tail_event_id = events.last().map(|event| event.id.clone());
+    Ok(ReadResumePrefix {
+        events,
+        accepted_byte_len,
+        tail_event_id,
+    })
+}
+
+fn accepted_prefix_byte_len(content: &str) -> Result<u64, ResumeError> {
+    let len = if content.ends_with('\n') {
+        content.len()
+    } else {
+        content.rfind('\n').map_or(0, |index| index + 1)
+    };
+    u64::try_from(len)
+        .map_err(|_| io::Error::other("provenance log accepted prefix is too large").into())
 }
 
 pub fn resume_session<D>(

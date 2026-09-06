@@ -97,6 +97,85 @@ fn session_store_later_successful_model_result_recovers_failed_status() {
 }
 
 #[test]
+fn discovery_reprojects_failed_sidecar_after_resumed_success() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    append_session_events(record.events_path(), &[session_error(record.id())]);
+    let failed = store
+        .refresh_session_metadata(record.id())
+        .expect("cache failed projection");
+    assert_eq!(failed.status(), SessionStatus::Failed);
+    let failed_projection_key = metadata_projection_key(record.session_json_path());
+
+    append_session_events(
+        record.events_path(),
+        &[
+            session_resumed(record.id()),
+            model_result(record.id(), "completed"),
+        ],
+    );
+    // Append changes durable authority, not its cache. The stale sidecar can
+    // remain on disk until the next reader, but its old tail key cannot hit.
+    assert_eq!(metadata_status(record.session_json_path()), Some("failed"));
+    assert_eq!(
+        metadata_projection_key(record.session_json_path()),
+        failed_projection_key
+    );
+
+    let discovered = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(discovered.status(), SessionStatus::Active);
+    assert_eq!(metadata_status(record.session_json_path()), Some("active"));
+    assert_ne!(
+        metadata_projection_key(record.session_json_path()),
+        failed_projection_key
+    );
+}
+
+#[test]
+fn turn_boundary_touch_invalidates_failed_sidecar_after_resumed_success() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    append_session_events(record.events_path(), &[session_error(record.id())]);
+    store
+        .refresh_session_metadata(record.id())
+        .expect("cache failed projection");
+    let failed_projection_key = metadata_projection_key(record.session_json_path());
+    append_session_events(
+        record.events_path(),
+        &[
+            session_resumed(record.id()),
+            model_result(record.id(), "completed"),
+        ],
+    );
+    assert_eq!(metadata_status(record.session_json_path()), Some("failed"));
+    assert_eq!(
+        metadata_projection_key(record.session_json_path()),
+        failed_projection_key
+    );
+
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch observes new tail");
+
+    // The touch never projects (it runs on the UI thread), so the sidecar
+    // status is still the stale cached value — but its key is gone, so no
+    // reader can serve that stale projection as a cache hit.
+    assert_eq!(metadata_status(record.session_json_path()), Some("failed"));
+    assert_eq!(metadata_projection_key(record.session_json_path()), None);
+
+    let discovered = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(discovered.status(), SessionStatus::Active);
+    assert_eq!(metadata_status(record.session_json_path()), Some("active"));
+    assert!(metadata_projection_key(record.session_json_path()).is_some());
+}
+
+#[test]
 fn session_store_error_model_result_projects_failed_status() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");
@@ -163,6 +242,20 @@ fn model_result(session_id: &str, stop_reason: &'static str) -> EventEnvelope {
     )
 }
 
+fn session_resumed(session_id: &str) -> EventEnvelope {
+    EventEnvelope::new(
+        session_id.to_owned(),
+        "store-agent",
+        None,
+        EventKind::SESSION_RESUMED,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("events_folded", 1.into()),
+        ]),
+    )
+}
+
 fn metadata_status(path: &Path) -> Option<&'static str> {
     let metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path).expect("metadata")).expect("metadata json");
@@ -171,4 +264,10 @@ fn metadata_status(path: &Path) -> Option<&'static str> {
         Some("failed") => Some("failed"),
         _ => None,
     }
+}
+
+fn metadata_projection_key(path: &Path) -> Option<serde_json::Value> {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).expect("metadata")).expect("metadata json");
+    metadata.get("projected_events").cloned()
 }

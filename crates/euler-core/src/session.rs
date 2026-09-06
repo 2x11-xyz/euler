@@ -17,6 +17,7 @@ use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, Permissio
 use crate::project_context::ProjectContextBootstrap;
 use crate::provenance::ProvenanceWriter;
 use crate::redaction::SecretRedactor;
+use crate::runtime_identity::RuntimeIdentity;
 use crate::sandbox::SubprocessSandbox;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
@@ -3622,6 +3623,22 @@ fn session_start_payload(config: &SessionConfig) -> JsonObject {
             bootstrap.session_start_summary(),
         );
     }
+    let attached_root = payload
+        .get("root")
+        .and_then(Value::as_str)
+        .expect("fresh session roots are strings")
+        .to_owned();
+    // This digest commits narrowly to the complete non-runtime
+    // `session.start` projection. It is not an identity for every live
+    // `SessionConfig` field: its exact source bytes remain in the same event
+    // without persisting config files or secret-bearing provider settings.
+    let projection_bytes = serde_json::to_vec(&payload).expect("JSON values serialize");
+    let projection_sha256 = format!("{:x}", Sha256::digest(projection_bytes));
+    let runtime = RuntimeIdentity::current(projection_sha256, vec![attached_root]);
+    payload.insert(
+        "runtime".to_owned(),
+        serde_json::to_value(runtime).expect("runtime identity serializes"),
+    );
     payload
 }
 

@@ -4,17 +4,19 @@ use crate::home::{
     EulerHomeError,
 };
 use crate::provenance::accepted_prefix_lines;
+#[cfg(test)]
 use crate::resume::read_resume_prefix;
+use crate::resume::read_resume_prefix_with_identity;
 use crate::session_kind::SessionKind;
 use crate::session_name::session_name_for_display;
 #[cfg(test)]
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::{session_root_for_event, session_root_from_str};
-use euler_event::EventKind;
+use euler_event::{EventEnvelope, EventKind};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -22,6 +24,7 @@ use ulid::Ulid;
 
 const SESSION_METADATA_VERSION: u64 = 1;
 const INDEX_ENTRY_VERSION: u64 = 1;
+const EVENT_PROJECTION_TAIL_SCAN_BYTES: u64 = 1024 * 1024;
 
 // Performance regression instrumentation (test builds only, zero-cost in
 // production). Counts full event-log projections — the expensive per-session
@@ -84,7 +87,7 @@ impl SessionStore {
         let mut sessions = records
             .into_values()
             .flatten()
-            .filter_map(|entry| self.record_from_index_entry(entry))
+            .filter_map(|entry| self.record_from_index_entry(entry, true))
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(sessions)
@@ -107,6 +110,14 @@ impl SessionStore {
     }
 
     pub fn find_session(&self, id: &str) -> Result<Option<SessionRecord>, SessionStoreError> {
+        self.find_session_with_cache_fill(id, true)
+    }
+
+    fn find_session_with_cache_fill(
+        &self,
+        id: &str,
+        fill_projection_cache: bool,
+    ) -> Result<Option<SessionRecord>, SessionStoreError> {
         validate_session_id(id)?;
         ensure_private_dir(&self.sessions_dir())?;
         // Targeted resolution: project only this session's record.
@@ -134,7 +145,7 @@ impl SessionStore {
                 }
             }
         };
-        Ok(entry.and_then(|entry| self.record_from_index_entry(entry)))
+        Ok(entry.and_then(|entry| self.record_from_index_entry(entry, fill_projection_cache)))
     }
 
     /// Resolve a user-facing session reference.
@@ -211,7 +222,7 @@ impl SessionStore {
     pub fn refresh_session_metadata(&self, id: &str) -> Result<SessionRecord, SessionStoreError> {
         validate_session_id(id)?;
         let record = self
-            .find_session(id)?
+            .find_session_with_cache_fill(id, false)?
             .ok_or_else(|| SessionStoreError::SessionNotFound { id: id.to_owned() })?;
         let updated_at_ms = record.updated_at_ms.max(now_unix_ms());
         let refreshed = record.with_updated_at_ms(updated_at_ms);
@@ -225,9 +236,12 @@ impl SessionStore {
     /// [`Self::refresh_session_metadata`]: the TUI touches the active
     /// session after every turn, and re-reading a multi-megabyte event log
     /// (plus blob verification) per turn stalls the UI thread. The sidecar's
-    /// other fields are carried forward verbatim — event-derived truth
-    /// (status, rename events) still wins wherever records are projected,
-    /// and the next full refresh re-syncs the sidecar.
+    /// other fields are carried forward verbatim; only the bounded, blob-free
+    /// durable-tail identity is observed. When it disagrees with the cached
+    /// projection key (the ordinary case right after a turn appends), the key
+    /// is dropped from the rewritten sidecar so the next listing re-projects
+    /// off the UI thread — a failed or stale projection never survives a new
+    /// tail as a cache hit, and this path never pays for the projection.
     pub fn touch_session_updated_at(&self, id: &str) -> Result<(), SessionStoreError> {
         validate_session_id(id)?;
         let record = match self.record_from_sidecar(id) {
@@ -238,6 +252,17 @@ impl SessionStore {
                 self.refresh_session_metadata(id)?;
                 return Ok(());
             }
+        };
+        // A turn or resume may have appended since this sidecar was written.
+        // Never project here: on a key mismatch, invalidate the cached key so
+        // the stale projection cannot be served, and leave the authoritative
+        // (event- and blob-verifying) re-projection to the next listing.
+        let live_key = event_projection_key(record.events_path()).ok();
+        let key_matches = live_key.is_some_and(|key| record.projection_key == Some(key));
+        let record = if key_matches {
+            record
+        } else {
+            record.with_projection_key(None)
         };
         let updated_at_ms = record.updated_at_ms.max(now_unix_ms());
         let refreshed = record.with_updated_at_ms(updated_at_ms);
@@ -378,7 +403,11 @@ impl SessionStore {
             .collect()
     }
 
-    fn record_from_index_entry(&self, entry: IndexEntry) -> Option<SessionRecord> {
+    fn record_from_index_entry(
+        &self,
+        entry: IndexEntry,
+        fill_projection_cache: bool,
+    ) -> Option<SessionRecord> {
         if validate_session_id(&entry.id).is_err() {
             return None;
         }
@@ -387,7 +416,13 @@ impl SessionStore {
             return None;
         }
         let updated_at_ms = entry.effective_updated_at_ms();
-        Some(self.record_from_parts(entry.id, dir, entry.created_at_ms, updated_at_ms))
+        Some(self.record_from_parts(
+            entry.id,
+            dir,
+            entry.created_at_ms,
+            updated_at_ms,
+            fill_projection_cache,
+        ))
     }
 
     /// Builds the record for `id` from its `session.json` sidecar alone —
@@ -418,8 +453,8 @@ impl SessionStore {
         // Carry the projection cache key through so a metadata touch that
         // rewrites the sidecar keeps the cached projection warm.
         let key = metadata
-            .projected_events_len
-            .zip(metadata.projected_events_modified_ns);
+            .projected_events
+            .filter(EventProjectionKey::is_valid);
         Some(
             SessionRecord::new(id.to_owned(), dir, created_at_ms, updated_at_ms, projection)
                 .with_projection_key(key),
@@ -432,6 +467,7 @@ impl SessionStore {
         dir: PathBuf,
         created_at_ms: u64,
         updated_at_ms: u64,
+        fill_projection_cache: bool,
     ) -> SessionRecord {
         let sidecar = read_session_metadata(&dir.join("session.json"))
             .ok()
@@ -445,6 +481,13 @@ impl SessionStore {
             .unwrap_or(created_at_ms)
             .max(updated_at_ms)
             .max(created_at_ms);
+        // Sidecar name/root/kind double as the transition display fallback
+        // (docs/contracts/events.md, `session.renamed` / `session.start`):
+        // used only when the stream is readable and lacks the corresponding
+        // event. Sessions created or renamed before those events existed
+        // rely on this after every append, including once a projection has
+        // been cached — a cache fill carries the fallback into the sidecar
+        // and must not be the point where the session loses its identity.
         let sidecar_name = sidecar.as_ref().and_then(|metadata| metadata.name.clone());
         let sidecar_root = sidecar
             .as_ref()
@@ -452,42 +495,39 @@ impl SessionStore {
             .and_then(session_root_from_str);
         let sidecar_kind = sidecar.as_ref().and_then(|metadata| metadata.kind);
         let events_path = dir.join("events.jsonl");
-        // Stat before reading: if the log grows mid-projection the key
-        // describes an older file than what was read, so the next listing
-        // re-projects rather than serving a stale hit.
-        let events_key = events_stat_key(&events_path);
-        if let (Some(metadata), Some(key)) = (&sidecar, events_key) {
-            if metadata.projected_events_len == Some(key.0)
-                && metadata.projected_events_modified_ns == Some(key.1)
-            {
+        let events_key = event_projection_key(&events_path).ok();
+        if let (Some(metadata), Some(key)) = (&sidecar, &events_key) {
+            if metadata.projected_events.as_ref() == Some(key) {
                 let projection = SessionProjection {
                     status: metadata.status,
-                    name: sidecar_name
-                        .clone()
-                        .and_then(|name| session_name_for_display(&name)),
+                    name: sidecar_name.and_then(|name| session_name_for_display(&name)),
                     title: metadata.title.clone(),
-                    root: sidecar_root.clone(),
+                    root: sidecar_root,
                     kind: sidecar_kind,
                     invalid_reason: None,
                 };
                 return SessionRecord::new(id, dir, created_at_ms, updated_at_ms, projection)
-                    .with_projection_key(Some(key));
+                    .with_projection_key(Some(key.clone()));
             }
         }
-        let projection = session_projection_from_events_or_sidecar(
+        let projected = session_projection_from_events_or_sidecar(
             &events_path,
             sidecar_name,
             sidecar_root,
             sidecar_kind,
         );
-        let record = SessionRecord::new(id, dir, created_at_ms, updated_at_ms, projection)
-            .with_projection_key(events_key);
+        let record =
+            SessionRecord::new(id, dir, created_at_ms, updated_at_ms, projected.projection)
+                .with_projection_key(projected.key);
         // Best-effort cache fill so the next listing reuses this projection.
         // Invalid projections are never cached: an integrity failure (e.g. a
         // missing blob) must be re-checked — and can recover — without the
         // event log changing. Write errors only cost the cache, never the
         // listing.
-        if record.status != SessionStatus::Invalid && record.projection_key.is_some() {
+        if fill_projection_cache
+            && record.status != SessionStatus::Invalid
+            && record.projection_key.is_some()
+        {
             let _ = write_session_metadata_replace(&record);
         }
         record
@@ -513,9 +553,10 @@ pub struct SessionRecord {
     /// never cached to the sidecar, so a sidecar-served record carries no
     /// reason and a repaired log clears it on the next full projection.
     invalid_reason: Option<String>,
-    /// (len, mtime-ns) of events.jsonl that the projection fields describe;
-    /// carried into sidecar writes so metadata touches keep the cache warm.
-    projection_key: Option<(u64, u64)>,
+    /// Accepted byte length and durable tail event id of `events.jsonl` that
+    /// the projection fields describe; carried into sidecar writes so
+    /// metadata touches keep the cache warm.
+    projection_key: Option<EventProjectionKey>,
 }
 
 impl SessionRecord {
@@ -544,7 +585,7 @@ impl SessionRecord {
         }
     }
 
-    fn with_projection_key(mut self, key: Option<(u64, u64)>) -> Self {
+    fn with_projection_key(mut self, key: Option<EventProjectionKey>) -> Self {
         self.projection_key = key;
         self
     }
@@ -668,25 +709,29 @@ struct SessionMetadata {
     /// Cached first-user-message title, valid under the projection key below.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     title: Option<String>,
-    /// Projection cache key: the byte length and mtime (nanoseconds since
-    /// epoch) of `events.jsonl` when status/name/title/root/kind above were
-    /// last derived from it. While the key matches the live file, listings
-    /// reuse these fields instead of re-projecting the event log (which
-    /// reads and integrity-checks the whole log plus its blobs). Absent on
-    /// sidecars written before this cache existed and after an Invalid
-    /// projection (never cached, so integrity errors stay re-checked).
-    ///
-    /// Trust boundary (docs/contracts/events.md, `session.renamed`): the
-    /// events remain the sole naming/root authority, enforced at projection
-    /// time rather than on every read. Within a matching key the cached
-    /// fields are served verbatim, so a hand-edited sidecar can misreport
-    /// display fields until the log next changes — the same actor could edit
-    /// the log itself, so this stays inside the store's existing trust
-    /// boundary. Any log append/rewrite moves the key and re-projects.
+    /// Rebuildable projection-cache identity. Unlike filesystem mtime, this
+    /// binds the display fields to the exact accepted JSONL prefix and its
+    /// durable tail envelope. Absent on legacy sidecars, after an Invalid
+    /// projection, and after a turn-boundary touch observed a changed tail,
+    /// so disagreement and integrity failures re-project. The superseded
+    /// `projected_events_len` / `projected_events_modified_ns` pair is
+    /// ignored on read and never emitted again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    projected_events_len: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    projected_events_modified_ns: Option<u64>,
+    projected_events: Option<EventProjectionKey>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct EventProjectionKey {
+    accepted_byte_len: u64,
+    tail_event_id: Option<String>,
+}
+
+impl EventProjectionKey {
+    fn is_valid(&self) -> bool {
+        self.tail_event_id
+            .as_ref()
+            .is_none_or(|event_id| !event_id.is_empty())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -798,23 +843,109 @@ fn session_metadata_from_record(record: &SessionRecord) -> SessionMetadata {
         events_path: "events.jsonl".to_owned(),
         blobs_dir: "blobs".to_owned(),
         title: record.title.clone(),
-        projected_events_len: record.projection_key.map(|(len, _)| len),
-        projected_events_modified_ns: record.projection_key.map(|(_, modified)| modified),
+        projected_events: record.projection_key.clone(),
     }
 }
 
-/// Projection cache key for an event log: byte length plus mtime in
-/// nanoseconds since the epoch. Appends always move the length; the mtime
-/// covers same-length rewrites (e.g. a scrub).
-fn events_stat_key(path: &Path) -> Option<(u64, u64)> {
-    let metadata = fs::metadata(path).ok()?;
-    let modified_ns = metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_nanos();
-    Some((metadata.len(), u64::try_from(modified_ns).ok()?))
+/// Read the accepted JSONL byte boundary and final envelope id without folding
+/// the complete log or touching blobs. A mismatch forces the authoritative
+/// projection path, which validates every event and referenced blob.
+fn event_projection_key(path: &Path) -> io::Result<EventProjectionKey> {
+    let mut file = File::open(path)?;
+    let first = event_projection_key_from_file(&mut file)?;
+    // Re-open the pathname and observe it again. An append (or replacement)
+    // during the first tail scan must not manufacture a cache hit from a
+    // length read at one instant and a tail read at another.
+    let mut check = File::open(path)?;
+    let second = event_projection_key_from_file(&mut check)?;
+    if first != second {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "provenance log changed while reading its projection identity",
+        ));
+    }
+    Ok(first)
+}
+
+fn event_projection_key_from_file(file: &mut File) -> io::Result<EventProjectionKey> {
+    let file_len = file.metadata()?.len();
+    let scan_floor = file_len.saturating_sub(EVENT_PROJECTION_TAIL_SCAN_BYTES);
+    let accepted_byte_len = accepted_prefix_end(file, file_len, scan_floor)?;
+    let tail_event_id = accepted_tail_event_id(file, accepted_byte_len, scan_floor)?;
+    if file.metadata()?.len() != file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "provenance log changed while reading its projection identity",
+        ));
+    }
+    Ok(EventProjectionKey {
+        accepted_byte_len,
+        tail_event_id,
+    })
+}
+
+fn accepted_prefix_end(file: &mut File, file_len: u64, scan_floor: u64) -> io::Result<u64> {
+    if file_len == 0 {
+        return Ok(0);
+    }
+    file.seek(SeekFrom::Start(file_len - 1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(file_len);
+    }
+    Ok(previous_newline(file, file_len, scan_floor)?.map_or(0, |offset| offset + 1))
+}
+
+fn accepted_tail_event_id(
+    file: &mut File,
+    mut boundary: u64,
+    scan_floor: u64,
+) -> io::Result<Option<String>> {
+    while boundary > 0 {
+        let terminator = boundary - 1;
+        let start = previous_newline(file, terminator, scan_floor)?.map_or(0, |offset| offset + 1);
+        let byte_len = usize::try_from(terminator - start)
+            .map_err(|_| io::Error::other("provenance tail line is too large"))?;
+        let mut bytes = vec![0; byte_len];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut bytes)?;
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
+        if !text.trim().is_empty() {
+            let event = EventEnvelope::from_json_line(text)
+                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
+            return Ok(Some(event.id));
+        }
+        boundary = start;
+    }
+    Ok(None)
+}
+
+fn previous_newline(file: &mut File, mut end: u64, scan_floor: u64) -> io::Result<Option<u64>> {
+    const TAIL_SCAN_CHUNK: u64 = 8 * 1024;
+    while end > scan_floor {
+        let start = end.saturating_sub(TAIL_SCAN_CHUNK).max(scan_floor);
+        let byte_len = usize::try_from(end - start).expect("tail scan chunk fits usize");
+        let mut bytes = vec![0; byte_len];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut bytes)?;
+        if let Some(index) = bytes.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(Some(start + index as u64));
+        }
+        end = start;
+    }
+    if scan_floor == 0 {
+        Ok(None)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provenance tail exceeds the bounded projection-cache observation window",
+        ))
+    }
 }
 
 fn write_session_metadata(record: &SessionRecord) -> Result<(), SessionStoreError> {
@@ -877,6 +1008,11 @@ fn write_json_private_replace<T: Serialize>(
     Ok(())
 }
 
+struct ProjectedSession {
+    projection: SessionProjection,
+    key: Option<EventProjectionKey>,
+}
+
 struct SessionProjection {
     status: SessionStatus,
     name: Option<String>,
@@ -920,7 +1056,7 @@ fn session_projection_from_events_or_sidecar(
     sidecar_name: Option<String>,
     sidecar_root: Option<PathBuf>,
     sidecar_kind: Option<SessionKind>,
-) -> SessionProjection {
+) -> ProjectedSession {
     // Work-counter tick: this is the single expensive per-session projection
     // the sidecar cache elides. Guards assert how many times hot paths reach
     // here (see EVENT_LOG_PROJECTIONS).
@@ -930,24 +1066,44 @@ fn session_projection_from_events_or_sidecar(
     // on seeing the latest terminal status event in that durable prefix.
     // Failures carry the diagnosis: an Invalid status without a reason is
     // unactionable after e.g. a power-loss tear zero-fills a log page.
-    let events = match read_resume_prefix(path) {
-        Ok(events) => events,
-        Err(error) => return SessionProjection::invalid(error.to_string()),
-    };
-    let root = match root_from_events(&events) {
-        Ok(root) => root.or(sidecar_root),
+    let prefix = match read_resume_prefix_with_identity(path) {
+        Ok(prefix) => prefix,
         Err(error) => {
-            return SessionProjection::invalid(format!("invalid root projection: {error}"))
+            return ProjectedSession {
+                projection: SessionProjection::invalid(error.to_string()),
+                key: None,
+            }
         }
     };
-    SessionProjection {
-        status: status_from_events(&events),
-        name: name_from_events(&events)
-            .or_else(|| sidecar_name.and_then(|name| session_name_for_display(&name))),
-        title: title_from_events(&events),
-        root,
-        kind: kind_from_events(&events).or(sidecar_kind),
-        invalid_reason: None,
+    if let Err(error) = crate::runtime_identity::runtime_identity_from_events(&prefix.events) {
+        return ProjectedSession {
+            projection: SessionProjection::invalid(error.to_string()),
+            key: None,
+        };
+    }
+    let root = match root_from_events(&prefix.events) {
+        Ok(root) => root.or(sidecar_root),
+        Err(error) => {
+            return ProjectedSession {
+                projection: SessionProjection::invalid(format!("invalid root projection: {error}")),
+                key: None,
+            }
+        }
+    };
+    ProjectedSession {
+        projection: SessionProjection {
+            status: status_from_events(&prefix.events),
+            name: name_from_events(&prefix.events)
+                .or_else(|| sidecar_name.and_then(|name| session_name_for_display(&name))),
+            title: title_from_events(&prefix.events),
+            root,
+            kind: kind_from_events(&prefix.events).or(sidecar_kind),
+            invalid_reason: None,
+        },
+        key: Some(EventProjectionKey {
+            accepted_byte_len: prefix.accepted_byte_len,
+            tail_event_id: prefix.tail_event_id,
+        }),
     }
 }
 

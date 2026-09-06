@@ -4,10 +4,11 @@ use euler_core::permissions::{
     ApprovalMode, DeciderVerdict, PermissionDecider, PermissionRequest, ScriptedDecider,
 };
 use euler_core::{
-    assemble_canvas, fold_model_target, fold_reasoning_effort, AutoCompactionPolicy, CanvasItem,
-    CompactionTier, ContextLimitConfig, GrantScope, ModelTarget, ProvenanceWriter, ReasoningEffort,
-    ScopePattern, Session, SessionConfig, SessionError, SteeringQueue, ToolRegistry,
-    WorkingStateProjection,
+    assemble_canvas, fold_model_target, fold_reasoning_effort, runtime_identity_from_events,
+    AutoCompactionPolicy, CanvasItem, CompactionTier, ContextLimitConfig, GrantScope, ModelTarget,
+    ProvenanceWriter, ReasoningEffort, RecordedRuntimeIdentity, RuntimeIdentity, ScopePattern,
+    Session, SessionConfig, SessionError, SteeringQueue, ToolRegistry, WorkingStateProjection,
+    RUNTIME_IDENTITY_SCHEMA_VERSION,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::{
@@ -74,6 +75,37 @@ fn session_new_records_session_start_first() {
         .to_string_lossy()
         .to_string();
     assert_eq!(payload_str(start, "root"), Some(expected_root.as_str()));
+    let runtime = serde_json::from_value::<RuntimeIdentity>(start.payload["runtime"].clone())
+        .expect("runtime identity");
+    assert_eq!(runtime.schema_version, RUNTIME_IDENTITY_SCHEMA_VERSION);
+    assert_eq!(runtime.binary_name, "euler");
+    assert_eq!(runtime.package_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        runtime.provider_client_version,
+        euler_provider::CLIENT_VERSION
+    );
+    assert_eq!(runtime.attached_roots, [expected_root]);
+    assert_eq!(runtime.git_sha.is_some(), runtime.git_dirty.is_some());
+    assert!(runtime
+        .build_features
+        .windows(2)
+        .all(|pair| pair[0] < pair[1]));
+    let mut config_projection = start.payload.clone();
+    config_projection.remove("runtime");
+    let expected_projection_sha = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&config_projection).expect("config projection"))
+    );
+    assert_eq!(
+        runtime.session_start_projection_sha256,
+        expected_projection_sha
+    );
+    let report = runtime_identity_from_events(session.events()).expect("runtime report projection");
+    assert_eq!(report, RecordedRuntimeIdentity::Recorded(runtime));
+    assert_eq!(
+        serde_json::to_value(report).expect("runtime report JSON")["status"],
+        "recorded"
+    );
 }
 
 #[test]

@@ -3518,6 +3518,11 @@ fn export_session_writes_current_events_json() {
             .expect("export json");
     assert_eq!(exported["model"], "echo");
     assert_eq!(exported["reasoning_effort"], "medium");
+    assert_eq!(exported["runtime_identity"]["status"], "recorded");
+    assert_eq!(
+        exported["runtime_identity"]["identity"]["binary_name"],
+        "euler"
+    );
     assert!(exported["events"]
         .as_array()
         .is_some_and(|events| !events.is_empty()));

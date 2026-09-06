@@ -524,6 +524,27 @@ envelope `v` per `docs/contracts/persistence.md`.
   mixed shape and resume fails closed. The summary is validated like the
   snapshot (key whitelist, grammar) and every overlapping field must agree
   exactly with the snapshot it announces; any mismatch fails resume.
+  Current streams additionally carry `runtime`, an object with exact keys:
+  `schema_version` (currently `1`), `binary_name`, `package_version`, nullable
+  `git_sha` and `git_dirty` represented as an all-known or all-null pair,
+  sorted unique `build_features`, `session_start_projection_sha256`,
+  `provider_client_version`, and nonempty `attached_roots`. The projection
+  digest is SHA-256 over the complete `session.start` payload before the
+  `runtime` object is inserted. It commits only to that recorded projection,
+  not every behavior-affecting field of the live `SessionConfig`; the exact
+  committed bytes remain beside their identity without serializing live
+  config files or secret-bearing provider settings. Git identity is captured at
+  build time; `git_dirty` describes tracked source/index differences from
+  `HEAD`. If the build environment has no trustworthy Git checkout, both Git
+  fields are null rather than guessed. The current authority model attaches
+  exactly the normalized `root` above; additional roots require the explicit
+  multi-root authority contract. A missing `runtime` object means unknown
+  legacy identity, never the currently running build. Report/export
+  projections serialize these states explicitly as `recorded` or
+  `legacy_unknown`; they never substitute the reader's build. A present
+  malformed or unsupported object is incompatible rather than silently
+  treated as legacy. More than one `session.start` is likewise invalid; a
+  report or resume must not select one of several claimed identities.
 - `session.resumed`: `provider`, `model`, `events_folded`, optional
   `resumed_from_event_id`. A durable audit marker recording that the session
   lifetime was continued, against which target and from which tail event.
@@ -538,16 +559,33 @@ envelope `v` per `docs/contracts/persistence.md`.
   event stream is readable and contains no `session.renamed`; the next rename
   writes this canonical event and refreshes the sidecar projection.
   Projection caching: `session.json` may additionally carry the cached
-  event-log projection (status/name/title/root/kind) keyed by the event
-  log's `(byte length, mtime)`. While the key matches the live log, listings
-  serve the cached projection verbatim instead of re-deriving it — the
-  events remain the sole naming authority, but their authority is enforced
-  at projection time, not on every read. A hand-edited sidecar can therefore
-  misreport display fields until the event log next changes; that is inside
-  the store's trust boundary (the same actor could edit the log itself) and
-  outside its integrity model. Any event append or log rewrite moves the key
-  and forces re-projection, and integrity failures (`invalid` status) are
-  never cached, so they are re-checked on every listing.
+  event-log projection (status/name/title/root/kind) under
+  `projected_events`, keyed by `accepted_byte_len` and `tail_event_id` for the
+  same verified accepted JSONL prefix. The accepted length stops at the final
+  newline, excluding a torn final fragment under the persistence contract;
+  an empty prefix records a null tail. Each cache-key observation reads only
+  the final 1 MiB window, covering any torn fragment, trailing blank lines,
+  and the last accepted event; lookup repeats the observation on a fresh file
+  handle and rejects disagreement. If that window cannot contain the complete
+  accepted tail event, the fast path declines the cache key and performs the
+  authoritative full projection. A valid large-tail session remains valid; it
+  merely receives no cache hit. No cache-key line allocation exceeds the
+  window.
+  An append invalidates the old accepted-length/tail key; it need not
+  synchronously rewrite the sidecar, and the stale key cannot be a cache hit.
+  Mismatch, truncation, an unreadable tail, a legacy `(length, mtime)` key, or
+  a missing key forces the complete event/blob projection and an atomic
+  sidecar replacement on the next listing. A turn-boundary metadata touch
+  performs the same key comparison but never projects: on mismatch it drops
+  the key from the rewritten sidecar so the stale projection cannot be served
+  before that listing re-derives it. While the durable key
+  matches, listings serve the cached projection verbatim instead of
+  re-deriving it — the events remain the sole naming authority, enforced at
+  projection time rather than on every read. Same-length hostile rewrites
+  preserving the tail id remain inside the session-directory trust boundary.
+  Integrity failures (`invalid` status) never receive a projection key, so
+  they are re-checked on every listing. Sidecars and indexes remain
+  rebuildable caches and never become session authority.
 - `project.context.snapshot` (current schema version 2; ADR 0017,
   `docs/contracts/project-context.md`): `schema_version`, `status`
   (`admitted` | `disabled` | `declined` | `unacknowledged`, each gated by the

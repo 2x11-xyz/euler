@@ -10,6 +10,15 @@ Derived research structures, such as causal DAGs, are projections or extension a
 
 Provenance uses the canonical session event envelope in `docs/contracts/events.md`. Persistence policy, durability semantics (emitted/appended/durable), and schema versioning are defined in `docs/contracts/persistence.md`.
 
+Every fresh `session.start` records the exact compile-time runtime identity
+defined by the event contract: package/binary version, build-time Git revision
+and tracked dirty state when knowable, sorted build features, the digest of the
+recorded non-runtime `session.start` projection, provider-client version, and
+the currently attached root. That digest does not claim to cover unrecorded
+`SessionConfig` state. Legacy omission projects and serializes as explicit
+`legacy_unknown` provenance; a recorded value serializes as `recorded`. Neither
+report nor resume inherits the identity of its reader.
+
 Accepted event ids are globally unique within a session stream. A duplicate
 makes request links and causal references ambiguous, so resume rejects the
 prefix during canonical preflight before recovery closures, resume markers, or

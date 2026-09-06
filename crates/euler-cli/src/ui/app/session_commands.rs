@@ -115,6 +115,10 @@ impl AppCore {
             }
             _ => return self.notice_item("export waits for the active turn".to_owned()),
         };
+        let runtime_identity = match euler_core::runtime_identity_from_events(&events) {
+            Ok(identity) => identity,
+            Err(error) => return self.error_item(format!("export failed: {error}")),
+        };
         let path = match path.map(PathBuf::from) {
             Some(path) => path,
             None => match self.default_export_path(&session_id) {
@@ -127,6 +131,7 @@ impl AppCore {
             "provider": self.status.provider,
             "model": self.status.model,
             "reasoning_effort": self.current_reasoning_effort().as_str(),
+            "runtime_identity": runtime_identity,
             "events": events,
         });
         match serde_json::to_vec_pretty(&payload)
