@@ -9,8 +9,10 @@
 //! resurrects an older manifest.
 
 use super::digest::{candidate_digest_v1, rendered_digest_v1, workspace_identity_digest_v1};
-use super::framing::{render_project_context, FRAMING_VERSION};
-use super::manifest::{validate_identity, validate_reason_code, CandidateManifest};
+use super::framing::{
+    render_project_context, render_skill_activation, render_skill_command, FRAMING_VERSION,
+};
+use super::manifest::{validate_identity, validate_reason_code, CandidateManifest, ManifestSkill};
 use super::{MAX_EULER_MD_SOURCES, MAX_MANIFEST_DIAGNOSTICS, SNAPSHOT_SCHEMA_VERSION};
 use euler_event::JsonObject;
 use euler_event::{EventEnvelope, EventKind};
@@ -64,6 +66,7 @@ impl PinnedProjectContext {
             .map(|skill| crate::tools::FrozenSkill {
                 snapshot_digest: self.candidate_digest.clone(),
                 name: skill.name.clone(),
+                description: skill.description.clone(),
                 scope: skill.scope.as_str().to_owned(),
                 path: skill.path.clone(),
                 body_digest: skill.body_digest.clone(),
@@ -124,19 +127,35 @@ impl std::error::Error for ProjectContextFoldError {}
 pub(crate) fn fold_project_context(
     events: &[EventEnvelope],
 ) -> Result<ProjectContextFold, ProjectContextFoldError> {
+    let has_skill_activations = events.iter().any(is_skill_activation_event);
     let Some(snapshot) = events
         .iter()
         .rev()
         .find(|event| event.kind.as_str() == EventKind::PROJECT_CONTEXT_SNAPSHOT)
     else {
-        return Ok(ProjectContextFold::Absent);
+        return if has_skill_activations {
+            Err(ProjectContextFoldError::new(
+                "an explicit skill activation has no frozen project-context snapshot",
+            ))
+        } else {
+            Ok(ProjectContextFold::Absent)
+        };
     };
     match validate_snapshot_payload(&snapshot.payload)? {
-        ValidatedSnapshot::Disabled => Ok(ProjectContextFold::Disabled),
+        ValidatedSnapshot::Disabled => {
+            if has_skill_activations {
+                Err(ProjectContextFoldError::new(
+                    "an explicit skill activation names a snapshot without admitted skills",
+                ))
+            } else {
+                Ok(ProjectContextFold::Disabled)
+            }
+        }
         ValidatedSnapshot::Admitted {
             manifest,
             candidate_digest,
         } => {
+            validate_skill_activations(events, &manifest, &candidate_digest)?;
             let rendered = render_project_context(&manifest);
             let rendered_digest = rendered_digest_v1(&rendered);
             Ok(ProjectContextFold::Admitted(Box::new(
@@ -150,6 +169,141 @@ pub(crate) fn fold_project_context(
             )))
         }
     }
+}
+
+const SKILL_ACTIVATION_REQUIRED_KEYS: &[&str] = &[
+    "schema_version",
+    "name",
+    "scope",
+    "source",
+    "body_digest",
+    "snapshot_digest",
+];
+const SKILL_ACTIVATION_OPTIONAL_KEYS: &[&str] = &["arguments"];
+
+fn is_skill_activation_event(event: &EventEnvelope) -> bool {
+    event.kind.as_str() == EventKind::USER_MESSAGE && event.payload.contains_key("skill_activation")
+}
+
+fn validate_skill_activations(
+    events: &[EventEnvelope],
+    manifest: &CandidateManifest,
+    candidate_digest: &str,
+) -> Result<(), ProjectContextFoldError> {
+    for event in events
+        .iter()
+        .filter(|event| is_skill_activation_event(event))
+    {
+        validate_skill_activation(event, manifest, candidate_digest)?;
+    }
+    Ok(())
+}
+
+fn validate_skill_activation(
+    event: &EventEnvelope,
+    manifest: &CandidateManifest,
+    candidate_digest: &str,
+) -> Result<(), ProjectContextFoldError> {
+    let activation = event
+        .payload
+        .get("skill_activation")
+        .and_then(Value::as_object)
+        .ok_or_else(skill_activation_error)?;
+    if activation.keys().any(|key| {
+        !SKILL_ACTIVATION_REQUIRED_KEYS.contains(&key.as_str())
+            && !SKILL_ACTIVATION_OPTIONAL_KEYS.contains(&key.as_str())
+    }) || SKILL_ACTIVATION_REQUIRED_KEYS
+        .iter()
+        .any(|key| !activation.contains_key(*key))
+        || activation.get("schema_version").and_then(Value::as_u64) != Some(1)
+    {
+        return Err(skill_activation_error());
+    }
+    let name = activation_string(activation, "name")?;
+    let skill = manifest
+        .skills
+        .iter()
+        .find(|skill| skill.name == name)
+        .ok_or_else(skill_activation_error)?;
+    let arguments = activation_arguments(activation)?;
+    validate_skill_activation_identity(activation, skill, candidate_digest)?;
+    let content = event
+        .payload
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(skill_activation_error)?;
+    let model_content = event
+        .payload
+        .get("model_content")
+        .and_then(Value::as_str)
+        .ok_or_else(skill_activation_error)?;
+    let classification = event
+        .payload
+        .get("project_context_snapshot_digest")
+        .and_then(Value::as_str);
+    let expected_model_content = render_skill_activation(
+        &skill.name,
+        skill.scope.as_str(),
+        &skill.path,
+        &skill.body_digest,
+        &skill.body,
+        arguments,
+    );
+    if content != render_skill_command(name, arguments)
+        || model_content != expected_model_content
+        || classification != Some(candidate_digest)
+    {
+        return Err(skill_activation_error());
+    }
+    Ok(())
+}
+
+fn validate_skill_activation_identity(
+    activation: &JsonObject,
+    skill: &ManifestSkill,
+    candidate_digest: &str,
+) -> Result<(), ProjectContextFoldError> {
+    let exact_fields = [
+        ("scope", skill.scope.as_str()),
+        ("source", skill.path.as_str()),
+        ("body_digest", skill.body_digest.as_str()),
+        ("snapshot_digest", candidate_digest),
+    ];
+    if exact_fields
+        .into_iter()
+        .any(|(key, expected)| activation.get(key).and_then(Value::as_str) != Some(expected))
+    {
+        return Err(skill_activation_error());
+    }
+    Ok(())
+}
+
+fn activation_string<'a>(
+    activation: &'a JsonObject,
+    key: &str,
+) -> Result<&'a str, ProjectContextFoldError> {
+    activation
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(skill_activation_error)
+}
+
+fn activation_arguments(activation: &JsonObject) -> Result<Option<&str>, ProjectContextFoldError> {
+    match activation.get("arguments") {
+        None => Ok(None),
+        Some(Value::String(arguments))
+            if !arguments.is_empty()
+                && !arguments.chars().next().is_some_and(char::is_whitespace) =>
+        {
+            Ok(Some(arguments))
+        }
+        Some(_) => Err(skill_activation_error()),
+    }
+}
+
+fn skill_activation_error() -> ProjectContextFoldError {
+    ProjectContextFoldError::new("an explicit skill activation is malformed or was altered")
 }
 
 /// A snapshot payload that passed full field validation.

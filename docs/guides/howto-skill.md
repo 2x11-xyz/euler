@@ -60,12 +60,21 @@ Start a new Euler session after creating or editing a skill. In the TUI, use
 `/new`. Euler freezes accepted skill content for the session, so an existing or
 resumed session does not pick up later file changes.
 
-Euler can select a skill from its catalog when the description matches the
-task. You can also ask directly:
+Activate a skill directly with its slash command:
 
 ```text
-Use the commit-writing skill for this change.
+/skill:commit-writing
 ```
+
+Add a request after the name when useful:
+
+```text
+/skill:commit-writing prepare the current staged changes
+```
+
+The slash palette lists every skill frozen into the current session. The
+model can also select a relevant skill from the same catalog by calling
+`skill_read`.
 
 Skills provide guidance only. They do not grant tool permissions or bypass
 Euler policy. Only `SKILL.md` enters the skill snapshot. Supporting files

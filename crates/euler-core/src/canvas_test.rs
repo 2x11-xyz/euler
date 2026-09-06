@@ -86,6 +86,129 @@ fn default_policy_enables_automatic_compaction_and_tool_stubs() {
     assert!(policy.with_settings(false, true).stubs_enabled());
 }
 
+#[test]
+fn explicit_skill_activation_projects_resolved_content_not_literal_command() {
+    let pinned = PinnedProjectContext::for_test(
+        "snapshot-event",
+        "snapshot",
+        "project context",
+        "rendered-digest",
+    );
+    let event = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::USER_MESSAGE,
+        object([
+            ("content", "/skill:review focus".into()),
+            ("model_content", "frozen body\nuser request".into()),
+            ("project_context_snapshot_digest", "snapshot".into()),
+            (
+                "skill_activation",
+                object([
+                    ("schema_version", 1.into()),
+                    ("snapshot_digest", "snapshot".into()),
+                ])
+                .into(),
+            ),
+        ]),
+    );
+
+    let expected = CanvasItem::SkillActivation {
+        event_id: event.id.clone(),
+        snapshot_digest: "snapshot".to_owned(),
+        content: "frozen body\nuser request".to_owned(),
+    };
+    for policy in [off_policy(usize::MAX), stubs_policy(0)] {
+        let canvas = assemble_canvas_prefolded(
+            std::slice::from_ref(&event),
+            &policy,
+            &BTreeSet::new(),
+            Some(&pinned),
+            None,
+        );
+        assert_eq!(canvas.last(), Some(&expected));
+    }
+}
+
+#[test]
+fn malformed_skill_activation_cannot_smuggle_unclassified_model_content() {
+    let pinned = PinnedProjectContext::for_test(
+        "snapshot-event",
+        "outer",
+        "project context",
+        "rendered-digest",
+    );
+    let event = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::USER_MESSAGE,
+        object([
+            ("content", "/skill:review".into()),
+            ("model_content", "unclassified body".into()),
+            ("project_context_snapshot_digest", "outer".into()),
+            (
+                "skill_activation",
+                object([
+                    ("schema_version", 1.into()),
+                    ("snapshot_digest", "different".into()),
+                ])
+                .into(),
+            ),
+        ]),
+    );
+
+    assert_eq!(
+        assemble_canvas_prefolded(
+            std::slice::from_ref(&event),
+            &off_policy(usize::MAX),
+            &BTreeSet::new(),
+            Some(&pinned),
+            None,
+        )
+        .last()
+        .cloned(),
+        Some(CanvasItem::Message {
+            event_id: event.id,
+            role: CanvasRole::User,
+            content: "/skill:review".to_owned(),
+        })
+    );
+}
+
+#[test]
+fn unpinned_skill_activation_never_projects_model_content() {
+    let event = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::USER_MESSAGE,
+        object([
+            ("content", "/skill:review".into()),
+            ("model_content", "unverified body".into()),
+            ("project_context_snapshot_digest", "snapshot".into()),
+            (
+                "skill_activation",
+                object([
+                    ("schema_version", 1.into()),
+                    ("snapshot_digest", "snapshot".into()),
+                ])
+                .into(),
+            ),
+        ]),
+    );
+
+    assert_eq!(
+        assemble_canvas(std::slice::from_ref(&event), &off_policy(usize::MAX)),
+        vec![CanvasItem::Message {
+            event_id: event.id,
+            role: CanvasRole::User,
+            content: "/skill:review".to_owned(),
+        }]
+    );
+}
+
 fn demoted_outputs(canvas: &[CanvasItem]) -> Vec<&str> {
     canvas
         .iter()
@@ -743,6 +866,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
             .map(|item| match item {
                 CanvasItem::ProjectContext { .. } => "project.context",
                 CanvasItem::Message { role, .. } => role.as_str(),
+                CanvasItem::SkillActivation { .. } => "user",
                 CanvasItem::Projection { .. } => "projection",
                 CanvasItem::Slot { .. } => "slot",
                 CanvasItem::ExtensionContribution { .. } => "extension.contribution",

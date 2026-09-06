@@ -31,6 +31,11 @@ the canonical session event stream: `none` rejects every classified result,
 while `inherit` accepts only an exact candidate-snapshot-digest match and
 propagates the same classification to the new result.
 
+User-explicit `/skill:<name> [request]` activation is a session command, not a
+synthetic tool call. It resolves against the same frozen registry and uses the
+same attributed framing, but remains a canonical `user.message`; Euler never
+forges `tool.call` or `tool.result` provenance for it.
+
 Core tools are the minimal coding substrate.
 
 Tool calls must be permission checked, provenance logged, and represented cleanly in the active canvas.

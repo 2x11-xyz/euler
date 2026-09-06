@@ -790,6 +790,66 @@ fn patch_payload_old_new_externalize_to_blobs_and_rehydrate() {
 }
 
 #[test]
+fn explicit_skill_model_content_externalizes_and_rehydrates() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let model_content = "f".repeat(DEFAULT_BLOB_THRESHOLD + 1);
+    let unrelated_model_content = "u".repeat(DEFAULT_BLOB_THRESHOLD + 1);
+    let event = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([
+            ("content", "/skill:review".into()),
+            ("model_content", model_content.clone().into()),
+            (
+                "skill_activation",
+                object([("schema_version", 1.into())]).into(),
+            ),
+        ]),
+    );
+    let ordinary = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(event.id.clone()),
+        EventKind::USER_MESSAGE,
+        object([
+            ("content", "ordinary".into()),
+            ("model_content", unrelated_model_content.clone().into()),
+        ]),
+    );
+
+    writer
+        .append(&[event, ordinary])
+        .expect("append activation");
+
+    let raw = fs::read_to_string(&log).expect("raw log");
+    assert!(!raw.contains(&model_content));
+    assert!(raw.contains(&unrelated_model_content));
+    let raw_events = raw
+        .lines()
+        .map(|line| EventEnvelope::from_json_line(line).expect("raw event"))
+        .collect::<Vec<_>>();
+    let raw_event = &raw_events[0];
+    assert!(raw_event.payload["model_content"]
+        .as_str()
+        .expect("blob ref")
+        .starts_with("blob:"));
+    assert!(raw_event.blobs.contains_key("model_content"));
+    assert!(raw_events[1].blobs.is_empty());
+    let rehydrated = read_provenance(&log).expect("rehydrated log");
+    assert_eq!(rehydrated[0].payload["content"], "/skill:review");
+    assert_eq!(rehydrated[0].payload["model_content"], model_content);
+    assert!(rehydrated[0].blobs.is_empty());
+    assert_eq!(
+        rehydrated[1].payload["model_content"],
+        unrelated_model_content
+    );
+}
+
+#[test]
 fn write_blob_durable_creates_missing_blob() {
     let temp = tempfile::tempdir().expect("temp dir");
     let path = temp.path().join("blob");

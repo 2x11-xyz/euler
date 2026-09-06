@@ -53,7 +53,7 @@ use euler_core::{
     resume_session_from_folded_prefix, AgentResult, AgentTask, ApprovalMode, CompactionStatus,
     EulerHome, ExtensionMaterialization, ExtensionRegistry, GrantSource, ModelTarget,
     ProjectContextBootstrap, ProvenanceWriter, ProviderRuntimeEvent, ProviderRuntimeObserver,
-    QueuedInput, ReasoningEffort, ScopePattern, Session, SessionStore,
+    QueuedInput, ReasoningEffort, ScopePattern, Session, SessionStore, SkillCatalogEntry,
 };
 use euler_event::{EventEnvelope, EventKind};
 use euler_provider::catalog::MergedModelCatalog;
@@ -221,6 +221,7 @@ pub struct AppCore {
     /// this snapshot so the reviewer-model picker never silently shrinks to
     /// empty because of turn state.
     authenticated_providers: BTreeSet<String>,
+    skill_commands: Vec<SkillCatalogEntry>,
     model_catalog: MergedModelCatalog,
     catalog_refresh_rx: Option<Receiver<Result<crate::provider_catalog::RefreshReport>>>,
     model_catalog_path: Option<PathBuf>,
@@ -881,6 +882,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         ..TokenUsageSnapshot::default()
     };
     let authenticated_providers = session.providers().authenticated_provider_ids();
+    let skill_commands = session.skill_catalog();
     let initial_context = command_context(
         &model_catalog,
         &target.provider,
@@ -893,6 +895,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
                 automatic: session.auto_compaction_policy().automatic,
                 stubs: session.auto_compaction_policy().stubs_enabled(),
             },
+            skill_commands.clone(),
         ),
     );
     AppCoreBootstrap {
@@ -944,6 +947,7 @@ impl AppCore {
         options: AppOptions,
     ) -> Self {
         let boot = bootstrap_app_core(&session, options);
+        let skill_commands = boot.initial_context.skill_commands.clone();
         Self {
             state: AppState::Idle {
                 session: Box::new(session),
@@ -955,6 +959,7 @@ impl AppCore {
             bottom: BottomSurface::new(boot.initial_context),
             status: boot.status,
             authenticated_providers: boot.authenticated_providers,
+            skill_commands,
             model_catalog: boot.model_catalog,
             catalog_refresh_rx: None,
             model_catalog_path: None,
@@ -1013,6 +1018,7 @@ impl AppCore {
 
     fn rebuild_bottom_surface(&mut self) {
         self.refresh_authenticated_providers();
+        self.refresh_skill_commands();
         let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
@@ -1020,6 +1026,7 @@ impl AppCore {
             checkpoint_items: self.current_checkpoint_items(),
             extension_items,
             extension_slash_commands,
+            skill_commands: self.skill_commands.clone(),
             code_swarm_models: self.code_swarm_models.clone(),
             compaction: self.current_compaction_settings(),
         };
@@ -1034,6 +1041,7 @@ impl AppCore {
 
     fn replace_bottom_surface_for_session(&mut self) {
         self.refresh_authenticated_providers();
+        self.refresh_skill_commands();
         let (extension_items, extension_slash_commands) = self.current_extension_context();
         let parts = CommandContextParts {
             current_effort: self.current_reasoning_effort(),
@@ -1041,6 +1049,7 @@ impl AppCore {
             checkpoint_items: self.current_checkpoint_items(),
             extension_items,
             extension_slash_commands,
+            skill_commands: self.skill_commands.clone(),
             code_swarm_models: self.code_swarm_models.clone(),
             compaction: self.current_compaction_settings(),
         };
@@ -1060,6 +1069,12 @@ impl AppCore {
     fn refresh_authenticated_providers(&mut self) {
         if let AppState::Idle { session } = &self.state {
             self.authenticated_providers = session.providers().authenticated_provider_ids();
+        }
+    }
+
+    fn refresh_skill_commands(&mut self) {
+        if let AppState::Idle { session } = &self.state {
+            self.skill_commands = session.skill_catalog();
         }
     }
 
@@ -2324,6 +2339,9 @@ impl AppCore {
             CommandAction::SwitchModel { provider, model } => self.switch_model(provider, model),
             CommandAction::SetReasoningEffort { effort } => self.set_reasoning_effort(effort),
             CommandAction::CompactSession => self.compact_session(),
+            CommandAction::ActivateSkill { name, arguments } => {
+                self.activate_skill(name, arguments)
+            }
             CommandAction::SetCompactionPolicy { automatic, stubs } => {
                 self.set_compaction_policy(automatic, stubs)
             }
@@ -2383,6 +2401,26 @@ impl AppCore {
             CommandAction::ExtensionRemove { id } => self.remove_extension(id),
             CommandAction::ExtensionAdd { path } => self.add_extension(path),
         }
+    }
+
+    fn activate_skill(&mut self, name: String, arguments: Option<String>) -> CoreEffect {
+        let prompt = arguments.map_or_else(
+            || format!("/skill:{name}"),
+            |arguments| format!("/skill:{name} {arguments}"),
+        );
+        if !matches!(self.state, AppState::Idle { .. }) {
+            self.push_queued_input_back(prompt);
+            self.queued_selection = self.queued_inputs.len().checked_sub(1);
+            self.notice = None;
+            return CoreEffect::Render;
+        }
+        self.visual_scroll_offset = 0;
+        self.queued_inputs.set_paused(false);
+        self.bottom.record_submission(&prompt);
+        let session = self.take_idle_session();
+        self.rebuild_bottom_surface();
+        self.spawn_turn(prompt, session);
+        CoreEffect::Render
     }
 
     fn toggle_timestamps(&mut self) -> CoreEffect {
@@ -3294,6 +3332,7 @@ fn empty_command_context_parts(
     current_effort: ReasoningEffort,
     current_theme: ThemeChoice,
     compaction: CompactionSettings,
+    skill_commands: Vec<SkillCatalogEntry>,
 ) -> CommandContextParts {
     CommandContextParts {
         current_effort,
@@ -3301,6 +3340,7 @@ fn empty_command_context_parts(
         checkpoint_items: Vec::new(),
         extension_items: Vec::new(),
         extension_slash_commands: Vec::new(),
+        skill_commands,
         code_swarm_models: Vec::new(),
         compaction,
     }

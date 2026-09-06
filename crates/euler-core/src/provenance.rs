@@ -415,7 +415,7 @@ impl ProvenanceWriter {
 
     fn externalize_large_payloads(&self, event: &EventEnvelope) -> io::Result<EventEnvelope> {
         let mut event = event.clone();
-        for &field in externalized_payload_fields(event.kind.as_str()) {
+        for &field in externalized_payload_fields(&event) {
             let Some(value) = event
                 .payload
                 .get(field)
@@ -455,9 +455,15 @@ impl ProvenanceWriter {
     }
 }
 
-fn externalized_payload_fields(kind: &str) -> &'static [&'static str] {
-    match kind {
+fn externalized_payload_fields(event: &EventEnvelope) -> &'static [&'static str] {
+    match event.kind.as_str() {
         EventKind::TOOL_RESULT => &["output"],
+        // Explicit skill activation keeps the literal command in `content`
+        // and the exact frozen model expansion here. Large expansions use the
+        // same content-addressed, hash-checked storage as other model input.
+        EventKind::USER_MESSAGE if event.payload.contains_key("skill_activation") => {
+            &["model_content"]
+        }
         EventKind::PATCH_PROPOSED | EventKind::PATCH_APPLIED => &["old", "new"],
         // The admitted manifest is one top-level payload string; above the
         // threshold that complete string becomes one content-addressed blob

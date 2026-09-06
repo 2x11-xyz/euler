@@ -460,6 +460,55 @@ If two accepted files claim the same normalized skill name, every claimant is
 excluded and a typed ambiguity diagnostic names their bounded relative paths.
 There is no first-wins, nearest-wins, or filesystem-order override.
 
+### 10a. Support explicit frozen-snapshot skill activation
+
+The core session command `/skill:<name> [request]` lets a user select an
+accepted skill directly. The prefix is reserved at the user-message admission
+boundary. It is recognized only at byte zero, uses the same normalized name
+grammar as discovery, and requires an exact match in the current session's
+immutable catalog. An invalid or unavailable name fails before a
+`user.message` is admitted or a provider is called. Indented and embedded
+examples remain ordinary text. The optional request is free-form and may span
+lines; only the whitespace separating the name from that request is
+canonicalized.
+
+The event keeps the canonical literal invocation in `content`. Core resolves
+the skill from the frozen `ToolRegistry`, never from disk, and records the
+exact framed provider input in `model_content`. A versioned
+`skill_activation` object separately records name, scope, source, body digest,
+snapshot digest, and optional live arguments. Skill guidance and arguments
+occupy distinct core-marked, line-indented sections. The former remains
+attributed guidance; the latter remains live user-authored input. Neither
+section grants permissions or can forge a core marker at column zero.
+
+`model_content` is the authoritative model-facing projection while `content`
+is the authoritative user-visible command. Both are durable. Large
+`model_content` values use the provenance blob store, and resume rehydrates
+the recorded bytes instead of resolving the command again. Before request
+assembly or resume, core recomputes the command, metadata, classification, and
+framed expansion from the recorded frozen snapshot. Missing or altered fields
+fail closed instead of silently sending the literal command or unclassified
+bytes. Layer-1 compaction does not demote user inputs; a validated full canvas
+projection may summarize old input while the original event and exact
+expansion remain in provenance.
+
+The TUI derives sorted command rows and descriptions from the same immutable
+registry catalog. That list is only a discovery cache: core resolution at
+admission remains authoritative. The command uses the ordinary idle,
+mid-turn steering, and queued follow-up paths, so one durability and ordering
+contract governs every timing case.
+
+An activated body is a project-context-classified canvas item carrying its
+snapshot digest. Child request assembly removes it under `project_context:
+none` and retains it only when `inherit` allows that exact digest, just like a
+classified `skill_read` result.
+
+The current bootstrap contract admits exactly one immutable snapshot per
+session, so every activation validates against that snapshot. Explicit reload
+remains deferred. Before any reload implementation permits multiple snapshot
+events, activation folding must select and validate each historical activation
+against the snapshot named by its recorded digest.
+
 ### 11. Bound discovery and prompt cost
 
 The initial implementation targets these contract limits:
@@ -845,7 +894,6 @@ This feature neither relies on nor changes repository ignore rules.
 - explicit reload and session fork semantics (interactive resume relocation
   moved to issue #180 phase 3 by the 2026-07-21 owner decision; see decision 7
   amendment);
-- `/skill:name` user commands;
 - skill installation, registries, and management UX;
 - automatic dependency installation or helper-script execution;
 - a bounded skill-resource API for supporting files outside the tool root;

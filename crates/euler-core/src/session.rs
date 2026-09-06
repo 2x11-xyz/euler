@@ -25,7 +25,7 @@ use crate::sandbox::SubprocessSandbox;
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
-use crate::tools::{ReteachTracker, ToolError, ToolRegistry};
+use crate::tools::{ReteachTracker, SkillCatalogEntry, ToolError, ToolRegistry};
 use crate::EventBus;
 use euler_agents::{generated_agent_id, AgentError, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
@@ -95,6 +95,8 @@ const CONTEXT_LIMIT_MESSAGE: &str =
     "Session stopped because the context limit threshold was reached.";
 const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
     "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
+const SKILL_COMMAND_PREFIX: &str = "/skill:";
+const SKILL_ACTIVATION_SCHEMA_VERSION: u64 = 1;
 const SYSTEM_INSTRUCTIONS_VERSION: u64 = 1;
 const SYSTEM_INSTRUCTIONS: &str = concat!(
     "You are Euler, a coding agent. Work through the user's task completely: do not stop after ",
@@ -341,6 +343,10 @@ pub enum SessionError {
     InvalidModelSwitchEvent(String),
     #[error("invalid session name: {name}")]
     InvalidSessionName { name: String },
+    #[error("invalid skill command; usage: /skill:<name> [request]")]
+    InvalidSkillCommand,
+    #[error("skill is not available in this session: {name}")]
+    SkillUnavailable { name: String },
     #[error("queued input is not the current dispatch reservation for this steering queue")]
     InvalidQueuedInput,
     #[error("cannot replace a session while a user-message admission is unresolved")]
@@ -828,6 +834,19 @@ where
             },
         );
         if result.is_err() {
+            if result.as_ref().is_err_and(|error| {
+                matches!(
+                    error,
+                    SessionError::InvalidSkillCommand | SessionError::SkillUnavailable { .. }
+                )
+            }) {
+                // Parsing and catalog lookup happen before a pending event is
+                // installed. Their failures are deterministic rejection, not
+                // ambiguous provenance I/O, so the queued row must remain
+                // editable rather than becoming durability-protected.
+                debug_assert!(self.session.pending_admission.is_none());
+                queue.release_rejected_admission();
+            }
             // Prior accepted backlog may remain on the bus if draining it was
             // the append that failed. Flush that evidence while the queue
             // retains its reserved id. The rejected user.message itself is
@@ -1141,6 +1160,14 @@ impl<D> Session<D> {
     /// The live workspace root, for a `/new` acknowledgment card's folder label.
     pub fn workspace_root(&self) -> &std::path::Path {
         &self.config.root
+    }
+
+    /// The immutable skill catalog backing this session's model tool and
+    /// explicit `/skill:<name>` commands. Interactive surfaces may cache it
+    /// while the session is checked out to a worker; admission still resolves
+    /// against this registry as the authoritative source.
+    pub fn skill_catalog(&self) -> Vec<SkillCatalogEntry> {
+        self.tools.skill_catalog()
     }
 
     /// Build the fresh session `/new` composes, with the bootstrap obtained
@@ -1574,7 +1601,7 @@ impl<D> Session<D> {
         queue_id: Option<steering::QueueEntryId>,
     ) -> Result<String, SessionError> {
         self.ensure_terminalization_intact()?;
-        let payload = object([("content", content.to_owned().into())]);
+        let payload = self.user_message_payload(content)?;
         if let Some(pending) = &self.pending_admission {
             if pending.queue_id != queue_id
                 || pending.event.kind.as_str() != EventKind::USER_MESSAGE
@@ -1614,6 +1641,41 @@ impl<D> Session<D> {
             self.persisted_events = self.bus.events().len();
         }
         Ok(id)
+    }
+
+    fn user_message_payload(&self, content: &str) -> Result<JsonObject, SessionError> {
+        let mut payload = object([("content", content.to_owned().into())]);
+        let Some((name, arguments)) = parse_skill_command(content)? else {
+            return Ok(payload);
+        };
+        let resolved = self
+            .tools
+            .resolve_skill_activation(name, arguments)
+            .ok_or_else(|| SessionError::SkillUnavailable {
+                name: name.to_owned(),
+            })?;
+        payload.insert(
+            "content".to_owned(),
+            crate::project_context::render_skill_command(name, arguments).into(),
+        );
+        let mut activation = object([
+            ("schema_version", SKILL_ACTIVATION_SCHEMA_VERSION.into()),
+            ("name", name.to_owned().into()),
+            ("scope", resolved.scope.into()),
+            ("source", resolved.source.into()),
+            ("body_digest", resolved.body_digest.into()),
+            ("snapshot_digest", resolved.snapshot_digest.clone().into()),
+        ]);
+        if let Some(arguments) = arguments {
+            activation.insert("arguments".to_owned(), arguments.to_owned().into());
+        }
+        payload.insert("skill_activation".to_owned(), activation.into());
+        payload.insert(
+            "project_context_snapshot_digest".to_owned(),
+            resolved.snapshot_digest.clone().into(),
+        );
+        payload.insert("model_content".to_owned(), resolved.model_content.into());
+        Ok(payload)
     }
 
     /// The sole append path allowed after a pending user admission has been
@@ -3547,7 +3609,7 @@ fn canvas_counts(canvas: &[CanvasItem]) -> JsonObject {
                         CanvasItem::Message {
                             role: CanvasRole::User,
                             ..
-                        }
+                        } | CanvasItem::SkillActivation { .. }
                     )
                 })
                 .count()
@@ -3827,6 +3889,9 @@ fn apply_child_project_context_policy(
     canvas.retain(|item| match item {
         CanvasItem::ProjectContext {
             snapshot_digest, ..
+        }
+        | CanvasItem::SkillActivation {
+            snapshot_digest, ..
         } => allowed_snapshot_digest == Some(snapshot_digest.as_str()),
         _ => true,
     });
@@ -3907,6 +3972,10 @@ fn model_input_item(item: &CanvasItem) -> ModelInputItem {
                 CanvasRole::User => ModelRole::User,
                 CanvasRole::Assistant => ModelRole::Assistant,
             },
+            content: content.clone(),
+        },
+        CanvasItem::SkillActivation { content, .. } => ModelInputItem::Message {
+            role: ModelRole::User,
             content: content.clone(),
         },
         CanvasItem::Projection { content, .. } => ModelInputItem::Message {
@@ -4167,6 +4236,23 @@ pub fn fold_reasoning_effort(
 fn payload_string(event: &EventEnvelope, key: &str) -> Option<String> {
     event.payload.get(key)?.as_str().map(str::to_owned)
 }
+
+/// Parse the core-reserved explicit skill command at the user-message
+/// boundary. Only a byte-zero prefix is active; quoted or indented examples
+/// remain ordinary user text. Names use the same canonical grammar as skill
+/// discovery, and arguments preserve every byte after leading separation.
+fn parse_skill_command(content: &str) -> Result<Option<(&str, Option<&str>)>, SessionError> {
+    let Some(rest) = content.strip_prefix(SKILL_COMMAND_PREFIX) else {
+        return Ok(None);
+    };
+    let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let name = &rest[..name_end];
+    crate::project_context::validate_skill_name(name)
+        .map_err(|_| SessionError::InvalidSkillCommand)?;
+    let arguments = rest[name_end..].trim_start();
+    Ok(Some((name, (!arguments.is_empty()).then_some(arguments))))
+}
+
 fn validate_effort_change_reason(reason: &str) -> Result<(), String> {
     if is_safe_switch_reason(reason) {
         Ok(())

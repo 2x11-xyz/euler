@@ -393,6 +393,7 @@ pub(super) struct CommandContextParts {
     pub checkpoint_items: Vec<CheckpointItem>,
     pub extension_items: Vec<super::super::commands::ExtensionManagerItem>,
     pub extension_slash_commands: Vec<super::super::commands::ExtensionSlashCommand>,
+    pub skill_commands: Vec<euler_core::SkillCatalogEntry>,
     pub code_swarm_models: Vec<String>,
     pub compaction: CompactionSettings,
 }
@@ -431,6 +432,7 @@ pub(super) fn command_context(
         checkpoint_items: parts.checkpoint_items,
         extension_items: parts.extension_items,
         extension_slash_commands: parts.extension_slash_commands,
+        skill_commands: parts.skill_commands,
         code_swarm_models: parts.code_swarm_models,
         compaction: parts.compaction,
     }

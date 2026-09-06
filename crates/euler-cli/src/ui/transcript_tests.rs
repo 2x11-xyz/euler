@@ -68,6 +68,28 @@ fn projects_supported_events_and_skips_control_events() {
 }
 
 #[test]
+fn explicit_skill_activation_displays_the_literal_user_command() {
+    let activation = event(
+        EventKind::USER_MESSAGE,
+        object([
+            ("content", "/skill:review focus".into()),
+            ("model_content", "large frozen model input".into()),
+            (
+                "skill_activation",
+                object([("schema_version", 1.into())]).into(),
+            ),
+        ]),
+    );
+
+    assert_eq!(
+        project_events(&[activation]),
+        vec![TranscriptItem::UserMessage(
+            "/skill:review focus".to_owned()
+        )]
+    );
+}
+
+#[test]
 fn operation_permission_panel_names_the_operation_and_every_capability() {
     let items = vec![TranscriptItem::PermissionBatchAsk {
         operation: "extension session-export.export".to_owned(),

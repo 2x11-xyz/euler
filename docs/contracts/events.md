@@ -111,6 +111,33 @@ envelope `v` per `docs/contracts/persistence.md`.
   even when another row has identical content. Repair and retry therefore
   reconcile that event exactly once instead of persisting a failed bus copy or
   acknowledging a content-equal duplicate.
+
+  An explicit skill activation has canonical `content` in the form
+  `/skill:<name> [request]` plus these additive fields:
+
+  - `model_content`: the exact core-framed user-role bytes sent to the model;
+  - `project_context_snapshot_digest`: the candidate digest classifying the
+    expanded bytes;
+  - `skill_activation`: an object containing `schema_version` (currently 1),
+    `name`, `scope`, `source`, `body_digest`, `snapshot_digest`, and optional
+    `arguments`.
+
+  The skill name must use the frozen catalog grammar and match exactly. Core
+  resolves it before installing the pending admission; invalid or unavailable
+  commands therefore append no event and consume no queue row. The skill body
+  and live arguments occupy separate, indented, core-marked sections in
+  `model_content`. Arguments are free-form and may be multiline. Request
+  assembly uses `model_content`; transcript, search, and history use the
+  literal `content`. Large `model_content` is
+  blob-externalized and hash-checked. Resume and replay use the recorded bytes,
+  never the current filesystem or a newly resolved catalog. At every
+  model-facing fold, core verifies those bytes and every activation field
+  against the frozen snapshot recorded by the session. Missing, mismatched, or
+  unknown fields reject request assembly and resume. The projected canvas item
+  carries the snapshot classification, so child context policy can filter it.
+  Layer-1 compaction does not demote it; a validated full canvas swap may
+  replace it in active context without removing the original event or blob
+  from provenance.
 - `assistant.message`: `content`. It commits the visible content of a
   no-tool model round. Pending steering may keep that same user turn active,
   append more `user.message` events, and dispatch another model round only

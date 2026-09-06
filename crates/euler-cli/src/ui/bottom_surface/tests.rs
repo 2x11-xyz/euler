@@ -5,7 +5,7 @@ use crate::ui::commands::{
     ExtensionManagerItem, ModelChoice, PermissionPosture, ResumeItem,
 };
 use crate::ui::theme::ThemeChoice;
-use euler_core::{ApprovalMode, ReasoningEffort};
+use euler_core::{ApprovalMode, ReasoningEffort, SkillCatalogEntry};
 use insta::assert_snapshot;
 
 fn code_swarm_picker_surface(selected: Vec<String>) -> BottomSurface {
@@ -443,6 +443,23 @@ fn palette_confirm_activates_highlighted_command_token() {
     assert_eq!(
         unknown.confirm(),
         SurfaceEvent::Message("unknown command: /zz".to_owned())
+    );
+
+    let mut skill = BottomSurface::new(CommandContext {
+        skill_commands: vec![SkillCatalogEntry {
+            name: "review".to_owned(),
+            description: "Review changes.".to_owned(),
+        }],
+        ..CommandContext::default()
+    });
+    skill.open_palette();
+    skill.palette_insert("skill:rev focus on safety");
+    assert_eq!(
+        skill.confirm(),
+        SurfaceEvent::Action(CommandAction::ActivateSkill {
+            name: "review".to_owned(),
+            arguments: Some("focus on safety".to_owned()),
+        })
     );
 }
 

@@ -129,7 +129,7 @@ pub use swarm::{
     resolve_swarm_config, SwarmConfig, SwarmConfigError, SwarmConfigStore, SwarmConfigTier,
     SwarmReviewer, MAX_SWARM_REVIEWERS, UNCONFIGURED_SWARM_ERROR,
 };
-pub use tools::{ToolError, ToolRegistry};
+pub use tools::{SkillCatalogEntry, ToolError, ToolRegistry};
 
 #[derive(Default)]
 pub struct EventBus {

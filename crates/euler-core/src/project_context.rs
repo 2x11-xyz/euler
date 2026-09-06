@@ -34,7 +34,8 @@ pub(crate) use fold::{
     fold_project_context, validate_bootstrap_shape, verify_workspace_identity,
     PinnedProjectContext, ProjectContextFold, WorkspaceIdentityIssue,
 };
-pub(crate) use framing::render_skill_result;
+pub(crate) use framing::{render_skill_activation, render_skill_command, render_skill_result};
+pub(crate) use manifest::validate_skill_name;
 
 use crate::redaction::SecretRedactor;
 use crate::session_kind::SessionKind;
@@ -898,6 +899,7 @@ impl ProjectContextBootstrap {
                     .map(|skill| crate::tools::FrozenSkill {
                         snapshot_digest: self.candidate_digest.clone(),
                         name: skill.name.clone(),
+                        description: skill.description.clone(),
                         scope: skill.scope.as_str().to_owned(),
                         path: skill.path.clone(),
                         body_digest: skill.body_digest.clone(),

@@ -13,6 +13,11 @@ pull requests that landed them; deeper design rationale lives in
   that directory with a non-fatal compatibility diagnostic, and the
   1,024-character description limit counts Unicode scalar values instead of
   UTF-8 bytes.
+- Users can activate any catalogued session skill with
+  `/skill:<name> [request]`. Euler resolves only the immutable frozen snapshot,
+  preserves the compact command in the transcript, records the exact expanded
+  model input in provenance, and uses the same admission path for idle turns,
+  steering, and queued follow-ups.
 - Euler now discovers user-global skills from `${EULER_HOME}/skills/` and
   project skills from `.euler/skills/`, freezes them in schema-v2 session
   snapshots, renders a compact catalog, and exposes snapshot-backed

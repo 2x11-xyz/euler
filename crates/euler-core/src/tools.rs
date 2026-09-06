@@ -186,12 +186,32 @@ pub struct FrozenSkill {
     /// Candidate digest of the immutable snapshot that owns this body.
     pub snapshot_digest: String,
     pub name: String,
+    pub description: String,
     pub scope: String,
     /// Source identity (workspace-relative or `user/` path) echoed in the
     /// `skill_read` result header; never re-read from disk.
     pub path: String,
     pub body_digest: String,
     pub body: String,
+}
+
+/// Discoverable metadata for one skill frozen into the current session.
+///
+/// This view deliberately omits the body. Interactive surfaces may use it for
+/// command discovery, but admission always resolves against the registry that
+/// produced it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SkillCatalogEntry {
+    pub name: String,
+    pub description: String,
+}
+
+pub(crate) struct ResolvedSkillActivation {
+    pub model_content: String,
+    pub snapshot_digest: String,
+    pub scope: String,
+    pub source: String,
+    pub body_digest: String,
 }
 
 impl ToolRegistry {
@@ -225,6 +245,39 @@ impl ToolRegistry {
             .into_iter()
             .map(|skill| (skill.name.clone(), skill))
             .collect();
+    }
+
+    /// Return the frozen catalog in canonical name order.
+    pub fn skill_catalog(&self) -> Vec<SkillCatalogEntry> {
+        self.skills
+            .values()
+            .map(|skill| SkillCatalogEntry {
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn resolve_skill_activation(
+        &self,
+        name: &str,
+        arguments: Option<&str>,
+    ) -> Option<ResolvedSkillActivation> {
+        let skill = self.skills.get(name)?;
+        Some(ResolvedSkillActivation {
+            model_content: crate::project_context::render_skill_activation(
+                &skill.name,
+                &skill.scope,
+                &skill.path,
+                &skill.body_digest,
+                &skill.body,
+                arguments,
+            ),
+            snapshot_digest: skill.snapshot_digest.clone(),
+            scope: skill.scope.clone(),
+            source: skill.path.clone(),
+            body_digest: skill.body_digest.clone(),
+        })
     }
 
     /// The workspace root every tool executes in (`run_shell` is
