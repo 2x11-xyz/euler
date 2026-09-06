@@ -866,6 +866,23 @@ fn driver_snapshot_authority(
     event: &EventEnvelope,
     duplicate_ids: &BTreeSet<String>,
 ) -> Option<DriverSnapshotAuthority> {
+    let (canvas_items, selected_event_ids) = driver_snapshot_selection(event)?;
+    if selected_event_ids
+        .iter()
+        .any(|id| duplicate_ids.contains(id))
+    {
+        return None;
+    }
+    Some(DriverSnapshotAuthority {
+        canvas_items,
+        selected_event_ids,
+    })
+}
+
+/// Canonical structural validator for a driver `canvas.snapshot` selection.
+/// Consumers add their own temporal and actor authority checks around this
+/// shared payload grammar.
+pub(crate) fn driver_snapshot_selection(event: &EventEnvelope) -> Option<(u64, Vec<String>)> {
     let selected_event_ids = event
         .payload
         .get("selected_event_ids")?
@@ -876,18 +893,8 @@ fn driver_snapshot_authority(
     let canvas_items = event.payload.get("counts")?.get("items")?.as_u64()?;
     let expected_items = usize::try_from(canvas_items).ok()?;
     let unique_items = selected_event_ids.iter().collect::<BTreeSet<_>>();
-    if selected_event_ids.len() != expected_items
-        || unique_items.len() != selected_event_ids.len()
-        || selected_event_ids
-            .iter()
-            .any(|id| duplicate_ids.contains(id))
-    {
-        return None;
-    }
-    Some(DriverSnapshotAuthority {
-        canvas_items,
-        selected_event_ids,
-    })
+    (selected_event_ids.len() == expected_items && unique_items.len() == selected_event_ids.len())
+        .then_some((canvas_items, selected_event_ids))
 }
 
 fn consume_request_backed_contributions(

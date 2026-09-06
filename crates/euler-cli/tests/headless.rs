@@ -50,7 +50,7 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
 
     let jsonl = fs::read_to_string(&log).expect("read jsonl");
     let lines: Vec<&str> = jsonl.lines().collect();
-    assert_eq!(lines.len(), 7);
+    assert_eq!(lines.len(), 8);
     assert!(lines[0].contains("\"kind\":\"session.start\""));
     // Dormant project-context bootstrap (ADR 0017): one disabled snapshot,
     // no diagnostics in an empty temp workspace, and no source bodies.
@@ -59,14 +59,16 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
     assert!(lines[2].contains("\"kind\":\"user.message\""));
     assert!(lines[3].contains("\"kind\":\"canvas.snapshot\""));
     assert!(lines[4].contains("\"kind\":\"model.call\""));
-    assert!(lines[5].contains("\"kind\":\"model.result\""));
-    assert!(lines[6].contains("\"kind\":\"assistant.message\""));
+    assert!(lines[5].contains("\"kind\":\"assistant.response.chunk\""));
+    assert!(lines[6].contains("\"kind\":\"model.result\""));
+    assert!(lines[7].contains("\"kind\":\"assistant.message\""));
 
     assert!(lines[2].contains("\"content\":\"hello skeleton\""));
     assert!(lines[4].contains("\"provider\":\"fixture\""));
     assert!(lines[4].contains("\"model\":\"echo\""));
     assert!(lines[5].contains("\"content\":\"user: hello skeleton\""));
     assert!(lines[6].contains("\"content\":\"user: hello skeleton\""));
+    assert!(lines[7].contains("\"content\":\"user: hello skeleton\""));
 }
 
 #[test]
@@ -251,6 +253,66 @@ fn headless_session_writes_stable_diagnostics_jsonl() {
     assert!(has_diagnostic_event(&lines, "model_call_end"));
     assert!(has_diagnostic_event(&lines, "tool_exec_end"));
     assert!(has_diagnostic_event(&lines, "permission_decision"));
+    let model_calls = lines
+        .iter()
+        .filter(|line| line["event"] == "model_call_end")
+        .collect::<Vec<_>>();
+    assert_eq!(model_calls.len(), 2);
+    assert!(model_calls
+        .iter()
+        .all(|line| line["usage_available"] == false));
+    assert!(model_calls
+        .iter()
+        .all(|line| line.get("input_tokens").is_none()
+            && line.get("output_tokens").is_none()
+            && line["observed_output_bytes"].is_u64()));
+    assert!(model_calls
+        .iter()
+        .any(|line| line["observed_output_bytes"] == 4));
+}
+
+#[test]
+fn diagnostics_keep_numeric_usage_when_provider_reports_it() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = tempfile::tempdir().expect("root dir");
+    let log = root.path().join("events.jsonl");
+
+    let mut child = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .arg("--provider")
+        .arg("fixture")
+        .arg("--provenance")
+        .arg(path_str(&log))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"diagnostics usage\n")
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait euler");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let lines = read_diagnostics_jsonl(&root.path().join("diagnostics.jsonl"));
+    let model_call = lines
+        .iter()
+        .find(|line| line["event"] == "model_call_end")
+        .expect("model-call diagnostic");
+    assert_eq!(model_call["usage_available"], true);
+    assert!(model_call["input_tokens"].is_u64());
+    assert!(model_call["output_tokens"].is_u64());
+    assert!(model_call["observed_output_bytes"]
+        .as_u64()
+        .is_some_and(|bytes| bytes > 0));
 }
 
 #[test]
@@ -966,7 +1028,7 @@ fn fixture_loop_without_provenance_writes_home_session_store() {
 
     let log = sessions.join(session_id).join("events.jsonl");
     let events = read_jsonl(&log);
-    assert_eq!(events.len(), 7);
+    assert_eq!(events.len(), 8);
     assert!(events.iter().all(|event| event.session == session_id));
     assert_eq!(events[0].kind.as_str(), EventKind::SESSION_START);
     assert!(sessions.join(session_id).join("session.json").is_file());
@@ -4190,7 +4252,7 @@ fn resume_then_next_turn_matches_uninterrupted_transcript_projection() {
     assert!(resumed.status.success());
     let stderr = String::from_utf8_lossy(&resumed.stderr);
     assert!(stderr.contains("resumed session headless-session"));
-    assert!(stderr.contains("folded 7 events"));
+    assert!(stderr.contains("folded 8 events"));
     assert!(stderr.contains("target fixture/echo"));
     assert!(stderr.contains("recovery closure not appended"));
 
@@ -5973,7 +6035,15 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
     tui.write("a");
     assert!(
         tui.wait_for_screen("thirty lines of output captured"),
-        "turn did not finish:\n{}",
+        "answer did not start streaming:\n{}",
+        tui.screen_text()
+    );
+    // The first visible answer fragment can precede durable completion.
+    // Finish the turn before testing fold geometry, while retaining the
+    // immediate resize -> toggle sequence below.
+    assert!(
+        tui.wait_for_home_session_event_count(temp.path(), EventKind::ASSISTANT_MESSAGE, 1),
+        "assistant message was not persisted:\n{}",
         tui.screen_text()
     );
     assert!(
@@ -6524,7 +6594,7 @@ fn tui_pty_without_provenance_writes_home_session_store() {
 
     let session_id = only_home_session_id(home.path());
     let events = read_jsonl(&home_session_log(home.path(), &session_id));
-    assert_eq!(events.len(), 7);
+    assert_eq!(events.len(), 8);
     assert!(events.iter().all(|event| event.session == session_id));
 }
 

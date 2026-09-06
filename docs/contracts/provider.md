@@ -162,12 +162,21 @@ allows it (the ChatGPT Responses adapter requests `reasoning.summary: auto`)
 so that legitimate long thinking resets semantic idle rather than tripping it.
 Each retry is separately observed and its backoff is recorded in diagnostics.
 
+Root readable text is durably checkpointed before it is forwarded as live UI
+content. A handled provider failure or cancellation flushes every observed
+text suffix before the canonical terminal error. Checkpoints do not broaden
+the retry window: any nonempty semantic output still forbids automatic replay.
+
 ## Diagnostics and provenance
 
 Attempt diagnostics record request start, response headers, first byte, first
 semantic output, retry scheduling, timeout/cancellation/completion outcome, and
 the final transport/semantic timing summary. Diagnostics must remain
-content-free and follow the secrets contract.
+content-free and follow the secrets contract. The final record distinguishes
+unavailable provider usage from known zero usage and includes the locally
+observed output byte count. `usage_available: false` omits token-count fields;
+when true, input/output counts are numeric scalars even when either known
+value is zero.
 
 The canonical `model.call` plus its ordinary `model.result` or terminal
 `error` remains the durable semantic history. A provider terminal error may

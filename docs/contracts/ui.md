@@ -432,6 +432,17 @@ The terminal UI renders the canonical session event stream from
 `docs/contracts/events.md` as an ordered ledger. Avoid permanent sidebars,
 dashboards, and boilerplate panels in the core CLI.
 
+A failed, cancelled, or resume-interrupted root response with durable text
+checkpoints renders that exact partial text as one incomplete assistant cell,
+alongside its canonical status and error source/message. It offers only real
+recovery affordances: `Ctrl+Shift+C` or `/copy` copies the retained text, and
+the user may submit a new instruction to continue or retry. Euler never
+silently retries after visible output and never injects a recovered draft into
+the model canvas. A completed response follows the ordinary
+`model.result`/`assistant.message` path with no partial duplicate. Malformed,
+cross-actor, and child checkpoints render no assistant prose; transcript and
+resume share the same core-owned protocol fold.
+
 ## Activity and thinking
 
 The pinned Activity block has one deterministic, replayable projection of the
@@ -460,6 +471,9 @@ even though its phase age restarts. A stall becomes visible after 30 seconds
 without meaningful progress in a phase that can advance; waiting for user
 approval is exempt. Replayed events use their provenance timestamps, while
 live rendering injects only the current clock used to calculate ages.
+Durable response checkpoints update observed-event liveness only; because they
+mirror already-observed text, they do not independently reset meaningful
+progress or expose their content in the Activity block.
 
 Ordinary extension, guardian, and nonterminal session errors are failed
 operation milestones, not authority to terminalize the Activity projection.

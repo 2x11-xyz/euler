@@ -23,6 +23,8 @@ impl EventKind {
     pub const USER_MESSAGE: &'static str = "user.message";
     pub const ASSISTANT_MESSAGE: &'static str = "assistant.message";
     pub const ASSISTANT_ACTIVITY: &'static str = "assistant.activity";
+    /// One append-only text checkpoint for a streamed root response.
+    pub const ASSISTANT_RESPONSE_CHUNK: &'static str = "assistant.response.chunk";
     pub const PLAN_UPDATE: &'static str = "plan.update";
     pub const TOOL_CALL: &'static str = "tool.call";
     pub const TOOL_RESULT: &'static str = "tool.result";
@@ -87,6 +89,7 @@ impl EventKind {
         Self::USER_MESSAGE,
         Self::ASSISTANT_MESSAGE,
         Self::ASSISTANT_ACTIVITY,
+        Self::ASSISTANT_RESPONSE_CHUNK,
         Self::PLAN_UPDATE,
         Self::TOOL_CALL,
         Self::TOOL_RESULT,
@@ -256,6 +259,16 @@ mod tests {
         assert_round_trip(
             EventKind::ASSISTANT_ACTIVITY,
             object([("message", "working".into())]),
+        );
+        assert_round_trip(
+            EventKind::ASSISTANT_RESPONSE_CHUNK,
+            object([
+                ("response_id", "model-call-1".into()),
+                ("sequence", 0.into()),
+                ("content", "partial response".into()),
+                ("observed_output_bytes", 16.into()),
+                ("retained_content_bytes", 16.into()),
+            ]),
         );
         assert_round_trip(
             EventKind::PLAN_UPDATE,
@@ -504,6 +517,7 @@ mod tests {
             EventKind::USER_MESSAGE,
             EventKind::ASSISTANT_MESSAGE,
             EventKind::ASSISTANT_ACTIVITY,
+            EventKind::ASSISTANT_RESPONSE_CHUNK,
             EventKind::PLAN_UPDATE,
             EventKind::TOOL_CALL,
             EventKind::TOOL_RESULT,
@@ -586,6 +600,16 @@ mod tests {
             base(EventKind::USER_MESSAGE, json!({"content": "hello"})),
             base(EventKind::ASSISTANT_MESSAGE, json!({"content": "hi"})),
             base(EventKind::ASSISTANT_ACTIVITY, json!({"message": "working"})),
+            base(
+                EventKind::ASSISTANT_RESPONSE_CHUNK,
+                json!({
+                    "response_id": "01J00000000000000000000001",
+                    "sequence": 0,
+                    "content": "partial response",
+                    "observed_output_bytes": 16,
+                    "retained_content_bytes": 16
+                }),
+            ),
             base(
                 EventKind::PLAN_UPDATE,
                 json!({
@@ -695,7 +719,8 @@ mod tests {
                     "content": "hi",
                     "tool_calls": [],
                     "stop_reason": "completed",
-                    "usage": {"input_tokens": 1, "output_tokens": 1, "cached_tokens": 0, "reasoning_tokens": 0}
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "cached_tokens": 0, "reasoning_tokens": 0},
+                    "observed_output_bytes": 2
                 }),
             ),
             base(
@@ -834,6 +859,13 @@ mod tests {
     fn assert_ratified_fields_present(event: &EventEnvelope) {
         let required = match event.kind.as_str() {
             EventKind::USER_MESSAGE | EventKind::ASSISTANT_MESSAGE => vec!["content"],
+            EventKind::ASSISTANT_RESPONSE_CHUNK => vec![
+                "response_id",
+                "sequence",
+                "content",
+                "observed_output_bytes",
+                "retained_content_bytes",
+            ],
             EventKind::PLAN_UPDATE => vec![
                 "source",
                 "extension_id",
@@ -891,6 +923,7 @@ mod tests {
                     "tool_calls",
                     "stop_reason",
                     "usage",
+                    "observed_output_bytes",
                 ]
             }
             EventKind::MODEL_REASONING => vec!["provider", "model", "fidelity", "content"],

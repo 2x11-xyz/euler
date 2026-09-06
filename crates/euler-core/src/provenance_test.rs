@@ -21,6 +21,10 @@ fn persist_policy_excludes_only_model_delta() {
         PersistDecision::Persist
     );
     assert_eq!(
+        policy.classify(EventKind::ASSISTANT_RESPONSE_CHUNK),
+        PersistDecision::Persist
+    );
+    assert_eq!(
         policy.classify(EventKind::FILE_CHANGE),
         PersistDecision::Persist
     );
@@ -846,6 +850,523 @@ fn explicit_skill_model_content_externalizes_and_rehydrates() {
     assert_eq!(
         rehydrated[1].payload["model_content"],
         unrelated_model_content
+    );
+}
+
+#[test]
+fn response_chunk_blob_rehydrates_and_scrubs_with_valid_byte_accounting() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let secret = "tiny".to_owned();
+    let content = format!(
+        "{}{}",
+        "x".repeat(crate::assistant_response::MAX_RESPONSE_CHUNK_BYTES - secret.len()),
+        secret
+    );
+    let start = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_START,
+        object([]),
+    );
+    let snapshot = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            ("selected_event_ids", serde_json::json!([])),
+            ("counts", serde_json::json!({"items": 0})),
+        ]),
+    );
+    let call = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(snapshot.id.clone()),
+        EventKind::MODEL_CALL,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("canvas_items", 0.into()),
+            ("canvas_snapshot_id", snapshot.id.clone().into()),
+        ]),
+    );
+    let response_id = call.id.clone();
+    let chunk = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::ASSISTANT_RESPONSE_CHUNK,
+        object([
+            ("response_id", call.id.clone().into()),
+            ("sequence", 0.into()),
+            ("content", content.clone().into()),
+            ("observed_output_bytes", (content.len() as u64).into()),
+            ("retained_content_bytes", (content.len() as u64).into()),
+        ]),
+    );
+    let terminal = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::ERROR,
+        object([
+            ("source", "provider".into()),
+            ("message", "stream failed".into()),
+            ("response_id", call.id.clone().into()),
+            ("response_status", "failed".into()),
+            ("observed_output_bytes", (content.len() as u64).into()),
+            ("retained_content_bytes", (content.len() as u64).into()),
+        ]),
+    );
+    writer
+        .append(&[start, snapshot, call, chunk, terminal])
+        .expect("append response");
+
+    let raw = fs::read_to_string(&log).expect("raw log");
+    assert!(!raw.contains(&content));
+    let old_blob_hash = EventEnvelope::from_json_line(raw.lines().nth(3).expect("chunk line"))
+        .expect("raw chunk")
+        .blobs["content"]
+        .clone();
+    let before = read_provenance(&log).expect("rehydrate response");
+    assert_eq!(before[3].payload["content"], content);
+
+    writer
+        .scrub_and_audit(
+            &[secret.clone(), response_id.clone()],
+            None,
+            "session",
+            "agent",
+        )
+        .expect("scrub response");
+    assert!(
+        !temp.path().join("blobs").join(old_blob_hash).exists(),
+        "the externalized pre-scrub response must be retired"
+    );
+    let scrubbed = read_provenance(&log).expect("read scrubbed response");
+    let scrubbed_content = scrubbed[3].payload["content"]
+        .as_str()
+        .expect("chunk content");
+    assert!(!scrubbed_content.contains(&secret));
+    assert_eq!(scrubbed_content, "[scrubbed]");
+    assert_eq!(scrubbed[3].payload["response_id"], response_id);
+    assert_eq!(scrubbed[4].payload["response_id"], response_id);
+    let projected = crate::assistant_response::project_assistant_response_terminals(&scrubbed)
+        .expect("scrub preserves response protocol");
+    let recovered = projected.get(&scrubbed[4].id).expect("terminal response");
+    assert_eq!(recovered.content, scrubbed_content);
+    assert_eq!(recovered.observed_output_bytes, content.len() as u64);
+    assert_eq!(
+        recovered.retained_content_bytes,
+        scrubbed_content.len() as u64
+    );
+    assert_eq!(
+        scrubbed[3].payload["observed_output_bytes"],
+        serde_json::json!(content.len())
+    );
+    assert_eq!(
+        scrubbed[4].payload["observed_output_bytes"],
+        serde_json::json!(content.len())
+    );
+}
+
+#[test]
+fn response_protocol_only_scrub_is_a_durable_and_live_noop() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let start = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_START,
+        object([]),
+    );
+    let snapshot = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            ("selected_event_ids", serde_json::json!([])),
+            ("counts", serde_json::json!({"items": 0})),
+        ]),
+    );
+    let call = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(snapshot.id.clone()),
+        EventKind::MODEL_CALL,
+        object([
+            ("canvas_snapshot_id", snapshot.id.clone().into()),
+            ("canvas_items", 0.into()),
+        ]),
+    );
+    let response_id = call.id.clone();
+    let chunk = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(response_id.clone()),
+        EventKind::ASSISTANT_RESPONSE_CHUNK,
+        object([
+            ("response_id", response_id.clone().into()),
+            ("sequence", 0.into()),
+            ("content", "kept text".into()),
+            ("observed_output_bytes", 9.into()),
+            ("retained_content_bytes", 9.into()),
+        ]),
+    );
+    let terminal = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(response_id.clone()),
+        EventKind::ERROR,
+        object([
+            ("source", "session".into()),
+            ("message", "process restarted".into()),
+            ("response_id", response_id.clone().into()),
+            ("response_status", "interrupted".into()),
+            ("observed_output_bytes", 9.into()),
+            ("retained_content_bytes", 9.into()),
+            ("cancelled", false.into()),
+            ("recovery_closure", true.into()),
+        ]),
+    );
+    let events = vec![start, snapshot, call, chunk, terminal];
+    writer.append(&events).expect("append response");
+    let raw_before = fs::read(&log).expect("raw log before scrub");
+    let event_ids = events
+        .iter()
+        .map(|event| event.id.clone())
+        .collect::<Vec<_>>();
+    let projection =
+        crate::project_assistant_response_terminals(&events).expect("valid response before scrub");
+    let response = projection.values().next().expect("failed response");
+    assert_eq!(response.observed_output_bytes, 9);
+    assert_eq!(response.retained_content_bytes, 9);
+
+    let secrets = vec![
+        response_id.clone(),
+        "session".to_owned(),
+        "interrupted".to_owned(),
+        "response_id".to_owned(),
+        "sequence".to_owned(),
+        "content".to_owned(),
+        "observed_output_bytes".to_owned(),
+        "retained_content_bytes".to_owned(),
+        "response_status".to_owned(),
+        "source".to_owned(),
+        "cancelled".to_owned(),
+        "recovery_closure".to_owned(),
+    ];
+    let report = writer
+        .scrub_and_audit(&secrets, None, "session", "agent")
+        .expect("durable protocol-only scrub");
+    assert!(!report.anything_scrubbed(), "{report:?}");
+    assert!(report.audit_event_id.is_none());
+    assert_eq!(fs::read(&log).expect("raw log after scrub"), raw_before);
+
+    let mut live = crate::EventBus::new();
+    for event in events {
+        live.push(event);
+    }
+    assert_eq!(live.scrub_payloads(&secrets), 0);
+    assert_eq!(
+        live.events()
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>(),
+        event_ids
+    );
+    let live_projection = crate::project_assistant_response_terminals(live.events())
+        .expect("valid live response after scrub");
+    assert_eq!(live_projection, projection);
+
+    let durable = read_provenance(&log).expect("durable response after scrub");
+    assert_eq!(
+        durable
+            .iter()
+            .map(|event| event.id.clone())
+            .collect::<Vec<_>>(),
+        event_ids
+    );
+    let durable_projection = crate::project_assistant_response_terminals(&durable)
+        .expect("valid durable response after scrub");
+    assert_eq!(durable_projection, projection);
+    let response = durable_projection
+        .values()
+        .next()
+        .expect("durable failed response");
+    assert_eq!(response.response_id, response_id);
+    assert_eq!(response.status, crate::AssistantResponseStatus::Interrupted);
+    assert_eq!(response.source, "session");
+    assert_eq!(response.observed_output_bytes, 9);
+    assert_eq!(response.retained_content_bytes, 9);
+}
+
+#[test]
+fn malformed_response_claims_cannot_hide_secrets_from_durable_scrub() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(&log).expect("writer");
+    let secret = "malformed-response-secret".to_owned();
+    let terminal = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::ERROR,
+        object([
+            ("source", secret.clone().into()),
+            ("message", "ordinary error".into()),
+            ("response_id", secret.clone().into()),
+            ("response_status", secret.clone().into()),
+        ]),
+    );
+    writer
+        .append(std::slice::from_ref(&terminal))
+        .expect("append malformed claim");
+
+    let report = writer
+        .scrub_and_audit(std::slice::from_ref(&secret), None, "session", "agent")
+        .expect("scrub malformed claim");
+
+    assert!(report.anything_scrubbed());
+    assert_eq!(report.replacements, 3);
+    assert!(!fs::read_to_string(&log)
+        .expect("scrubbed log")
+        .contains(&secret));
+    let events = read_provenance(&log).expect("read scrubbed malformed claim");
+    assert_eq!(events[0].payload["source"], "[scrubbed]");
+    assert_eq!(events[0].payload["response_id"], "[scrubbed]");
+    assert_eq!(events[0].payload["response_status"], "[scrubbed]");
+}
+
+fn checkpointed_response_events(chunks: &[&str]) -> Vec<EventEnvelope> {
+    let start = EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::SESSION_START,
+        object([]),
+    );
+    let snapshot = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            ("selected_event_ids", serde_json::json!([])),
+            ("counts", serde_json::json!({"items": 0})),
+        ]),
+    );
+    let call = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(snapshot.id.clone()),
+        EventKind::MODEL_CALL,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("canvas_items", 0.into()),
+            ("canvas_snapshot_id", snapshot.id.clone().into()),
+        ]),
+    );
+    let mut events = vec![start, snapshot, call.clone()];
+    let mut observed = 0_u64;
+    for (sequence, content) in chunks.iter().enumerate() {
+        observed += u64::try_from(content.len()).expect("fixture length");
+        events.push(EventEnvelope::new(
+            "session",
+            "agent",
+            Some(call.id.clone()),
+            EventKind::ASSISTANT_RESPONSE_CHUNK,
+            object([
+                ("response_id", call.id.clone().into()),
+                ("sequence", (sequence as u64).into()),
+                ("content", (*content).into()),
+                ("observed_output_bytes", observed.into()),
+                ("retained_content_bytes", observed.into()),
+            ]),
+        ));
+    }
+    events.push(EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::ERROR,
+        object([
+            ("source", "provider".into()),
+            ("message", "stream failed".into()),
+            ("response_id", call.id.into()),
+            ("response_status", "failed".into()),
+            ("observed_output_bytes", observed.into()),
+            ("retained_content_bytes", observed.into()),
+        ]),
+    ));
+    events
+}
+
+fn raw_response_blob_hashes(log: &Path) -> Vec<String> {
+    fs::read_to_string(log)
+        .expect("raw log")
+        .lines()
+        .map(|line| EventEnvelope::from_json_line(line).expect("raw event"))
+        .filter(|event| event.kind.as_str() == EventKind::ASSISTANT_RESPONSE_CHUNK)
+        .map(|event| event.blobs["content"].clone())
+        .collect()
+}
+
+#[test]
+fn escaped_secret_across_externalized_chunks_retires_every_old_blob() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+    let writer =
+        ProvenanceWriter::with_threshold(log.clone(), blob_dir.clone(), 1).expect("writer");
+    let secret = "line\nquote".to_owned();
+    let encoded = serde_json::to_string(&secret)
+        .expect("encode secret")
+        .trim_matches('"')
+        .to_owned();
+    assert_eq!(encoded, "line\\nquote");
+    let events = checkpointed_response_events(&["line\\", "nquote"]);
+    writer.append(&events).expect("append response");
+    let old_hashes = raw_response_blob_hashes(&log);
+    assert_eq!(old_hashes.len(), 2);
+
+    writer
+        .scrub_and_audit(std::slice::from_ref(&secret), None, "session", "agent")
+        .expect("scrub cross-boundary response");
+
+    for hash in &old_hashes {
+        assert!(
+            !blob_dir.join(hash).exists(),
+            "old response blob {hash} survived scrub"
+        );
+    }
+    for path in fs::read_dir(&blob_dir).expect("blob dir") {
+        let bytes = fs::read(path.expect("blob entry").path()).expect("blob bytes");
+        assert!(!bytes
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        assert!(!bytes
+            .windows(encoded.len())
+            .any(|window| window == encoded.as_bytes()));
+    }
+    let scrubbed = read_provenance(&log).expect("scrubbed response");
+    let projected = crate::assistant_response::project_assistant_response_terminals(&scrubbed)
+        .expect("valid scrubbed protocol");
+    assert_eq!(
+        projected.values().next().expect("terminal").content,
+        "[scrubbed][scrubbed]"
+    );
+}
+
+#[test]
+fn collapsed_response_blob_staging_failure_leaves_old_log_and_blobs_readable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+    let writer =
+        ProvenanceWriter::with_threshold(log.clone(), blob_dir.clone(), 1).expect("writer");
+    let secret = "partial-secret-value".to_owned();
+    writer
+        .append(&checkpointed_response_events(&["partial-", "secret-value"]))
+        .expect("append response");
+    let old_log = fs::read(&log).expect("original log");
+    let old_hashes = raw_response_blob_hashes(&log);
+
+    {
+        let expected = blob_dir.clone();
+        let guard = arm_matching(Op::DirSync, move |path| path == expected);
+        writer
+            .scrub_and_audit(std::slice::from_ref(&secret), None, "session", "agent")
+            .expect_err("marker durability failure must abort before log rewrite");
+        assert!(guard.fired());
+    }
+
+    assert_eq!(fs::read(&log).expect("unchanged log"), old_log);
+    assert!(old_hashes.iter().all(|hash| blob_dir.join(hash).is_file()));
+    read_provenance(&log).expect("old log remains rehydratable");
+
+    writer
+        .scrub_and_audit(std::slice::from_ref(&secret), None, "session", "agent")
+        .expect("retry scrub");
+    assert!(old_hashes.iter().all(|hash| !blob_dir.join(hash).exists()));
+    read_provenance(&log).expect("rewritten log remains rehydratable");
+}
+
+#[test]
+fn collapsed_response_rewrites_every_reference_to_a_shared_old_blob() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let blob_dir = temp.path().join("blobs");
+    let writer =
+        ProvenanceWriter::with_threshold(log.clone(), blob_dir.clone(), 1).expect("writer");
+    let secret = "partial-secret-value".to_owned();
+    let mut events = checkpointed_response_events(&["partial-", "secret-value"]);
+    let terminal_id = events.last().expect("terminal").id.clone();
+    events.push(EventEnvelope::new(
+        "session",
+        "agent",
+        Some(terminal_id),
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "shared-output".into()),
+            ("name", "fixture".into()),
+            ("ok", true.into()),
+            ("output", "partial-".into()),
+        ]),
+    ));
+    writer
+        .append(&events)
+        .expect("append shared blob references");
+
+    let raw_before = fs::read_to_string(&log).expect("raw log");
+    let raw_before = raw_before
+        .lines()
+        .map(|line| EventEnvelope::from_json_line(line).expect("raw event"))
+        .collect::<Vec<_>>();
+    let first_chunk = raw_before
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::ASSISTANT_RESPONSE_CHUNK)
+        .expect("first chunk");
+    let tool = raw_before
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .expect("tool result");
+    let old_hash = first_chunk.blobs["content"].clone();
+    assert_eq!(tool.blobs["output"], old_hash);
+
+    writer
+        .scrub_and_audit(std::slice::from_ref(&secret), None, "session", "agent")
+        .expect("scrub shared hash");
+
+    assert!(!blob_dir.join(&old_hash).exists());
+    let raw_after = fs::read_to_string(&log).expect("scrubbed raw log");
+    let raw_after = raw_after
+        .lines()
+        .map(|line| EventEnvelope::from_json_line(line).expect("raw event"))
+        .collect::<Vec<_>>();
+    assert!(raw_after
+        .iter()
+        .flat_map(|event| event.blobs.values())
+        .all(|hash| hash != &old_hash));
+
+    let rehydrated = read_provenance(&log).expect("shared rewrite remains rehydratable");
+    let tool = rehydrated
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .expect("rehydrated tool result");
+    assert_eq!(tool.payload["output"], crate::redaction::SCRUBBED);
+    let projected = crate::assistant_response::project_assistant_response_terminals(&rehydrated)
+        .expect("shared rewrite preserves response protocol");
+    assert_eq!(
+        projected.values().next().expect("terminal").content,
+        "[scrubbed][scrubbed]"
     );
 }
 

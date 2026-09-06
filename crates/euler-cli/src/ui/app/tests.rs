@@ -3630,6 +3630,13 @@ fn export_session_omits_runtime_only_model_delta_and_stays_parent_closed() {
             .any(|event| event.kind.as_str() == EventKind::MODEL_DELTA),
         "test setup should produce a model.delta event to filter"
     );
+    assert!(
+        session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == EventKind::ASSISTANT_RESPONSE_CHUNK),
+        "durable response checkpoint should accompany streamed text"
+    );
 
     assert_eq!(
         core.export_session(Some(out.display().to_string())),
@@ -3641,6 +3648,12 @@ fn export_session_omits_runtime_only_model_delta_and_stays_parent_closed() {
             .expect("export json");
     let events = exported["events"].as_array().expect("events array").clone();
     assert!(!events.is_empty());
+    assert!(events.iter().any(|event| {
+        event["kind"].as_str() == Some(EventKind::ASSISTANT_RESPONSE_CHUNK)
+            && event["payload"]["content"]
+                .as_str()
+                .is_some_and(|content| !content.is_empty())
+    }));
 
     let exported_ids: std::collections::BTreeSet<&str> = events
         .iter()

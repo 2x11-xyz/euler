@@ -2,10 +2,11 @@
 
 use euler_core::permissions::{DeciderVerdict, PermissionDecider, PermissionRequest};
 use euler_core::{
-    assemble_canvas, fold_session, read_resume_prefix, resume_session, resume_session_from_prefix,
-    resume_session_with_outcome, AutoCompactionPolicy, CanvasItem, CompactionStatus,
-    CompactionTier, ContextLimitConfig, ModelTarget, ProvenanceWriter, ReasoningEffort,
-    ResumeError, Session, SessionConfig, WorkingStateProjection,
+    assemble_canvas, fold_session, project_assistant_response_terminals, read_resume_prefix,
+    resume_session, resume_session_from_prefix, resume_session_with_outcome,
+    AssistantResponseStatus, AutoCompactionPolicy, CanvasItem, CompactionStatus, CompactionTier,
+    ContextLimitConfig, ModelTarget, ProvenanceWriter, ReasoningEffort, ResumeError, Session,
+    SessionConfig, WorkingStateProjection,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
@@ -1319,6 +1320,69 @@ fn model_call_tail_appends_a_recovery_closure() {
     assert_eq!(closure.parent.as_deref(), Some(call.id.as_str()));
     assert_eq!(session.events().len(), 3);
     assert_eq!(line_count(&log), 3);
+}
+
+#[test]
+fn response_checkpoint_tail_resumes_as_the_same_interrupted_partial() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let start = session_start("fixture", "fixture");
+    let snapshot = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            ("selected_event_ids", json!([])),
+            ("counts", json!({"items": 0})),
+        ]),
+    );
+    let mut call = model_call(Some(snapshot.id.clone()));
+    call.payload
+        .insert("canvas_snapshot_id".to_owned(), snapshot.id.clone().into());
+    let content = "kept after crash";
+    let chunk = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::ASSISTANT_RESPONSE_CHUNK,
+        object([
+            ("response_id", call.id.clone().into()),
+            ("sequence", 0.into()),
+            ("content", content.into()),
+            ("observed_output_bytes", (content.len() as u64).into()),
+            ("retained_content_bytes", (content.len() as u64).into()),
+        ]),
+    );
+    write_events(&log, &[start, snapshot, call.clone(), chunk]);
+
+    let session = resume_session(
+        SessionConfig::new(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    let closure = model_recovery_closures(session.events())
+        .into_iter()
+        .next()
+        .expect("model recovery closure");
+    assert_eq!(closure.parent.as_deref(), Some(call.id.as_str()));
+    assert_eq!(payload_str(closure, "response_id"), Some(call.id.as_str()));
+    assert_eq!(payload_str(closure, "response_status"), Some("interrupted"));
+    assert_eq!(
+        closure.payload["observed_output_bytes"],
+        json!(content.len())
+    );
+    assert_eq!(
+        closure.payload["retained_content_bytes"],
+        json!(content.len())
+    );
+    let projected = project_assistant_response_terminals(session.events()).expect("projection");
+    let recovered = projected.get(&closure.id).expect("interrupted draft");
+    assert_eq!(recovered.status, AssistantResponseStatus::Interrupted);
+    assert_eq!(recovered.content, content);
 }
 
 #[test]

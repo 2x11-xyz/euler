@@ -48,28 +48,47 @@ pub fn scrub_secrets_in_text(text: &str, secrets: &[String]) -> (String, usize) 
 /// artifacts can be binary or can embed JSON inside HTML/JavaScript, where a
 /// value containing `"` or `\\` no longer appears as its literal UTF-8 bytes.
 pub fn scrub_secrets_in_bytes(bytes: &[u8], secrets: &[String]) -> (Vec<u8>, usize) {
+    scrub_byte_needles(bytes, &scrub_secret_byte_needles(secrets))
+}
+
+pub(crate) fn scrub_byte_needles(bytes: &[u8], needles: &[Vec<u8>]) -> (Vec<u8>, usize) {
     let mut out = bytes.to_vec();
     let mut replacements = 0;
+    for needle in needles {
+        let (next, count) = replace_bytes(&out, needle, SCRUBBED.as_bytes());
+        out = next;
+        replacements += count;
+    }
+    (out, replacements)
+}
+
+/// Exact byte spellings removed by [`scrub_secrets_in_bytes`], in replacement
+/// order. Seam-aware persistent surfaces use this same list so a JSON-escaped
+/// credential cannot survive merely because its spelling crosses a boundary.
+pub(crate) fn scrub_secret_byte_needles(secrets: &[String]) -> Vec<Vec<u8>> {
+    let mut needles = Vec::new();
     for secret in secrets {
         if secret.is_empty() {
             continue;
         }
-        let (next, count) = replace_bytes(&out, secret.as_bytes(), SCRUBBED.as_bytes());
-        out = next;
-        replacements += count;
+        push_distinct_needle(&mut needles, secret.as_bytes());
 
         let encoded = serde_json::to_string(secret).unwrap_or_default();
         let encoded = encoded
             .strip_prefix('"')
             .and_then(|value| value.strip_suffix('"'))
             .unwrap_or_default();
-        if !encoded.is_empty() && encoded.as_bytes() != secret.as_bytes() {
-            let (next, count) = replace_bytes(&out, encoded.as_bytes(), SCRUBBED.as_bytes());
-            out = next;
-            replacements += count;
+        if !encoded.is_empty() {
+            push_distinct_needle(&mut needles, encoded.as_bytes());
         }
     }
-    (out, replacements)
+    needles
+}
+
+fn push_distinct_needle(needles: &mut Vec<Vec<u8>>, needle: &[u8]) {
+    if !needles.iter().any(|existing| existing == needle) {
+        needles.push(needle.to_vec());
+    }
 }
 
 pub(crate) fn replace_bytes(input: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>, usize) {
@@ -116,6 +135,92 @@ pub fn scrub_secrets_in_object(object: &mut euler_event::JsonObject, secrets: &[
     };
     *object = scrubbed;
     count
+}
+
+/// Scrub one event payload while preserving response-protocol routing fields.
+///
+/// Durable and live scrub paths share this owner so a value that happens to
+/// equal a response id or closed status cannot corrupt replay identity. Blob
+/// pointer text is structural until the durable blob rewrite updates it;
+/// rehydrated/live chunk content has no blob entry and remains scrub-visible.
+pub(crate) fn scrub_event_payload(
+    event: &mut euler_event::EventEnvelope,
+    secrets: &[String],
+    protect_response_protocol: bool,
+) -> usize {
+    let mut protected = if protect_response_protocol {
+        take_response_protocol_fields(event)
+    } else {
+        Vec::new()
+    };
+    let mut replacements = scrub_secrets_in_object(&mut event.payload, secrets);
+    for field in &mut protected {
+        if field.scrub_value {
+            replacements += scrub_secrets_in_value(&mut field.value, secrets);
+        }
+    }
+    restore_response_protocol_fields(event, protected);
+    replacements
+}
+
+struct ProtectedResponseField {
+    name: &'static str,
+    value: serde_json::Value,
+    scrub_value: bool,
+}
+
+fn take_response_protocol_fields(
+    event: &mut euler_event::EventEnvelope,
+) -> Vec<ProtectedResponseField> {
+    let is_chunk = event.kind.as_str() == euler_event::EventKind::ASSISTANT_RESPONSE_CHUNK;
+    let is_terminal = matches!(
+        event.kind.as_str(),
+        euler_event::EventKind::MODEL_RESULT | euler_event::EventKind::ERROR
+    ) && event.payload.contains_key("response_id");
+    if !is_chunk && !is_terminal {
+        return Vec::new();
+    }
+    let mut fields = vec![("response_id", false)];
+    if is_chunk {
+        fields.extend([
+            ("sequence", false),
+            ("content", !event.blobs.contains_key("content")),
+            ("observed_output_bytes", false),
+            ("retained_content_bytes", false),
+        ]);
+    }
+    if is_terminal {
+        fields.extend([
+            ("response_status", false),
+            ("source", false),
+            ("observed_output_bytes", false),
+            ("retained_content_bytes", false),
+            ("cancelled", false),
+            ("recovery_closure", false),
+        ]);
+    }
+    fields
+        .into_iter()
+        .filter_map(|(name, scrub_value)| {
+            event
+                .payload
+                .remove(name)
+                .map(|value| ProtectedResponseField {
+                    name,
+                    value,
+                    scrub_value,
+                })
+        })
+        .collect()
+}
+
+fn restore_response_protocol_fields(
+    event: &mut euler_event::EventEnvelope,
+    fields: Vec<ProtectedResponseField>,
+) {
+    for field in fields {
+        event.payload.insert(field.name.to_owned(), field.value);
+    }
 }
 
 fn scrub_value_rec(value: &mut serde_json::Value, secrets: &[String], count: &mut usize) {
@@ -679,5 +784,152 @@ mod tests {
         assert_eq!(replacements, 1);
         assert!(!String::from_utf8_lossy(&scrubbed).contains(&secret));
         serde_json::from_slice::<serde_json::Value>(&scrubbed).expect("valid JSON");
+    }
+
+    #[test]
+    fn event_payload_scrub_preserves_response_protocol_and_scrubs_runtime_delta() {
+        let response_id = "response-credential-id".to_owned();
+        let mut chunk = euler_event::EventEnvelope::new(
+            "session",
+            "agent",
+            None,
+            euler_event::EventKind::ASSISTANT_RESPONSE_CHUNK,
+            euler_event::object([
+                ("response_id", response_id.clone().into()),
+                ("sequence", 0.into()),
+                ("content", response_id.clone().into()),
+                ("observed_output_bytes", 22.into()),
+                ("retained_content_bytes", 22.into()),
+            ]),
+        );
+        let replacements =
+            scrub_event_payload(&mut chunk, std::slice::from_ref(&response_id), true);
+        assert_eq!(replacements, 1);
+        assert_eq!(chunk.payload["response_id"], response_id);
+        assert_eq!(chunk.payload["content"], SCRUBBED);
+
+        let pointer = "blob:credential-hash".to_owned();
+        chunk
+            .payload
+            .insert("content".to_owned(), pointer.clone().into());
+        chunk
+            .blobs
+            .insert("content".to_owned(), "credential-hash".to_owned());
+        assert_eq!(
+            scrub_event_payload(&mut chunk, std::slice::from_ref(&pointer), true),
+            0
+        );
+        assert_eq!(chunk.payload["content"], pointer);
+
+        let start = euler_event::EventEnvelope::new(
+            "session",
+            "agent",
+            None,
+            euler_event::EventKind::SESSION_START,
+            euler_event::object([]),
+        );
+        let snapshot = euler_event::EventEnvelope::new(
+            "session",
+            "agent",
+            Some(start.id.clone()),
+            euler_event::EventKind::CANVAS_SNAPSHOT,
+            euler_event::object([
+                ("selected_event_ids", serde_json::json!([])),
+                ("counts", serde_json::json!({"items": 0})),
+            ]),
+        );
+        let call = euler_event::EventEnvelope::new(
+            "session",
+            "agent",
+            Some(snapshot.id.clone()),
+            euler_event::EventKind::MODEL_CALL,
+            euler_event::object([
+                ("canvas_snapshot_id", snapshot.id.clone().into()),
+                ("canvas_items", 0.into()),
+            ]),
+        );
+        let response_id = call.id.clone();
+        let live_chunk = euler_event::EventEnvelope::new(
+            "session",
+            "agent",
+            Some(response_id.clone()),
+            euler_event::EventKind::ASSISTANT_RESPONSE_CHUNK,
+            euler_event::object([
+                ("response_id", response_id.clone().into()),
+                ("sequence", 0.into()),
+                ("content", "kept text".into()),
+                ("observed_output_bytes", 9.into()),
+                ("retained_content_bytes", 9.into()),
+            ]),
+        );
+        let terminal = euler_event::EventEnvelope::new(
+            "session",
+            "agent",
+            Some(response_id.clone()),
+            euler_event::EventKind::ERROR,
+            euler_event::object([
+                ("source", "provider".into()),
+                ("message", "provider failed".into()),
+                ("response_id", response_id.clone().into()),
+                ("response_status", "failed".into()),
+                ("observed_output_bytes", 9.into()),
+                ("retained_content_bytes", 9.into()),
+            ]),
+        );
+        let mut secrets = vec![
+            response_id.clone(),
+            "provider".to_owned(),
+            "failed".to_owned(),
+        ];
+        let runtime_secret = "runtime-delta-secret".to_owned();
+        secrets.push(runtime_secret.clone());
+        let delta = euler_event::EventEnvelope::new(
+            "session",
+            "agent",
+            None,
+            euler_event::EventKind::MODEL_DELTA,
+            euler_event::object([
+                ("kind", "text".into()),
+                ("delta", runtime_secret.clone().into()),
+            ]),
+        );
+        let mut live = crate::EventBus::new();
+        for event in [start, snapshot, call, live_chunk, terminal, delta] {
+            live.push(event);
+        }
+
+        assert_eq!(live.scrub_payloads(&secrets), 3);
+        let terminal = &live.events()[4];
+        assert_eq!(terminal.payload["response_id"], response_id);
+        assert_eq!(terminal.payload["source"], "provider");
+        assert_eq!(terminal.payload["response_status"], "failed");
+        assert_eq!(terminal.payload["message"], "[scrubbed] [scrubbed]");
+        assert_eq!(live.events()[5].payload["delta"], SCRUBBED);
+    }
+
+    #[test]
+    fn malformed_response_claims_receive_no_protocol_scrub_exemption() {
+        let secret = "malformed-response-secret".to_owned();
+        let terminal = euler_event::EventEnvelope::new(
+            "session",
+            "agent",
+            None,
+            euler_event::EventKind::ERROR,
+            euler_event::object([
+                ("source", secret.clone().into()),
+                ("message", "ordinary error".into()),
+                ("response_id", secret.clone().into()),
+                ("response_status", secret.clone().into()),
+            ]),
+        );
+        let mut live = crate::EventBus::new();
+        live.push(terminal);
+
+        assert_eq!(live.scrub_payloads(std::slice::from_ref(&secret)), 3);
+        let payload = serde_json::to_string(&live.events()[0].payload).expect("payload JSON");
+        assert!(!payload.contains(&secret));
+        assert_eq!(live.events()[0].payload["source"], SCRUBBED);
+        assert_eq!(live.events()[0].payload["response_id"], SCRUBBED);
+        assert_eq!(live.events()[0].payload["response_status"], SCRUBBED);
     }
 }

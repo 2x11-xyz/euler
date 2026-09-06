@@ -208,7 +208,12 @@ One surface-sweeping engine (`euler_core::scrub`), two entry points:
   closed session has no live candidate, so exact values are read one per line
   from stdin; values are never accepted through argv.
 
-Both remove every occurrence from **every persistent surface**:
+Both exhaustively remove every occurrence of each requested value from **every
+persistent content surface**. Content includes every user-, model-, tool-, and
+extension-authored value plus every nonstructural event payload key or value.
+Generated identities and the closed response-routing grammar enumerated below
+are protocol metadata, not authored content; preserving them is the sole
+structural exception needed to keep the scrubbed log replayable.
 
 - `events.jsonl` payloads, including the inline `projection_blob` compaction
   state (recursive JSON string/key walk);
@@ -231,6 +236,32 @@ marker so the record shows WHICH mechanism removed a value. A `secret.scrubbed`
 audit event records per-surface counts (never the value) and notes that
 **already-exported, copied, terminal-scrollback, or pushed data cannot be
 recalled**.
+
+The preserved response-routing grammar consists only of its fixed field names,
+the generated root `model.call` id in `response_id`, numeric sequence/byte
+accounting, boolean terminal discriminators, the closed `response_status` and
+terminal `source` values, and an externalized content pointer derived from a
+content hash. Like the envelope id they associate, these values are never user
+or model content. The `content` field name remains structural while its inline
+or rehydrated value remains authored content and is scrubbed. One
+protocol-aware payload scrub owns this rule for both durable and live events.
+All nonstructural payload text remains scrub-visible, including assistant
+chunk content and runtime-only `model.delta` content in the live bus.
+The exception activates only when the complete accepted event prefix passes
+the shared root-response protocol fold. A malformed/custom event that merely
+claims `response_id`, a non-closed status/source, a forged call association,
+or duplicate identity receives no exception; its payload is scrubbed as
+ordinary content.
+
+Append-only assistant response chunks are scrubbed as one logical text stream.
+When an occurrence crosses a chunk boundary, or marker expansion would exceed
+a chunk's byte limit, scrub conservatively replaces every chunk in that
+response with `[scrubbed]`. This deliberate over-redaction keeps event ids,
+ordering, chunk cardinality, and per-event size limits stable while ensuring
+replay cannot reconstruct the requested value across events. Both literal and
+distinct JSON-escaped spellings use the same bounded seam detector as the blob
+scrubber. Collapsed externalized chunks move every shared reference to a
+durable scrub-marker blob, then sanitize and retire the old hashes.
 
 ## Non-Goals
 

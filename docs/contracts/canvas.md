@@ -6,9 +6,16 @@ Euler separates three surfaces:
 - **Transcript**: what the user and assistant meaningfully said or did.
 - **Canvas**: what the next model turn is allowed to reason over.
 
-Provider retries, partial streams, raw finish metadata, failed repair
-attempts, and diagnostic facts belong in provenance, not in the transcript
-or canvas. The model must not eat the log.
+Provider retry attempts, raw stream/control fragments, finish metadata,
+failed repair attempts, and diagnostic facts belong in provenance, not in the
+transcript or canvas. The model must not eat the log. Canonically checkpointed
+root-assistant text is the narrow exception below: a failed/interrupted
+terminal may project it into transcript recovery, never model context.
+
+Durable `assistant.response.chunk` checkpoints are never canvas items. An
+interrupted draft remains recoverable transcript/provenance text, but it enters
+a later model request only if the user explicitly submits new input asking to
+continue or reuse it; resume never silently injects the draft into context.
 
 The active model canvas is working memory, not the provenance log. It is assembled from selected/summarized canonical session events, not from ad hoc UI or provenance-specific representations.
 

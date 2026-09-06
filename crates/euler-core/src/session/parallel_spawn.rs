@@ -791,6 +791,7 @@ impl RoundLoopIo for WorkerIo<'_> {
         &mut self,
         error: &ProviderError,
         model_call_id: String,
+        _observed_output_bytes: Option<u64>,
     ) -> Result<String, SessionError> {
         if error.request_outcome_unknown() {
             // The provider request thread disappeared after dispatch may have
@@ -807,7 +808,11 @@ impl RoundLoopIo for WorkerIo<'_> {
         Ok(String::new())
     }
 
-    fn emit_model_call_cancelled(&mut self, model_call_id: String) -> Result<String, SessionError> {
+    fn emit_model_call_cancelled(
+        &mut self,
+        model_call_id: String,
+        _observed_output_bytes: Option<u64>,
+    ) -> Result<String, SessionError> {
         self.buffered_error = Some((
             super::round_loop::model_call_cancelled_payload(),
             model_call_id,

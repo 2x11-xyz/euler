@@ -209,6 +209,30 @@ fn unpinned_skill_activation_never_projects_model_content() {
     );
 }
 
+#[test]
+fn durable_partial_response_chunks_never_enter_model_canvas() {
+    let chunk = EventEnvelope::new(
+        "session",
+        "root",
+        None,
+        EventKind::ASSISTANT_RESPONSE_CHUNK,
+        object([
+            ("response_id", "model-call".into()),
+            ("sequence", 0.into()),
+            ("content", "transcript recovery only".into()),
+            ("observed_output_bytes", 24.into()),
+            ("retained_content_bytes", 24.into()),
+        ]),
+    );
+
+    let canvas = assemble_canvas(&[chunk], &off_policy(usize::MAX));
+
+    assert!(
+        canvas.is_empty(),
+        "checkpoint text leaked into canvas: {canvas:#?}"
+    );
+}
+
 fn demoted_outputs(canvas: &[CanvasItem]) -> Vec<&str> {
     canvas
         .iter()

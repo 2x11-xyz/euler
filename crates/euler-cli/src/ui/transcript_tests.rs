@@ -31,6 +31,198 @@ fn local_hms(ts: &str) -> String {
         .to_string()
 }
 
+fn failed_partial_response_events(agent: &str, sequence: u64) -> Vec<EventEnvelope> {
+    let start = event(EventKind::SESSION_START, object([]));
+    let mut snapshot = event(
+        EventKind::CANVAS_SNAPSHOT,
+        object([
+            ("selected_event_ids", serde_json::json!([])),
+            ("counts", serde_json::json!({"items": 0})),
+        ]),
+    );
+    snapshot.parent = Some(start.id.clone());
+    let mut call = event(
+        EventKind::MODEL_CALL,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "echo".into()),
+            ("canvas_snapshot_id", snapshot.id.clone().into()),
+            ("canvas_items", 0.into()),
+        ]),
+    );
+    call.agent = agent.to_owned();
+    call.parent = Some(snapshot.id.clone());
+    let mut chunk = event(
+        EventKind::ASSISTANT_RESPONSE_CHUNK,
+        object([
+            ("response_id", call.id.clone().into()),
+            ("sequence", sequence.into()),
+            ("content", "recoverable text".into()),
+            ("observed_output_bytes", 16.into()),
+            ("retained_content_bytes", 16.into()),
+        ]),
+    );
+    chunk.agent = agent.to_owned();
+    chunk.parent = Some(call.id.clone());
+    let mut terminal = event(
+        EventKind::ERROR,
+        object([
+            ("source", "provider".into()),
+            ("message", "stream closed".into()),
+            ("response_id", call.id.clone().into()),
+            ("response_status", "failed".into()),
+            ("observed_output_bytes", 16.into()),
+            ("retained_content_bytes", 16.into()),
+        ]),
+    );
+    terminal.agent = agent.to_owned();
+    terminal.parent = Some(call.id.clone());
+    vec![start, snapshot, call, chunk, terminal]
+}
+
+#[test]
+fn failed_partial_response_projects_identically_in_full_and_incremental_replay() {
+    let events = failed_partial_response_events("agent", 0);
+    let expected = TranscriptItem::IncompleteAssistantResponse {
+        content: "recoverable text".to_owned(),
+        status: "failed".to_owned(),
+        observed_output_bytes: 16,
+        source: "provider".to_owned(),
+        message: "stream closed".to_owned(),
+    };
+
+    assert!(project_events(&events).contains(&expected));
+    let mut state = TranscriptState::default();
+    for event in events {
+        state.push_event(event);
+    }
+    assert!(state.items().contains(&expected));
+    assert_eq!(
+        state.last_visible_assistant_response().as_deref(),
+        Some("recoverable text")
+    );
+
+    let rendered = line_texts(&render_items_for_history(
+        std::slice::from_ref(&expected),
+        &Theme::default(),
+        100,
+    ))
+    .join("\n");
+    assert!(rendered.contains("stream closed"));
+    assert!(rendered.contains("Ctrl+Shift+C or /copy copies it"));
+    assert!(!rendered.contains("c copies it"));
+}
+
+#[test]
+fn successful_checkpoint_uses_normal_assistant_message_without_partial_duplicate() {
+    let mut events = failed_partial_response_events("agent", 0);
+    let call_id = events[2].id.clone();
+    events.pop();
+    let mut result = event(
+        EventKind::MODEL_RESULT,
+        object([
+            ("content", "recoverable text".into()),
+            ("tool_calls", serde_json::json!([])),
+            ("stop_reason", "completed".into()),
+            ("usage", serde_json::Value::Null),
+            ("observed_output_bytes", 16.into()),
+            ("retained_content_bytes", 16.into()),
+            ("response_id", call_id.clone().into()),
+            ("response_status", "completed".into()),
+        ]),
+    );
+    result.parent = Some(call_id);
+    let assistant = event(
+        EventKind::ASSISTANT_MESSAGE,
+        object([("content", "recoverable text".into())]),
+    );
+    events.extend([result, assistant]);
+
+    let mut state = TranscriptState::default();
+    for event in events {
+        state.push_event(event);
+    }
+
+    assert_eq!(
+        state
+            .items()
+            .iter()
+            .filter(|item| matches!(item, TranscriptItem::AssistantMessage(_)))
+            .count(),
+        1
+    );
+    assert!(!state
+        .items()
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::IncompleteAssistantResponse { .. })));
+}
+
+#[test]
+fn malformed_cross_agent_and_child_response_chunks_never_render_as_assistant_prose() {
+    let child = failed_partial_response_events("child", 0);
+    for (case, events) in [
+        ("noncontiguous", failed_partial_response_events("agent", 1)),
+        ("child", child),
+    ] {
+        let full = project_events(&events);
+        assert!(
+            !full
+                .iter()
+                .any(|item| matches!(item, TranscriptItem::IncompleteAssistantResponse { .. })),
+            "{case}: {full:#?}"
+        );
+        assert!(
+            !format!("{full:#?}").contains("recoverable text"),
+            "{case} text leaked: {full:#?}"
+        );
+
+        let mut state = TranscriptState::default();
+        for event in events {
+            state.push_event(event);
+        }
+        assert!(
+            !state
+                .items()
+                .iter()
+                .any(|item| matches!(item, TranscriptItem::IncompleteAssistantResponse { .. })),
+            "{case}: {:#?}",
+            state.items()
+        );
+        assert!(!format!("{:#?}", state.items()).contains("recoverable text"));
+    }
+
+    let mut crossed = failed_partial_response_events("agent", 0);
+    crossed[3].agent = "other".to_owned();
+    let full = project_events(&crossed);
+    assert!(!full
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::IncompleteAssistantResponse { .. })));
+    assert!(!format!("{full:#?}").contains("recoverable text"));
+}
+
+#[test]
+fn duplicate_response_authority_never_renders_checkpoint_prose() {
+    let mut events = failed_partial_response_events("agent", 0);
+    let mut duplicate = event(EventKind::ASSISTANT_ACTIVITY, object([]));
+    duplicate.id = events[2].id.clone();
+    events.push(duplicate);
+
+    let full = project_events(&events);
+    assert!(!full
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::IncompleteAssistantResponse { .. })));
+    assert!(!format!("{full:#?}").contains("recoverable text"));
+
+    let mut state = TranscriptState::default();
+    for event in events {
+        state.push_event(event);
+    }
+    assert!(!state
+        .items()
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::IncompleteAssistantResponse { .. })));
+}
+
 #[test]
 fn projects_supported_events_and_skips_control_events() {
     let events = vec![

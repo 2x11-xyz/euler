@@ -852,11 +852,11 @@ mod tests {
         kind: &'static str,
         payload: euler_event::JsonObject,
         seconds: i64,
-    ) {
+    ) -> bool {
         let ts = at(seconds).to_rfc3339();
         let mut event = event_at(kind, payload, T0);
         event.ts = ts;
-        projection.observe(&event);
+        projection.observe(&event)
     }
 
     fn rendered_state(projection: &RunActivityProjection, seconds: i64) -> String {
@@ -1218,6 +1218,37 @@ mod tests {
         assert_eq!(snapshot.progress_age, Some(Duration::from_secs(30)));
         assert_eq!(snapshot.last_event_age, Some(Duration::from_secs(10)));
         assert!(snapshot.stalled);
+    }
+
+    #[test]
+    fn response_checkpoint_updates_liveness_but_not_meaningful_progress() {
+        let mut projection = RunActivityProjection::default();
+        projection.begin_at(at(0));
+        observed(
+            &mut projection,
+            EventKind::MODEL_DELTA,
+            object([("kind", "text".into()), ("delta", "visible".into())]),
+            5,
+        );
+
+        let meaningful = observed(
+            &mut projection,
+            EventKind::ASSISTANT_RESPONSE_CHUNK,
+            object([
+                ("response_id", "model-call".into()),
+                ("sequence", 0.into()),
+                ("content", "must not render here".into()),
+                ("observed_output_bytes", 20.into()),
+                ("retained_content_bytes", 20.into()),
+            ]),
+            25,
+        );
+
+        assert!(!meaningful);
+        let snapshot = projection.snapshot_at(at(35));
+        assert_eq!(snapshot.progress_age, Some(Duration::from_secs(30)));
+        assert_eq!(snapshot.last_event_age, Some(Duration::from_secs(10)));
+        assert!(!rendered_state(&projection, 35).contains("must not render here"));
     }
 
     #[test]

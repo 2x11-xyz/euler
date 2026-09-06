@@ -1202,6 +1202,18 @@ fn normalize_events(
                         Value::String(file_change_id),
                     );
                 }
+                if let Some(response_id) = payload
+                    .get("response_id")
+                    .and_then(Value::as_str)
+                    .map(|id| mapped_id(&id_map, id))
+                {
+                    replace_allowed(
+                        payload,
+                        allowlist,
+                        "response_id",
+                        Value::String(response_id),
+                    );
+                }
             }
             if object.get("kind").and_then(Value::as_str) == Some(EventKind::SESSION_START) {
                 if let Some(payload) = object.get_mut("payload").and_then(Value::as_object_mut) {
@@ -1455,6 +1467,7 @@ fn nondeterministic_fields() -> BTreeSet<&'static str> {
         "event_id",
         "canvas_snapshot_id",
         "file_change_id",
+        "response_id",
         "root",
         "attached_roots",
         "session_start_projection_sha256",

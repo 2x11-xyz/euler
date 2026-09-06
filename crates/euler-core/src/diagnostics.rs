@@ -17,27 +17,44 @@ pub(crate) fn turn_end(session_id: &str, rounds: u64) {
     tracing::info!(target: TARGET, event = "turn_end", session_id, rounds);
 }
 
-pub(crate) fn model_call_end(
-    session_id: &str,
-    provider: &str,
-    model: &str,
-    duration_ms: u64,
-    usage: Option<&Usage>,
-    ok: bool,
-) {
-    let input_tokens = usage.map_or(0, |usage| usage.input_tokens);
-    let output_tokens = usage.map_or(0, |usage| usage.output_tokens);
-    tracing::info!(
-        target: TARGET,
-        event = "model_call_end",
-        session_id,
-        provider,
-        model,
-        duration_ms,
-        input_tokens,
-        output_tokens,
-        ok
-    );
+pub(crate) struct ModelCallEnd<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) duration_ms: u64,
+    pub(crate) usage: Option<&'a Usage>,
+    pub(crate) observed_output_bytes: u64,
+    pub(crate) ok: bool,
+}
+
+pub(crate) fn model_call_end(record: ModelCallEnd<'_>) {
+    if let Some(usage) = record.usage {
+        tracing::info!(
+            target: TARGET,
+            event = "model_call_end",
+            session_id = record.session_id,
+            provider = record.provider,
+            model = record.model,
+            duration_ms = record.duration_ms,
+            usage_available = true,
+            input_tokens = usage.input_tokens,
+            output_tokens = usage.output_tokens,
+            observed_output_bytes = record.observed_output_bytes,
+            ok = record.ok
+        );
+    } else {
+        tracing::info!(
+            target: TARGET,
+            event = "model_call_end",
+            session_id = record.session_id,
+            provider = record.provider,
+            model = record.model,
+            duration_ms = record.duration_ms,
+            usage_available = false,
+            observed_output_bytes = record.observed_output_bytes,
+            ok = record.ok
+        );
+    }
 }
 
 pub(crate) fn provider_retry(
