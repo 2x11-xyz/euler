@@ -2425,19 +2425,11 @@ impl<D: PermissionDecider> Session<D> {
             },
         )
         .run(&cancellation);
-        // A successful semantic terminal releases the checkpoint. If the
-        // round exits earlier, retrying an accepted backlog cannot restore
-        // response ownership. Fence checkpoint/reasoning/terminal failures;
-        // a terminal in the bus may still be unsynced.
-        // A queued user admission retains its own exact retry owner instead.
-        if result.is_err()
-            && io.response_checkpoint.is_some()
-            && io.session.pending_admission.is_none()
-            && io.session.provenance.as_ref().is_some_and(|writer| {
-                writer.has_unresolved_append()
-                    || io.session.persisted_events < io.session.bus.events().len()
-            })
-        {
+        // A successful semantic terminal releases the checkpoint. On any
+        // earlier error, this adapter drops the remaining response owner.
+        // Require reopen even if the failure preceded a provenance append.
+        // Post-terminal appends and queued admissions keep their own retries.
+        if result.is_err() && io.response_checkpoint.is_some() {
             io.session.terminalization_failed = true;
         }
         if matches!(&result, Err(SessionError::Cancelled)) {

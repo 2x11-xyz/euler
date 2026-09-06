@@ -853,7 +853,6 @@ fn explicit_skill_model_content_externalizes_and_rehydrates() {
     );
 }
 
-
 #[test]
 fn response_chunk_blob_rehydrates_and_scrubs_with_valid_byte_accounting() {
     let temp = tempfile::tempdir().expect("temp dir");
