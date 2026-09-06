@@ -680,34 +680,41 @@ fn log_truncation_invalidates_projection_cache() {
         EventKind::SESSION_START,
         object([("provider", "fixture".into()), ("model", "echo".into())]),
     );
-    let rename = session_renamed_event(
+    let user = EventEnvelope::new(
         record.id().to_owned(),
-        "store-agent".to_owned(),
+        "store-agent",
         Some(start.id.clone()),
-        "event name".to_owned(),
+        EventKind::USER_MESSAGE,
+        object([("content", "cached title".into())]),
     );
     let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
-    writer.append(&[start.clone(), rename]).expect("append");
+    writer.append(&[start.clone(), user]).expect("append");
     drop(writer);
-    store
+    let warm = store
         .find_session(record.id())
         .expect("find")
         .expect("warm cache");
+    assert_eq!(warm.title(), Some("cached title"));
 
+    // Truncate below the cached accepted length: the old key cannot hit, so
+    // the listing re-projects. The title has no sidecar fallback, so it is
+    // the direct witness that the cached projection was not served.
     fs::write(
         record.events_path(),
         format!("{}\n", start.to_json_line().expect("start line")),
     )
     .expect("truncate events");
+    reset_event_log_projections();
     let listed = store
         .find_session(record.id())
         .expect("find")
         .expect("record");
-    assert_eq!(listed.name(), None);
+    assert_eq!(event_log_projections(), 1);
+    assert_eq!(listed.title(), None);
 }
 
 #[test]
-fn touch_reprojects_when_sidecar_has_no_durable_log_identity() {
+fn touch_bumps_updated_at_without_reading_the_event_log() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");
     let stale_metadata = format!(
@@ -718,20 +725,88 @@ fn touch_reprojects_when_sidecar_has_no_durable_log_identity() {
         record.created_at_ms()
     );
     fs::write(record.session_json_path(), stale_metadata).expect("stale metadata");
-    // A legacy/stale sidecar has no durable-prefix key, so the turn-boundary
-    // touch must reconcile it before carrying fields forward.
+    // A corrupt event log proves the touch never projects events: the
+    // projecting refresh would surface this as an Invalid status rewrite.
     fs::write(record.events_path(), "not json\n").expect("corrupt events");
 
+    reset_event_log_projections();
     store
         .touch_session_updated_at(record.id())
         .expect("touch metadata");
+    assert_eq!(event_log_projections(), 0);
 
     let metadata = fs::read_to_string(record.session_json_path()).expect("metadata");
+    // Sidecar fields carry forward verbatim; only the recency stamp moves and
+    // the (already absent) projection key stays absent so the next listing
+    // re-projects.
+    assert!(metadata.contains("kept name"));
     let parsed: serde_json::Value = serde_json::from_str(&metadata).expect("json");
     assert!(parsed["updated_at_ms"].as_u64().expect("updated") > record.created_at_ms());
-    assert_eq!(parsed["status"], "invalid");
-    assert!(parsed.get("name").is_none());
+    assert_eq!(parsed["status"], "active");
     assert!(parsed.get("projected_events").is_none());
+}
+
+#[test]
+fn touch_after_append_never_projects_and_invalidates_projection_cache() {
+    // Turn-boundary guard for the ordinary case: every turn appends to the
+    // log, so the cached key disagrees with the live tail on every touch.
+    // The touch must still perform zero full projections (it runs on the UI
+    // thread) and must drop the stale key so the next listing re-projects.
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    append_session_start(&record, None);
+    store
+        .find_session(record.id())
+        .expect("find")
+        .expect("warm cache");
+    let warm: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert!(warm.get("projected_events").is_some());
+
+    let user = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "next turn".into())]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(std::slice::from_ref(&user)).expect("append");
+    drop(writer);
+
+    reset_event_log_projections();
+    for _ in 0..3 {
+        store
+            .touch_session_updated_at(record.id())
+            .expect("touch metadata");
+    }
+    assert_eq!(
+        event_log_projections(),
+        0,
+        "touch after an append must never project the event log"
+    );
+    let touched: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert!(touched["updated_at_ms"].as_u64().expect("updated") >= record.created_at_ms());
+    assert!(
+        touched.get("projected_events").is_none(),
+        "a touch that observes a changed tail must drop the stale cache key"
+    );
+
+    // The next listing re-projects exactly once and re-fills the cache.
+    reset_event_log_projections();
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(event_log_projections(), 1);
+    assert_eq!(listed.title(), Some("next turn"));
+    let refilled: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert_eq!(refilled["projected_events"]["tail_event_id"], user.id);
 }
 
 #[test]
@@ -771,8 +846,8 @@ fn touch_keeps_event_derived_name_authoritative_in_listings() {
         .touch_session_updated_at(record.id())
         .expect("touch metadata");
 
-    // The touch reconciled the keyless sidecar from the durable log, so the
-    // canonical event-derived name is retained.
+    // The touch carried the stale sidecar name forward (without projecting),
+    // but listings still derive the name from events.
     let listed = store
         .find_session(record.id())
         .expect("find")
@@ -1225,6 +1300,108 @@ fn listing_uses_sidecar_kind_as_transition_fallback_without_event_kind() {
         .expect("find")
         .expect("record");
     assert_eq!(listed.kind(), Some(SessionKind::Interactive));
+}
+
+#[test]
+fn legacy_sidecar_name_fallback_survives_cache_fill_and_later_appends() {
+    // Sessions renamed before `session.renamed` existed carry their name only
+    // in `session.json`. The contract keeps that display fallback whenever
+    // the stream is readable and has no rename event — including after the
+    // first listing cached a projection and a later turn appended.
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    write_metadata_with_name_and_root(&record, "legacy name", None);
+    append_session_start(&record, None);
+
+    let cold = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(cold.name(), Some("legacy name"));
+    let filled: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert!(filled.get("projected_events").is_some());
+    assert_eq!(filled["name"], "legacy name");
+
+    let user = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "another turn".into())]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(std::slice::from_ref(&user)).expect("append");
+    drop(writer);
+    store
+        .touch_session_updated_at(record.id())
+        .expect("touch metadata");
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.name(), Some("legacy name"));
+    assert_eq!(listed.title(), Some("another turn"));
+    let refilled: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert_eq!(refilled["name"], "legacy name");
+
+    // A canonical rename still wins over the sidecar fallback.
+    store
+        .name_session(record.id(), "canonical name")
+        .expect("rename");
+    let renamed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(renamed.name(), Some("canonical name"));
+}
+
+#[test]
+fn legacy_sidecar_kind_fallback_survives_cache_fill_and_later_appends() {
+    // Sessions created before `session_kind` was recorded on `session.start`
+    // carry their kind only in `session.json`; it must survive the cache fill
+    // and the next append rather than being dropped on the first re-projection.
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let metadata = format!(
+        r#"{{"version":1,"id":"{}","created_at_ms":{},"status":"active","kind":"interactive","events_path":"events.jsonl","blobs_dir":"blobs"}}
+"#,
+        record.id(),
+        record.created_at_ms()
+    );
+    fs::write(record.session_json_path(), metadata).expect("write metadata");
+    append_session_start(&record, None);
+
+    let cold = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(cold.kind(), Some(SessionKind::Interactive));
+
+    let user = EventEnvelope::new(
+        record.id().to_owned(),
+        "store-agent",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", "another turn".into())]),
+    );
+    let writer = ProvenanceWriter::new(record.events_path()).expect("writer");
+    writer.append(std::slice::from_ref(&user)).expect("append");
+    drop(writer);
+
+    let listed = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(listed.kind(), Some(SessionKind::Interactive));
+    let refilled: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(record.session_json_path()).expect("sidecar"))
+            .expect("json");
+    assert_eq!(refilled["kind"], "interactive");
 }
 
 #[test]

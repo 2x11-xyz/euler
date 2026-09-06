@@ -566,8 +566,10 @@ envelope `v` per `docs/contracts/persistence.md`.
   synchronously rewrite the sidecar, and the stale key cannot be a cache hit.
   Mismatch, truncation, an unreadable tail, a legacy `(length, mtime)` key, or
   a missing key forces the complete event/blob projection and an atomic
-  sidecar replacement. A turn-boundary metadata touch performs the same key
-  comparison before carrying projection fields forward. While the durable key
+  sidecar replacement on the next listing. A turn-boundary metadata touch
+  performs the same key comparison but never projects: on mismatch it drops
+  the key from the rewritten sidecar so the stale projection cannot be served
+  before that listing re-derives it. While the durable key
   matches, listings serve the cached projection verbatim instead of
   re-deriving it — the events remain the sole naming authority, enforced at
   projection time rather than on every read. Same-length hostile rewrites

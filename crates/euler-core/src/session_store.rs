@@ -231,11 +231,17 @@ impl SessionStore {
         Ok(refreshed)
     }
 
-    /// Bumps the session's `updated_at_ms` recency stamp. The warm path reads
-    /// only the bounded durable-tail identity; if the log changed since the
-    /// sidecar projection, this becomes a full refresh before carrying any
-    /// other field forward. That keeps the ordinary turn-boundary path cheap
-    /// without allowing a failed or stale projection to survive a new tail.
+    /// Bumps the session's `updated_at_ms` recency stamp without projecting
+    /// its event log. This is the turn-boundary hot-path variant of
+    /// [`Self::refresh_session_metadata`]: the TUI touches the active
+    /// session after every turn, and re-reading a multi-megabyte event log
+    /// (plus blob verification) per turn stalls the UI thread. The sidecar's
+    /// other fields are carried forward verbatim; only the bounded, blob-free
+    /// durable-tail identity is observed. When it disagrees with the cached
+    /// projection key (the ordinary case right after a turn appends), the key
+    /// is dropped from the rewritten sidecar so the next listing re-projects
+    /// off the UI thread — a failed or stale projection never survives a new
+    /// tail as a cache hit, and this path never pays for the projection.
     pub fn touch_session_updated_at(&self, id: &str) -> Result<(), SessionStoreError> {
         validate_session_id(id)?;
         let record = match self.record_from_sidecar(id) {
@@ -248,19 +254,16 @@ impl SessionStore {
             }
         };
         // A turn or resume may have appended since this sidecar was written.
-        // The tail identity check is bounded and blob-free; only a mismatch
-        // takes the authoritative full projection path. This prevents a turn
-        // boundary from carrying a failed/stale projection forward under its
-        // old key while preserving the warm O(1)-projection hot path.
-        let live_key = event_projection_key(record.events_path());
-        let key_matches = live_key
-            .as_ref()
-            .ok()
-            .is_some_and(|key| record.projection_key.as_ref() == Some(key));
-        if !key_matches {
-            self.refresh_session_metadata(id)?;
-            return Ok(());
-        }
+        // Never project here: on a key mismatch, invalidate the cached key so
+        // the stale projection cannot be served, and leave the authoritative
+        // (event- and blob-verifying) re-projection to the next listing.
+        let live_key = event_projection_key(record.events_path()).ok();
+        let key_matches = live_key.is_some_and(|key| record.projection_key == Some(key));
+        let record = if key_matches {
+            record
+        } else {
+            record.with_projection_key(None)
+        };
         let updated_at_ms = record.updated_at_ms.max(now_unix_ms());
         let refreshed = record.with_updated_at_ms(updated_at_ms);
         write_session_metadata_replace(&refreshed)?;
@@ -478,38 +481,29 @@ impl SessionStore {
             .unwrap_or(created_at_ms)
             .max(updated_at_ms)
             .max(created_at_ms);
-        let cached_name = sidecar.as_ref().and_then(|metadata| metadata.name.clone());
-        let cached_root = sidecar
+        // Sidecar name/root/kind double as the transition display fallback
+        // (docs/contracts/events.md, `session.renamed` / `session.start`):
+        // used only when the stream is readable and lacks the corresponding
+        // event. Sessions created or renamed before those events existed
+        // rely on this after every append, including once a projection has
+        // been cached — a cache fill carries the fallback into the sidecar
+        // and must not be the point where the session loses its identity.
+        let sidecar_name = sidecar.as_ref().and_then(|metadata| metadata.name.clone());
+        let sidecar_root = sidecar
             .as_ref()
             .and_then(|metadata| metadata.root.as_deref())
             .and_then(session_root_from_str);
-        let cached_kind = sidecar.as_ref().and_then(|metadata| metadata.kind);
-        // A sidecar which has ever cached an event projection is not a
-        // transition fallback after its key disagrees: truncation must not
-        // resurrect a removed rename/root/kind from derived metadata. Only a
-        // genuinely pre-cache sidecar can supply the legacy fallback.
-        let allows_legacy_fallback = sidecar.as_ref().is_some_and(|metadata| {
-            metadata.projected_events.is_none()
-                && metadata.legacy_projected_events_len.is_none()
-                && metadata.legacy_projected_events_modified_ns.is_none()
-        });
-        let sidecar_name = allows_legacy_fallback
-            .then_some(cached_name.clone())
-            .flatten();
-        let sidecar_root = allows_legacy_fallback
-            .then_some(cached_root.clone())
-            .flatten();
-        let sidecar_kind = allows_legacy_fallback.then_some(cached_kind).flatten();
+        let sidecar_kind = sidecar.as_ref().and_then(|metadata| metadata.kind);
         let events_path = dir.join("events.jsonl");
         let events_key = event_projection_key(&events_path).ok();
         if let (Some(metadata), Some(key)) = (&sidecar, &events_key) {
             if metadata.projected_events.as_ref() == Some(key) {
                 let projection = SessionProjection {
                     status: metadata.status,
-                    name: cached_name.and_then(|name| session_name_for_display(&name)),
+                    name: sidecar_name.and_then(|name| session_name_for_display(&name)),
                     title: metadata.title.clone(),
-                    root: cached_root,
-                    kind: cached_kind,
+                    root: sidecar_root,
+                    kind: sidecar_kind,
                     invalid_reason: None,
                 };
                 return SessionRecord::new(id, dir, created_at_ms, updated_at_ms, projection)
@@ -717,18 +711,13 @@ struct SessionMetadata {
     title: Option<String>,
     /// Rebuildable projection-cache identity. Unlike filesystem mtime, this
     /// binds the display fields to the exact accepted JSONL prefix and its
-    /// durable tail envelope. Absent on legacy sidecars and after an Invalid
-    /// projection, so disagreement and integrity failures re-project.
+    /// durable tail envelope. Absent on legacy sidecars, after an Invalid
+    /// projection, and after a turn-boundary touch observed a changed tail,
+    /// so disagreement and integrity failures re-project. The superseded
+    /// `projected_events_len` / `projected_events_modified_ns` pair is
+    /// ignored on read and never emitted again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     projected_events: Option<EventProjectionKey>,
-    /// Read-only recognition of the superseded `(len, mtime)` cache. These
-    /// fields are never emitted again; their presence merely prevents a stale
-    /// derived sidecar from being mistaken for a pre-cache transition
-    /// fallback when the durable log disagrees.
-    #[serde(default, rename = "projected_events_len", skip_serializing)]
-    legacy_projected_events_len: Option<u64>,
-    #[serde(default, rename = "projected_events_modified_ns", skip_serializing)]
-    legacy_projected_events_modified_ns: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -855,8 +844,6 @@ fn session_metadata_from_record(record: &SessionRecord) -> SessionMetadata {
         blobs_dir: "blobs".to_owned(),
         title: record.title.clone(),
         projected_events: record.projection_key.clone(),
-        legacy_projected_events_len: None,
-        legacy_projected_events_modified_ns: None,
     }
 }
 

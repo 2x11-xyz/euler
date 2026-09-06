@@ -135,7 +135,7 @@ fn discovery_reprojects_failed_sidecar_after_resumed_success() {
 }
 
 #[test]
-fn turn_boundary_touch_reprojects_failed_sidecar_after_resumed_success() {
+fn turn_boundary_touch_invalidates_failed_sidecar_after_resumed_success() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");
     append_session_events(record.events_path(), &[session_error(record.id())]);
@@ -158,13 +158,21 @@ fn turn_boundary_touch_reprojects_failed_sidecar_after_resumed_success() {
 
     store
         .touch_session_updated_at(record.id())
-        .expect("touch reconciles new tail");
+        .expect("touch observes new tail");
 
+    // The touch never projects (it runs on the UI thread), so the sidecar
+    // status is still the stale cached value — but its key is gone, so no
+    // reader can serve that stale projection as a cache hit.
+    assert_eq!(metadata_status(record.session_json_path()), Some("failed"));
+    assert_eq!(metadata_projection_key(record.session_json_path()), None);
+
+    let discovered = store
+        .find_session(record.id())
+        .expect("find")
+        .expect("record");
+    assert_eq!(discovered.status(), SessionStatus::Active);
     assert_eq!(metadata_status(record.session_json_path()), Some("active"));
-    assert_ne!(
-        metadata_projection_key(record.session_json_path()),
-        failed_projection_key
-    );
+    assert!(metadata_projection_key(record.session_json_path()).is_some());
 }
 
 #[test]
