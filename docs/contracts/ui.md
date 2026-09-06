@@ -247,6 +247,13 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   persistence failure leaves the recovery worker on the exact retained Core
   batch, including its original target and replacement identity; the UI does
   not restore or resubmit draft state while that outcome remains ambiguous.
+  That recovery retry is bounded and interruptible: it stops after a fixed
+  backoff budget (about ten seconds) or promptly when Escape or shutdown raises
+  its interrupt, and returns a typed notice instead of holding the session
+  hostage. Stopping never discards the batch. Core keeps the queue fenced on
+  it, the row stays in the recovery projection, and choosing the same recovery
+  action again resumes only that exact retained write; a different action is
+  rejected with a typed mismatch rather than synthesizing a new resolution.
   An explicit empty-submit
   continue dispatches only a pending follow-up head. Dispatch reserves the
   head without removing it; only the durable

@@ -2944,6 +2944,199 @@ fn ambiguous_recovery_dismiss_retries_the_exact_marker_and_unfences_queue() {
 }
 
 #[test]
+fn retained_retry_returns_within_its_budget_when_persistence_never_recovers() {
+    let attempts = AtomicUsize::new(0);
+    let started = Instant::now();
+    let budget = Duration::from_millis(150);
+    let result = retry_retained_persistence(
+        || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err::<(), QueueError>(QueueError::Persistence(std::io::Error::other("disk full")))
+        },
+        |error| matches!(error, QueueError::Persistence(_)),
+        RetainedRetryPolicy {
+            budget: Some(budget),
+            cancel: None,
+        },
+    );
+    let elapsed = started.elapsed();
+    match result {
+        Err(RetainedRetryFailure::BudgetExhausted {
+            budget: reported,
+            last,
+        }) => {
+            assert_eq!(reported, budget);
+            assert!(matches!(last, QueueError::Persistence(_)));
+        }
+        other => panic!("expected an exhausted budget, got {other:?}"),
+    }
+    assert!(
+        attempts.load(Ordering::SeqCst) >= 2,
+        "budget must allow retries"
+    );
+    assert!(
+        elapsed < budget + Duration::from_secs(1),
+        "retry must stop soon after its budget: {elapsed:?}"
+    );
+}
+
+#[test]
+fn retained_retry_stops_promptly_when_cancelled() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let trigger = Arc::clone(&cancel);
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(60));
+        trigger.store(true, Ordering::SeqCst);
+    });
+    let started = Instant::now();
+    let result = retry_retained_persistence(
+        || {
+            Err::<(), QueueError>(QueueError::Persistence(std::io::Error::other(
+                "read-only file system",
+            )))
+        },
+        |error| matches!(error, QueueError::Persistence(_)),
+        RetainedRetryPolicy {
+            budget: Some(Duration::from_secs(30)),
+            cancel: Some(&cancel),
+        },
+    );
+    let elapsed = started.elapsed();
+    canceller.join().expect("canceller thread");
+    assert!(
+        matches!(result, Err(RetainedRetryFailure::Cancelled)),
+        "expected cancellation, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "cancellation must return within one poll slice, took {elapsed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn escape_cancels_a_blocked_recovery_retry_and_keeps_the_row_recoverable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (mut core, gate, events_path) = durable_core_gated(temp.path());
+    submit_without_wait(&mut core, "active");
+    wait_for_model_call(&mut core);
+    submit_queued_without_wait(&mut core, "dismiss this", QueueMode::Steering);
+    core.handle_input(key(KeyCode::Esc));
+    gate.open();
+    wait_for_idle(&mut core);
+    assert!(matches!(core.modal, Some(Modal::QueueRecovery(_))));
+
+    let original_log = replace_log_with_directory(&events_path);
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('d'))),
+        CoreEffect::Render
+    );
+    wait_for_queue_write(&core);
+    assert!(core.turn_in_flight());
+    assert!(core.is_in_flight_cancellable());
+
+    // Escape reaches the recovery worker: the exact retained retry returns
+    // promptly instead of looping on the persistent fault.
+    assert_eq!(core.handle_input(key(KeyCode::Esc)), CoreEffect::Render);
+    let started = Instant::now();
+    wait_for_idle(&mut core);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancelled recovery must return promptly"
+    );
+    assert_eq!(
+        core.notice.as_deref(),
+        Some(QueueRecoveryFailure::Cancelled.to_string().as_str())
+    );
+    assert_eq!(core.recoverable_queue_inputs.len(), 1);
+    assert!(matches!(core.modal, Some(Modal::QueueRecovery(_))));
+    assert!(core.recovery_edit.is_none());
+    assert_eq!(core.bottom.composer().submit_text(), "");
+    assert!(matches!(
+        core.queued_inputs
+            .push_follow_up_back("still fenced".to_owned()),
+        Err(QueueError::UnresolvedChange)
+    ));
+
+    // Choosing the same recovery again resumes only the retained write.
+    std::fs::remove_dir(&events_path).expect("remove fault directory");
+    std::fs::write(&events_path, &original_log).expect("restore original ledger");
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('d'))),
+        CoreEffect::Render
+    );
+    wait_for_idle(&mut core);
+    assert_eq!(core.notice.as_deref(), Some("recovery input dismissed"));
+    assert!(core.recoverable_queue_inputs.is_empty());
+    assert!(!core.queued_inputs.has_unresolved_authoritative_write());
+    core.queued_inputs
+        .push_follow_up_back("accepted after resume".to_owned())
+        .expect("resumed recovery must reopen the queue");
+}
+
+#[cfg(unix)]
+#[test]
+fn exhausted_recovery_retry_budget_surfaces_a_notice_and_keeps_the_row_recoverable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let (mut core, gate, events_path) = durable_core_gated(temp.path());
+    core.queue_recovery_retry_budget = Duration::from_millis(200);
+    submit_without_wait(&mut core, "active");
+    wait_for_model_call(&mut core);
+    submit_queued_without_wait(&mut core, "requeue this", QueueMode::Steering);
+    core.handle_input(key(KeyCode::Esc));
+    gate.open();
+    wait_for_idle(&mut core);
+    assert!(matches!(core.modal, Some(Modal::QueueRecovery(_))));
+
+    let original_log = replace_log_with_directory(&events_path);
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('r'))),
+        CoreEffect::Render
+    );
+    wait_for_queue_write(&core);
+    assert!(core.turn_in_flight());
+
+    // No Escape: the never-succeeding fault must exhaust the budget on its own.
+    wait_for_idle(&mut core);
+    let notice = core.notice.clone().expect("budget notice");
+    assert!(
+        notice.starts_with("queue recovery paused after 0s:"),
+        "notice: {notice}"
+    );
+    assert!(
+        notice.contains("resume its exact retained write"),
+        "notice: {notice}"
+    );
+    assert_eq!(core.recoverable_queue_inputs.len(), 1);
+    assert!(matches!(core.modal, Some(Modal::QueueRecovery(_))));
+    assert!(core.recovery_edit.is_none());
+    assert_eq!(
+        core.bottom.composer().submit_text(),
+        "",
+        "the retained write owns the content; no draft may be restored"
+    );
+    assert!(matches!(
+        core.queued_inputs
+            .push_follow_up_back("still fenced".to_owned()),
+        Err(QueueError::UnresolvedChange)
+    ));
+
+    std::fs::remove_dir(&events_path).expect("remove fault directory");
+    std::fs::write(&events_path, &original_log).expect("restore original ledger");
+    assert_eq!(
+        core.handle_input(key(KeyCode::Char('r'))),
+        CoreEffect::Render
+    );
+    wait_for_idle(&mut core);
+    assert_eq!(core.notice.as_deref(), Some("requeued as a follow-up"));
+    assert!(core.recoverable_queue_inputs.is_empty());
+    let snapshot = core.queued_inputs.metadata_snapshot();
+    assert_eq!(snapshot.rows().len(), 1);
+    assert_eq!(snapshot.rows()[0].content(), "requeue this");
+    assert!(!core.queued_inputs.has_unresolved_authoritative_write());
+}
+
+#[test]
 fn scrubbed_recovery_cannot_reintroduce_stale_modal_or_stashed_bytes() {
     let temp = tempfile::tempdir().expect("temp dir");
     let secret = "RECOVERY-SECRET-123456";

@@ -1,12 +1,51 @@
 use euler_core::{QueueError, QueueMode, QueuePosition, QueuedInputMetadata, SteeringQueue};
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const EXACT_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 const EXACT_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
+/// Slice length for interruptible backoff sleeps so a raised cancellation
+/// flag is observed within one slice rather than one full backoff.
+const EXACT_RETRY_CANCEL_POLL: Duration = Duration::from_millis(25);
+
+/// Bounds on an exact retained retry. `None` for both means the caller
+/// accepts an indefinite retry; only the serialized queue worker does, because
+/// the UI contract keeps accepted input on its exact retry rather than
+/// discarding it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct RetainedRetryPolicy<'a> {
+    /// Total wall-clock budget measured from the first retry. The retry that
+    /// crosses the budget is the last one attempted.
+    pub(super) budget: Option<Duration>,
+    /// Cooperative cancellation. Checked before every sleep slice and after
+    /// every failed retry, so cancellation returns within one poll slice.
+    pub(super) cancel: Option<&'a AtomicBool>,
+}
+
+impl RetainedRetryPolicy<'static> {
+    pub(super) const INDEFINITE: Self = Self {
+        budget: None,
+        cancel: None,
+    };
+}
+
+/// Why an exact retained retry returned without the write resolving.
+#[derive(Debug)]
+pub(super) enum RetainedRetryFailure<E> {
+    /// Core returned a definitive, non-ambiguous error; the retained batch is
+    /// no longer the reason the operation is unresolved.
+    Definitive(E),
+    /// The caller's cancellation flag was raised. The retained batch stays
+    /// fenced in Core and can be resumed by a later exact retry.
+    Cancelled,
+    /// The budget elapsed while the write stayed ambiguous. `last` is the
+    /// most recent persistence error so a notice can name the fault.
+    BudgetExhausted { budget: Duration, last: E },
+}
 
 /// One user action whose durable queue append runs off the terminal thread.
 pub(super) enum QueueMutation {
@@ -489,7 +528,7 @@ fn apply_queue_mutation(
 }
 
 fn retry_exact_enqueue(queue: &SteeringQueue) -> Result<QueueMutationSuccess, QueueError> {
-    retry_retained_persistence(
+    retry_retained_persistence_indefinitely(
         || {
             queue
                 .retry_unresolved_enqueue_with_metadata()?
@@ -501,7 +540,7 @@ fn retry_exact_enqueue(queue: &SteeringQueue) -> Result<QueueMutationSuccess, Qu
 }
 
 fn retry_exact_cancel(queue: &SteeringQueue) -> Result<QueueMutationSuccess, QueueError> {
-    retry_retained_persistence(
+    retry_retained_persistence_indefinitely(
         || {
             let outcome = queue
                 .retry_unresolved_change_with_metadata()?
@@ -516,7 +555,7 @@ fn retry_exact_cancel(queue: &SteeringQueue) -> Result<QueueMutationSuccess, Que
 }
 
 fn retry_exact_replace(queue: &SteeringQueue) -> Result<QueueMutationSuccess, QueueError> {
-    retry_retained_persistence(
+    retry_retained_persistence_indefinitely(
         || {
             let outcome = queue
                 .retry_unresolved_change_with_metadata()?
@@ -531,21 +570,67 @@ fn retry_exact_replace(queue: &SteeringQueue) -> Result<QueueMutationSuccess, Qu
     )
 }
 
+/// The serialized queue worker's policy: retry the exact retained enqueue or
+/// change until it resolves. The UI stays live meanwhile and orderly shutdown
+/// waits within its own cleanup bound, so this loop never wedges the terminal.
+fn retry_retained_persistence_indefinitely<T, E>(
+    retry: impl FnMut() -> Result<T, E>,
+    is_persistence: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    match retry_retained_persistence(retry, is_persistence, RetainedRetryPolicy::INDEFINITE) {
+        Ok(value) => Ok(value),
+        Err(RetainedRetryFailure::Definitive(error))
+        | Err(RetainedRetryFailure::BudgetExhausted { last: error, .. }) => Err(error),
+        Err(RetainedRetryFailure::Cancelled) => {
+            unreachable!("the indefinite policy carries no cancellation flag")
+        }
+    }
+}
+
 /// Keep retrying only an exact retained operation while its durable outcome
-/// remains ambiguous. Callers own the retained envelope; this helper owns the
-/// shared bounded-backoff policy and must never receive a fresh mutation.
+/// remains ambiguous, within `policy`. Callers own the retained envelope; this
+/// helper owns the shared backoff and must never receive a fresh mutation.
+/// Stopping early never discards the retained batch: Core keeps it fenced and
+/// a later exact retry resumes the same write.
 pub(super) fn retry_retained_persistence<T, E>(
     mut retry: impl FnMut() -> Result<T, E>,
     is_persistence: impl Fn(&E) -> bool,
-) -> Result<T, E> {
+    policy: RetainedRetryPolicy<'_>,
+) -> Result<T, RetainedRetryFailure<E>> {
+    let cancelled = || {
+        policy
+            .cancel
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    };
+    let started = Instant::now();
     let mut backoff = EXACT_RETRY_BACKOFF;
     loop {
-        std::thread::sleep(backoff);
+        let mut remaining = backoff;
+        while !remaining.is_zero() {
+            if cancelled() {
+                return Err(RetainedRetryFailure::Cancelled);
+            }
+            let slice = remaining.min(EXACT_RETRY_CANCEL_POLL);
+            std::thread::sleep(slice);
+            remaining -= slice;
+        }
         match retry() {
+            Ok(value) => return Ok(value),
             Err(error) if is_persistence(&error) => {
+                if cancelled() {
+                    return Err(RetainedRetryFailure::Cancelled);
+                }
+                if let Some(budget) = policy.budget {
+                    if started.elapsed() >= budget {
+                        return Err(RetainedRetryFailure::BudgetExhausted {
+                            budget,
+                            last: error,
+                        });
+                    }
+                }
                 backoff = backoff.saturating_mul(2).min(EXACT_RETRY_MAX_BACKOFF);
             }
-            result => return result,
+            Err(error) => return Err(RetainedRetryFailure::Definitive(error)),
         }
     }
 }

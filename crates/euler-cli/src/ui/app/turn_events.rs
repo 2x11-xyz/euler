@@ -164,7 +164,7 @@ impl AppCore {
     fn finish_queue_recovery(
         &mut self,
         request: QueueRecoveryRequest,
-        result: Result<Option<String>, String>,
+        result: Result<Option<String>, QueueRecoveryFailure>,
         session: Box<Session<TuiDecider>>,
     ) {
         self.last_working_elapsed_secs = None;
@@ -183,15 +183,17 @@ impl AppCore {
                     self.notice = Some("recovery input dismissed".to_owned());
                 }
             }
-            Err(error) => {
-                match request.action {
-                    QueueRecoveryAction::Requeue { content } => {
+            Err(failure) => {
+                // A retained failure leaves the exact batch fenced in Core;
+                // the content still belongs to that write, so no draft is
+                // restored and the row is offered for recovery again.
+                if !failure.retains_exact_write() {
+                    if let QueueRecoveryAction::Requeue { content } = request.action {
                         self.recovery_edit = Some(request.recovered);
                         self.bottom.replace_composer_text(&content);
                     }
-                    QueueRecoveryAction::Dismiss => {}
                 }
-                self.notice = Some(format!("queue recovery failed: {error}"));
+                self.notice = Some(failure.to_string());
             }
         }
         self.refresh_recoverable_queue_inputs();

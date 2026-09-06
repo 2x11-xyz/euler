@@ -5,6 +5,7 @@ use self::notify::NotifyEvent;
 use self::queue_mutations::{
     retry_retained_persistence, QueueMutation, QueueMutationBoundary, QueueMutationCompletion,
     QueueMutationFailure, QueueMutationIntent, QueueMutationSuccess, QueueProjectionRow,
+    RetainedRetryFailure, RetainedRetryPolicy,
 };
 #[cfg(test)]
 use self::resume::TuiResume;
@@ -100,11 +101,54 @@ fn inactive_permission_reply_sender() -> Sender<PermissionReply> {
 }
 const QUIT_ARM_NOTICE: &str = "ctrl+c again to quit · session saved, /resume restores";
 const MODEL_TURN_IN_FLIGHT_LABEL: &str = "turn";
+const QUEUE_RECOVERY_IN_FLIGHT_LABEL: &str = "queue recovery";
+/// Total backoff a queue recovery spends on its exact retained write before
+/// returning to the UI with a typed failure. Escape or shutdown stops it
+/// sooner; the retained batch stays fenced in Core and resumes on the next
+/// identical recovery choice.
+const QUEUE_RECOVERY_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const TURN_STARTING_NOTICE: &str =
     "turn is starting · input kept in the composer; submit again when steering is ready";
 const QUEUE_MUTATION_SAVING_NOTICE: &str = "queue change is being saved";
 const DENY_INSTRUCTION_SAVING_NOTICE: &str =
     "deny instruction is still being saved · approval stays open";
+
+/// Resume only the exact recovery batch Core retained for `queue_id`, within
+/// `policy`. A fresh attempt lands here on an ambiguous persistence error or
+/// on `UnresolvedChange`, which means an earlier recovery (cancelled or budget
+/// exhausted) left its batch fenced. Core rejects a mismatched shape with a
+/// typed error instead of synthesizing a new resolution.
+fn resume_retained_queue_recovery(
+    session: &mut Session<TuiDecider>,
+    queued_inputs: &Arc<euler_core::SteeringQueue>,
+    queue_id: &str,
+    expected_replacement: bool,
+    policy: RetainedRetryPolicy<'_>,
+) -> Result<Option<String>, QueueRecoveryFailure> {
+    match retry_retained_persistence(
+        || {
+            session.retry_unresolved_recoverable_queue_operation(
+                Arc::clone(queued_inputs),
+                queue_id,
+                expected_replacement,
+            )
+        },
+        |error| matches!(error, SessionError::Queue(QueueError::Persistence(_))),
+        policy,
+    ) {
+        Ok(replacement) => Ok(replacement),
+        Err(RetainedRetryFailure::Definitive(error)) => {
+            Err(QueueRecoveryFailure::Core(error.to_string()))
+        }
+        Err(RetainedRetryFailure::Cancelled) => Err(QueueRecoveryFailure::Cancelled),
+        Err(RetainedRetryFailure::BudgetExhausted { budget, last }) => {
+            Err(QueueRecoveryFailure::RetryBudgetExhausted {
+                budget,
+                last: last.to_string(),
+            })
+        }
+    }
+}
 
 fn join_drafts(first: &str, second: &str) -> String {
     match (first.is_empty(), second.is_empty()) {
@@ -329,6 +373,9 @@ pub struct AppCore {
     /// Last reconciled private recovery projection, refreshed whenever the
     /// live Session is on the UI thread.
     recoverable_queue_inputs: Vec<RecoverableQueueInput>,
+    /// Wall-clock bound on a queue recovery's exact retained retry. Tests
+    /// shrink it; production uses [`QUEUE_RECOVERY_RETRY_BUDGET`].
+    queue_recovery_retry_budget: Duration,
     /// Edge-triggered `/compact` request shared with the root turn worker.
     /// The session consumes it at the next settled model-round boundary.
     compaction_request: Arc<AtomicBool>,
@@ -418,9 +465,46 @@ enum TurnEvent {
     },
     QueueRecoveryDone {
         request: QueueRecoveryRequest,
-        result: Result<Option<String>, String>,
+        result: Result<Option<String>, QueueRecoveryFailure>,
         session: Box<Session<TuiDecider>>,
     },
+}
+
+/// Why a queue recovery worker returned without resolving its row. The
+/// retained variants leave Core fenced on the exact recovery batch; the UI
+/// keeps the row in its recovery projection and never restores draft text
+/// for them, because the retained write still owns that content.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum QueueRecoveryFailure {
+    /// Core returned a definitive typed error.
+    Core(String),
+    /// Escape or shutdown interrupted the exact retained retry.
+    Cancelled,
+    /// The retained retry stayed ambiguous for the whole budget.
+    RetryBudgetExhausted { budget: Duration, last: String },
+}
+
+impl QueueRecoveryFailure {
+    /// The exact retained Core batch is still fenced and resumable.
+    fn retains_exact_write(&self) -> bool {
+        matches!(self, Self::Cancelled | Self::RetryBudgetExhausted { .. })
+    }
+}
+
+impl std::fmt::Display for QueueRecoveryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Core(error) => write!(formatter, "queue recovery failed: {error}"),
+            Self::Cancelled => formatter.write_str(
+                "queue recovery cancelled · choose the same recovery again to resume its exact retained write",
+            ),
+            Self::RetryBudgetExhausted { budget, last } => write!(
+                formatter,
+                "queue recovery paused after {}s: {last} · choose the same recovery again to resume its exact retained write",
+                budget.as_secs()
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1241,6 +1325,7 @@ impl AppCore {
             recalled_queue_id: None,
             recovery_edit: None,
             recoverable_queue_inputs: initial_queue.recoverable,
+            queue_recovery_retry_budget: QUEUE_RECOVERY_RETRY_BUDGET,
             compaction_request: Arc::new(AtomicBool::new(false)),
             queued_selection: initial_queue.selected,
             in_flight_label: None,
@@ -1459,6 +1544,17 @@ impl AppCore {
                 ),
                 Err(error) => self.error_item(format!("compaction interruption failed: {error}")),
             };
+        }
+        if self.in_flight_label.as_deref() == Some(QUEUE_RECOVERY_IN_FLIGHT_LABEL) {
+            // A queue recovery owns no model turn and no steering boundary:
+            // raising the flag only stops its exact retained retry. Core keeps
+            // the batch fenced, so nothing is lost and nothing is resubmitted.
+            if let AppState::TurnInFlight { interrupt_flag, .. } = &self.state {
+                interrupt_flag.store(true, Ordering::SeqCst);
+            }
+            self.notice =
+                Some("cancelling queue recovery · its retained write stays recoverable".to_owned());
+            return CoreEffect::Render;
         }
         let cleared = self.pending_runs.len();
         self.pending_runs.clear();
@@ -1705,11 +1801,13 @@ impl AppCore {
         let permission_run_matches = self.permission_run_id.as_deref() == source_run
             && self.queued_inputs.metadata_snapshot().active_run() == source_run;
         if !permission_run_matches {
-            let current = self.bottom.composer().submit_text();
-            self.bottom
-                .replace_composer_text(&join_drafts(original, &current));
+            // The instruction is already a durable queue row (steering for
+            // the still-active run, or terminal-cancelled and recoverable).
+            // Restoring it to the composer as well would let the same
+            // guidance be submitted twice; the row is the single owner.
             self.notice = Some(
-                "deny instruction retained: the permission's run is no longer active".to_owned(),
+                "deny instruction retained as a queued row: the permission's run is no longer active"
+                    .to_owned(),
             );
             self.normalize_queue_selection();
             return;
@@ -2579,9 +2677,35 @@ impl AppCore {
         let mut session = self.take_idle_session();
         let worker_request = request.clone();
         let (worker_tx, worker_rx) = mpsc::channel();
+        let interrupt_flag = Arc::new(AtomicBool::new(false));
+        let worker_interrupt = Arc::clone(&interrupt_flag);
+        let retry_budget = self.queue_recovery_retry_budget;
         std::thread::spawn(move || {
             let expected_replacement =
                 matches!(&worker_request.action, QueueRecoveryAction::Requeue { .. });
+            let policy = RetainedRetryPolicy {
+                budget: Some(retry_budget),
+                cancel: Some(&worker_interrupt),
+            };
+            // An earlier recovery (cancelled or budget exhausted) may have
+            // left its exact batch fenced. A fresh attempt would trip the
+            // provenance writer's own fence before reaching the queue, so
+            // resume the retained write directly instead.
+            if queued_inputs.has_unresolved_change() {
+                let result = resume_retained_queue_recovery(
+                    &mut session,
+                    &queued_inputs,
+                    worker_request.recovered.queue_id(),
+                    expected_replacement,
+                    policy,
+                );
+                let _ = worker_tx.send(TurnEvent::QueueRecoveryDone {
+                    request: worker_request,
+                    result,
+                    session,
+                });
+                return;
+            }
             let first_attempt = match &worker_request.action {
                 QueueRecoveryAction::Dismiss => session
                     .dismiss_recoverable_queue_input(
@@ -2600,19 +2724,18 @@ impl AppCore {
                     .map(Some),
             };
             let result = match first_attempt {
-                Err(SessionError::Queue(QueueError::Persistence(_))) => retry_retained_persistence(
-                    || {
-                        session.retry_unresolved_recoverable_queue_operation(
-                            Arc::clone(&queued_inputs),
-                            worker_request.recovered.queue_id(),
-                            expected_replacement,
-                        )
-                    },
-                    |error| matches!(error, SessionError::Queue(QueueError::Persistence(_))),
+                Err(SessionError::Queue(
+                    QueueError::Persistence(_) | QueueError::UnresolvedChange,
+                )) => resume_retained_queue_recovery(
+                    &mut session,
+                    &queued_inputs,
+                    worker_request.recovered.queue_id(),
+                    expected_replacement,
+                    policy,
                 ),
-                result => result,
-            }
-            .map_err(|error| error.to_string());
+                Ok(replacement) => Ok(replacement),
+                Err(error) => Err(QueueRecoveryFailure::Core(error.to_string())),
+            };
             let _ = worker_tx.send(TurnEvent::QueueRecoveryDone {
                 request: worker_request,
                 result,
@@ -2621,12 +2744,12 @@ impl AppCore {
         });
         self.install_state(AppState::TurnInFlight {
             worker_rx,
-            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            interrupt_flag,
             started_at: Instant::now(),
         });
-        self.in_flight_label = Some("queue recovery".to_owned());
+        self.in_flight_label = Some(QUEUE_RECOVERY_IN_FLIGHT_LABEL.to_owned());
         self.in_flight_companion_name = None;
-        self.in_flight_cancellable = false;
+        self.in_flight_cancellable = true;
         self.model_turn_steering_ready = false;
         self.notice = Some("saving queue recovery".to_owned());
         CoreEffect::Render

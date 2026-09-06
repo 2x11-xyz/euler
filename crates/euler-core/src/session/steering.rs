@@ -1892,6 +1892,13 @@ impl SteeringQueue {
     }
 
     /// Compatibility query for the narrower admission owner.
+    /// Whether an exact cancellation, replacement, or recovery batch is
+    /// retained after an ambiguous append. While set, every fresh queue
+    /// mutation is fenced and only that exact batch may be retried.
+    pub fn has_unresolved_change(&self) -> bool {
+        self.state().unresolved_change.is_some()
+    }
+
     pub fn has_unresolved_admission(&self) -> bool {
         self.state().unresolved_admission.is_some()
     }
