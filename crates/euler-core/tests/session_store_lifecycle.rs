@@ -224,6 +224,21 @@ fn canonical_cancelled_or_interrupted_terminal_clears_preceding_failure_noise() 
 }
 
 #[test]
+fn session_level_error_after_completed_terminal_projects_failed() {
+    let (_temp, store) = test_store();
+    let record = store.create_session().expect("session");
+    let mut events = canonical_run(record.id(), "completed", &[]);
+    events.push(session_error(record.id()));
+    append_session_events(record.events_path(), &events);
+
+    let refreshed = store
+        .refresh_session_metadata(record.id())
+        .expect("refresh metadata");
+    assert_eq!(refreshed.status(), SessionStatus::Failed);
+    assert_eq!(metadata_status(record.session_json_path()), Some("failed"));
+}
+
+#[test]
 fn canonical_completed_terminal_ignores_a_late_captured_async_error() {
     let (_temp, store) = test_store();
     let record = store.create_session().expect("session");

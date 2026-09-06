@@ -2439,8 +2439,28 @@ impl<D> Session<D> {
     }
 
     fn ensure_no_pending_admission_except_agent_result(&self) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission_fence(true)
+    }
+
+    /// Fence for the retained exact agent result and the live backlog it
+    /// flushes first. A deferred run terminal waits on that very append
+    /// (`finish_run_result` and `terminalize_deferred_run` retry orphaned
+    /// results before the terminal batch), so the deferred intent must not
+    /// fence it or neither side could ever settle. Every other unresolved
+    /// authoritative write still fences, and new user admissions stay fenced
+    /// through [`Self::ensure_no_pending_admission`].
+    fn ensure_no_pending_admission_except_deferred_terminal(&self) -> Result<(), SessionError> {
+        self.ensure_no_pending_admission_fence(false)
+    }
+
+    fn ensure_no_pending_admission_fence(
+        &self,
+        fence_deferred_terminal: bool,
+    ) -> Result<(), SessionError> {
         self.ensure_terminalization_intact()?;
-        if self.pending_run_terminal.is_some() || self.deferred_run_terminal.is_some() {
+        if self.pending_run_terminal.is_some()
+            || (fence_deferred_terminal && self.deferred_run_terminal.is_some())
+        {
             Err(QueueError::UnresolvedTerminal.into())
         } else if self.pending_admission.is_some() {
             Err(pending_admission_error())
@@ -2504,7 +2524,7 @@ impl<D> Session<D> {
     }
 
     fn persist_new_events_before_agent_result(&mut self) -> Result<(), SessionError> {
-        self.ensure_no_pending_admission_except_agent_result()?;
+        self.ensure_no_pending_admission_except_deferred_terminal()?;
         self.reconcile_accepted_events()?;
         if let Some(writer) = &self.provenance {
             writer.append(&self.bus.events()[self.persisted_events..])?;
@@ -2541,8 +2561,15 @@ impl<D> Session<D> {
             })?;
         pending.append_attempted = true;
         let result_event_id = pending.event.id.clone();
-        let append =
-            self.accept_ordered_batch_inner(std::slice::from_mut(&mut pending.event), false);
+        let append = self
+            .ensure_no_pending_admission_except_deferred_terminal()
+            .and_then(|()| self.ensure_no_pending_agent_result())
+            .and_then(|()| {
+                self.accept_ordered_batch_after_admission_check(
+                    std::slice::from_mut(&mut pending.event),
+                    false,
+                )
+            });
         if let Err(error) = append {
             self.open_agent_spawns
                 .get_mut(spawn_event_id)

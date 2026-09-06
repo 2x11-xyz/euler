@@ -977,6 +977,95 @@ fn sequential_companion_result_failure_reconciles_before_root_terminal() {
 }
 
 #[test]
+fn deferred_terminal_retry_settles_the_orphaned_agent_result_it_waits_on() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("deferred-terminal-orphaned-result.jsonl");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "admitted after terminal".to_owned(),
+        )]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session
+        .admit_user_message("active root run", None, true)
+        .expect("open root run");
+    let task = AgentTask::new_inheriting_target("review", "worker")
+        .expect("task")
+        .with_budget(AgentBudget::new(Some(1), None, Some(0)).expect("zero-output budget"));
+    let sync_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fault_count = Arc::clone(&sync_count);
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| {
+        path == expected_log && fault_count.fetch_add(1, Ordering::SeqCst) == 1
+    });
+
+    let companion_error = session
+        .spawn_companion(task)
+        .expect_err("agent.result sync fails after agent.spawn");
+    assert!(guard.fired(), "agent.result sync fault must fire");
+    assert!(session.has_pending_agent_result());
+    drop(guard);
+
+    // The orphan retry inside terminalization fails too: terminal intent is
+    // deferred behind the retained exact result.
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+    assert!(matches!(
+        session.finish_run_result(Err(companion_error)),
+        Err(SessionError::Io(_))
+    ));
+    assert!(guard.fired(), "orphaned result retry fault must fire");
+    drop(guard);
+    assert_eq!(
+        session.deferred_run_terminal,
+        Some(RunTerminalStatus::Failed)
+    );
+    assert!(session.has_pending_agent_result());
+    assert!(session.active_run.is_some());
+    assert!(matches!(
+        session.run_turn("fenced while the terminal is deferred"),
+        Err(SessionError::Queue(QueueError::UnresolvedTerminal))
+    ));
+
+    session
+        .retry_unresolved_run_terminal()
+        .expect("deferred terminal settles its own orphaned result first");
+
+    assert!(!session.has_pending_agent_result());
+    assert!(session.deferred_run_terminal.is_none());
+    assert!(session.pending_run_terminal.is_none());
+    assert!(session.active_run.is_none());
+    let durable = read_provenance(&log).expect("durable events");
+    let result_index = durable
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::AGENT_RESULT)
+        .expect("agent result");
+    let terminal_index = durable
+        .iter()
+        .position(|event| event.kind.as_str() == EventKind::RUN_TERMINAL)
+        .expect("run terminal");
+    assert!(result_index < terminal_index);
+    assert_eq!(
+        durable
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.kind.as_str(),
+                    EventKind::AGENT_RESULT | EventKind::RUN_TERMINAL
+                )
+            })
+            .count(),
+        2
+    );
+
+    session
+        .run_turn("admission recovers after the deferred terminal")
+        .expect("new turn after the deferred terminal settles");
+}
+
+#[test]
 fn ambiguous_direct_admission_does_not_publish_an_active_run() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("direct-admission-ambiguity.jsonl");
