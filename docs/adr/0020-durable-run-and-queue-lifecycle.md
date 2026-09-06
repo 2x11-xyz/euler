@@ -51,10 +51,12 @@ parent chains.
 
 ## Consequences
 
-- Session listing status follows `run.terminal` first, with a session-level
-  `error` or failed `model.result` recorded after the latest terminal still
-  reported as failed. Errors attributed to an already terminalized run are
-  settled by that run's terminal.
+- Session listing validates the lifecycle before selecting status. An open
+  run is active; otherwise the latest `run.terminal` is authoritative: failed
+  runs report failed, while completed, cancelled, and interrupted runs leave
+  the session active. Ordinary run-less root errors after lifecycle activity
+  are invalid streams, not late overrides of a completed terminal. Legacy
+  streams without run terminals retain the model/error status fallback.
 - The fold scans O(events x runs) per batch and clones the projection.
   Acceptable for current histories; an open-run index is the expected follow-up
   for long logs.

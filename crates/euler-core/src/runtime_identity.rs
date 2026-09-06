@@ -1,4 +1,4 @@
-use euler_event::{EventEnvelope, EventKind};
+use euler_event::{EventEnvelope, EventKind, JsonObject};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -183,6 +183,34 @@ pub fn runtime_identity_from_events(
         ));
     }
     Ok(RecordedRuntimeIdentity::Recorded(identity))
+}
+
+/// Recompute a `session.start` event's stored projection digest in place
+/// after its payload was legitimately rewritten (e.g. by scrub redacting a
+/// value that happened to appear in a non-runtime field such as the recorded
+/// root). Scrub is a writer-owned, audited mutation, not external tampering,
+/// so keeping the digest in sync here preserves the check's purpose —
+/// detecting payload drift from *outside* the writer — without leaving every
+/// rescrubbed session permanently `Invalid`. A payload with no `runtime`
+/// object, or one that no longer deserializes as `RuntimeIdentity`, is left
+/// untouched; `runtime_identity_from_events` reports that state on its own
+/// terms.
+pub(crate) fn resync_session_start_projection_digest(payload: &mut JsonObject) {
+    let Some(runtime_value) = payload.get("runtime").cloned() else {
+        return;
+    };
+    let Ok(mut identity) = serde_json::from_value::<RuntimeIdentity>(runtime_value) else {
+        return;
+    };
+    let mut configuration = payload.clone();
+    configuration.remove("runtime");
+    let Ok(config_bytes) = serde_json::to_vec(&configuration) else {
+        return;
+    };
+    identity.session_start_projection_sha256 = format!("{:x}", Sha256::digest(config_bytes));
+    if let Ok(runtime_value) = serde_json::to_value(identity) {
+        payload.insert("runtime".to_owned(), runtime_value);
+    }
 }
 
 fn validate_nonempty(value: &str, message: &'static str) -> Result<(), RuntimeIdentityError> {

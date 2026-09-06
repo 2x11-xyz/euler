@@ -1099,9 +1099,7 @@ fn session_projection_from_events_or_sidecar(
         Ok(lifecycle) => lifecycle,
         Err(error) => {
             return ProjectedSession {
-                projection: SessionProjection::invalid(format!(
-                    "invalid run lifecycle: {error}"
-                )),
+                projection: SessionProjection::invalid(format!("invalid run lifecycle: {error}")),
                 key: None,
             }
         }

@@ -746,7 +746,7 @@ fn preflight_recovery_candidate(
     config: &SessionConfig,
     events: &[EventEnvelope],
 ) -> Result<RunLifecycleProjection, ResumeError> {
-    let lifecycle = preflight_session(config, events)?;
+    let lifecycle = preflight_recovery_lifecycle(config, events)?;
     if recovery_closures(events, &lifecycle)?.is_empty() {
         Ok(lifecycle)
     } else {
@@ -845,7 +845,7 @@ fn policy_from_object(
     }
 }
 
-fn preflight_session(
+fn preflight_recovery_lifecycle(
     config: &SessionConfig,
     events: &[EventEnvelope],
 ) -> Result<RunLifecycleProjection, ResumeError> {

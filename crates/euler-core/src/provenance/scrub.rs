@@ -133,6 +133,13 @@ impl ProvenanceWriter {
         if replacements > 0 {
             pass.report.replacements += replacements;
             changed = true;
+            // A redacted value may have appeared in a non-runtime `session.start`
+            // field (e.g. the recorded root). Keep the stored projection digest
+            // in sync with this writer-owned, audited rewrite so the session
+            // does not become permanently Invalid.
+            if event.kind.as_str() == EventKind::SESSION_START {
+                crate::runtime_identity::resync_session_start_projection_digest(&mut event.payload);
+            }
         }
 
         let mut response_content_bytes = if event.kind.as_str()
