@@ -8,6 +8,11 @@ pull requests that landed them; deeper design rationale lives in
 
 ### Project context and skills
 
+- Skill authoring is now more interoperable: a missing or YAML null name
+  derives from a valid parent directory, a valid explicit name may differ from
+  that directory with a non-fatal compatibility diagnostic, and the
+  1,024-character description limit counts Unicode scalar values instead of
+  UTF-8 bytes.
 - Euler now discovers user-global skills from `${EULER_HOME}/skills/` and
   project skills from `.euler/skills/`, freezes them in schema-v2 session
   snapshots, renders a compact catalog, and exposes snapshot-backed

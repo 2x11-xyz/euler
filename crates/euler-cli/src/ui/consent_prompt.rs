@@ -85,26 +85,32 @@ where
     Ok(choice)
 }
 
-/// Present the acknowledgment card. `content_changed` selects the changed
-/// headline; `sources`, `skipped_count`, and `skill_count` populate the
-/// disclosure lists.
+/// The immutable acknowledgment facts; prompt selection remains local to the
+/// interactive surface.
+pub(crate) struct AcknowledgmentPrompt<'a> {
+    pub(crate) folder_label: &'a str,
+    pub(crate) content_changed: bool,
+    pub(crate) sources: &'a [String],
+    pub(crate) skipped_count: usize,
+    pub(crate) compatibility_warning_count: usize,
+    pub(crate) skill_count: usize,
+}
+
+/// Present the acknowledgment card.
 pub(crate) fn prompt_acknowledgment(
-    folder_label: &str,
-    content_changed: bool,
-    sources: &[String],
-    skipped_count: usize,
-    skill_count: usize,
+    prompt_view: AcknowledgmentPrompt<'_>,
     theme_choice: ThemeChoice,
 ) -> Result<ConsentChoice> {
     prompt(
         |load_selected, width, theme| {
             crate::ui::transcript::render_acknowledgment_card(
                 &crate::ui::transcript::AcknowledgmentCardView {
-                    folder_label,
-                    content_changed,
-                    sources,
-                    skipped_count,
-                    skill_count,
+                    folder_label: prompt_view.folder_label,
+                    content_changed: prompt_view.content_changed,
+                    sources: prompt_view.sources,
+                    skipped_count: prompt_view.skipped_count,
+                    compatibility_warning_count: prompt_view.compatibility_warning_count,
+                    skill_count: prompt_view.skill_count,
                     load_selected,
                 },
                 theme,

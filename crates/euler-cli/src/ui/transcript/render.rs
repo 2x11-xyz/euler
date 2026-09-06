@@ -445,6 +445,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 content_changed,
                 sources,
                 skipped_count,
+                compatibility_warning_count,
                 skill_count,
                 load_selected,
             } => {
@@ -454,6 +455,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                         content_changed: *content_changed,
                         sources,
                         skipped_count: *skipped_count,
+                        compatibility_warning_count: *compatibility_warning_count,
                         skill_count: *skill_count,
                         load_selected: *load_selected,
                     },

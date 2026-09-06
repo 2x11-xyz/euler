@@ -394,6 +394,7 @@ struct AckModalState {
     content_changed: bool,
     sources: Vec<String>,
     skipped_count: usize,
+    compatibility_warning_count: usize,
     skill_count: usize,
     load_selected: bool,
 }
@@ -2469,6 +2470,7 @@ impl AppCore {
                     content_changed: pending.content_changed(),
                     sources: pending.source_identities().to_vec(),
                     skipped_count: pending.skipped_count(),
+                    compatibility_warning_count: pending.compatibility_warning_count(),
                     skill_count: pending.skill_count(),
                     load_selected: false,
                 };
@@ -3211,6 +3213,7 @@ impl AppCore {
                 content_changed: state.content_changed,
                 sources: state.sources.clone(),
                 skipped_count: state.skipped_count,
+                compatibility_warning_count: state.compatibility_warning_count,
                 skill_count: state.skill_count,
                 load_selected: state.load_selected,
             }),
