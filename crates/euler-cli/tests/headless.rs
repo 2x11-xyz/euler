@@ -5206,9 +5206,28 @@ fn tui_pty_stacked_steering_during_final_stream_hydrates_the_next_request() {
         "round 1 did not start:\n{}",
         tui.screen_text()
     );
-    tui.write("steer one\r");
-    tui.write("steer two\r");
-    tui.write("steer three\r");
+    for (expected_count, content) in ["steer one", "steer two", "steer three"]
+        .into_iter()
+        .enumerate()
+    {
+        tui.write(content);
+        tui.write("\r");
+        assert!(
+            tui.wait_for_screen_glimpse("Queue input for active run"),
+            "explicit queue-mode choice did not open:\n{}",
+            tui.screen_text()
+        );
+        tui.write("s");
+        assert!(
+            tui.wait_for_home_session_event_count(
+                temp.path(),
+                EventKind::QUEUE_ENQUEUED,
+                expected_count + 1,
+            ),
+            "steering row was not durably queued:\n{}",
+            tui.screen_text()
+        );
+    }
     assert!(
         tui.wait_for_screen("continued after stacked steering"),
         "turn did not finish:\n{}",

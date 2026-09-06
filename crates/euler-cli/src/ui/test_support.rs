@@ -98,7 +98,7 @@ struct GateInner {
 }
 
 impl Gate {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: std::sync::Arc::new(GateInner {
                 open: std::sync::Mutex::new(false),
@@ -107,7 +107,7 @@ impl Gate {
         }
     }
 
-    fn wait_until_open(&self) {
+    pub(crate) fn wait_until_open(&self) {
         let mut open = self.inner.open.lock().expect("gate mutex poisoned");
         while !*open {
             open = self.inner.signal.wait(open).expect("gate mutex poisoned");

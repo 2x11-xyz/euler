@@ -35,7 +35,7 @@ use euler_sdk::{
 };
 use serde_json::Map;
 use std::cell::Cell;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[test]
@@ -1247,6 +1247,75 @@ fn live_scrub_rewrites_pending_queue_and_later_delivery() {
 }
 
 #[test]
+fn expected_follow_up_dispatch_uses_the_snapshotted_head_and_planned_run() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("expected-follow-up-dispatch.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "expected-follow-up-dispatch".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("done".to_owned())]),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    let first = queue
+        .enqueue_with_metadata(
+            QueueMode::FollowUp,
+            None,
+            QueuePosition::Back,
+            "first follow-up".to_owned(),
+        )
+        .expect("first row");
+    let second = queue
+        .enqueue_with_metadata(
+            QueueMode::FollowUp,
+            None,
+            QueuePosition::Back,
+            "second follow-up".to_owned(),
+        )
+        .expect("second row");
+
+    let stale = session
+        .run_expected_queued_follow_up_with_sink(
+            Arc::clone(&queue),
+            second.queue_id(),
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .expect_err("a stale UI snapshot must not dispatch its successor");
+    assert!(matches!(
+        stale,
+        SessionError::Queue(QueueError::HeadChanged {
+            expected_queue_id,
+            actual_queue_id: Some(actual),
+        }) if expected_queue_id == second.queue_id() && actual == first.queue_id()
+    ));
+    assert_eq!(queue.snapshot(), ["first follow-up", "second follow-up"]);
+
+    session
+        .run_expected_queued_follow_up_with_sink(
+            Arc::clone(&queue),
+            first.queue_id(),
+            Arc::new(AtomicBool::new(false)),
+            |_| {},
+        )
+        .expect("dispatch expected head")
+        .expect("queued follow-up");
+    assert_eq!(queue.snapshot(), ["second follow-up"]);
+    let delivered = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .expect("delivered user message");
+    assert_eq!(delivered.payload["content"], "first follow-up");
+    assert_eq!(delivered.run.as_deref(), Some(first.run_id()));
+}
+
+#[test]
 fn terminal_cancelled_steering_can_be_requeued_or_dismissed_durably() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("recoverable-queue-resolution.jsonl");
@@ -1362,6 +1431,119 @@ fn terminal_cancelled_steering_can_be_requeued_or_dismissed_durably() {
     assert!(folded.recoverable().is_empty());
     assert_eq!(folded.pending().len(), 1);
     assert_eq!(folded.pending()[0].queue_id(), replacement_id);
+}
+
+#[test]
+fn ambiguous_recovery_retry_requires_the_exact_owner_and_resolution_shape() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("recovery-retry-owner.jsonl");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "recovery-retry-owner".to_owned();
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    let queue = Arc::new(SteeringQueue::default());
+    session
+        .set_steering_queue(Arc::clone(&queue))
+        .expect("bind queue");
+    session
+        .admit_user_message("active run", None, true)
+        .expect("open run");
+    let run_id = session.active_run.clone().expect("active run id");
+    queue.activate_turn(&run_id);
+    queue
+        .enqueue(
+            QueueMode::Steering,
+            Some(&run_id),
+            QueuePosition::Back,
+            "recover exactly".to_owned(),
+        )
+        .expect("steering");
+    queue
+        .with_terminal_boundary(|| {
+            session.terminalize_active_run_unfenced(RunTerminalStatus::Cancelled)
+        })
+        .expect("cancel run");
+    let recovered = session
+        .recoverable_queue_inputs()
+        .expect("recovery projection")
+        .into_iter()
+        .next()
+        .expect("recoverable row");
+
+    let expected_log = log.clone();
+    let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+    assert!(matches!(
+        session.requeue_recoverable_queue_input(
+            Arc::clone(&queue),
+            recovered.queue_id(),
+            None,
+            QueuePosition::Back,
+            "edited recovery".to_owned(),
+        ),
+        Err(SessionError::Queue(QueueError::Persistence(_)))
+    ));
+    assert!(guard.fired(), "recovery append sync fault must fire");
+    drop(guard);
+    assert!(queue.has_unresolved_authoritative_write());
+    let physical_prefix = read_provenance(&log).expect("complete ambiguous batch bytes");
+    let retained_recovery = physical_prefix
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::QUEUE_RECOVERED
+                && event.payload.get("queue_id") == Some(&json!(recovered.queue_id()))
+        })
+        .expect("retained recovery marker");
+    let retained_event_id = retained_recovery.id.clone();
+    let retained_replacement_id = retained_recovery.payload["replacement_queue_id"]
+        .as_str()
+        .expect("retained replacement id")
+        .to_owned();
+
+    let wrong_queue_id = Ulid::new().to_string();
+    for (queue_id, expected_replacement) in [
+        (wrong_queue_id.as_str(), true),
+        (recovered.queue_id(), false),
+    ] {
+        assert!(matches!(
+            session.retry_unresolved_recoverable_queue_operation(
+                Arc::clone(&queue),
+                queue_id,
+                expected_replacement,
+            ),
+            Err(SessionError::Queue(
+                QueueError::RecoveryRetryMismatch { .. }
+            ))
+        ));
+        assert!(
+            queue.has_unresolved_authoritative_write(),
+            "a mismatched retry must leave the retained owner fenced"
+        );
+    }
+
+    let replacement_id = session
+        .retry_unresolved_recoverable_queue_operation(
+            Arc::clone(&queue),
+            recovered.queue_id(),
+            true,
+        )
+        .expect("retry exact recovery")
+        .expect("retained replacement");
+    assert_eq!(replacement_id, retained_replacement_id);
+    assert!(!queue.has_unresolved_authoritative_write());
+    let durable = read_provenance(&log).expect("reconciled recovery batch");
+    let matching = durable
+        .iter()
+        .filter(|event| event.id == retained_event_id)
+        .count();
+    assert_eq!(matching, 1, "exact retry cannot duplicate its marker");
+    assert_eq!(
+        session.pending_queue_inputs().expect("pending replacement")[0].queue_id(),
+        replacement_id
+    );
 }
 
 #[test]

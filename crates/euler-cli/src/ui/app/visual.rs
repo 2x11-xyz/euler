@@ -1,5 +1,7 @@
 use super::*;
-use crate::ui::composer::{queued_line_prefix, queued_saving_prefix};
+use crate::ui::composer::{
+    queued_context_prefix, queued_line_prefix, queued_saving_prefix, queued_selection_prefix,
+};
 use crate::ui::transcript;
 use ratatui::style::Style;
 use ratatui::text::Line;
@@ -209,6 +211,21 @@ impl AppCore {
                 blocks,
                 VisualBlockRole::PermissionAsk,
                 self.patch_approval_canvas_lines(modal, width),
+            ),
+            Some(Modal::QueueMode(modal)) => push_visual_block(
+                blocks,
+                VisualBlockRole::Notice,
+                queue_mode_canvas_lines(modal),
+            ),
+            Some(Modal::FollowUpConfirmation(modal)) => push_visual_block(
+                blocks,
+                VisualBlockRole::Notice,
+                follow_up_confirmation_canvas_lines(modal),
+            ),
+            Some(Modal::QueueRecovery(modal)) => push_visual_block(
+                blocks,
+                VisualBlockRole::Notice,
+                queue_recovery_canvas_lines(modal),
             ),
             // The acknowledgment card renders through `push_visual_permission_block`
             // (like the permission asks), so it is a no-op here.
@@ -426,6 +443,58 @@ impl AppCore {
     }
 }
 
+fn queue_mode_canvas_lines(modal: &QueueModeModal) -> Vec<CanvasLine> {
+    let run = short_run_identity(&modal.expected_run_id);
+    let steer = if modal.selected == QueueMode::Steering {
+        "› s  Steer"
+    } else {
+        "  s  Steer"
+    };
+    let follow_up = if modal.selected == QueueMode::FollowUp {
+        "› f  Follow up"
+    } else {
+        "  f  Follow up"
+    };
+    vec![
+        CanvasLine::plain_lossy(format!("Queue input for active run {run}")),
+        CanvasLine::plain_lossy(format!("{steer} · deliver at the next safe round boundary")),
+        CanvasLine::plain_lossy(format!("{follow_up} · start a distinct run afterward")),
+        CanvasLine::plain_lossy("  esc  Keep editing"),
+    ]
+}
+
+fn follow_up_confirmation_canvas_lines(modal: &FollowUpConfirmationModal) -> Vec<CanvasLine> {
+    let run = short_run_identity(&modal.source_run_id);
+    let run_choice = if modal.run_selected {
+        "› r  Run follow-up"
+    } else {
+        "  r  Run follow-up"
+    };
+    let keep_choice = if modal.run_selected {
+        "  k  Keep queued"
+    } else {
+        "› k  Keep queued"
+    };
+    vec![
+        CanvasLine::plain_lossy(format!("Source run {run} ended {}", modal.status.as_str())),
+        CanvasLine::plain_lossy(run_choice),
+        CanvasLine::plain_lossy(keep_choice),
+    ]
+}
+
+fn queue_recovery_canvas_lines(modal: &QueueRecoveryModal) -> Vec<CanvasLine> {
+    let run = short_run_identity(modal.recovered.run_id());
+    let preview = crate::ui::text::truncate_display(modal.recovered.content(), 64);
+    vec![
+        CanvasLine::plain_lossy(format!(
+            "Steering from {} run {run} was not delivered",
+            modal.recovered.reason().as_str().trim_start_matches("run_")
+        )),
+        CanvasLine::plain_lossy(format!("  {preview}")),
+        CanvasLine::plain_lossy("  r  Requeue as follow-up · e  Edit · d  Dismiss · esc  Keep"),
+    ]
+}
+
 fn push_visual_block(blocks: &mut Vec<VisualBlock>, role: VisualBlockRole, lines: Vec<CanvasLine>) {
     if !lines.is_empty() {
         blocks.push(VisualBlock::new(role, lines));
@@ -572,6 +641,8 @@ fn composer_line_to_canvas(line: ComposerLine) -> CanvasLine {
                     queued_line_prefix(line.position, line.total),
                     TextRole::Status,
                 ),
+                CanvasSpan::new_lossy(queued_selection_prefix(line.selected), TextRole::Prompt),
+                CanvasSpan::new_lossy(queued_context_prefix(&line.context), TextRole::Status),
                 CanvasSpan::new_lossy(queued_saving_prefix(line.saving), TextRole::Status),
                 CanvasSpan::new_lossy(line.text, TextRole::Plain),
             ],

@@ -186,6 +186,14 @@ different source run. Cancel and replace select `queue_id`; if the snapshotted
 row settled first they return typed not-pending rather than targeting the row
 that moved into its former index.
 
+Interactive follow-up dispatch also compares a snapshotted stable identity.
+Core reserves only when the supplied `queue_id` is still the canonical FIFO
+head. A different or absent head returns a typed head-changed error without
+reserving or delivering either row. If the same head is temporarily protected
+by another queue transaction, dispatch returns unavailable while preserving
+that identity; temporary busyness is not reported as head movement. The host
+supplies no prompt clone on this path.
+
 Run and queue lifecycle is reconstructed by a deterministic fold over the
 accepted stream. The fold rejects duplicate starts or terminals, reused queue
 ids, crossed run ownership, steering for an inactive run, follow-up runs that

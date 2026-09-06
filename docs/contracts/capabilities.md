@@ -214,7 +214,18 @@ A decider may return:
 - allow project-scoped (`project` + pattern);
 - allow user-scoped (`user` + pattern — a durable prefix rule);
 - deny;
-- deny with **instruction** text — guidance the UI passes back as a user turn.
+- deny with **instruction** text — guidance for the exact active run blocked
+  by this permission request.
+
+In the interactive UI, deny-with-instruction is a narrow permission response,
+not ordinary composer submission. The UI captures the permission's active
+durable run identity when the ask opens and admits the instruction only as
+same-run steering for that identity. It never infers steering versus follow-up
+from timing, and it never converts the instruction into a later run when the
+blocked run has moved or terminalized. If the run identity cannot be proven,
+the prompt and instruction remain visible and no permission reply is sent.
+The instruction may be acknowledged to the decider only after that exact
+steering enqueue is durable.
 
 Legacy verdicts map as: `Allow` → `once`, `AllowSession` → `session` unscoped,
 `Deny` → deny without instruction.

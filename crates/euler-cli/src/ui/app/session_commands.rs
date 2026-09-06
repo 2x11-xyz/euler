@@ -177,6 +177,37 @@ impl AppCore {
         if let Some(reviewer) = self.status.permission_reviewer.as_deref() {
             status.push_str(&format!("\npermission reviewer: {reviewer}"));
         }
+        let queue = self.queued_inputs.metadata_snapshot();
+        if let Some(run_id) = queue.active_run() {
+            status.push_str(&format!("\nactive run: {}", short_run_identity(run_id)));
+        }
+        let steering = queue
+            .rows()
+            .iter()
+            .filter(|row| row.mode() == QueueMode::Steering)
+            .count();
+        let follow_ups = queue.rows().len().saturating_sub(steering);
+        status.push_str(&format!(
+            "\nqueue: {} pending ({steering} steering, {follow_ups} follow-up{}){}",
+            queue.rows().len(),
+            if follow_ups == 1 { "" } else { "s" },
+            if self.queued_inputs.paused() {
+                " · paused"
+            } else {
+                ""
+            }
+        ));
+        if !self.recoverable_queue_inputs.is_empty() {
+            status.push_str(&format!(
+                "\nqueue recovery: {} input{} awaiting a decision",
+                self.recoverable_queue_inputs.len(),
+                if self.recoverable_queue_inputs.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ));
+        }
         self.notice_item(status)
     }
 
@@ -269,26 +300,102 @@ impl AppCore {
                 euler_core::scrub::MIN_SCRUB_VALUE_LEN
             ));
         }
-        let result = match &mut self.state {
-            AppState::Idle { session } => session
-                .scrub_live(&prepared)
-                .map(|report| (report, session.events().to_vec())),
+        let (result, events) = match &mut self.state {
+            AppState::Idle { session } => {
+                let result = session.scrub_live(&prepared);
+                (result, session.events().to_vec())
+            }
             _ => unreachable!("state checked above"),
         };
-        let (report, events) = match result {
-            Ok(result) => result,
+        self.reconcile_ui_after_scrub(&prepared, &events);
+        let report = match result {
+            Ok(report) => report,
             Err(error) => return self.error_item(format!("scrub failed: {error}")),
         };
-
-        if let Some(name) = self.status.session_name.as_mut() {
-            *name = euler_core::redaction::scrub_secrets_in_text(name, &prepared).0;
-        }
-        self.rebuild_transcript_from_events(&events);
-        self.rebuild_bottom_surface();
         if report.audit_event_id.is_some() {
             CoreEffect::Render
         } else {
             self.notice_item(report.summary_line())
+        }
+    }
+
+    /// Rebuild every process-private surface that can retain user/session
+    /// text. This runs after both successful and fail-closed live scrubs: the
+    /// core masks its live state even when persistence reconciliation fails,
+    /// and stale UI clones must not be able to resurrect the old bytes.
+    fn reconcile_ui_after_scrub(&mut self, secrets: &[String], events: &[EventEnvelope]) {
+        let scrub = |text: &str| euler_core::redaction::scrub_secrets_in_text(text, secrets).0;
+        if let Some(name) = self.status.session_name.as_mut() {
+            *name = scrub(name);
+        }
+        if let Some(draft) = self.modal_stashed_draft.as_mut() {
+            *draft = scrub(draft);
+        }
+        // OSC 52 payloads are encoded, so plaintext replacement cannot
+        // reliably sanitize this process-private cache. Invalidate it.
+        self.pending_terminal_clipboard = None;
+        if let Some(notice) = self.notice.as_mut() {
+            *notice = scrub(notice);
+        }
+        if let Some(error) = self.in_flight_error.as_mut() {
+            *error = scrub(error);
+        }
+        for failed in &mut self.failed_queue_drafts {
+            failed.content = Arc::from(scrub(&failed.content));
+        }
+        if let Some(Modal::QueueMode(modal)) = &mut self.modal {
+            modal.content = Arc::from(scrub(&modal.content));
+        }
+
+        let recovery_edit_id = self
+            .recovery_edit
+            .as_ref()
+            .map(|recovered| recovered.queue_id().to_owned());
+        let recovery_modal_id = match &self.modal {
+            Some(Modal::QueueRecovery(modal)) => Some(modal.recovered.queue_id().to_owned()),
+            _ => None,
+        };
+        self.recovery_edit = None;
+        self.refresh_recoverable_queue_inputs();
+        if let Some(queue_id) = recovery_edit_id {
+            self.recovery_edit = self
+                .recoverable_queue_inputs
+                .iter()
+                .find(|recovered| recovered.queue_id() == queue_id)
+                .cloned();
+        }
+        if let Some(queue_id) = recovery_modal_id {
+            self.modal = self
+                .recoverable_queue_inputs
+                .iter()
+                .find(|recovered| recovered.queue_id() == queue_id)
+                .cloned()
+                .map(|recovered| Modal::QueueRecovery(QueueRecoveryModal { recovered }));
+        }
+
+        self.rebuild_transcript_from_events(events);
+        self.live_committed_cache.clear();
+        self.activity = RunActivityProjection::default();
+        for event in events {
+            self.activity.observe(event);
+        }
+        self.rebuild_bottom_surface();
+        self.bottom.scrub_history(secrets);
+
+        if let Some(queue_id) = self.recalled_queue_id.clone() {
+            let content = self
+                .queued_inputs
+                .metadata_snapshot()
+                .rows()
+                .iter()
+                .find(|row| row.queue_id() == queue_id)
+                .map(|row| row.content().to_owned());
+            match content {
+                Some(content) => self.bottom.replace_composer_text(&content),
+                None => self.recalled_queue_id = None,
+            }
+        } else if let Some(recovered) = &self.recovery_edit {
+            self.bottom.replace_composer_text(recovered.content());
         }
     }
 

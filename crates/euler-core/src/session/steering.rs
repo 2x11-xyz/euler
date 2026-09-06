@@ -154,6 +154,7 @@ enum QueueChangeEffect {
         replacement: Entry,
     },
     ResolveRecovery {
+        recovered: QueueEntryId,
         replacement: Option<(Entry, QueuePosition)>,
     },
 }
@@ -214,8 +215,22 @@ pub enum QueueError {
     InvalidQueueId { queue_id: String },
     #[error("queued input {queue_id} is not pending")]
     NotPending { queue_id: String },
+    #[error(
+        "queued follow-up head changed: expected {expected_queue_id}, found {actual_queue_id:?}"
+    )]
+    HeadChanged {
+        expected_queue_id: String,
+        actual_queue_id: Option<String>,
+    },
     #[error("queued input {queue_id} is not recoverable")]
     NotRecoverable { queue_id: String },
+    #[error(
+        "retained queue recovery does not match queue {queue_id} with replacement={expected_replacement}"
+    )]
+    RecoveryRetryMismatch {
+        queue_id: String,
+        expected_replacement: bool,
+    },
     #[error("recoverable queue operations require a durable queue owner")]
     DurableQueueRequired,
     #[error("queued input {queue_id} is already protected by another queue transaction")]
@@ -356,7 +371,10 @@ fn apply_queue_change(state: &mut SteeringState, effect: &QueueChangeEffect) {
                 state.entries[index] = replacement.clone();
             }
         }
-        QueueChangeEffect::ResolveRecovery { replacement } => {
+        QueueChangeEffect::ResolveRecovery {
+            recovered: _,
+            replacement,
+        } => {
             if let Some((entry, position)) = replacement {
                 match position {
                     QueuePosition::Front => state.entries.push_front(entry.clone()),
@@ -365,6 +383,22 @@ fn apply_queue_change(state: &mut SteeringState, effect: &QueueChangeEffect) {
             }
         }
     }
+}
+
+fn queue_change_retry_outcome(effect: &QueueChangeEffect) -> QueueChangeRetryOutcome {
+    let replacement = match effect {
+        QueueChangeEffect::Replace { replacement, .. }
+        | QueueChangeEffect::ResolveRecovery {
+            recovered: _,
+            replacement: Some((replacement, _)),
+        } => Some(SteeringQueue::entry_metadata(replacement)),
+        QueueChangeEffect::Cancel(_)
+        | QueueChangeEffect::ResolveRecovery {
+            recovered: _,
+            replacement: None,
+        } => None,
+    };
+    QueueChangeRetryOutcome { replacement }
 }
 
 fn validate_durable_bind_state(
@@ -469,6 +503,23 @@ pub struct QueuedInputMetadata {
     source_run_id: Option<String>,
     mode: QueueMode,
     content: String,
+}
+
+/// Result of reconciling one exact queue-change batch whose first append had
+/// an ambiguous outcome.
+///
+/// Cancellation and dismissal have no replacement row. Replacement and
+/// recovery-requeue return the immutable row allocated by the original
+/// transaction; retries never generate a second identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueueChangeRetryOutcome {
+    replacement: Option<QueuedInputMetadata>,
+}
+
+impl QueueChangeRetryOutcome {
+    pub fn replacement(&self) -> Option<&QueuedInputMetadata> {
+        self.replacement.as_ref()
+    }
 }
 
 impl QueuedInputMetadata {
@@ -803,6 +854,21 @@ impl SteeringQueue {
         position: QueuePosition,
         content: String,
     ) -> Result<String, QueueError> {
+        self.enqueue_with_metadata(mode, expected_run_id, position, content)
+            .map(|row| row.queue_id)
+    }
+
+    /// Enqueue and return the immutable canonical row allocated by the same
+    /// transaction. Unlike a post-commit snapshot lookup, this remains a
+    /// truthful success result even when a session worker immediately settles
+    /// the new row before the caller reacquires the queue lock.
+    pub fn enqueue_with_metadata(
+        &self,
+        mode: QueueMode,
+        expected_run_id: Option<&str>,
+        position: QueuePosition,
+        content: String,
+    ) -> Result<QueuedInputMetadata, QueueError> {
         let expected_run = expected_run_id
             .map(|run_id| {
                 Ulid::from_string(run_id).map_err(|_| QueueError::InvalidRunId {
@@ -855,10 +921,11 @@ impl SteeringQueue {
             position,
             content,
         };
-        let queue_id = entry.id.value.to_string();
+        let metadata = Self::entry_metadata(&entry);
+        let queue_id = metadata.queue_id.clone();
         let Some(durable) = state.durable.clone() else {
             self.insert_entry(&mut state, entry, position);
-            return Ok(queue_id);
+            return Ok(metadata);
         };
         state.durable_write_in_flight = true;
         drop(state);
@@ -868,7 +935,8 @@ impl SteeringQueue {
             position,
             generation.expect("durable queue assigned a submission generation"),
             queue_id,
-        )
+        )?;
+        Ok(metadata)
     }
 
     fn wait_for_enqueue_writer<'a>(
@@ -1015,6 +1083,17 @@ impl SteeringQueue {
     /// Retry the exact envelope retained after an ambiguous enqueue append.
     /// No new ids, timestamps, payloads, or parents are generated.
     pub fn retry_unresolved_enqueue(&self) -> Result<Option<String>, QueueError> {
+        self.retry_unresolved_enqueue_with_metadata()
+            .map(|row| row.map(|row| row.queue_id))
+    }
+
+    /// Retry the exact retained enqueue and return the row allocated by the
+    /// original transaction. Interactive hosts use this to reconcile a
+    /// saving projection without reconstructing queue identity from mutable
+    /// state after the retry.
+    pub fn retry_unresolved_enqueue_with_metadata(
+        &self,
+    ) -> Result<Option<QueuedInputMetadata>, QueueError> {
         let mut state = self.state();
         while state.durable_write_in_flight {
             state = self
@@ -1040,7 +1119,8 @@ impl SteeringQueue {
         };
         state.durable_write_in_flight = true;
         drop(state);
-        let queue_id = unresolved.entry.id.value.to_string();
+        let metadata = Self::entry_metadata(&unresolved.entry);
+        let queue_id = metadata.queue_id().to_owned();
         let result = unresolved
             .durable
             .writer
@@ -1062,13 +1142,62 @@ impl SteeringQueue {
         state.unresolved_enqueue = None;
         self.insert_entry(&mut state, unresolved.entry, unresolved.position);
         self.submission_settled.notify_all();
-        Ok(Some(queue_id))
+        Ok(Some(metadata))
     }
 
     /// Retry the exact cancellation or replacement batch retained after an
     /// ambiguous provenance append. The queue remains globally fenced until
     /// this exact batch is confirmed.
     pub fn retry_unresolved_change(&self) -> Result<bool, QueueError> {
+        self.retry_unresolved_change_with_metadata()
+            .map(|outcome| outcome.is_some())
+    }
+
+    /// Retry the exact retained queue-change batch and return any replacement
+    /// row allocated by the original transaction. The original batch is the
+    /// only write attempted; this method never synthesizes a fresh change.
+    pub fn retry_unresolved_change_with_metadata(
+        &self,
+    ) -> Result<Option<QueueChangeRetryOutcome>, QueueError> {
+        self.retry_unresolved_change_matching(|_| Ok(()))
+    }
+
+    /// Retry only an exact retained recovery resolution. A different
+    /// unresolved queue mutation remains fenced and is never reinterpreted as
+    /// recovery by a host worker.
+    pub(super) fn retry_unresolved_recovery_with_metadata(
+        &self,
+        expected_queue_id: &str,
+        expected_replacement: bool,
+    ) -> Result<Option<QueueChangeRetryOutcome>, QueueError> {
+        let expected = QueueEntryId {
+            value: Ulid::from_string(expected_queue_id).map_err(|_| {
+                QueueError::InvalidQueueId {
+                    queue_id: expected_queue_id.to_owned(),
+                }
+            })?,
+        };
+        self.retry_unresolved_change_matching(|effect| {
+            if matches!(
+                effect,
+                QueueChangeEffect::ResolveRecovery {
+                    recovered,
+                    replacement,
+                } if *recovered == expected && replacement.is_some() == expected_replacement
+            ) {
+                return Ok(());
+            }
+            Err(QueueError::RecoveryRetryMismatch {
+                queue_id: expected_queue_id.to_owned(),
+                expected_replacement,
+            })
+        })
+    }
+
+    fn retry_unresolved_change_matching(
+        &self,
+        validate: impl FnOnce(&QueueChangeEffect) -> Result<(), QueueError>,
+    ) -> Result<Option<QueueChangeRetryOutcome>, QueueError> {
         let mut state = self.state();
         while state.durable_write_in_flight {
             state = self
@@ -1088,9 +1217,11 @@ impl SteeringQueue {
         if state.unresolved_enqueue.is_some() {
             return Err(QueueError::UnresolvedEnqueue);
         }
-        let Some(mut unresolved) = state.unresolved_change.clone() else {
-            return Ok(false);
+        let Some(unresolved) = state.unresolved_change.as_ref() else {
+            return Ok(None);
         };
+        validate(&unresolved.effect)?;
+        let mut unresolved = unresolved.clone();
         state.durable_write_in_flight = true;
         drop(state);
 
@@ -1116,10 +1247,11 @@ impl SteeringQueue {
             self.submission_settled.notify_all();
             return Err(error.into());
         }
+        let outcome = queue_change_retry_outcome(&unresolved.effect);
         state.unresolved_change = None;
         apply_queue_change(&mut state, &unresolved.effect);
         self.submission_settled.notify_all();
-        Ok(true)
+        Ok(Some(outcome))
     }
 
     /// Reserve the front entry for dispatch without removing it.
@@ -1128,6 +1260,43 @@ impl SteeringQueue {
     /// worker, so a reservation cannot be overtaken by another queued turn.
     pub fn reserve_front_for_dispatch(&self) -> Option<QueuedInput> {
         let mut state = self.state();
+        Self::reserve_front_for_dispatch_inner(&mut state)
+    }
+
+    /// Reserve one exact snapshotted follow-up head for core-owned dispatch.
+    ///
+    /// A UI can render and ask about a stable queue id, then hand that id to
+    /// the Session without supplying prompt bytes. If another durable queue
+    /// operation moved the head first, this returns a typed mismatch and
+    /// leaves both the actual head and any pre-existing reservation intact.
+    pub fn reserve_expected_follow_up_for_dispatch(
+        &self,
+        expected_queue_id: &str,
+    ) -> Result<Option<QueuedInput>, QueueError> {
+        let expected = QueueEntryId {
+            value: Ulid::from_string(expected_queue_id).map_err(|_| {
+                QueueError::InvalidQueueId {
+                    queue_id: expected_queue_id.to_owned(),
+                }
+            })?,
+        };
+        let mut state = self.state();
+        let actual = state
+            .reserved_dispatch
+            .or(state.unresolved_admission)
+            .or_else(|| state.entries.front().map(|entry| entry.id));
+        if actual != Some(expected) {
+            return Err(QueueError::HeadChanged {
+                expected_queue_id: expected_queue_id.to_owned(),
+                actual_queue_id: actual.map(|id| id.value.to_string()),
+            });
+        }
+        let input = Self::reserve_front_for_dispatch_inner(&mut state);
+        debug_assert!(input.as_ref().is_none_or(|input| input.id == expected));
+        Ok(input)
+    }
+
+    fn reserve_front_for_dispatch_inner(state: &mut SteeringState) -> Option<QueuedInput> {
         if state.lifecycle_transition
             || state.durable_write_in_flight
             || state.terminal_cutoff.is_some()
@@ -1413,6 +1582,17 @@ impl SteeringQueue {
 
     /// Replace the exact row selected from a metadata snapshot.
     pub fn replace_pending(&self, queue_id: &str, content: String) -> Result<String, QueueError> {
+        self.replace_pending_with_metadata(queue_id, content)
+            .map(|row| row.queue_id)
+    }
+
+    /// Replace one exact row and return the immutable replacement allocated
+    /// by that same durable transaction.
+    pub fn replace_pending_with_metadata(
+        &self,
+        queue_id: &str,
+        content: String,
+    ) -> Result<QueuedInputMetadata, QueueError> {
         let selected_id = QueueEntryId {
             value: Ulid::from_string(queue_id).map_err(|_| QueueError::InvalidQueueId {
                 queue_id: queue_id.to_owned(),
@@ -1465,16 +1645,17 @@ impl SteeringQueue {
             position: current.position,
             content,
         };
-        let replacement_id = replacement.id.value.to_string();
+        let metadata = Self::entry_metadata(&replacement);
         let Some(durable) = state.durable.clone() else {
             state.entries[index] = replacement;
             state.mutating.remove(&current.id);
             self.submission_settled.notify_all();
-            return Ok(replacement_id);
+            return Ok(metadata);
         };
         state.durable_write_in_flight = true;
         drop(state);
-        self.persist_replacement(durable, current, replacement)
+        self.persist_replacement(durable, current, replacement)?;
+        Ok(metadata)
     }
 
     fn persist_replacement(
@@ -1572,7 +1753,8 @@ impl SteeringQueue {
                 queue_id: recovered.queue_id().to_owned(),
             });
         }
-        let prepared = self.prepare_recovery_resolution(&mut state, recovered, requeue);
+        let prepared =
+            self.prepare_recovery_resolution(&mut state, recovered_id, recovered, requeue);
         let (durable, events, effect, replacement_id) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -1588,6 +1770,7 @@ impl SteeringQueue {
     fn prepare_recovery_resolution(
         &self,
         state: &mut SteeringState,
+        recovered_id: QueueEntryId,
         recovered: &RecoverableQueueInput,
         requeue: Option<RecoveryRequeue>,
     ) -> Result<
@@ -1646,7 +1829,10 @@ impl SteeringQueue {
         Ok((
             durable,
             events,
-            QueueChangeEffect::ResolveRecovery { replacement },
+            QueueChangeEffect::ResolveRecovery {
+                recovered: recovered_id,
+                replacement,
+            },
             replacement_id,
         ))
     }
@@ -1706,6 +1892,13 @@ impl SteeringQueue {
     }
 
     /// Compatibility query for the narrower admission owner.
+    /// Whether an exact cancellation, replacement, or recovery batch is
+    /// retained after an ambiguous append. While set, every fresh queue
+    /// mutation is fenced and only that exact batch may be retried.
+    pub fn has_unresolved_change(&self) -> bool {
+        self.state().unresolved_change.is_some()
+    }
+
     pub fn has_unresolved_admission(&self) -> bool {
         self.state().unresolved_admission.is_some()
     }
@@ -1734,21 +1927,21 @@ impl SteeringQueue {
     pub fn metadata_snapshot(&self) -> SteeringQueueSnapshot {
         let state = self.state();
         let active_run = state.active_run.map(|run_id| run_id.to_string());
-        let rows = state
-            .entries
-            .iter()
-            .map(|entry| QueuedInputMetadata {
-                queue_id: entry.id.value.to_string(),
-                run_id: entry.run_id.to_string(),
-                source_run_id: entry.source_run_id.map(|run_id| run_id.to_string()),
-                mode: match entry.kind {
-                    QueuedInputKind::FollowUp => QueueMode::FollowUp,
-                    QueuedInputKind::Steering(_) => QueueMode::Steering,
-                },
-                content: entry.content.clone(),
-            })
-            .collect();
+        let rows = state.entries.iter().map(Self::entry_metadata).collect();
         SteeringQueueSnapshot { active_run, rows }
+    }
+
+    fn entry_metadata(entry: &Entry) -> QueuedInputMetadata {
+        QueuedInputMetadata {
+            queue_id: entry.id.value.to_string(),
+            run_id: entry.run_id.to_string(),
+            source_run_id: entry.source_run_id.map(|run_id| run_id.to_string()),
+            mode: match entry.kind {
+                QueuedInputKind::FollowUp => QueueMode::FollowUp,
+                QueuedInputKind::Steering(_) => QueueMode::Steering,
+            },
+            content: entry.content.clone(),
+        }
     }
 
     /// Serialize a live secret scrub with every queue append and rewrite the
@@ -3316,6 +3509,116 @@ mod tests {
     }
 
     #[test]
+    fn expected_dispatch_never_substitutes_a_different_head() {
+        let queue = SteeringQueue::default();
+        queue
+            .push_follow_up_back("one".to_owned())
+            .expect("first follow-up");
+        queue
+            .push_follow_up_back("two".to_owned())
+            .expect("second follow-up");
+        let snapshot = queue.metadata_snapshot();
+        let first_id = snapshot.rows()[0].queue_id().to_owned();
+        let second_id = snapshot.rows()[1].queue_id().to_owned();
+
+        assert!(matches!(
+            queue.reserve_expected_follow_up_for_dispatch(&second_id),
+            Err(QueueError::HeadChanged {
+                expected_queue_id,
+                actual_queue_id: Some(actual),
+            }) if expected_queue_id == second_id && actual == first_id
+        ));
+        assert_eq!(queue.snapshot(), ["one", "two"]);
+
+        let first = queue
+            .reserve_expected_follow_up_for_dispatch(&first_id)
+            .expect("expected-head comparison")
+            .expect("first reservation");
+        assert_eq!(first.content(), "one");
+        assert!(matches!(
+            queue.reserve_expected_follow_up_for_dispatch(&second_id),
+            Err(QueueError::HeadChanged {
+                actual_queue_id: Some(actual),
+                ..
+            }) if actual == first_id
+        ));
+        assert_eq!(
+            queue
+                .reserve_front_for_dispatch()
+                .expect("same reservation"),
+            first,
+            "a stale expected id must not disturb the current reservation"
+        );
+    }
+
+    #[test]
+    fn expected_dispatch_reports_same_head_as_temporarily_busy() {
+        let queue = SteeringQueue::default();
+        let row = queue
+            .enqueue_with_metadata(
+                QueueMode::FollowUp,
+                None,
+                QueuePosition::Back,
+                "wait for write boundary".to_owned(),
+            )
+            .expect("follow-up");
+        {
+            let mut state = queue.state();
+            state.durable_write_in_flight = true;
+        }
+
+        assert_eq!(
+            queue
+                .reserve_expected_follow_up_for_dispatch(row.queue_id())
+                .expect("the expected identity still matches"),
+            None,
+            "a busy boundary is not a moved-head race"
+        );
+
+        {
+            let mut state = queue.state();
+            state.durable_write_in_flight = false;
+        }
+        assert_eq!(
+            queue
+                .reserve_expected_follow_up_for_dispatch(row.queue_id())
+                .expect("expected head")
+                .expect("reservation")
+                .content(),
+            "wait for write boundary"
+        );
+    }
+
+    #[test]
+    fn enqueue_and_replace_return_their_own_committed_metadata() {
+        let queue = SteeringQueue::default();
+        let original = queue
+            .enqueue_with_metadata(
+                QueueMode::FollowUp,
+                None,
+                QueuePosition::Back,
+                "original".to_owned(),
+            )
+            .expect("enqueue metadata");
+        assert_eq!(original.content(), "original");
+
+        let replacement = queue
+            .replace_pending_with_metadata(original.queue_id(), "replacement".to_owned())
+            .expect("replacement metadata");
+        assert_ne!(replacement.queue_id(), original.queue_id());
+        assert_eq!(replacement.run_id(), original.run_id());
+        assert_eq!(replacement.source_run_id(), original.source_run_id());
+        assert_eq!(replacement.mode(), original.mode());
+        assert_eq!(replacement.content(), "replacement");
+
+        queue
+            .cancel(replacement.queue_id())
+            .expect("settle replacement immediately after return");
+        assert_eq!(replacement.content(), "replacement");
+        assert!(queue.is_empty());
+    }
+
+    #[test]
     fn failed_dispatch_release_keeps_the_entry_editable() {
         let queue = SteeringQueue::default();
         queue
@@ -3523,6 +3826,49 @@ mod tests {
                 .queue_id(),
             queue_id
         );
+    }
+
+    #[test]
+    fn exact_enqueue_retry_rejects_a_concurrently_replaced_retained_owner() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (queue, log_path) = durable_queue(temp.path(), "stale-enqueue-retry-owner");
+        let expected_log = log_path.clone();
+        let guard = arm_matching(Op::FileSync, move |path| path == expected_log);
+        assert!(matches!(
+            queue.push_follow_up_back("retain exact owner".to_owned()),
+            Err(QueueError::Persistence(_))
+        ));
+        assert!(guard.fired());
+        drop(guard);
+        let queue_id = queue
+            .state()
+            .unresolved_enqueue
+            .as_ref()
+            .expect("retained enqueue")
+            .entry
+            .id
+            .value
+            .to_string();
+
+        let queue = Arc::new(queue);
+        let retry_queue = Arc::clone(&queue);
+        let expected_log = log_path.clone();
+        let guard = arm_matching(Op::FileSync, move |path| {
+            if path != expected_log {
+                return false;
+            }
+            retry_queue.state().unresolved_enqueue = None;
+            true
+        });
+        let error = queue
+            .retry_unresolved_enqueue_with_metadata()
+            .expect_err("stale retained owner must not be applied");
+        assert!(guard.fired());
+        assert!(matches!(
+            error,
+            QueueError::EntryBusy { queue_id: actual } if actual == queue_id
+        ));
+        assert!(queue.is_empty());
     }
 
     #[test]
