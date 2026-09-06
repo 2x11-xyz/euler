@@ -1040,13 +1040,18 @@ fn in_flight_error_frame_is_failed_not_working_or_prompt_ready() {
             ("output", "partial work".into()),
         ]),
     )));
-    core.handle_turn_event(TurnEvent::Event(event(
+    let mut provider_error = event(
         EventKind::ERROR,
         object([
             ("source", "provider".into()),
             ("message", "transport down".into()),
         ]),
-    )));
+    );
+    provider_error.agent = core
+        .primary_agent_id
+        .clone()
+        .expect("fresh session primary agent");
+    core.handle_turn_event(TurnEvent::Event(provider_error));
     render_compact_frame(&mut terminal, &mut core);
 
     let failed_gap = terminal.backend().screen_contents();
@@ -1140,7 +1145,7 @@ fn failed_outcome_without_error_event_restores_prompt_after_turn_done() {
     )));
     render_compact_frame(&mut terminal, &mut core);
     let before_done = terminal.backend().screen_contents();
-    assert!(before_done.contains("⠋ working"));
+    assert!(before_done.contains("⠋ Preparing next step"));
     assert!(!before_done.contains("■ Turn failed"));
 
     core.handle_turn_event(TurnEvent::TurnDone {

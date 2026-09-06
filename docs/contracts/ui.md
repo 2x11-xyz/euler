@@ -138,6 +138,10 @@ promotes, or reorders lines.
   exit status) and trailing whitespace padding is never stored, so the
   collapsed and expanded views agree on line count and order by
   construction. The expanded view is the full buffer, in buffer order.
+- The header status uses the canonical effective tool outcome. A nonzero
+  `exit_code` is always failure, including for legacy events that also carry
+  `ok: true`; raw legacy metadata cannot turn `exit 101` into a successful
+  `Ran` block, suppress a failed extension result, or produce a passing recap.
 
 ### Fold
 
@@ -411,14 +415,47 @@ dashboards, and boilerplate panels in the core CLI.
 
 ## Activity and thinking
 
-Short activity/status lines may show intent while the agent works (not boxed
-chrome). The working HUD is exactly **one line** — spinner, phase verb, turn
-timer, and the esc-to-interrupt affordance (`thinking · Ns · esc to
-interrupt` while reasoning streams, driven by the live `model.reasoning`
-deltas, cleared when answer text starts or the reasoning finalizes). It
-never carries reasoning body text, and the esc affordance is advertised
-there **exactly once** — nowhere else, including the transcript's live
-thinking header.
+The pinned Activity block is a deterministic projection of the canonical
+session event stream, not an independent activity log. It reports observable
+system state while a run is live and is never persisted once per tick. The
+block is one or two lines: its first line carries the spinner (or stall
+marker), high-level phase, **phase age**, and the sole esc-to-interrupt
+affordance; an optional second line carries changed-file aggregation, the
+latest completed milestone, and **time since meaningful progress**. The esc
+affordance appears there exactly once — nowhere else, including the
+transcript's live thinking header.
+
+Phase age and progress age are separate event-timestamp clocks. Accepted user
+input, response text/reasoning delta kinds, completed tools/checks, file
+changes, and terminal outcomes establish meaningful progress. Context
+assembly, a new model call, and transport/control liveness may advance the
+phase or last-observed-event clock but do not reset meaningful progress. A
+stall becomes visible after 30 seconds without meaningful progress in a phase
+that can advance; waiting for user approval is exempt. Replayed events use
+their provenance timestamps, while live rendering injects only the current
+clock used to calculate ages.
+
+Ordinary extension, guardian, and nonterminal session errors are failed
+operation milestones, not authority to terminalize the Activity projection.
+The worker's run outcome owns completed/failed/cancelled terminal state. A
+provider-terminal error may retain the existing short `turn failed — waiting
+for cleanup` gap while the worker returns session ownership.
+
+Concurrent tool calls are grouped into one stable high-level phase and retain
+their batch peak until the batch settles (`Inspecting 5 files`, `Editing 3
+files`, `Running 2 checks`). The projection may classify commands into broad
+observable families such as inspection, editing, checks/tests, and Git
+publication, but it never renders command output or model content. Legacy
+shell/check results are successful only when `ok` is true and any present
+`exit_code` is zero; a nonzero process exit remains a visible failure even if
+an older event recorded `ok: true`.
+
+The Activity block never carries reasoning body text. A text or reasoning
+`model.delta` kind can establish the body-free `Receiving model response`
+phase and meaningful progress, but the projection does not inspect or render
+the delta. A provider-opaque reasoning artifact may update the last-observed
+event clock, but it never establishes meaningful progress and remains
+unavailable to core UI.
 
 Reasoning TEXT is owned solely by the transcript: a separate collapsible
 ledger element driven by `model.reasoning`, subject to the reasoning policy
@@ -494,6 +531,12 @@ modal. Both are single-keypress with a safe-bias default highlight (Skip for the
 acknowledgment card, Cancel for the relocation card). Because this system has no
 horizontal button row, the choices are a stacked single-key list, exactly like
 the permission panels.
+
+The acknowledgment card distinguishes candidates that were omitted from
+skills that were admitted with a compatibility advisory. It never describes
+an admitted skill as skipped. `skill_name_directory_mismatch` warnings are
+counted only after final catalog admission and render separately from the
+skipped count.
 
 The relocation card's content is facts only, never a guessed reason for the
 change: the recorded workspace path, the current workspace path, and when the

@@ -143,11 +143,14 @@ fn finalize_project_context_tui(
         Resolution::NeedsAcknowledgment(pending) => {
             let label = project_context_folder_label(root);
             let choice = crate::ui::consent_prompt::prompt_acknowledgment(
-                &label,
-                pending.content_changed(),
-                pending.source_identities(),
-                pending.skipped_count(),
-                pending.skill_count(),
+                crate::ui::consent_prompt::AcknowledgmentPrompt {
+                    folder_label: &label,
+                    content_changed: pending.content_changed(),
+                    sources: pending.source_identities(),
+                    skipped_count: pending.skipped_count(),
+                    compatibility_warning_count: pending.compatibility_warning_count(),
+                    skill_count: pending.skill_count(),
+                },
                 theme_choice,
             )?;
             Ok(finalize_pending_choice(&pending, choice))
@@ -195,6 +198,22 @@ fn finalize_project_context_line(
             eprintln!(
                 "It's guidance for the model only. It can't grant permissions or run anything."
             );
+            let skipped_count = pending.skipped_count();
+            if skipped_count > 0 {
+                eprintln!(
+                    "{} project-context item{} could not be loaded.",
+                    skipped_count,
+                    if skipped_count == 1 { "" } else { "s" }
+                );
+            }
+            let warning_count = pending.compatibility_warning_count();
+            if warning_count > 0 {
+                eprintln!(
+                    "{} project skill{} will load with a name compatibility warning.",
+                    warning_count,
+                    if warning_count == 1 { "" } else { "s" }
+                );
+            }
             eprint!("Load this project's guidance? It won't ask again unless it changes. [y/N] ");
             let _ = io::stderr().flush();
             let mut answer = String::new();

@@ -6,7 +6,7 @@ use crate::compaction::{
     WorkingStateProjection, COMPACTION_POLICY_VERSION, PROJECTION_SCHEMA_VERSION,
 };
 use crate::project_context::{PinnedProjectContext, ProjectContextFold};
-use euler_event::{EventEnvelope, EventKind};
+use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use euler_sdk::MAX_CONTEXT_SLOTS_PER_SESSION;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1228,11 +1228,7 @@ fn tool_output_item_with_compaction(event: &EventEnvelope, compact: bool) -> Opt
         event_id: event.id.clone(),
         call_id: string_field(event, "id")?,
         name,
-        ok: event
-            .payload
-            .get("ok")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
+        ok: tool_result_succeeded(&event.payload),
         output,
         error: string_field(event, "error"),
         exit_code: event.payload.get("exit_code").and_then(Value::as_i64),

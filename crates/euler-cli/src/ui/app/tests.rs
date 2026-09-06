@@ -2430,7 +2430,10 @@ fn active_turn_live_transcript_prefix_stays_after_commit_boundary() {
         .join("\n");
 
     assert!(text.contains("line one"), "frame: {text:?}");
-    assert!(text.contains("⠋ working"), "frame: {text:?}");
+    assert!(
+        text.contains("⠋ Receiving model response"),
+        "frame: {text:?}"
+    );
     let first_live = frame
         .active_frame_lines()
         .iter()
@@ -4585,6 +4588,106 @@ fn activity_live_status_is_gated_by_turn_state() {
     assert!(contents.contains("▌"));
 }
 
+#[test]
+fn stall_notification_uses_meaningful_progress_and_only_model_turns() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.in_flight_label = Some(MODEL_TURN_IN_FLIGHT_LABEL.to_owned());
+    core.notifications_enabled = true;
+    core.terminal_focused = false;
+    core.activity
+        .begin_at(Utc::now() - chrono::Duration::seconds(31));
+    core.activity.observe(&event(
+        EventKind::MODEL_CALL,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    ));
+
+    core.check_stall_notification();
+    assert_eq!(core.take_pending_notification(), Some(NotifyEvent::Stall));
+
+    core.stall_notified = false;
+    core.in_flight_label = Some("companion run".to_owned());
+    core.check_stall_notification();
+    assert_eq!(core.take_pending_notification(), None);
+}
+
+#[test]
+fn ordinary_errors_do_not_replace_or_terminalize_the_activity_hud() {
+    for source in ["extension", "guardian", "session"] {
+        let mut core = core();
+        let (_tx, worker_rx) = mpsc::channel();
+        core.state = AppState::TurnInFlight {
+            worker_rx,
+            interrupt_flag: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+        };
+        core.in_flight_label = Some(MODEL_TURN_IN_FLIGHT_LABEL.to_owned());
+        core.in_flight_cancellable = true;
+        core.activity.begin_at(Utc::now());
+
+        core.handle_turn_event(TurnEvent::Event(event(
+            EventKind::ERROR,
+            object([
+                ("source", source.into()),
+                ("message", "recoverable private detail".into()),
+            ]),
+        )));
+
+        assert_eq!(core.in_flight_error, None, "source: {source}");
+        assert_eq!(
+            core.activity.snapshot_at(Utc::now()).phase,
+            activity::ActivityPhase::PreparingNextStep,
+            "source: {source}"
+        );
+        let hud = core.live_status_line().expect("activity HUD remains live");
+        assert!(
+            hud.contains("Preparing next step"),
+            "source: {source}: {hud}"
+        );
+        assert!(!hud.contains("turn failed"), "source: {source}: {hud}");
+        assert!(
+            !hud.contains("recoverable private detail"),
+            "source: {source}: {hud}"
+        );
+    }
+}
+
+#[test]
+fn child_provider_error_does_not_replace_the_primary_activity_hud() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.in_flight_label = Some(MODEL_TURN_IN_FLIGHT_LABEL.to_owned());
+    core.in_flight_cancellable = true;
+    core.activity.begin_at(Utc::now());
+
+    let mut child_error = event(
+        EventKind::ERROR,
+        object([
+            ("source", "provider".into()),
+            ("message", "child transport failed".into()),
+        ]),
+    );
+    child_error.agent = "reviewer-child".to_owned();
+    core.handle_turn_event(TurnEvent::Event(child_error));
+
+    assert_eq!(core.in_flight_error, None);
+    let hud = core
+        .live_status_line()
+        .expect("primary activity remains live");
+    assert!(hud.contains("Preparing next step"), "{hud}");
+    assert!(!hud.contains("turn failed"), "{hud}");
+}
+
 /// Issue #27: the spinner frame is a pure tick counter, advanced only by
 /// `advance_spinner` (the periodic background poll) never by reading
 /// `Instant::now()` fresh in render — so the animation is testable by
@@ -4636,11 +4739,10 @@ fn working_hud_spinner_resets_when_turn_ends() {
     assert_eq!(core.spinner_frame, 0);
 }
 
-/// Issue #27: the phase verb swaps in place as streamed tool-call/reasoning
-/// events arrive, with `run_shell` distinguishing bash from a test-runner
-/// invocation, and falls back to "working" before any such event lands.
+/// Observable event phases replace the generic working verb without reading
+/// any reasoning or response body.
 #[test]
-fn working_hud_phase_verb_reflects_streamed_turn_events() {
+fn working_hud_activity_reflects_streamed_turn_events() {
     let mut core = core();
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -4648,16 +4750,18 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
         interrupt_flag: Arc::new(AtomicBool::new(false)),
         started_at: Instant::now(),
     };
-    assert_eq!(core.current_phase_verb, None);
+    core.activity.begin_at(Utc::now());
+    assert_eq!(core.activity.phase(), &activity::ActivityPhase::Starting);
 
-    // "thinking" comes from the live reasoning DELTAS — deltas arrive before
-    // the finalized MODEL_REASONING event, so this is the moment the model
-    // is actually thinking.
+    // Only the delta kind is projected. The body remains transcript-owned.
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::MODEL_DELTA,
         object([("kind", "reasoning".into()), ("delta", "hmm".into())]),
     )));
-    assert_eq!(core.current_phase_verb.as_deref(), Some("thinking"));
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::ReceivingResponse
+    );
 
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::TOOL_CALL,
@@ -4668,9 +4772,17 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
         ]),
     )));
     assert_eq!(
-        core.current_phase_verb.as_deref(),
-        Some("reading src/lib.rs")
+        core.activity.phase(),
+        &activity::ActivityPhase::Inspecting(1)
     );
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-read".into()),
+            ("name", "read_file".into()),
+            ("ok", true.into()),
+        ]),
+    )));
 
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::TOOL_CALL,
@@ -4680,10 +4792,15 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
             ("input", json!({"path": "src/lib.rs"})),
         ]),
     )));
-    assert_eq!(
-        core.current_phase_verb.as_deref(),
-        Some("writing src/lib.rs")
-    );
+    assert_eq!(core.activity.phase(), &activity::ActivityPhase::Editing(1));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-edit".into()),
+            ("name", "edit_file".into()),
+            ("ok", true.into()),
+        ]),
+    )));
 
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::TOOL_CALL,
@@ -4693,7 +4810,19 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
             ("input", json!({"command": "ls -la"})),
         ]),
     )));
-    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::RunningTools(1)
+    );
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-bash".into()),
+            ("name", "run_shell".into()),
+            ("ok", true.into()),
+            ("exit_code", 0.into()),
+        ]),
+    )));
 
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::TOOL_CALL,
@@ -4703,22 +4832,28 @@ fn working_hud_phase_verb_reflects_streamed_turn_events() {
             ("input", json!({"command": "cargo nextest run --workspace"})),
         ]),
     )));
-    assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::RunningChecks {
+            count: 1,
+            kind: activity::CheckKind::Tests,
+        }
+    );
 
-    // A non-phase-carrying event (model delta) leaves the verb in place.
+    // A child/stream delta cannot hide a still-running tool batch.
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::MODEL_DELTA,
         object([("kind", "text".into()), ("delta", "answer".into())]),
     )));
-    assert_eq!(core.current_phase_verb.as_deref(), Some("running tests"));
+    assert!(matches!(
+        core.activity.phase(),
+        activity::ActivityPhase::RunningChecks { .. }
+    ));
 }
 
-/// #62: the verb must not go stale once its tool call terminates — success,
-/// failure, *or* auto-denial via the turn denial cache all resolve through
-/// the same `tool.result` event, so all three must clear the verb back to
-/// the live phase instead of parroting a tool that already finished.
+/// #62: a result closes its active tool for success, failure, and denial.
 #[test]
-fn working_hud_phase_verb_clears_when_tool_call_terminates_any_way() {
+fn working_hud_activity_closes_when_tool_call_terminates_any_way() {
     let mut core = core();
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -4726,6 +4861,7 @@ fn working_hud_phase_verb_clears_when_tool_call_terminates_any_way() {
         interrupt_flag: Arc::new(AtomicBool::new(false)),
         started_at: Instant::now(),
     };
+    core.activity.begin_at(Utc::now());
 
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::TOOL_CALL,
@@ -4735,7 +4871,10 @@ fn working_hud_phase_verb_clears_when_tool_call_terminates_any_way() {
             ("input", json!({"command": "ls -la"})),
         ]),
     )));
-    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::RunningTools(1)
+    );
 
     // Auto-denied via the turn denial cache: `ok: false`, no distinct
     // tool-call event precedes it — same shape as a normal failure result.
@@ -4749,8 +4888,8 @@ fn working_hud_phase_verb_clears_when_tool_call_terminates_any_way() {
         ]),
     )));
     assert_eq!(
-        core.current_phase_verb, None,
-        "verb must fall back to the live phase once the tool call resolves, denied or not"
+        core.activity.phase(),
+        &activity::ActivityPhase::PreparingNextStep
     );
 
     // A second bash attempt that succeeds also clears on its own result.
@@ -4762,7 +4901,10 @@ fn working_hud_phase_verb_clears_when_tool_call_terminates_any_way() {
             ("input", json!({"command": "ls -la"})),
         ]),
     )));
-    assert_eq!(core.current_phase_verb.as_deref(), Some("running bash"));
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::RunningTools(1)
+    );
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::TOOL_RESULT,
         object([
@@ -4771,16 +4913,18 @@ fn working_hud_phase_verb_clears_when_tool_call_terminates_any_way() {
             ("ok", true.into()),
         ]),
     )));
-    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::PreparingNextStep
+    );
 }
 
 /// Ownership: reasoning TEXT renders only in the transcript's live card
-/// behind the hairline; the HUD is a single status line carrying the sole
-/// esc affordance. Event order here is the REAL one — reasoning deltas
-/// first, the finalized `MODEL_REASONING` after — so the HUD must show
-/// `thinking · Ns` DURING streaming, not only after finalize.
+/// behind the hairline; the HUD carries only the observable receiving phase
+/// and the sole esc affordance. Event order here is the real one: reasoning
+/// deltas first, then finalized `MODEL_REASONING`.
 #[test]
-fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
+fn hud_shows_response_activity_without_reasoning_body() {
     let mut core = core();
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -4796,9 +4940,12 @@ fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
             ("delta", "weighing the residue lemma".into()),
         ]),
     )));
-    assert_eq!(core.current_phase_verb.as_deref(), Some("thinking"));
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::ReceivingResponse
+    );
     let status = core.live_status_line().expect("working HUD line");
-    assert!(status.contains("thinking"), "{status}");
+    assert!(status.contains("Receiving model response"), "{status}");
     assert!(status.contains("esc to interrupt"), "{status}");
 
     let frame = core.render_visual_canvas(80);
@@ -4846,8 +4993,8 @@ fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
         "the HUD must not carry reasoning text: {hud_line}"
     );
 
-    // Finalize collapses the transcript card to the committed gist and
-    // clears the HUD thinking status back to the "working" fallback.
+    // Finalize collapses the transcript card to the committed gist. The HUD
+    // stays at the body-free response phase until the result boundary.
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::MODEL_REASONING,
         object([
@@ -4858,9 +5005,12 @@ fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
             ),
         ]),
     )));
-    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::ReceivingResponse
+    );
     let status = core.live_status_line().expect("working HUD line");
-    assert!(status.contains("working"), "{status}");
+    assert!(status.contains("Receiving model response"), "{status}");
 
     let frame = core.render_visual_canvas(80);
     let text = frame
@@ -4873,11 +5023,10 @@ fn hud_shows_one_line_thinking_status_during_reasoning_deltas() {
     assert!(!text.contains("thinking ·"), "{text}");
 }
 
-/// The HUD thinking status clears the moment answer text starts streaming
-/// — while streamed text deltas leave a tool-phase verb alone (issue #27:
-/// no mid-phase flicker).
+/// Text and reasoning deltas share one observable response phase, while a
+/// still-running tool batch remains the stronger phase.
 #[test]
-fn hud_thinking_status_clears_when_answer_text_starts() {
+fn hud_response_activity_does_not_override_a_tool_batch() {
     let mut core = core();
     let (_tx, worker_rx) = mpsc::channel();
     core.state = AppState::TurnInFlight {
@@ -4890,13 +5039,19 @@ fn hud_thinking_status_clears_when_answer_text_starts() {
         EventKind::MODEL_DELTA,
         object([("kind", "reasoning".into()), ("delta", "hmm".into())]),
     )));
-    assert_eq!(core.current_phase_verb.as_deref(), Some("thinking"));
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::ReceivingResponse
+    );
 
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::MODEL_DELTA,
         object([("kind", "text".into()), ("delta", "answer".into())]),
     )));
-    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(
+        core.activity.phase(),
+        &activity::ActivityPhase::ReceivingResponse
+    );
 
     // A tool phase set later is NOT clobbered by further text deltas.
     core.handle_turn_event(TurnEvent::Event(event(
@@ -4908,36 +5063,40 @@ fn hud_thinking_status_clears_when_answer_text_starts() {
         ]),
     )));
     assert_eq!(
-        core.current_phase_verb.as_deref(),
-        Some("reading src/lib.rs")
+        core.activity.phase(),
+        &activity::ActivityPhase::Inspecting(1)
     );
     core.handle_turn_event(TurnEvent::Event(event(
         EventKind::MODEL_DELTA,
         object([("kind", "text".into()), ("delta", "more".into())]),
     )));
     assert_eq!(
-        core.current_phase_verb.as_deref(),
-        Some("reading src/lib.rs")
+        core.activity.phase(),
+        &activity::ActivityPhase::Inspecting(1)
     );
 }
 
 #[test]
-fn working_hud_phase_verb_resets_when_a_new_turn_spawns() {
+fn working_hud_activity_resets_when_a_new_turn_spawns() {
     let mut core = core();
     let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
         panic!("core should start idle");
     };
-    core.current_phase_verb = Some("thinking".to_owned());
+    core.activity.begin_at(Utc::now());
+    core.activity.observe(&event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "private".into())]),
+    ));
     core.spinner_frame = 3;
 
     core.spawn_turn("next".to_owned(), session);
 
-    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(core.activity.phase(), &activity::ActivityPhase::Starting);
     assert_eq!(core.spinner_frame, 0);
 }
 
 #[test]
-fn working_hud_phase_verb_resets_when_the_turn_completes() {
+fn working_hud_activity_terminalizes_when_the_turn_completes() {
     let mut core = core();
     let AppState::Idle { session } = std::mem::replace(&mut core.state, AppState::Empty) else {
         panic!("core should start idle");
@@ -4948,7 +5107,11 @@ fn working_hud_phase_verb_resets_when_the_turn_completes() {
         interrupt_flag: Arc::new(AtomicBool::new(false)),
         started_at: Instant::now(),
     };
-    core.current_phase_verb = Some("thinking".to_owned());
+    core.activity.begin_at(Utc::now());
+    core.activity.observe(&event(
+        EventKind::MODEL_DELTA,
+        object([("kind", "reasoning".into()), ("delta", "private".into())]),
+    ));
     core.spinner_frame = 3;
 
     core.handle_turn_event(TurnEvent::TurnDone {
@@ -4956,7 +5119,7 @@ fn working_hud_phase_verb_resets_when_the_turn_completes() {
         session,
     });
 
-    assert_eq!(core.current_phase_verb, None);
+    assert_eq!(core.activity.phase(), &activity::ActivityPhase::Completed);
     assert_eq!(core.spinner_frame, 0);
 }
 
@@ -4990,6 +5153,58 @@ fn working_hud_canvas_line_uses_theme_tokens_for_spinner_and_suffix() {
         activity_line.spans[2].style.fg,
         Some(core.theme.palette.muted)
     );
+}
+
+#[test]
+fn activity_projection_renders_through_the_pinned_visual_block() {
+    let mut core = core();
+    let (_tx, worker_rx) = mpsc::channel();
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::new(AtomicBool::new(false)),
+        started_at: Instant::now(),
+    };
+    core.activity.begin_at(Utc::now());
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_CALL,
+        object([
+            ("id", "cargo-check".into()),
+            ("name", "run_shell".into()),
+            ("input", json!({"command": "cargo check --workspace"})),
+        ]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "cargo-check".into()),
+            ("name", "run_shell".into()),
+            ("ok", true.into()),
+            ("exit_code", 101.into()),
+            ("output", "private compiler output".into()),
+        ]),
+    )));
+    core.handle_turn_event(TurnEvent::Event(event(
+        EventKind::MODEL_CALL,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    )));
+
+    let block = core
+        .visual_canvas_snapshot(100)
+        .blocks
+        .into_iter()
+        .find(|block| block.role == VisualBlockRole::Activity)
+        .expect("pinned activity block");
+    assert_eq!(block.role, VisualBlockRole::Activity);
+    assert_eq!(block.lines.len(), 2);
+    let text = block
+        .lines
+        .iter()
+        .map(CanvasLine::plain_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("Waiting for model"), "{text}");
+    assert!(text.contains("cargo check failed (exit 101)"), "{text}");
+    assert!(!text.contains("private compiler output"), "{text}");
 }
 
 /// Issue #27: the HUD line sits directly above the composer with no blank

@@ -92,7 +92,7 @@ impl AppCore {
         self.render_visual_canvas(width)
     }
 
-    fn visual_canvas_snapshot(&mut self, width: u16) -> VisualCanvasSnapshot {
+    pub(super) fn visual_canvas_snapshot(&mut self, width: u16) -> VisualCanvasSnapshot {
         let status = self.canvas_status_snapshot(width);
         let composer = self.canvas_composer_snapshot(width);
         let focus = self.canvas_focus_owner();
@@ -263,17 +263,24 @@ impl AppCore {
         let lines = match hud {
             HudLine::Plain(text) => vec![CanvasLine::plain_lossy(text)],
             HudLine::Working {
-                spinner,
+                marker,
+                stalled,
                 verb,
                 suffix,
+                detail,
             } => {
-                vec![CanvasLine::from_spans(vec![
-                    // Gold (warning-token) spinner — routed through Theme, never
-                    // a literal hex (issue #27).
+                let marker_color = if stalled {
+                    self.theme.palette.error
+                } else {
+                    self.theme.palette.warning
+                };
+                let mut lines = vec![CanvasLine::from_spans(vec![
+                    // Attention spinner / failure-colored stall marker — both
+                    // routed through Theme, never literal colors (issue #27).
                     CanvasSpan::styled_lossy(
-                        format!("{spinner} "),
+                        format!("{marker} "),
                         TextRole::Plain,
-                        Style::default().fg(self.theme.palette.warning),
+                        Style::default().fg(marker_color),
                     ),
                     CanvasSpan::new_lossy(verb, TextRole::Plain),
                     CanvasSpan::styled_lossy(
@@ -281,7 +288,15 @@ impl AppCore {
                         TextRole::Plain,
                         Style::default().fg(self.theme.palette.muted),
                     ),
-                ])]
+                ])];
+                if let Some(detail) = detail {
+                    lines.push(CanvasLine::from_spans(vec![CanvasSpan::styled_lossy(
+                        format!("  {detail}"),
+                        TextRole::Plain,
+                        Style::default().fg(self.theme.palette.muted),
+                    )]));
+                }
+                lines
             }
         };
         push_visual_block(blocks, VisualBlockRole::Activity, lines);

@@ -1,8 +1,8 @@
 //! Turn-end recap and exit-recap formatting (Warm Ledger §5.7 / §5.8).
 
 use crate::ui::status::short_session_id;
-use euler_event::{EventEnvelope, EventKind};
-use std::collections::BTreeMap;
+use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TurnRecap {
@@ -11,6 +11,103 @@ pub struct TurnRecap {
     pub removed: usize,
     pub paths: Vec<String>,
     pub test_status: Option<TestStatus>,
+}
+
+/// Incremental turn facts shared by the end-of-turn recap and the live
+/// activity projection. Keeping this fold in one place prevents the HUD from
+/// disagreeing with the durable recap about changed files or check outcomes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct TurnRecapAccumulator {
+    latest_files: BTreeMap<String, (usize, usize)>,
+    shell_commands: HashMap<String, String>,
+    test_status: Option<TestStatus>,
+}
+
+impl TurnRecapAccumulator {
+    pub(super) fn observe(&mut self, event: &EventEnvelope) {
+        match event.kind.as_str() {
+            EventKind::FILE_DIFF => {
+                let path = payload_str(event, "path").unwrap_or("");
+                if path.is_empty() {
+                    return;
+                }
+                let (added, removed) = event
+                    .payload
+                    .get("diff")
+                    .and_then(|value| value.as_str())
+                    .map(count_diff_lines)
+                    .unwrap_or((0, 0));
+                self.latest_files.insert(path.to_owned(), (added, removed));
+            }
+            EventKind::FILE_CHANGE => {
+                let path = payload_str(event, "path").unwrap_or("");
+                if !path.is_empty() {
+                    self.latest_files.entry(path.to_owned()).or_insert((0, 0));
+                }
+            }
+            EventKind::TOOL_CALL if payload_str(event, "name") == Some("run_shell") => {
+                let id = payload_str(event, "id").unwrap_or("");
+                let command = event
+                    .payload
+                    .get("input")
+                    .and_then(|value| value.get("command"))
+                    .and_then(|value| value.as_str());
+                if !id.is_empty() {
+                    if let Some(command) = command {
+                        self.shell_commands
+                            .insert(id.to_owned(), command.to_owned());
+                    }
+                }
+            }
+            EventKind::TOOL_RESULT if payload_str(event, "name") == Some("run_shell") => {
+                let id = payload_str(event, "id").unwrap_or("");
+                let command = self
+                    .shell_commands
+                    .get(id)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let output = payload_str(event, "output").unwrap_or("");
+                if !looks_test_like(command, output) {
+                    return;
+                }
+
+                let exit_code = shell_exit_code(event);
+                self.test_status = Some(if !tool_result_succeeded(&event.payload) {
+                    // Legacy logs can say `ok: true` even when the process
+                    // exited nonzero. Effective success requires both the
+                    // result flag and, when present, a zero process exit.
+                    TestStatus::Fail
+                } else if let Some(status) = parse_test_summary(output) {
+                    status
+                } else {
+                    match exit_code {
+                        Some(0) => TestStatus::Pass,
+                        None => TestStatus::Unknown,
+                        Some(_) => unreachable!("nonzero exit handled as effective failure"),
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn recap(&self) -> TurnRecap {
+        let mut added = 0usize;
+        let mut removed = 0usize;
+        let mut paths = Vec::with_capacity(self.latest_files.len());
+        for (path, (path_added, path_removed)) in &self.latest_files {
+            added += path_added;
+            removed += path_removed;
+            paths.push(path.clone());
+        }
+        TurnRecap {
+            file_count: paths.len(),
+            added,
+            removed,
+            paths,
+            test_status: self.test_status,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,54 +160,11 @@ impl TurnRecap {
 }
 
 pub fn turn_recap_from_events(events: &[EventEnvelope], start: usize) -> TurnRecap {
-    let slice = events.get(start..).unwrap_or(&[]);
-    let (paths, added, removed) = aggregate_turn_files(slice);
-    let test_status = detect_test_status(slice);
-    TurnRecap {
-        file_count: paths.len(),
-        added,
-        removed,
-        paths,
-        test_status,
+    let mut accumulator = TurnRecapAccumulator::default();
+    for event in events.get(start..).unwrap_or(&[]) {
+        accumulator.observe(event);
     }
-}
-
-fn aggregate_turn_files(events: &[EventEnvelope]) -> (Vec<String>, usize, usize) {
-    let mut latest: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for event in events {
-        match event.kind.as_str() {
-            EventKind::FILE_DIFF => {
-                let path = payload_str(event, "path").unwrap_or("");
-                if path.is_empty() {
-                    continue;
-                }
-                let (added, removed) = event
-                    .payload
-                    .get("diff")
-                    .and_then(|v| v.as_str())
-                    .map(count_diff_lines)
-                    .unwrap_or((0, 0));
-                latest.insert(path.to_owned(), (added, removed));
-            }
-            EventKind::FILE_CHANGE => {
-                let path = payload_str(event, "path").unwrap_or("");
-                if path.is_empty() {
-                    continue;
-                }
-                latest.entry(path.to_owned()).or_insert((0, 0));
-            }
-            _ => {}
-        }
-    }
-    let mut added = 0usize;
-    let mut removed = 0usize;
-    let mut paths = Vec::with_capacity(latest.len());
-    for (path, (a, r)) in latest {
-        added += a;
-        removed += r;
-        paths.push(path);
-    }
-    (paths, added, removed)
+    accumulator.recap()
 }
 
 fn count_diff_lines(diff: &str) -> (usize, usize) {
@@ -126,59 +180,20 @@ fn count_diff_lines(diff: &str) -> (usize, usize) {
     (added, removed)
 }
 
-pub fn detect_test_status(events: &[EventEnvelope]) -> Option<TestStatus> {
-    let mut last: Option<TestStatus> = None;
-    let mut call_commands = std::collections::HashMap::<String, String>::new();
+#[cfg(test)]
+fn detect_test_status(events: &[EventEnvelope]) -> Option<TestStatus> {
+    let mut accumulator = TurnRecapAccumulator::default();
     for event in events {
-        match event.kind.as_str() {
-            EventKind::TOOL_CALL => {
-                if payload_str(event, "name") != Some("run_shell") {
-                    continue;
-                }
-                let id = payload_str(event, "id").unwrap_or("").to_owned();
-                if id.is_empty() {
-                    continue;
-                }
-                if let Some(command) = event
-                    .payload
-                    .get("input")
-                    .and_then(|v| v.get("command"))
-                    .and_then(|v| v.as_str())
-                {
-                    call_commands.insert(id, command.to_owned());
-                }
-            }
-            EventKind::TOOL_RESULT => {
-                if payload_str(event, "name") != Some("run_shell") {
-                    continue;
-                }
-                let id = payload_str(event, "id").unwrap_or("");
-                let command = call_commands.get(id).map(String::as_str).unwrap_or("");
-                let output = payload_str(event, "output").unwrap_or("");
-                if !looks_test_like(command, output) {
-                    continue;
-                }
-                if let Some(status) = parse_test_summary(output) {
-                    last = Some(status);
-                } else {
-                    // `ok` on a run_shell result only reflects whether the
-                    // shell itself executed successfully — a test command
-                    // can run fine and still report failing tests via a
-                    // nonzero exit code. Classify off the exit code, not
-                    // `ok`, and fall back to Unknown (never a silent Pass)
-                    // when the exit code isn't available.
-                    let exit_code = event.payload.get("exit_code").and_then(|v| v.as_i64());
-                    last = Some(match exit_code {
-                        Some(0) => TestStatus::Pass,
-                        Some(_) => TestStatus::Fail,
-                        None => TestStatus::Unknown,
-                    });
-                }
-            }
-            _ => {}
-        }
+        accumulator.observe(event);
     }
-    last
+    accumulator.recap().test_status
+}
+
+pub(super) fn shell_exit_code(event: &EventEnvelope) -> Option<i64> {
+    event
+        .payload
+        .get("exit_code")
+        .and_then(|value| value.as_i64())
 }
 
 fn looks_test_like(command: &str, output: &str) -> bool {
@@ -186,7 +201,7 @@ fn looks_test_like(command: &str, output: &str) -> bool {
     // Runners with per-runner summary parsing (see parse_test_summary) plus
     // runners that are merely recognized so they fall through to the
     // exit-code-based Pass/Fail/Unknown classification in
-    // `detect_test_status` instead of having their turn recap silently
+    // the shared recap accumulator instead of having their turn recap silently
     // suppressed by turn_events.rs's "no tests ran" check.
     const TEST_COMMAND_NEEDLES: &[&str] = &[
         "cargo test",
@@ -432,10 +447,9 @@ mod tests {
 
     #[test]
     fn ok_true_with_nonzero_exit_code_is_fail_not_pass() {
-        // euler-core's run_shell sets `ok: true` for successful *execution*
-        // even when the shell command itself exited nonzero (e.g. `cargo
-        // test` ran fine but found failing tests). The recap must classify
-        // off exit_code, not `ok`, when no summary line is parseable.
+        // Legacy producers confused executor completion with command success.
+        // The nonzero exit remains authoritative even if output contains a
+        // superficially successful runner summary.
         let events = vec![
             event(
                 EventKind::TOOL_CALL,
@@ -452,7 +466,35 @@ mod tests {
                     ("name", "run_shell".into()),
                     ("ok", true.into()),
                     ("exit_code", 101.into()),
-                    ("output", "some unparseable output".into()),
+                    (
+                        "output",
+                        "test result: ok. 1 passed; 0 failed; 0 ignored".into(),
+                    ),
+                ]),
+            ),
+        ];
+        assert_eq!(detect_test_status(&events), Some(TestStatus::Fail));
+    }
+
+    #[test]
+    fn ok_false_cannot_be_overridden_by_a_pass_looking_summary() {
+        let events = vec![
+            event(
+                EventKind::TOOL_CALL,
+                object([
+                    ("id", "c1".into()),
+                    ("name", "run_shell".into()),
+                    ("input", json!({"command": "cargo test -q"})),
+                ]),
+            ),
+            event(
+                EventKind::TOOL_RESULT,
+                object([
+                    ("id", "c1".into()),
+                    ("name", "run_shell".into()),
+                    ("ok", false.into()),
+                    ("exit_code", 0.into()),
+                    ("output", "test result: ok. 3 passed; 0 failed".into()),
                 ]),
             ),
         ];

@@ -72,7 +72,7 @@ pub(crate) use permissions_gate::{
 };
 pub(crate) use tool_dispatch::{
     file_change_payload, file_diff_payload, maybe_store_pre_image, tool_cancelled_payload,
-    tool_success_payload,
+    tool_result_payload,
 };
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;

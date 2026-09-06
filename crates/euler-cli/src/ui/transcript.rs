@@ -4,7 +4,7 @@ use super::theme::Theme;
 use crate::ui::markdown_stream::MarkdownStreamCollector;
 use chrono::{DateTime, Local};
 use euler_core::canvas::projected_tool_output;
-use euler_event::{EventEnvelope, EventKind};
+use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use euler_sdk::{
     validate_plan_presentation, PlanItemStatus, PlanPresentation, PlanPresentationItem,
     PlanPresentationStatus,
@@ -56,6 +56,8 @@ pub enum PlanUpdateView {
     },
 }
 
+/// Ephemeral UI projection. Durable replay reconstructs these items from
+/// provenance events; this enum is never a persistence schema.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TranscriptItem {
     Banner {
@@ -155,6 +157,7 @@ pub enum TranscriptItem {
         content_changed: bool,
         sources: Vec<String>,
         skipped_count: usize,
+        compatibility_warning_count: usize,
         skill_count: usize,
         load_selected: bool,
     },
@@ -426,7 +429,7 @@ impl ExtensionPlanCoalescer {
 
         let result_provider_call_id = nonempty_payload_string(event, "id");
         let hide_result = event.kind.as_str() == EventKind::TOOL_RESULT
-            && event.payload.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+            && tool_result_succeeded(&event.payload)
             && call_id.as_ref().is_some_and(|call_id| {
                 self.calls.get(call_id).is_some_and(|call| {
                     call.plan_presented
@@ -829,11 +832,7 @@ fn project_event_with_checkpoints(
         }),
         EventKind::TOOL_RESULT => Some(TranscriptItem::ToolResult {
             name: payload_string(event, "name").unwrap_or_default(),
-            ok: event
-                .payload
-                .get("ok")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
+            ok: tool_result_succeeded(&event.payload),
             error: payload_string(event, "error").unwrap_or_default(),
             output: projected_tool_output(event),
             exit_code: event
@@ -1441,11 +1440,7 @@ fn project_tui_tool_result(
     calls: &HashMap<String, ToolCallProjection>,
 ) -> Option<TranscriptItem> {
     let name = payload_string(event, "name").unwrap_or_default();
-    let ok = event
-        .payload
-        .get("ok")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let ok = tool_result_succeeded(&event.payload);
     if let Some(run) = run_item_from_result(event, calls, ok) {
         return Some(run);
     }
@@ -1667,11 +1662,7 @@ fn project_tui_event(event: &EventEnvelope) -> Option<TranscriptItem> {
         }
         EventKind::TOOL_RESULT => {
             let name = payload_string(event, "name").unwrap_or_default();
-            let ok = event
-                .payload
-                .get("ok")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
+            let ok = tool_result_succeeded(&event.payload);
             if ok && matches!(name.as_str(), "edit_file" | "write_file") {
                 None
             } else {

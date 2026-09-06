@@ -184,7 +184,16 @@ envelope `v` per `docs/contracts/persistence.md`.
 - `tool.call`: `id`, `name`, `input` (structured JSON).
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
-  accompany `error` when the tool produced partial output before failing).
+  accompany `error` when the tool produced output before failing; cancellation
+  output may be partial, while a normally exited process output is complete).
+  `ok` is the canonical tool-operation outcome, not merely a statement that
+  the executor returned. For a process-backed tool, a nonzero `exit_code`
+  requires `ok: false` and `error`; collected `output` and the exit code remain
+  failure evidence. Readers derive the effective outcome as declared `ok`
+  AND a zero exit when `exit_code` is present. This rule is also the boundary
+  compatibility mapping for legacy events that recorded `ok: true` beside a
+  nonzero exit: preserve the event bytes, but project the operation as failed
+  in diagnostics, transcript, canvas/provider input, activity, and recaps.
   `output` is the complete redacted text supplied by the tool (and may be
   partial on the failure path described above). A producer that bounds the
   active display may add `output_preview_max_bytes` and
@@ -219,7 +228,7 @@ envelope `v` per `docs/contracts/persistence.md`.
   `docs/contracts/capabilities.md`). Both are ledger provenance tags rendered
   on the tool header, not fresh decisions.
   This payload is the canonical tool-result shape; provider adapters map
-  exactly this shape onto their wire formats.
+  exactly this effective shape onto their wire formats.
   Extension-backed model-tool calls/results additionally carry host-derived
   `extension_id` and `command`. A causally descended, identically attributed
   `plan.update` lets the TUI suppress the successful generic JSON result row
@@ -614,10 +623,14 @@ envelope `v` per `docs/contracts/persistence.md`.
   and request assembly.
 - `project.context.diagnostic` (current schema version 2): `schema_version`,
   `snapshot_event_id`, `reason` (stable content-free code), optional bounded
-  `path` (normalized relative identity), optional numeric `observed`. Never
-  carries excerpts, raw parser errors, outside-workspace paths, or exception
-  strings derived from a candidate. Its schema version must exactly match its
-  owning snapshot; v1 diagnostics remain valid only in a v1 bootstrap.
+  `path` (normalized relative identity), optional numeric `observed`. Reasons
+  normally record omissions. `skill_name_directory_mismatch` is a non-fatal
+  advisory emitted only for an admitted skill. The older
+  `skill_name_mismatch` reason remains an omission, so replay never
+  reinterprets an existing event. The event never carries excerpts, raw parser
+  errors, outside-workspace paths, or exception strings derived from a
+  candidate. Its schema version must exactly match its owning snapshot; v1
+  diagnostics remain valid only in a v1 bootstrap.
 - `canvas.snapshot`: `selected_event_ids`, `counts`, retention telemetry
   `retained_items`, `retained_bytes`, `demoted_items`, `automatic`, `stubs`,
   `tier`, `budget_bytes`,

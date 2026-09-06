@@ -700,6 +700,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
             object([
                 ("id", "call-alpha".into()),
                 ("name", "read_file".into()),
+                ("ok", true.into()),
                 ("output", "alpha".into()),
             ]),
         ),
@@ -729,6 +730,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
             object([
                 ("id", "call-beta".into()),
                 ("name", "run_shell".into()),
+                ("ok", true.into()),
                 ("output", "beta".into()),
             ]),
         ),
@@ -787,6 +789,50 @@ fn preserves_message_and_selected_tool_result_interleaving() {
             compacted: false,
             demoted: false,
         }
+    );
+}
+
+#[test]
+fn legacy_nonzero_process_exit_is_failed_model_input() {
+    let events = vec![
+        EventEnvelope::new(
+            "s",
+            "a",
+            None,
+            EventKind::TOOL_CALL,
+            object([
+                ("id", "call-check".into()),
+                ("name", "run_shell".into()),
+                ("input", serde_json::json!({"command": "cargo check"})),
+            ]),
+        ),
+        EventEnvelope::new(
+            "s",
+            "a",
+            None,
+            EventKind::TOOL_RESULT,
+            object([
+                ("id", "call-check".into()),
+                ("name", "run_shell".into()),
+                ("ok", true.into()),
+                ("output", "compiler error".into()),
+                ("exit_code", 101.into()),
+            ]),
+        ),
+    ];
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+    assert!(matches!(
+        &canvas[1],
+        CanvasItem::ToolOutput {
+            ok: false,
+            exit_code: Some(101),
+            ..
+        }
+    ));
+    assert!(
+        canvas_prompt(&canvas).contains("[tool failed] compiler error"),
+        "legacy nonzero exits must not reach a provider as successful output"
     );
 }
 
@@ -1948,6 +1994,7 @@ fn pairs_tool_call_with_selected_output() {
             object([
                 ("id", "call-abc".into()),
                 ("name", "read_file".into()),
+                ("ok", true.into()),
                 ("output", "hello world".into()),
             ]),
         ),
@@ -2096,6 +2143,7 @@ fn duplicate_call_ids_keep_first_pair() {
             object([
                 ("id", "call-dup".into()),
                 ("name", "read_file".into()),
+                ("ok", true.into()),
                 ("output", "first".into()),
             ]),
         ),
@@ -2118,6 +2166,7 @@ fn duplicate_call_ids_keep_first_pair() {
             object([
                 ("id", "call-dup".into()),
                 ("name", "read_file".into()),
+                ("ok", true.into()),
                 ("output", "second".into()),
             ]),
         ),
@@ -2171,6 +2220,7 @@ fn tool_pair_events(call_id: &str, name: &str, output: &str) -> Vec<EventEnvelop
             object([
                 ("id", call_id.into()),
                 ("name", name.into()),
+                ("ok", true.into()),
                 ("output", output.into()),
             ]),
         ),
