@@ -1,9 +1,8 @@
-use super::round_loop::ModelRoundData;
+use super::round_loop::{provider_failure_is_retryable, ModelRoundData};
 use super::{provider_cancellation, push_reasoning_chunk, ModelTarget, ProviderRuntimeContext};
 use crate::{ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope};
 use euler_provider::{
-    ModelRequest, ModelStreamEvent, ProviderAttemptEvent, ProviderError, ProviderErrorCategory,
-    ProviderSet,
+    ModelRequest, ModelStreamEvent, ProviderAttemptEvent, ProviderError, ProviderSet,
 };
 use euler_sdk::{CancellationSource, CancellationToken};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,12 +163,12 @@ fn invoke_with_retries(
             Ok(Some(data)) => return WorkerOutcome::Finished(Ok(data)),
             Ok(None) => return WorkerOutcome::Cancelled,
             Err(error)
-                if !provider_neutral_progress
-                    && attempt < config.retries
-                    && matches!(
-                        error.category(),
-                        ProviderErrorCategory::Transport | ProviderErrorCategory::RateLimit
-                    ) =>
+                if provider_failure_is_retryable(
+                    &error,
+                    provider_neutral_progress,
+                    attempt,
+                    config.retries,
+                ) =>
             {
                 let delay = config
                     .retry_backoff_ms
@@ -444,6 +443,70 @@ mod tests {
             panic!("terminal attempt must settle as its produced result");
         };
         assert_eq!(round.usage.expect("usage").input_tokens, 8);
+    }
+
+    #[test]
+    fn compaction_retries_inactivity_timeouts_by_stage() {
+        for (stage, should_retry) in [
+            (euler_provider::ProviderTimeoutStage::ResponseHeaders, true),
+            (euler_provider::ProviderTimeoutStage::FirstByte, true),
+            (euler_provider::ProviderTimeoutStage::SemanticIdle, false),
+        ] {
+            let invokes = Arc::new(AtomicUsize::new(0));
+            let providers = ProviderSet::single(QueuedStreamsProvider {
+                streams: Mutex::new(
+                    vec![
+                        vec![Err(ProviderError::timeout(stage, Duration::ZERO))],
+                        vec![
+                            Ok(ModelStreamEvent::TextDelta("projection".to_owned())),
+                            Ok(ModelStreamEvent::Finished {
+                                stop_reason: euler_provider::StopReason::Completed,
+                                usage: None,
+                            }),
+                        ],
+                    ]
+                    .into(),
+                ),
+                invokes: Arc::clone(&invokes),
+            });
+            let mut worker = spawn(
+                providers,
+                ModelTarget::new("fixture", "fixture"),
+                ModelRequest {
+                    model: "fixture".to_owned(),
+                    instructions: "compact".to_owned(),
+                    input: Vec::new(),
+                    tools: Vec::new(),
+                    reasoning_effort: ReasoningEffort::Medium,
+                    max_output_tokens: None,
+                },
+                ProviderRunConfig {
+                    session_id: "session".to_owned(),
+                    retries: 1,
+                    retry_backoff_ms: vec![0],
+                    liveness: ProviderLivenessConfig::default(),
+                    runtime_observer: ProviderRuntimeObserver::default(),
+                },
+            );
+
+            let outcome = worker
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker outcome");
+            worker.reap_after_terminal();
+            if should_retry {
+                let WorkerOutcome::Finished(Ok(round)) = outcome else {
+                    panic!("expected successful retry for {stage:?}");
+                };
+                assert_eq!(round.content, "projection");
+                assert_eq!(invokes.load(Ordering::Relaxed), 2, "{stage:?}");
+            } else {
+                let WorkerOutcome::Finished(Err(error)) = outcome else {
+                    panic!("semantic-idle timeout must stop compaction");
+                };
+                assert_eq!(error.timeout_stage(), Some(stage));
+                assert_eq!(invokes.load(Ordering::Relaxed), 1, "{stage:?}");
+            }
+        }
     }
 
     #[test]

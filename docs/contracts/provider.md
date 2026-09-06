@@ -144,7 +144,8 @@ automatically because its remote outcome and emitted prefix cannot be
 duplicated safely. Empty deltas, provider-opaque artifacts, and transport
 control observations do not suppress an otherwise safe pre-semantic retry.
 
-Inactivity timeouts retry by stage, not by category alone:
+Inactivity timeouts in both ordinary model rounds and shadow compaction retry
+by stage, not by category alone:
 
 - `response_headers` and `first_byte` timeouts are retryable (subject to the
   progress rule and the retry budget): nothing was received, so the attempt

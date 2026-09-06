@@ -429,7 +429,7 @@ fn collect_stream_event(event: ModelStreamEvent, data: &mut ModelRoundData) {
 /// (for example a long silent reasoning phase). Replaying it would bill the
 /// user again for an attempt that already ran. `response_headers` and
 /// `first_byte` timeouts stay retryable because nothing was received.
-fn provider_failure_is_retryable(
+pub(super) fn provider_failure_is_retryable(
     error: &ProviderError,
     provider_neutral_progress: bool,
     attempt: usize,
