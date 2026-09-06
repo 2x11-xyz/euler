@@ -252,6 +252,8 @@ impl AppCore {
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
+        self.activity.begin_at(Utc::now());
+        self.stall_notified = false;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
     }

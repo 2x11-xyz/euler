@@ -34,9 +34,6 @@ pub fn notification_sequence(event: NotifyEvent) -> String {
     format!("\x1b]9;{body}\x1b\\\x07")
 }
 
-/// Stall threshold: no turn output for this long → one stall notify.
-pub const STALL_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(30);
-
 #[cfg(test)]
 mod tests {
     use super::*;

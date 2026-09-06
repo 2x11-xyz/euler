@@ -1,6 +1,7 @@
+use self::activity::{ActivityTerminal, RunActivityProjection};
 use self::code_swarm::load_code_swarm_models_startup;
 use self::extension_runs::{list_extension_manager_items, ExtensionOutcome, ExtensionRunRequest};
-use self::notify::{NotifyEvent, STALL_THRESHOLD};
+use self::notify::NotifyEvent;
 #[cfg(test)]
 use self::resume::TuiResume;
 #[cfg(test)]
@@ -44,6 +45,7 @@ use crate::extension_cli::{resolve_round_observer, ObserveOptions};
 use crate::extension_enablement::{resolve_session_extensions, ExtensionSelection};
 use crate::model_preference;
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use crossterm::event::{self, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 use euler_core::permissions::{PermissionRequest, PermissionRequestBatch};
 use euler_core::{
@@ -107,6 +109,7 @@ fn is_slash_command_key(key: &KeyEvent) -> bool {
         && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
 }
 
+mod activity;
 #[cfg(test)]
 #[path = "app/chrome_test.rs"]
 mod chrome;
@@ -143,9 +146,11 @@ pub(super) enum HudLine {
     /// card — the HUD carries only the global status (verb, turn timer, and
     /// the sole esc-to-interrupt affordance).
     Working {
-        spinner: &'static str,
+        marker: &'static str,
+        stalled: bool,
         verb: String,
         suffix: String,
+        detail: Option<String>,
     },
 }
 
@@ -290,17 +295,15 @@ pub struct AppCore {
     /// Wall-clock anchor for the last spinner tick; only read outside
     /// render, in the periodic background poll.
     spinner_last_tick: Option<Instant>,
-    /// Current turn phase verb (thinking/exploring/reading X/writing X/
-    /// running bash/running tests), derived from streamed turn events.
-    /// `None` falls back to the generic "working" label.
-    current_phase_verb: Option<String>,
+    /// Deterministic projection of observable run activity. Event timestamps
+    /// own phase/progress anchors; rendering supplies the current clock.
+    activity: RunActivityProjection,
     extensions: ExtensionSelection,
     observe: ObserveOptions,
     /// Launch `--auth-file` override; consulted when an in-app resume
     /// re-seeds secret redaction (see [`AppOptions::auth_file`]).
     auth_file: Option<PathBuf>,
     turn_event_start: usize,
-    last_turn_activity_at: Option<Instant>,
     stall_notified: bool,
     terminal_focused: bool,
     notifications_enabled: bool,
@@ -991,12 +994,11 @@ impl AppCore {
             in_flight_cancellable: false,
             spinner_frame: 0,
             spinner_last_tick: None,
-            current_phase_verb: None,
+            activity: RunActivityProjection::default(),
             extensions: boot.extensions,
             observe: boot.observe,
             auth_file: boot.auth_file,
             turn_event_start: 0,
-            last_turn_activity_at: None,
             stall_notified: false,
             terminal_focused: true,
             notifications_enabled: boot.notifications_enabled,
@@ -1379,11 +1381,6 @@ impl AppCore {
             return;
         }
         self.pending_notifications.push_back(event);
-    }
-
-    fn note_turn_activity(&mut self) {
-        self.last_turn_activity_at = Some(Instant::now());
-        self.stall_notified = false;
     }
 
     pub(crate) fn exit_recap_lines(&self) -> Vec<self::turn_recap::ExitRecapLine> {
@@ -2294,13 +2291,13 @@ impl AppCore {
         self.in_flight_companion_name = None;
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
-        self.current_phase_verb = None;
+        self.activity.begin_at(Utc::now());
         self.spinner_frame = 0;
         self.spinner_last_tick = None;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
         self.turn_event_start = self.transcript.events().len();
-        self.note_turn_activity();
+        self.stall_notified = false;
     }
 
     fn surface_event(&mut self, event: SurfaceEvent) -> CoreEffect {
@@ -2615,6 +2612,8 @@ impl AppCore {
         self.in_flight_companion_name = Some(request.task.persona().to_owned());
         self.in_flight_cancellable = true;
         self.last_working_elapsed_secs = None;
+        self.activity.begin_at(Utc::now());
+        self.stall_notified = false;
         self.interrupted_guidance = false;
         self.in_flight_error = None;
     }
@@ -3075,6 +3074,10 @@ impl AppCore {
     /// phase verb, and dim suffix as separate pieces so the real path can
     /// color them independently (gold spinner, dim elapsed/hint).
     fn working_hud_line(&self) -> Option<HudLine> {
+        self.working_hud_line_at(Utc::now())
+    }
+
+    fn working_hud_line_at(&self, now: chrono::DateTime<Utc>) -> Option<HudLine> {
         if matches!(
             self.modal,
             Some(
@@ -3100,27 +3103,53 @@ impl AppCore {
         let AppState::TurnInFlight { started_at, .. } = &self.state else {
             return None;
         };
-        let secs = started_at.elapsed().as_secs();
         let spinner = super::glyphs::glyph_set().spinner(self.spinner_frame);
         let label = self.in_flight_label.as_deref().unwrap_or("turn");
         if !self.is_in_flight_cancellable() {
             return Some(HudLine::Working {
-                spinner,
+                marker: spinner,
+                stalled: false,
                 verb: format!("running {label}"),
-                suffix: format!(" · {secs}s · not cancellable"),
+                suffix: format!(
+                    " · {} · not cancellable",
+                    format_live_elapsed(started_at.elapsed())
+                ),
+                detail: None,
             });
         }
-        let verb = if label == "turn" {
-            self.current_phase_verb
-                .clone()
-                .unwrap_or_else(|| "working".to_owned())
+        if label != MODEL_TURN_IN_FLIGHT_LABEL {
+            return Some(HudLine::Working {
+                marker: spinner,
+                stalled: false,
+                verb: format!("working {label}"),
+                suffix: format!(
+                    " · {} · esc to interrupt",
+                    format_live_elapsed(started_at.elapsed())
+                ),
+                detail: None,
+            });
+        }
+        let snapshot = self.activity.snapshot_at(now);
+        let stalled = snapshot.stalled;
+        let marker = if stalled {
+            super::glyphs::interrupt()
         } else {
-            format!("working {label}")
+            spinner
+        };
+        let verb = if snapshot.phase == activity::ActivityPhase::Idle {
+            "working".to_owned()
+        } else {
+            snapshot.verb()
         };
         Some(HudLine::Working {
-            spinner,
+            marker,
+            stalled,
             verb,
-            suffix: format!(" · {secs}s · esc to interrupt"),
+            suffix: format!(
+                " · {} · esc to interrupt",
+                activity::format_age(snapshot.phase_age)
+            ),
+            detail: snapshot.detail(),
         })
     }
 
@@ -3132,10 +3161,11 @@ impl AppCore {
         Some(match self.working_hud_line()? {
             HudLine::Plain(text) => text,
             HudLine::Working {
-                spinner,
+                marker,
                 verb,
                 suffix,
-            } => format!("{spinner} {verb}{suffix}"),
+                ..
+            } => format!("{marker} {verb}{suffix}"),
         })
     }
 
