@@ -3063,7 +3063,23 @@ fn git_tools_say_that_submodule_worktree_changes_are_not_shown() {
         "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
     )
     .expect("gitmodules");
+
+    // Declared but not initialized: nothing is being hidden yet, so a notice
+    // would be noise on every call of a fresh clone.
     let registry = ToolRegistry::new(root);
+    let declared_only = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+    assert!(
+        !declared_only.output.contains("submodule"),
+        "{}",
+        declared_only.output
+    );
+
+    // `.git/modules/<name>` is what `git submodule update` creates, and is
+    // the point from which a worktree edit inside the submodule can be
+    // hidden by `--ignore-submodules=dirty`.
+    std::fs::create_dir_all(root.join(".git/modules/sub")).expect("initialized submodule");
 
     for tool in ["git_status", "git_diff"] {
         let execution = registry
