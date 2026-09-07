@@ -7881,7 +7881,24 @@ fn edit_file_modify_stores_workspace_checkpoint_and_rollback_restores() {
         fs::read_to_string(temp.path().join("note.txt")).expect("restored"),
         before
     );
-    assert_eq!(session.events().len(), prior_count + 1);
+    // A restore is recorded like any other write: it checkpoints what it
+    // replaces, appends its own file.change, then the restore ledger row.
+    let appended = &session.events()[prior_count..];
+    assert_eq!(
+        appended
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            EventKind::CHECKPOINT_STORED,
+            EventKind::FILE_CHANGE,
+            EventKind::WORKSPACE_RESTORE,
+        ]
+    );
+    assert_eq!(
+        payload_str(&appended[1], "origin"),
+        Some("workspace.restore")
+    );
     let restore = session.events().last().expect("workspace.restore");
     assert_eq!(restore.kind.as_str(), EventKind::WORKSPACE_RESTORE);
     assert_eq!(payload_str(restore, "path"), Some("note.txt"));

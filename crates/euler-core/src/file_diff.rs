@@ -230,6 +230,12 @@ impl WorkspaceSnapshot {
             return true;
         }
         if metadata.is_file() {
+            // A structured write's temporary file is never agent-authored
+            // content: a crash can leave one behind, and it must not surface
+            // as a change some command made.
+            if is_structured_write_temp(&name) {
+                return true;
+            }
             return self.record_file(entry.path(), path, metadata.len(), total_bytes);
         }
         true
@@ -507,6 +513,15 @@ fn relative_path(relative_dir: &str, name: &str) -> String {
     } else {
         format!("{relative_dir}/{name}")
     }
+}
+
+/// The temporary-file name shape a structured write renames from. Kept next
+/// to the snapshot walk so the ignore rule and the writer cannot drift.
+pub(crate) const STRUCTURED_WRITE_TEMP_PREFIX: &str = ".euler-write-";
+pub(crate) const STRUCTURED_WRITE_TEMP_SUFFIX: &str = ".tmp";
+
+pub(crate) fn is_structured_write_temp(name: &str) -> bool {
+    name.starts_with(STRUCTURED_WRITE_TEMP_PREFIX) && name.ends_with(STRUCTURED_WRITE_TEMP_SUFFIX)
 }
 
 fn ignored_dir(name: &OsStr) -> bool {

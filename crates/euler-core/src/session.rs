@@ -84,8 +84,8 @@ pub(crate) use permissions_gate::{
     approval_mode_str, permission_decision_payload, permission_request_for_tool, PermissionRuling,
 };
 pub(crate) use tool_dispatch::{
-    file_change_payload, file_diff_payload, prepare_checkpoint, tool_cancelled_payload,
-    tool_result_payload,
+    file_change_payload, file_diff_payload, prepare_checkpoint, prepare_checkpoint_for,
+    tool_cancelled_payload, tool_result_payload, PreparedCheckpoint,
 };
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
@@ -411,6 +411,52 @@ pub enum SessionError {
         "`{path}` changed after the checkpointed edit; restoring would discard that change. Inspect the file, then edit it directly"
     )]
     CheckpointFileChanged { path: String },
+}
+
+/// A restore's own `file.change`: it records what the workspace file held
+/// before and after, so the rollback baseline advances and the restore is
+/// itself restorable. `tool_call_id` is the checkpoint that was restored —
+/// no tool call produced this write.
+fn restore_file_change_payload(
+    checkpoint_event_id: &str,
+    path: &str,
+    before: &str,
+    after: &str,
+    pre_image_blob: Option<&str>,
+    checkpoint_stored_id: Option<&str>,
+) -> JsonObject {
+    let mut payload = object([
+        ("tool_call_id", checkpoint_event_id.to_owned().into()),
+        ("origin", EventKind::WORKSPACE_RESTORE.into()),
+        (
+            "action",
+            if before.is_empty() { "add" } else { "modify" }.into(),
+        ),
+        ("path", path.to_owned().into()),
+        ("old_path", Value::Null),
+        (
+            "before_sha256",
+            if before.is_empty() {
+                Value::Null
+            } else {
+                crate::tools::hash_bytes(before.as_bytes()).into()
+            },
+        ),
+        (
+            "after_sha256",
+            crate::tools::hash_bytes(after.as_bytes()).into(),
+        ),
+        ("before_byte_len", before.len().into()),
+        ("after_byte_len", after.len().into()),
+        ("diff_redaction", "omitted".into()),
+    ]);
+    if let Some(blob) = pre_image_blob {
+        payload.insert("pre_image_blob".to_owned(), blob.into());
+        if let Some(event_id) = checkpoint_stored_id {
+            payload.insert("checkpoint_event_id".to_owned(), event_id.into());
+        }
+    }
+    payload
 }
 
 /// The three facts a rollback needs: which file, the pre-image to restore,
@@ -3252,7 +3298,6 @@ impl<D: PermissionDecider> Session<D> {
         let expected_sha256 = events
             .iter()
             .filter(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
-            .filter(|event| required(event, "pre_image_blob").is_some())
             .filter(|event| required(event, "path").as_deref() == Some(path.as_str()))
             .filter_map(|event| required(event, "after_sha256"))
             .next_back()
@@ -3262,6 +3307,66 @@ impl<D: PermissionDecider> Session<D> {
             blob_sha256: required(checkpoint, "pre_image_blob").ok_or_else(missing)?,
             expected_sha256,
         })
+    }
+
+    /// Checkpoint what the restore replaces, replace it, and record the
+    /// result as an ordinary `file.change`.
+    ///
+    /// A restore is a destructive write like any other: recording it keeps it
+    /// undoable and advances the baseline the next rollback verifies against,
+    /// so rollback is not one-shot per path.
+    fn perform_restore(
+        &mut self,
+        checkpoint_event_id: &str,
+        path: &str,
+        replaced: &str,
+        content: &str,
+        expected: crate::tools::ExpectedTarget<'_>,
+    ) -> Result<Option<String>, SessionError> {
+        let restore_checkpoint = prepare_checkpoint_for(
+            self.config.root.as_path(),
+            checkpoint_event_id,
+            path,
+            if replaced.is_empty() { "add" } else { "modify" },
+            replaced,
+        )
+        .map_err(SessionError::CheckpointBlob)?;
+        let prepared_id = match &restore_checkpoint {
+            Some(prepared) => {
+                self.emit_control_event_required(
+                    EventKind::CHECKPOINT_STORED,
+                    prepared.payload.clone(),
+                )?;
+                self.bus.events().last().map(|event| event.id.clone())
+            }
+            None => None,
+        };
+        // Verify and replace resolve through one confined target, so an edit
+        // landing between the two is refused rather than clobbered.
+        let durability_warning = self
+            .tools
+            .write_verified_workspace_file(path, content, expected)
+            .map_err(|error| match error {
+                crate::ToolError::StalePreparedWrite { .. }
+                | crate::ToolError::FileAlreadyExists => SessionError::CheckpointFileChanged {
+                    path: path.to_owned(),
+                },
+                other => SessionError::from(other),
+            })?;
+        self.emit_control_event_required(
+            EventKind::FILE_CHANGE,
+            restore_file_change_payload(
+                checkpoint_event_id,
+                path,
+                replaced,
+                content,
+                restore_checkpoint
+                    .as_ref()
+                    .map(|prepared| prepared.blob.as_str()),
+                prepared_id.as_deref(),
+            ),
+        )?;
+        Ok(durability_warning)
     }
 
     /// Restore one workspace file to the pre-image captured on a `file.change`
@@ -3290,30 +3395,29 @@ impl<D: PermissionDecider> Session<D> {
             }
             Err(error) => return Err(SessionError::from(error)),
         };
-        let expected = match &current {
+        let replaced = match current {
             Some(current) if crate::tools::hash_bytes(current.as_bytes()) == expected_sha256 => {
-                crate::tools::ExpectedTarget::Exactly(current)
+                current
             }
             Some(_) => return Err(SessionError::CheckpointFileChanged { path }),
-            None => crate::tools::ExpectedTarget::Absent,
+            None => String::new(),
         };
-        // Verify and replace resolve through one confined target, so an edit
-        // landing between the two is refused rather than clobbered.
-        self.tools
-            .restore_workspace_file(&path, &content, expected)
-            .map_err(|error| match error {
-                crate::ToolError::StalePreparedWrite { .. }
-                | crate::ToolError::FileAlreadyExists => {
-                    SessionError::CheckpointFileChanged { path: path.clone() }
-                }
-                other => SessionError::from(other),
-            })?;
-        let payload = object([
+        let expected = if replaced.is_empty() {
+            crate::tools::ExpectedTarget::Absent
+        } else {
+            crate::tools::ExpectedTarget::Exactly(&replaced)
+        };
+        let durability_warning =
+            self.perform_restore(checkpoint_event_id, &path, &replaced, &content, expected)?;
+        let mut payload = object([
             ("path", path.clone().into()),
             ("checkpoint_event_id", checkpoint_event_id.to_owned().into()),
             ("blob_sha256", blob_sha256.clone().into()),
             ("restored", true.into()),
         ]);
+        if let Some(warning) = durability_warning {
+            payload.insert("durability_warning".to_owned(), warning.into());
+        }
         self.emit_control_event_required(EventKind::WORKSPACE_RESTORE, payload)?;
         let event_id = self
             .bus

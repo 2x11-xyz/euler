@@ -118,7 +118,9 @@ root to the target's *parent directory* and holding that descriptor: on Linux
 one `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
 RESOLVE_NO_MAGICLINKS`, falling back to a hop-by-hop `O_DIRECTORY | O_NOFOLLOW
 | O_CLOEXEC` walk when that syscall is unavailable (kernels before 5.6, or a
-seccomp profile that denies it); other Unix hosts always walk hop by hop. A
+seccomp profile that denies it); the fallback is latched process-wide, which
+is safe because that capability does not change while Euler runs and the
+walker is itself confined. Other Unix hosts always walk hop by hop. A
 component replaced between path resolution and the open — a directory swapped
 for a symlink, the root itself substituted — fails the walk rather than
 escaping the root. Every subsequent check runs on a descriptor obtained from
@@ -140,16 +142,37 @@ so the structured tools fail closed there rather than opening a joined path.
 - **The prepared pre-image must still be there.** A modifying write reads the
   target's current bytes and compares them to the exact content the tool call
   was prepared against. Anything else — a user edit, a `git checkout`, another
-  agent — is a refusal, not an overwrite, and the file is left alone.
+  agent — is a refusal, not an overwrite, and the file is left alone. The
+  comparison and the rename are two steps: a same-user edit landing between
+  them is replaced. Closing that would need file locks Euler does not take,
+  and the writer is a same-user process the workspace already trusts. A
+  symlink planted at the target name in that window is replaced as a
+  directory entry, never written through, so it cannot redirect the write.
 - **Writes are atomic.** The new bytes go to a temporary file created in the
   same confined directory, are given the target's permissions, are made
   durable, and are then renamed over the target name; the directory is synced
   afterwards. The target is only ever its complete old content or its complete
   new content, never a truncated intermediate, so a crash or an I/O failure
-  mid-write cannot leave a partial file. Because the replacement is a new
-  inode, any other hard link to the old file keeps the old content — editing a
-  multiply-linked file (a pnpm store, `cargo vendor`, `cp -al`) is allowed and
-  stays confined.
+  mid-write cannot leave a partial file. A create is the same promise by a
+  different route: `O_EXCL` reserves the name, and a failure before the
+  content is durable removes it again.
+  The replacement inherits the old file's permission bits masked to `0o777`
+  (setuid, setgid, and the sticky bit are never carried onto agent-written
+  content) and, where the process has the privilege, its ownership. Extended
+  attributes and ACLs are not copied; that loss is inherent to replace-by-
+  rename and is shared with `git` and most editors.
+  Because the replacement is a new inode, any other hard link to the old file
+  keeps the old content: editing a multiply-linked file (a pnpm store,
+  `cargo vendor`, `cp -al`) is allowed, stays confined, and silently breaks
+  the link — the alias keeps the pre-edit bytes.
+  A crash between creating the temporary file and renaming it can leave a
+  `.euler-write-<id>.tmp` sibling. The next structured write in that
+  directory removes stale ones, and workspace observation never reports them
+  as file changes.
+- **A published write is applied.** Once the rename succeeds the change is
+  present. If the directory entry cannot then be made durable, the tool still
+  succeeds and carries a durability warning; it is never reported as a failed
+  write.
 
 ## Rollback checkpoints
 
@@ -164,12 +187,19 @@ checkpoint applied and restorable.
 `/rollback` lists applied checkpoints only. A `checkpoint.stored` record with
 no `file.change` referencing it describes a write that was never observed to
 complete, so restoring it would be a destructive edit of its own. Before
-restoring, Euler verifies that the file still holds what the *newest* applied
-checkpoint for that path wrote — so an A→B→C chain can be rolled back to A,
-while a change made outside the ledger is refused rather than discarded. The
-verification and the replacement run against one confined target, so an edit
-landing between them is refused too. A checkpointed file the user deleted has
-nothing to discard and is recreated. Event shapes: `docs/contracts/events.md`.
+restoring, Euler verifies that the file still holds what the *newest*
+`file.change` for that path recorded — so an A→B→C chain can be rolled back to
+A, while a change made outside the ledger is refused rather than discarded.
+The verification and the replacement run against one confined target, so an
+edit landing between them is refused too. A checkpointed file the user deleted
+has nothing to discard and is recreated.
+
+A restore is itself a destructive write, and is recorded as one: it
+checkpoints the content it replaces and appends its own `file.change` with
+origin `workspace.restore`. That advances the baseline the next rollback
+verifies against — so rollback is not one-shot per file — and makes the
+restore undoable like any other write. Event shapes:
+`docs/contracts/events.md`.
 
 Process launch/executor completion and process success are separate facts.
 `run_shell` and direct Git tools retain collected output and the observed exit

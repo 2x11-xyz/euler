@@ -518,7 +518,8 @@ extension error does not consume the later result.
   `checkpoint_event_id` when a workspace checkpoint pre-image was stored for
   this edit. This event is metadata-only:
   `origin` is descriptive edit metadata with known values `edit_file`,
-  `apply_patch`, `run_shell:apply_patch`, and `run_shell`; `action` is `add`,
+  `apply_patch`, `run_shell:apply_patch`, `run_shell`, and
+  `workspace.restore`; `action` is `add`,
   `modify`, or `delete`, `old_path` is null, and `diff_redaction` is `omitted`.
   `run_shell:apply_patch` means Euler intercepted a strict apply-patch heredoc
   before shell execution; it does not mean a shell process ran. `run_shell`
@@ -550,7 +551,7 @@ extension error does not consume the later result.
   it describes a write that was not observed to complete, so its pre-image may
   already be the file's current content. A `file.change` referencing the same
   blob is what records the write as applied.
-  One residual window remains and is deliberate: the write is made durable
+  One residual window remains and is deliberate: the write is published
   before `patch.applied` and `file.change` are appended, so a crash in between
   leaves a changed file whose only checkpoint record is `checkpoint.stored`.
   `/rollback` will not offer it. The file's content is recoverable from the
@@ -558,7 +559,12 @@ extension error does not consume the later result.
   guess whether the write happened, which is exactly the guess audit F36
   removed.
 - `workspace.restore`: `path`, `checkpoint_event_id`, `blob_sha256`,
-  `restored` (always `true` on success). Appended when the user restores a
+  `restored` (always `true` on success), and optional `durability_warning`.
+  A restore also appends its own `checkpoint.stored` and `file.change` pair
+  with origin `workspace.restore`, whose `tool_call_id` is the checkpoint
+  event that was restored — no tool call produced this write. Recording the
+  restore advances the baseline the next rollback verifies against and makes
+  the restore itself undoable. Appended when the user restores a
   workspace file via `/rollback` to the pre-image of a prior applied
   `file.change`. A restore is refused when the target no longer holds exactly
   what the checkpointed edit wrote (`after_sha256`), so rolling back cannot

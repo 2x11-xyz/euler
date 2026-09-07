@@ -13,7 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -736,13 +736,17 @@ impl ToolRegistry {
 
     pub fn apply_patch(&self, patch: &PatchEvents) -> Result<(), ToolError> {
         self.apply_patch_cancellable(patch, &CancellationToken::new())
+            .map(|_| ())
     }
 
+    /// `Ok(Some(warning))` means the write is applied but its directory entry
+    /// could not be made durable. The write happened; the caller reports the
+    /// caveat rather than a failure.
     pub(crate) fn apply_patch_cancellable(
         &self,
         patch: &PatchEvents,
         cancellation: &CancellationToken,
-    ) -> Result<(), ToolError> {
+    ) -> Result<Option<String>, ToolError> {
         // This is the final check before the filesystem mutation. Patch
         // parsing, permission review, and `patch.proposed` emission may all
         // have taken time during which the user pressed Esc.
@@ -757,26 +761,25 @@ impl ToolRegistry {
         write_confined(&patch.target, &patch.write_content, expected)
     }
 
-    /// Read a workspace-relative path through the confined structured open
-    /// (used by `/rollback` to see what it is about to replace).
-    pub(crate) fn read_workspace_file(&self, relative: &str) -> Result<String, ToolError> {
-        self.read_resolved_file(&self.resolve_path(relative)?)
-    }
-
-    /// Replace a workspace-relative file (used by `/rollback`). `expected`
-    /// pins what must be there: the restore verifies and replaces through one
-    /// confined target, so nothing can slip in between.
-    pub(crate) fn restore_workspace_file(
+    /// Replace a workspace-relative file whose current content is already
+    /// known, without going through a prepared patch. Used by `/rollback`.
+    pub(crate) fn write_verified_workspace_file(
         &self,
         relative: &str,
         content: &str,
         expected: ExpectedTarget<'_>,
-    ) -> Result<(), ToolError> {
+    ) -> Result<Option<String>, ToolError> {
         let path = match expected {
             ExpectedTarget::Absent => self.resolve_create_path(relative)?,
             ExpectedTarget::Exactly(_) => self.resolve_path(relative)?,
         };
         write_confined(&path, content, expected)
+    }
+
+    /// Read a workspace-relative path through the confined structured open
+    /// (used by `/rollback` to see what it is about to replace).
+    pub(crate) fn read_workspace_file(&self, relative: &str) -> Result<String, ToolError> {
+        self.read_resolved_file(&self.resolve_path(relative)?)
     }
 
     fn run_shell(
@@ -1048,54 +1051,46 @@ fn write_confined(
     path: &ResolvedWorkspacePath,
     content: &str,
     expected: ExpectedTarget<'_>,
-) -> Result<(), ToolError> {
+) -> Result<Option<String>, ToolError> {
     let target = path.confine()?;
-    let ExpectedTarget::Exactly(expected) = expected else {
-        let mut file = target.create_new().map_err(|error| {
+    let durability = match expected {
+        ExpectedTarget::Absent => target.create_new(content.as_bytes()).map_err(|error| {
             if error.kind() == std::io::ErrorKind::AlreadyExists {
                 ToolError::FileAlreadyExists
             } else {
                 ToolError::Io(error)
             }
-        })?;
-        file.write_all(content.as_bytes())?;
-        crate::durability::sync_file_data(&file, target.absolute())?;
-        return Ok(());
+        })?,
+        ExpectedTarget::Exactly(expected) => {
+            let current = target.open_read()?;
+            let metadata = current.metadata()?;
+            if !metadata.is_file() {
+                return Err(ToolError::UnsupportedFileType {
+                    path: path.display(),
+                });
+            }
+            if read_to_string(current)? != expected {
+                return Err(ToolError::StalePreparedWrite {
+                    path: path.display(),
+                });
+            }
+            target.replace(content.as_bytes(), &metadata)?
+        }
     };
-    let current = target.open_read()?;
-    let metadata = current.metadata()?;
-    if !metadata.is_file() {
-        return Err(ToolError::UnsupportedFileType {
-            path: path.display(),
-        });
-    }
-    if read_to_string(current)? != expected {
-        return Err(ToolError::StalePreparedWrite {
-            path: path.display(),
-        });
-    }
-    target.replace(content.as_bytes(), file_mode(&metadata))?;
-    Ok(())
+    Ok(match durability {
+        structured_file::Durability::Synced => None,
+        structured_file::Durability::DirectoryUnsynced(reason) => Some(format!(
+            "`{}` was written, but its directory entry could not be made durable ({reason}); \
+the change is present and may not survive an immediate power loss",
+            path.display()
+        )),
+    })
 }
 
 fn read_to_string(mut file: fs::File) -> Result<String, ToolError> {
     let mut content = String::new();
     file.read_to_string(&mut content)?;
     Ok(content)
-}
-
-/// The permission bits the replacement must carry so an atomic replace does
-/// not silently reset a file's mode.
-#[cfg(unix)]
-fn file_mode(metadata: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    metadata.permissions().mode() & 0o7777
-}
-
-#[cfg(not(unix))]
-fn file_mode(_metadata: &fs::Metadata) -> u32 {
-    0o644
 }
 
 /// One prepared agent-controlled process, with enough provenance to remove

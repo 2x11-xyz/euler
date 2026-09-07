@@ -47,14 +47,6 @@ pub(crate) struct ConfinedTarget {
     absolute: PathBuf,
 }
 
-impl ConfinedTarget {
-    /// The joined path, for diagnostics and durability accounting only. It is
-    /// never re-resolved to reach the file.
-    pub(crate) fn absolute(&self) -> &Path {
-        &self.absolute
-    }
-}
-
 /// Resolve `relative` beneath `root` to a descriptor on its parent directory.
 pub(crate) fn confine(root: &Path, relative: &Path) -> io::Result<ConfinedTarget> {
     let components = normalized_components(relative)?;
@@ -117,64 +109,93 @@ impl ConfinedTarget {
         .map(fs::File::from)
     }
 
-    /// Create the target, failing if any name already exists there.
+    /// Create the target and fill it, failing if any name already exists.
     ///
-    /// `O_EXCL` is what makes an add refuse a file (or symlink) that appeared
-    /// after the tool call was prepared, instead of clobbering it.
-    pub(crate) fn create_new(&self) -> io::Result<fs::File> {
-        openat_in(
+    /// `O_EXCL` is the no-clobber guarantee: a file (or symlink) that
+    /// appeared after the tool call was prepared is refused, not overwritten.
+    /// A failure after the create removes the name again, so a create is
+    /// all-or-nothing like a replace.
+    pub(crate) fn create_new(&self, content: &[u8]) -> io::Result<Durability> {
+        let created = openat_in(
             &self.directory,
             &self.name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK,
             0o666,
-        )
-        .map(fs::File::from)
+        )?;
+        match self.fill(created, &self.name, content) {
+            Ok(()) => Ok(self.sync_directory()),
+            Err(error) => {
+                let _ = unlinkat(&self.directory, &self.name);
+                Err(error)
+            }
+        }
     }
 
     /// Replace the target's content atomically: write `content` to a fresh
-    /// file in the same confined directory, give it `mode`, make it durable,
-    /// then rename it over the target name and sync the directory.
+    /// file in the same confined directory, give it the old file's mode and
+    /// ownership, make it durable, then rename it over the target name.
     ///
     /// A crash at any point leaves the target as either its complete old
     /// content or its complete new content.
-    pub(crate) fn replace(&self, content: &[u8], mode: u32) -> io::Result<()> {
-        let temp_name = OsString::from(format!(".euler-write-{}.tmp", ulid::Ulid::new()));
+    pub(crate) fn replace(
+        &self,
+        content: &[u8],
+        previous: &fs::Metadata,
+    ) -> io::Result<Durability> {
+        self.remove_stale_temporaries();
+        let temp_name = OsString::from(format!(
+            "{}{}{}",
+            crate::file_diff::STRUCTURED_WRITE_TEMP_PREFIX,
+            ulid::Ulid::new(),
+            crate::file_diff::STRUCTURED_WRITE_TEMP_SUFFIX
+        ));
         let temp = openat_in(
             &self.directory,
             &temp_name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
             0o600,
         )?;
-        let published = self
-            .write_temp(temp, &temp_name, content, mode)
-            .and_then(|()| self.rename_over(&temp_name));
-        if let Err(error) = published {
+        let written = self
+            .inherit_identity(&temp, previous)
+            .and_then(|()| self.fill(temp, &temp_name, content));
+        if let Err(error) = written {
             let _ = unlinkat(&self.directory, &temp_name);
             return Err(error);
         }
+        if let Err(error) = self.rename_over(&temp_name) {
+            let _ = unlinkat(&self.directory, &temp_name);
+            return Err(error);
+        }
+        // Past this point the new content is published: the rename cannot be
+        // undone and the caller must not be told the write failed.
+        Ok(self.sync_directory())
+    }
+
+    /// Give the replacement the file it replaces. Permission bits are masked
+    /// to `0o777`: an atomic replace must never carry setuid, setgid, or the
+    /// sticky bit onto content the agent wrote. Ownership is best-effort —
+    /// only a root-owned Euler can set it, and `EPERM` is the ordinary case.
+    fn inherit_identity(&self, temp: &OwnedFd, previous: &fs::Metadata) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = previous.permissions().mode() & 0o777;
+        // SAFETY: the borrowed descriptor is live for the duration of the call.
+        if unsafe { libc::fchmod(temp.as_raw_fd(), mode as libc::mode_t) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: same live descriptor; a refusal is expected and ignored.
+        unsafe { libc::fchown(temp.as_raw_fd(), previous.uid(), previous.gid()) };
         Ok(())
     }
 
-    fn write_temp(
-        &self,
-        temp: OwnedFd,
-        temp_name: &OsStr,
-        content: &[u8],
-        mode: u32,
-    ) -> io::Result<()> {
+    fn fill(&self, file: OwnedFd, name: &OsStr, content: &[u8]) -> io::Result<()> {
         use std::io::Write as _;
 
-        let raw = temp.as_raw_fd();
-        let mut file = fs::File::from(temp);
+        let mut file = fs::File::from(file);
         file.write_all(content)?;
-        // Preserve the replaced file's permissions: the temp file was created
-        // 0o600 so no reader can see partial content under the real mode.
-        // SAFETY: `file` owns a live descriptor for the duration of the call.
-        if unsafe { libc::fchmod(raw, mode as libc::mode_t) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // The replacement must be on disk before the rename publishes it.
-        crate::durability::sync_file_data(&file, &self.absolute.with_file_name(temp_name))
+        // The bytes must be on disk before the name that publishes them.
+        crate::durability::sync_file_data(&file, &self.absolute.with_file_name(name))
     }
 
     fn rename_over(&self, temp_name: &OsStr) -> io::Result<()> {
@@ -193,12 +214,50 @@ impl ConfinedTarget {
         {
             return Err(io::Error::last_os_error());
         }
-        let parent = self
-            .absolute
-            .parent()
-            .ok_or_else(|| invalid("structured target has no parent directory"))?;
-        crate::durability::sync_dir(parent)
+        Ok(())
     }
+
+    /// Make the new directory entry durable through the descriptor the write
+    /// used, never by re-opening the path. A failure here does not undo the
+    /// write, so it is reported as a durability caveat rather than an error.
+    fn sync_directory(&self) -> Durability {
+        use std::os::fd::AsFd as _;
+
+        let parent = self.absolute.parent().unwrap_or(&self.absolute);
+        match crate::durability::sync_directory_fd(self.directory.as_fd(), parent) {
+            Ok(()) => Durability::Synced,
+            Err(error) => Durability::DirectoryUnsynced(error.to_string()),
+        }
+    }
+
+    /// Remove temporary files a crashed earlier write left in this directory.
+    /// Best-effort: a name that cannot be read or unlinked is left alone.
+    fn remove_stale_temporaries(&self) {
+        let Some(parent) = self.absolute.parent() else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(parent) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .is_some_and(crate::file_diff::is_structured_write_temp)
+            {
+                let _ = unlinkat(&self.directory, &name);
+            }
+        }
+    }
+}
+
+/// Whether the published write reached the disk. The content itself is
+/// always durable before it is published; only the directory entry can be
+/// left unsynced, and that cannot un-publish the write.
+#[derive(Debug)]
+pub(crate) enum Durability {
+    Synced,
+    DirectoryUnsynced(String),
 }
 
 #[cfg(unix)]

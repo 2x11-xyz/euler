@@ -2470,3 +2470,124 @@ fn public_tool_surface_has_no_plural_root_symbols() {
         );
     }
 }
+
+#[test]
+fn a_create_that_cannot_be_made_durable_leaves_no_partial_file() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let execution = registry
+        .execute(
+            "write_file",
+            &json!({"path": "new.txt", "content": "agent"}),
+        )
+        .expect("prepare create");
+
+    let guard = arm_matching(Op::FileSync, |path| path.ends_with("new.txt"));
+    let error = registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect_err("an undurable create must not be reported as applied");
+    assert!(guard.fired());
+    drop(guard);
+
+    assert!(matches!(error, ToolError::Io(_)), "{error}");
+    assert!(
+        !temp.path().join("new.txt").exists(),
+        "the created name must be removed again, not left partial"
+    );
+}
+
+#[test]
+fn a_directory_sync_failure_does_not_undo_a_published_write() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("note.txt");
+    fs::write(&target, "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+
+    let guard = arm_matching(Op::DirSync, |_| true);
+    let warning = registry
+        .apply_patch_cancellable(
+            edit.patch.as_ref().expect("patch"),
+            &CancellationToken::new(),
+        )
+        .expect("a rename that succeeded is an applied write");
+    assert!(guard.fired());
+    drop(guard);
+
+    let warning = warning.expect("the durability caveat is surfaced");
+    assert!(warning.contains("could not be made durable"), "{warning}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_stale_temporary_file_is_swept_and_never_observed_as_a_change() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("note.txt");
+    fs::write(&target, "old\n").expect("target");
+    // What a crash between temp create and rename leaves behind.
+    let stale = temp.path().join(".euler-write-01ABCDEF.tmp");
+    fs::write(&stale, "orphaned").expect("stale temp");
+
+    let before = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+    let after = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+    assert!(
+        before.changes_to(&after).is_empty(),
+        "a leftover temp is never workspace content"
+    );
+
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect("apply");
+
+    assert!(!stale.exists(), "the next write sweeps stale temporaries");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_atomic_replace_never_carries_setuid_onto_agent_content() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("tool");
+    fs::write(&target, "old\n").expect("target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o4755)).expect("chmod setuid");
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "tool", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect("apply");
+
+    let mode = fs::metadata(&target)
+        .expect("metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755, "permission bits are preserved");
+    assert_eq!(
+        mode & 0o7000,
+        0,
+        "setuid/setgid/sticky are not carried over"
+    );
+}

@@ -7431,64 +7431,6 @@ fn run_note_edit(root: &std::path::Path, old: &str, new: &str) -> Session<Script
 }
 
 #[test]
-fn every_checkpoint_in_a_chain_stays_restorable() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let note = temp.path().join("note.txt");
-    std::fs::write(&note, "a\n").expect("fixture");
-    let provider = ScriptedProvider::new(vec![
-        FixtureResponse::ToolCalls(vec![euler_provider::ToolCall {
-            id: "call-1".to_owned(),
-            name: "edit_file".to_owned(),
-            input: json!({"path": "note.txt", "old": "a", "new": "b"}),
-        }]),
-        FixtureResponse::ToolCalls(vec![euler_provider::ToolCall {
-            id: "call-2".to_owned(),
-            name: "edit_file".to_owned(),
-            input: json!({"path": "note.txt", "old": "b", "new": "c"}),
-        }]),
-    ]);
-    let mut session = Session::new(
-        SessionConfig::new(temp.path()),
-        provider,
-        ScriptedDecider::new(vec![
-            crate::permissions::DeciderVerdict::Allow,
-            crate::permissions::DeciderVerdict::Allow,
-        ]),
-    );
-    let _ = session.run_turn("edit once");
-    let _ = session.run_turn("edit twice");
-    assert_eq!(std::fs::read_to_string(&note).expect("read"), "c\n");
-
-    let checkpoints = session.workspace_checkpoints();
-    assert_eq!(checkpoints.len(), 2);
-    let oldest = checkpoints
-        .last()
-        .expect("oldest checkpoint")
-        .event_id
-        .clone();
-    let newest = checkpoints
-        .first()
-        .expect("newest checkpoint")
-        .event_id
-        .clone();
-
-    // The oldest checkpoint is still restorable: the file holds what the
-    // newest ledger write left there, so nothing outside the ledger is lost.
-    session
-        .restore_workspace_checkpoint(&oldest)
-        .expect("restoring to the start of the chain is legitimate");
-    assert_eq!(std::fs::read_to_string(&note).expect("read"), "a\n");
-
-    // After that restore the file no longer matches the newest write, so a
-    // second rollback must refuse rather than clobber it.
-    let error = session
-        .restore_workspace_checkpoint(&newest)
-        .expect_err("the file no longer holds the newest ledger content");
-    assert!(matches!(error, SessionError::CheckpointFileChanged { .. }));
-    assert_eq!(std::fs::read_to_string(&note).expect("read"), "a\n");
-}
-
-#[test]
 fn rollback_recreates_a_checkpointed_file_the_user_deleted() {
     let temp = tempfile::tempdir().expect("temp dir");
     let note = temp.path().join("note.txt");
@@ -7597,4 +7539,75 @@ fn a_legacy_file_change_without_the_new_fields_still_lists_and_restores() {
         .restore_workspace_checkpoint(&event_id)
         .expect("legacy checkpoints stay restorable");
     assert_eq!(std::fs::read_to_string(&note).expect("read"), before);
+}
+
+#[test]
+fn a_restore_records_itself_and_stays_undoable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    std::fs::write(&note, "a\n").expect("fixture");
+    let provider = ScriptedProvider::new(
+        ["b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(index, new)| {
+                let old = ["a", "b", "c"][index];
+                FixtureResponse::ToolCalls(vec![euler_provider::ToolCall {
+                    id: format!("call-{index}"),
+                    name: "edit_file".to_owned(),
+                    input: json!({"path": "note.txt", "old": old, "new": new}),
+                }])
+            })
+            .collect(),
+    );
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow; 3]),
+    );
+    for _ in 0..3 {
+        let _ = session.run_turn("edit");
+    }
+    assert_eq!(std::fs::read_to_string(&note).expect("read"), "d\n");
+
+    let checkpoints = session.workspace_checkpoints();
+    assert_eq!(checkpoints.len(), 3);
+    let oldest = checkpoints
+        .last()
+        .expect("oldest checkpoint")
+        .event_id
+        .clone();
+    let newest = checkpoints
+        .first()
+        .expect("newest checkpoint")
+        .event_id
+        .clone();
+
+    // Restore the oldest: the file goes back to the start of the chain.
+    session
+        .restore_workspace_checkpoint(&oldest)
+        .expect("restore the oldest checkpoint");
+    assert_eq!(std::fs::read_to_string(&note).expect("read"), "a\n");
+
+    // The restore recorded its own file.change, so the baseline advanced and
+    // rollback is not one-shot: the newest checkpoint is restorable next.
+    session
+        .restore_workspace_checkpoint(&newest)
+        .expect("rollback is not one-shot per path");
+    assert_eq!(std::fs::read_to_string(&note).expect("read"), "c\n");
+
+    // And a restore is itself undoable: its own checkpoint is the newest one.
+    let undo = session.workspace_checkpoints()[0].event_id.clone();
+    session
+        .restore_workspace_checkpoint(&undo)
+        .expect("a restore is undoable like any other write");
+    assert_eq!(std::fs::read_to_string(&note).expect("read"), "a\n");
+
+    let restore_changes = events_of_kind(session.events(), EventKind::FILE_CHANGE)
+        .into_iter()
+        .filter(|event| {
+            event.payload.get("origin").and_then(Value::as_str) == Some("workspace.restore")
+        })
+        .count();
+    assert_eq!(restore_changes, 3, "every restore records its own change");
 }

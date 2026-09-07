@@ -73,8 +73,10 @@ pull requests that landed them; deeper design rationale lives in
   stored durably does not happen at all. A checkpoint whose write was never
   observed to complete is never restorable, and restoring an applied
   checkpoint first verifies that the file still holds what the newest
-  checkpointed write left there — so a rollback can no longer silently discard
-  a later edit. A checkpointed file the user deleted is recreated.
+  recorded write left there — so a rollback can no longer silently discard a
+  later edit. A checkpointed file the user deleted is recreated, and a restore
+  is now recorded as a change of its own, so rollback is repeatable on the
+  same file and a restore can itself be undone.
 
 ### Project context and skills
 

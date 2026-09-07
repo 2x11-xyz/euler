@@ -196,13 +196,14 @@ impl<D: PermissionDecider> Session<D> {
             self.bus.events(),
             cancellation,
         ) {
-            Ok(ToolExecutionOutcome::Completed(execution)) => {
+            Ok(ToolExecutionOutcome::Completed(mut execution)) => {
                 // The input format was accepted: reset this tool's re-teach
                 // streak even if a later write fails for environmental
                 // reasons (the streak tracks format competence, issue #94).
                 self.tool_reteach
                     .record_success(self.tools.reteach_identity(&call.name, &call.input));
-                if let Some(patch) = execution.patch.as_ref() {
+                if let Some(patch) = execution.patch.clone() {
+                    let patch = &patch;
                     let mut payload = object([
                         ("path", patch.path.clone().into()),
                         ("old", patch.before.clone().into()),
@@ -238,7 +239,14 @@ impl<D: PermissionDecider> Session<D> {
                         None => None,
                     };
                     match self.tools.apply_patch_cancellable(patch, cancellation) {
-                        Ok(()) => {}
+                        // A published write whose directory entry could not
+                        // be synced is applied, not failed: the caveat rides
+                        // the successful result.
+                        Ok(warning) => {
+                            if let Some(warning) = warning {
+                                execution.output.push_str(&format!("\nwarning: {warning}"));
+                            }
+                        }
                         Err(ToolError::Cancelled) => {
                             self.emit_cancelled_tool_result(
                                 call,
@@ -582,21 +590,36 @@ pub(crate) fn prepare_checkpoint(
     patch: &PatchEvents,
 ) -> Result<Option<PreparedCheckpoint>, String> {
     // v0: modify-only. Adds have empty before; restore-as-delete is product debt.
-    if patch.action != "modify" || patch.before.is_empty() {
+    if patch.action != "modify" {
         return Ok(None);
     }
-    let blob =
-        crate::checkpoints::store_pre_image(root, &patch.path, &patch.before).map_err(|error| {
-            format!(
-                "the rollback checkpoint for this edit could not be stored ({error}); \
+    prepare_checkpoint_for(root, tool_call_id, &patch.path, patch.action, &patch.before)
+}
+
+/// The same guarantee for a write that has no prepared patch behind it — a
+/// `/rollback` restore is a destructive write like any other and needs its
+/// own way back.
+pub(crate) fn prepare_checkpoint_for(
+    root: &std::path::Path,
+    tool_call_id: &str,
+    path: &str,
+    action: &'static str,
+    replaced: &str,
+) -> Result<Option<PreparedCheckpoint>, String> {
+    if replaced.is_empty() {
+        return Ok(None);
+    }
+    let blob = crate::checkpoints::store_pre_image(root, path, replaced).map_err(|error| {
+        format!(
+            "the rollback checkpoint for this edit could not be stored ({error}); \
 the file was not changed"
-            )
-        })?;
+        )
+    })?;
     Ok(blob.map(|blob| PreparedCheckpoint {
         payload: object([
             ("tool_call_id", tool_call_id.to_owned().into()),
-            ("path", patch.path.clone().into()),
-            ("action", patch.action.into()),
+            ("path", path.to_owned().into()),
+            ("action", action.into()),
             ("pre_image_blob", blob.as_str().into()),
             (
                 "status",
