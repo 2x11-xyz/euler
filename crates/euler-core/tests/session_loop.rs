@@ -1779,7 +1779,7 @@ fn statically_safe_command_auto_approves_without_prompt() {
         FixtureResponse::ToolCalls(vec![ToolCall {
             id: "call-safe".to_owned(),
             name: "run_shell".to_owned(),
-            input: json!({"command": "find . | head -2"}),
+            input: json!({"command": "find . | head -n 2"}),
         }]),
         FixtureResponse::Assistant("done".to_owned()),
     ]);

@@ -687,8 +687,10 @@ mod tests {
         for command in [
             "cargo test && cargo clippy",
             "cargo test || true",
-            "cargo test; git status",
-            "cargo test | head -5",
+            // `git` is no longer provably read-only (it runs repo-controlled
+            // helpers), so the safe companion segment here is `ls`.
+            "cargo test; ls -la",
+            "cargo test | head -n 5",
             "cargo test\ncargo clippy --workspace",
             // Simple invocations with quoted spaces stay covered.
             "cargo test --features \"a b\" -q",

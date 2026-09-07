@@ -45,6 +45,16 @@ pub struct PermissionRequest {
     /// accessing the file takes an explicit decision or a covering grant
     /// (deep review P1-b).
     pub sensitive_path: bool,
+    /// True when the permissive danger walk
+    /// ([`crate::command_safety::contains_dangerous_command`]) flagged
+    /// `command`, or when the command was truncated so no walk can read
+    /// it. Computed ONCE, in [`PermissionRequest::with_command`].
+    ///
+    /// Such a request is auto-approved by nothing: no grant covers it
+    /// ([`PermissionGate::granted_source`]) and no capability mode short of
+    /// `always-deny` skips its prompt
+    /// ([`PermissionGate::mode_for_request`]) — ADR 0021 decision D.
+    pub dangerous_command: bool,
 }
 
 impl PermissionRequest {
@@ -57,6 +67,7 @@ impl PermissionRequest {
             path: None,
             workspace_root: None,
             sensitive_path: false,
+            dangerous_command: false,
         }
     }
 
@@ -72,6 +83,16 @@ impl PermissionRequest {
             .command
             .as_deref()
             .is_some_and(|bounded| bounded.len() < full.trim().len());
+        // Walked once here, then carried on the request: the dispatcher,
+        // grant matching, and the gate all read this field instead of
+        // re-parsing the command. A truncated command is dangerous by
+        // definition — the walk would read a prefix while `sh -c` runs the
+        // whole string, and a `;` past the bound hides anything.
+        self.dangerous_command = self.command_truncated
+            || self
+                .command
+                .as_deref()
+                .is_some_and(crate::command_safety::contains_dangerous_command);
         self
     }
 
@@ -426,11 +447,17 @@ impl<D> PermissionGate<D> {
     /// never weakened.
     pub fn mode_for_request(&self, request: &PermissionRequest) -> ApprovalMode {
         let mode = self.mode(request.capability);
-        if mode == ApprovalMode::SessionAllow && request.sensitive_path {
-            ApprovalMode::Ask
-        } else {
-            mode
+        if mode == ApprovalMode::AlwaysDeny {
+            return mode;
         }
+        // A sensitive path never rides a blanket allow (deep review P1-b),
+        // and neither does a dangerous or unreadable command: under ADR
+        // 0021 decision D the danger veto holds in EVERY mode, so a forced
+        // `rm` prompts even under full access.
+        if request.sensitive_path || request.dangerous_command {
+            return ApprovalMode::Ask;
+        }
+        mode
     }
 
     pub fn configured_capabilities(&self) -> impl Iterator<Item = Capability> + '_ {
@@ -552,12 +579,10 @@ impl<D> PermissionGate<D> {
     /// dispatcher and the grant check inside `decide_detailed_cancellable`,
     /// so the veto holds on every path.
     pub fn granted_source(&self, request: &PermissionRequest) -> Option<GrantSource> {
-        let command = request.command_for_matching();
-        if request.capability == Capability::ShellExec
-            && command.is_some_and(crate::command_safety::contains_dangerous_command)
-        {
+        if request.dangerous_command {
             return None;
         }
+        let command = request.command_for_matching();
         let path = request.path.as_deref();
         let root = request.workspace_root.as_deref();
         if self
@@ -1280,13 +1305,23 @@ mod tests {
         );
         assert_eq!(gate.granted_source(&request), None);
 
-        // Unscoped grants are capability-wide and unaffected by truncation.
+        // Review round 2, finding 10: an UNSCOPED grant used to cover a
+        // truncated command, because `command_for_matching()` returns None
+        // and an unscoped pattern matches capability-wide. That let
+        // `rm -rf .; echo <4 KiB of padding>` run with no prompt. A command
+        // nobody can read is now covered by no grant at all.
         gate.install_grant(
             Capability::ShellExec,
             GrantScope::Session(ScopePattern::unscoped()),
         )
         .expect("install unscoped");
-        assert!(gate.is_granted(&request));
+        assert!(!gate.is_granted(&request));
+        assert!(request.dangerous_command);
+        assert_eq!(
+            gate.mode_for_request(&request),
+            ApprovalMode::Ask,
+            "a truncated command must reach the prompt"
+        );
 
         // Non-truncated commands keep working.
         let short = PermissionRequest::new(Capability::ShellExec, "tool run_shell")

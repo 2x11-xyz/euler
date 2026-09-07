@@ -279,6 +279,12 @@ pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String>
 /// cwd from the request; without one no segment counts as safe and the
 /// offer follows the same fail-closed rule as coverage.
 pub(crate) fn derive_shell_prefix(command: &str, workspace_root: Option<&Path>) -> Option<String> {
+    // A danger-flagged command is covered by no grant, so offering
+    // "Allow rm * for this session" would offer a scope the gate can never
+    // honor — the next `rm -rf` would prompt again anyway.
+    if euler_core::command_safety::contains_dangerous_command(command) {
+        return None;
+    }
     let segments = parse_plain_segments(command)?;
     let mut unsafe_tokens = segments
         .iter()

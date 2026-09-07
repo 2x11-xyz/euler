@@ -8,31 +8,39 @@ pull requests that landed them; deeper design rationale lives in
 
 ### Shell command safety
 
-- Static shell approval now uses a two-parser design modeled on OpenAI
-  Codex instead of a name-keyed allowlist. A conservative grammar may prove
-  a command safe — literal words only, no shell-rewritable word for any
-  binary, per-binary argument rules, and `[sh|bash|zsh] -c` proved by
-  recursion — and a separate permissive walk may only find danger. A
-  command the danger walk flags (a forced `rm` anywhere, including inside
-  control flow, substitutions, and `sudo`/`env`/`trap`/`nohup`/`time`/
-  `xargs` wrappers) is never auto-approved by any rule: not by static
-  safety and not by any grant, scoped or unscoped. Capability modes are
-  unchanged.
-- Three auto-approvals that could act outside the workspace are gone
-  (audit F01, F02, F34). `uniq in out` truncates and writes `out`, so
-  `uniq` now allows at most one operand. Unquoted globs, `~`, and other
-  expansions are never provable for any binary — confinement used to run on
-  the literal word while the shell expanded it. `cd` left the read-only set
-  entirely, because a compound list's later segments were checked against
-  the directory the command started in. Traversal flags that dereference
-  symlinks (`ls -R`/`-L`, `grep -R`, `rg -L`/`--follow`, `find -L`/
-  `-follow`, `tail -f`) are no longer provable.
+- Static shell approval now parses with `tree-sitter-bash` and uses the
+  two-parser design of OpenAI Codex instead of a name-keyed allowlist over
+  a hand-rolled tokenizer. A conservative parser may prove a command safe —
+  an allowed node-kind tree, literal words only, and an allowlist of exact
+  option spellings per binary — and a separate permissive walk may only
+  find danger. The walk visits every command node, including inside control
+  flow, substitutions, redirection arguments, and the scripts carried by
+  `sh -c`, `eval`, `env -S`, and `trap`, and unwraps `sudo`, `su`, `env`,
+  `timeout`, `nice`, `xargs`, `exec`, `command`, and the rest.
+- A command that walk flags is **never auto-approved, in any mode**: no
+  grant covers it, and every capability mode short of `always-deny` is
+  escalated to a prompt for that request, so a forced `rm` asks even under
+  a blanket session allow. The danger table is extensible and covers more
+  than forced `rm`: `run_shell` closes stdin, so `rm -r` never gets its
+  confirmation, and `find -delete`, `git clean -f`, `shred`, `truncate`,
+  `dd of=`, `wipefs`, and `mkfs*` are in it too. A command truncated at the
+  retention bound counts as unreadable, so it can no longer ride an
+  unscoped grant.
+- Auto-approvals that could act outside the workspace are gone (audit F01,
+  F02, F34). `uniq in out` writes `out`, so `uniq` allows at most one
+  operand. Shell-rewritable words (globs, `~`, `${...}`, `$'...'`) are
+  never provable for any binary. `cd` and `git` left the read-only set —
+  `cd` moves the directory confinement is checked against, and read-only
+  `git` subcommands still run repository-controlled `diff.external`,
+  `core.fsmonitor`, and filter programs. Traversal flags that dereference
+  symlinks, attached option values, and GNU long abbreviations are all
+  rejected by the allowlist rather than chased with a denylist.
 - The sensitive-path denylist (which blocks both static shell approval and
   blanket fs-tool grants) now covers anything under a `.git` component,
   `.gitmodules`, `.gitattributes`, `.gitconfig`, `.cargo/config.toml`,
-  `.npmrc`, `.netrc`, and shell startup files — configuration an
-  interpreter honors on its next run, which is how a "read-only" write
-  became arbitrary execution at the next `git status`.
+  `.npmrc`, `.netrc`, and shell startup files, and applies to a path's
+  canonicalized form as well as its spelling, so an in-workspace symlink
+  cannot read through it.
 
 ### Project context and skills
 

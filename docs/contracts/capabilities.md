@@ -297,68 +297,68 @@ without a resolvable user grant dir hides it entirely.
 
 Core performs static analysis of `shell-exec` command lines
 (`euler-core/src/command_safety.rs`). Execution is `sh -c <command>`, so the
-analysis reasons about the whole line. It uses **two parsers**: one
-conservative parser that may prove a command safe, and one permissive walk
-that may only find danger. Neither can do the other's job.
+analysis reasons about the whole line. It parses with **tree-sitter-bash**
+and uses **two parsers over that syntax tree**: one conservative parser that
+may prove a command safe, and one permissive walk that may only find danger.
+Neither can do the other's job, and a lexical approximation of shell can do
+neither: redirections glued to a word, `${...}`, `$'...'`, brace expansion,
+and here-documents all evade a tokenizer while an AST reports them as
+distinct nodes.
 
 **Parser 1 — prove-safe grammar (conservative).**
 
-- **Parsing.** A command line decomposes into plain segments across `&&`,
-  `||`, `;`, `|`, and newlines. The tokenizer honors single/double quotes
-  (quoted metacharacters are literal text, never operators). Any redirect
-  (`>`, `<`, `>>`, `<<`), subshell/grouping/brace form (`(`, `)`, `{`, `}`),
-  substitution or expansion (`$`, backtick — including inside double
-  quotes), background `&`, comment, unterminated quote, control-flow
-  keyword, or empty segment makes the whole command **not statically
-  analyzable**. Unparseable commands are never auto-approved and never
-  covered by scoped grants; they fall to the ask path. False negatives cost
-  a prompt; false positives are forbidden.
+- **Parsing.** The parse must succeed with no error node, and every node in
+  the tree must be one of `program`, `list`, `pipeline`, `command`,
+  `command_name`, `word`, `string`, `string_content`, `raw_string`,
+  `number`, `concatenation`, joined only by `&&`, `||`, `;`, `|`. Anything
+  else — a redirection, here-document, here-string, substitution,
+  expansion, subshell, brace group, control flow, background `&`, variable
+  assignment — makes the command **not statically analyzable**. Such
+  commands are never auto-approved and never covered by scoped grants; they
+  fall to the ask path. False negatives cost a prompt; false positives are
+  forbidden.
 - **Literal words.** Every word must be exactly what the binary will
-  receive. A word carrying an unquoted `*`, `?`, `[`, `]`, `~`, `^`, or
-  `#`, or beginning with `=`, is never provable for ANY binary: the shell
-  rewrites it after the analysis ran, so confinement would be checked
-  against a spelling rather than against the files actually read.
-- **Classification.** Each segment's binary must be in the read-only set
-  AND satisfy that binary's argument rule:
-  `cat cut echo expr false head id nl paste pwd rev seq stat tr true uname
-  wc which whoami` (no flag or operand of these writes, executes, or
-  traverses); `ls` (no `-R`/`--recursive`, no `-L`/`--dereference`); `grep`
-  (no `-R`/`--dereference-recursive`; plain `-r` does not follow symlinks);
-  `tail` (no `-f`/`-F`/`--follow`/`--retry`); `uniq` (at most one operand —
-  the second operand is an output file `uniq` truncates); `find` (no
-  `-exec`/`-execdir`/`-ok`/`-okdir`/`-delete`/`-fls`/`-fprint`/`-fprint0`/
-  `-fprintf`, no `-L`/`-follow`); `rg` (no `--pre`/`--hostname-bin`/
-  `--search-zip`/`-z`, no `-L`/`--follow`, including bundled shorts);
-  `base64` (no `-o`/`--output`); `sed` (only `sed -n Np` / `sed -n M,Np`
-  print-range form); `git` (only `status`/`log`/`diff`/`show`/`branch` as
-  the token immediately after `git` — any global flag rejects — with no
-  `--output`/`--ext-diff`/`--textconv`/`--exec` args, and `branch` only as
-  a pure listing query). Binaries outside this set are never provable,
-  `sort` (`-o` writes a file) and `tee` among them. `cd` is deliberately
-  absent: it moves the directory later segments resolve against while
-  confinement keeps checking the root the command started in.
+  receive: no `* ? [ ] { } ~ $ ` \ ^ #`, and no word beginning with `=`.
+  A word the shell may rewrite is never proof, for any binary.
+- **Options are an allowlist.** Each binary in the read-only set declares
+  the exact option spellings it accepts. An unknown option, a GNU long
+  abbreviation (`--recu`, `--dereference-rec`, `--fol`), an attached short
+  value (`-oout.bin`, `-i.env`, `-n50`), or a bundle containing an unlisted
+  letter (`-rS`, `-Do`) is simply not provable. A denylist has to enumerate
+  every harmful spelling on every platform and misses one; this polarity
+  cannot.
+- **Read-only set.** `true false pwd whoami id uname echo expr seq which
+  cat head tail wc ls nl paste rev cut tr stat uniq grep rg base64`, plus
+  `find` (only the enumerated read-only predicates, so `-exec`, `-delete`,
+  `-L`, `-follow` are rejected by omission) and `sed` (only the print-range
+  form `sed -n Np [file]`). `uniq` accepts at most one operand, because the
+  second operand is an output file it truncates. Binaries outside the set
+  are never provable — `sort` (`-o` writes a file), `tee`, and every
+  interpreter included.
+- **`git` is not in the set**, even for `status`/`log`/`diff`/`show`. Those
+  subcommands execute repository-controlled programs through
+  `diff.external`, `core.fsmonitor`, `core.pager`, and clean and smudge
+  filters, all selected by `.git/config` — the very file audit F34 showed a
+  "read-only" command could write. Proving `git` safe needs the sandbox,
+  not a parser; it returns in Unit 2 (ADR 0021 row P).
+- **`cd` is not in the set**: it moves the directory later commands resolve
+  against while confinement keeps checking the root the command started in.
 - **Wrappers.** `[sh|bash|zsh] -c|-lc <script>` is provable only by
-  recursively proving `<script>` under these same rules, depth-capped at
-  eight. No other wrapper form (`env`, `/bin/sh`, extra flags) is provable.
+  recursively proving `<script>`, depth-capped at eight. No other wrapper
+  form (`env`, `/bin/sh`, extra flags) is provable.
 - **Workspace confinement.** Read-only is not harmless: `cat
-  ~/.aws/credentials` writes nothing and still exfiltrates. Every argument
-  of a safe segment that may name a filesystem path must stay inside the
-  workspace root the command executes in: an existing path must
-  canonicalize (symlinks resolved) under the canonicalized root; a
-  non-existing argument must be relative with no `..` component, no leading
-  `~`, and no `$`/backtick. Argument positions are classified
-  conservatively — only the grep/rg pattern position is exempt, and only
-  when no `-e`/`-f`-style flag can shift it; `--flag=value` values are
-  checked, and flags that could carry an attached path reject. A rejected
-  segment is simply not statically safe: the command falls back to the
-  ordinary ask path (fail open to ask, never a new denial surface).
+  ~/.aws/credentials` writes nothing and still exfiltrates. Every operand
+  and every option value — there is no exempt position, so a regex operand
+  is checked like any other word — must stay inside the workspace root the
+  command executes in: an existing path must canonicalize (symlinks
+  resolved) under the canonicalized root; a non-existing argument must be
+  relative with no `..` component and no leading `~`.
 - **Sensitive paths.** One denylist, used by static shell analysis and by
-  the fs-tool "Sensitive-basename ask" below (one list, not two), rejecting
-  a path even inside the workspace:
+  the fs-tool "Sensitive-basename ask" below (one list, not two), applied
+  to the literal spelling AND to the canonicalized resolution — so an
+  innocently named in-workspace symlink cannot read through it:
   - anything with a `.git` path component — the directory, the worktree
-    pointer file, and everything under it: `.git/config` selects hooks,
-    filters, and pagers, so writing one turns a later `git status` into
-    arbitrary execution;
+    pointer file, and everything under it;
   - `.gitmodules`, `.gitattributes`, `.gitconfig`, `.npmrc`, `.netrc`,
     `.cargo/config.toml` (and `.cargo/config`) — configuration an
     interpreter or build tool honors on its next run;
@@ -367,23 +367,38 @@ that may only find danger. Neither can do the other's job.
     `.zlogin`, `.zlogout`;
   - `.env*`, names containing `secret`/`credential`, `id_rsa`,
     `id_ed25519`, `*.pem`, `*.key`.
-- A command is **statically safe** iff it parses AND every segment is safe
-  AND every segment's path arguments are confined and non-sensitive AND the
-  danger walk below finds nothing.
+- A command is **statically safe** iff it parses under this grammar AND
+  every command in it is read-only with rule-conforming options AND every
+  operand and option value is confined and non-sensitive AND the danger
+  walk below finds nothing.
 
-**Parser 2 — find-danger walk (permissive).** A separate function walks
-*every* command in the line, including inside control flow, command
-substitutions, quoted wrapper scripts, and `sudo`/`env`/`trap`/`nohup`/
-`time`/`xargs` wrappers (depth-capped at eight; exceeding the cap counts as
-dangerous). Words it cannot resolve statically are dropped rather than
-rejected, so it is deliberately over-inclusive: it **must never be used to
-prove safety**. It flags a forced `rm` (`-f`, `--force`, `-rf`, …).
+**Parser 2 — find-danger walk (permissive).** A separate function visits
+*every* command node in the tree — inside control flow, command and process
+substitutions, expansions, redirection arguments, and the scripts carried by
+`sh -c`, `eval`, `env -S`, and `trap` — and unwraps `sudo`, `doas`, `su`,
+`env`, `nohup`, `time`, `timeout`, `nice`, `ionice`, `chrt`, `stdbuf`,
+`setsid`, `flock`, `xargs`, `command`, `builtin`, and `exec`. It **must
+never be used to prove safety**. It fails closed on a parse error, on a
+dynamic command name, on a dynamic argument of a dangerous or wrapper
+command, on an unrecognized `env` option, and past a wrapper depth of eight;
+both walks are iterative and node-bounded, so nesting cannot exhaust the
+stack.
 
-A flagged command is **never auto-approved by any rule**: it is not
-statically safe, and no grant — scoped or unscoped, session, project, or
-user — covers it. Under `ask` it prompts; under a never-prompt decider that
-same path denies. Capability modes are unchanged: `always-deny` still
-denies and `session-allow`/`always-allow` still allow capability-wide.
+Its danger predicate is an intentionally **extensible table** of commands
+that destroy data with no undo: `rm` with `-r`/`-R`/`-f`/`--recursive`/
+`--force` or any GNU abbreviation of those (`run_shell` closes stdin, so
+`rm -r` never gets its interactive confirmation and is as destructive as
+`rm -rf`), `find` with `-delete`/`-exec`/`-execdir`/`-ok`/`-okdir`, `git
+clean -f`, `shred`, `truncate`, `wipefs`, `dd of=`, and the `mkfs*` family.
+A command **truncated** at the retention bound counts as dangerous: nobody
+can read what will actually run.
+
+A flagged command is **never auto-approved, in any mode** (ADR 0021 decision
+D). No grant covers it — scoped or unscoped, session, project, or user —
+and every capability mode short of `always-deny` is escalated to `ask` for
+that one request, so a forced `rm` prompts even under a blanket
+`session-allow`. `always-deny` still denies without prompting, and a
+never-prompt decider denies on the same path.
 
 **Auto-approval under `ask`.** When `shell-exec` is in `ask` mode, a
 statically-safe command runs without a prompt. The run is recorded as a

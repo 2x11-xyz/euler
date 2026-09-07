@@ -110,10 +110,8 @@ impl<D: PermissionDecider> Session<D> {
             // would have covered it. Under `ask` that is a prompt; under a
             // never-prompt decider the same path denies. `always-allow`
             // and `always-deny` semantics are untouched.
-            let dangerous_command = capability == Capability::ShellExec
-                && request.command.as_deref().is_some_and(|command| {
-                    crate::command_safety::contains_dangerous_command(command)
-                });
+            // Walked once, when the request was built.
+            let dangerous_command = request.dangerous_command;
             // Statically-safe read-only shell commands run under `ask`
             // without a prompt (issue #78): recorded as a fresh
             // permission.decision with mode "static-safe" — allowed-once
