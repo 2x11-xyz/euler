@@ -47,38 +47,9 @@ const NEUTRALIZED_CONFIG: &[&str] = &[
 /// same pass is what keeps the probe to one launch.
 const EXECUTABLE_CONFIG_PATTERN: &str = r"^(core\.fsmonitor|filter\..*\.(clean|process))$";
 
-/// Environment that redirects Git at another repository, another index, or
-/// another configuration file. Euler resolves the repository from the
-/// workspace root, so every one of these is removed before its own git starts.
-///
-/// This applies to Euler's git only. `run_shell` keeps the caller's
-/// environment; ADR 0021 row C owns that policy.
-const REDIRECTING_GIT_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_CONFIG",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_NOSYSTEM",
-    "GIT_CONFIG_COUNT",
-];
-
-/// The indexed half of the `GIT_CONFIG_COUNT` family, which Euler sets itself
-/// and must not inherit. Matched by prefix because the indices are unbounded.
-const REDIRECTING_GIT_ENV_PREFIXES: &[&str] = &["GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"];
-
-fn is_redirecting_git_env_name(name: &str) -> bool {
-    REDIRECTING_GIT_ENV.contains(&name)
-        || REDIRECTING_GIT_ENV_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-}
+// The redirect list is shared verbatim with `build.rs`, which cannot depend
+// on this crate. One list, two includes.
+include!("git_redirect_env.rs");
 
 /// Whether Git's built-in filesystem monitor daemon may stay enabled.
 ///

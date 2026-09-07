@@ -92,24 +92,7 @@ const NEUTRALIZED_CONFIG: &[&str] = &[
     "core.fsmonitor=false",
 ];
 
-/// Environment that points Git at another repository, index, or config file.
-/// A developer with `GIT_DIR` set would otherwise stamp this build with
-/// another checkout's revision.
-const REDIRECTING_GIT_ENV: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_COMMON_DIR",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_NAMESPACE",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_CONFIG",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_CONFIG_NOSYSTEM",
-    "GIT_CONFIG_COUNT",
-];
+include!("src/git_redirect_env.rs");
 
 fn git_output(workspace: &Path, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
@@ -118,9 +101,7 @@ fn git_output(workspace: &Path, args: &[&str]) -> Option<String> {
         command.env_remove(name);
     }
     for (name, _) in env::vars_os() {
-        if name.to_str().is_some_and(|name| {
-            name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_")
-        }) {
+        if name.to_str().is_some_and(is_redirecting_git_env_name) {
             command.env_remove(name);
         }
     }
