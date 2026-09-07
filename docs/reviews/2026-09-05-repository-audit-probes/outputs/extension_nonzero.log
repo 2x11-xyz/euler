@@ -1,0 +1,3 @@
+result=Err(CommandFailed("go", Message("managed-process extension command failed")))
+elapsed_ms=74
+descendant_ran_after_failed_command=true

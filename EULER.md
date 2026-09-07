@@ -24,6 +24,10 @@ Apply `docs/contracts/boundaries.md` when ownership is unclear.
 ## Working practices
 
 - Keep each branch and PR focused on one change.
+- Build to a working version first, then remove: once tests and contracts
+  pass, strip every abstraction, branch, field, and duplicate the designed
+  behavior does not require, until nothing is left to take away. Verified
+  behavior is the boundary of that removal, never a casualty of it.
 - Use a separate Git worktree for independent concurrent writing work.
 - Prefer one canonical implementation over compatibility layers or parallel
   paths.
@@ -32,6 +36,17 @@ Apply `docs/contracts/boundaries.md` when ownership is unclear.
   potentially sensitive. Inspect only the minimum necessary metadata.
 - Keep commit and PR prose focused on the change and its verification.
 - Use an applicable skill from the catalog for detailed procedures.
+- Documentation lives where a future reader will look for it, not where it
+  was produced. Decisions that change an owner, boundary, or default become an
+  ADR under `docs/adr/` (the approval table is the ADR's decision section).
+  Audits, design reviews, and external comparisons go under `docs/reviews/`
+  with a dated filename. Session chronicles, work logs, raw model output,
+  superseded drafts, prompts, and build or CI logs are not committed: Git
+  history and PR threads already record what changed and why. Nothing of this
+  kind belongs at the repository root, whose Markdown is limited to the
+  project entry points (README, CHANGELOG, EULER, SECURITY, LICENSE). A probe or reproducer package that
+  asserts *current defects* may be committed only with a tracking issue that
+  maps each probe to the fix that retires it, and it must not be a CI gate.
 
 ## Verification
 
