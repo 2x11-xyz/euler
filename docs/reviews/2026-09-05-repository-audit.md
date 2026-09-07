@@ -705,7 +705,7 @@ env -u EULER_HOME TMPDIR=/private/tmp \
   --skip project_context::tests::user_skill_path_diagnostics_do_not_change_project_acknowledgment_digest
 ```
 
-`cargo nextest` was unavailable, so this used Cargo's workspace test runner instead of the exact documented nextest gate. The initial run's nine failures and their fixture diagnosis are retained; the one APFS-incompatible fixture was explicitly skipped, not silently counted as a pass. [Final workspace log](2026-09-05-repository-audit-probes/outputs/workspace-tests.log), [initial failing run](2026-09-05-repository-audit-probes/outputs/workspace-tests-initial.log), and [Clippy log](2026-09-05-repository-audit-probes/outputs/workspace-clippy.log) are included.
+`cargo nextest` was unavailable, so this used Cargo's workspace test runner instead of the exact documented nextest gate. The initial run's nine failures and their fixture diagnosis are retained; the one APFS-incompatible fixture was explicitly skipped, not silently counted as a pass. The full workspace test and Clippy logs were not retained; the summary table above records their results.
 
 The [portable evidence package](2026-09-05-repository-audit-probes/README.md) is separate from the production Cargo workspace and includes the ten probes, seven binaries, synthetic process fixture, locked dependencies, and recorded outputs. Its tests deliberately pass when the **current defects occur**. Convert individual probes into desired-behavior regression tests when implementing fixes; do not add the whole audit package to CI as a correctness gate. Source line references in this report refer to `9dfb881` and will move after edits.
 

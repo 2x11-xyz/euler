@@ -39,7 +39,8 @@ Apply `docs/contracts/boundaries.md` when ownership is unclear.
   with a dated filename. Session chronicles, work logs, raw model output,
   superseded drafts, prompts, and build or CI logs are not committed: Git
   history and PR threads already record what changed and why. Nothing of this
-  kind belongs at the repository root. A probe or reproducer package that
+  kind belongs at the repository root, whose Markdown is limited to the
+  project entry points (README, CHANGELOG, EULER, SECURITY, LICENSE). A probe or reproducer package that
   asserts *current defects* may be committed only with a tracking issue that
   maps each probe to the fix that retires it, and it must not be a CI gate.
 

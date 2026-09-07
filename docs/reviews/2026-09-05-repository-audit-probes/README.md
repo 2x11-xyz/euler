@@ -34,4 +34,4 @@ Contents:
 
 The lockfile began with the repository baseline dependency graph and was updated only to include this standalone probe package and its required graph. No compiled binaries, build caches, real credentials or real session contents are included.
 
-The final bundle also preserves `outputs/workspace-tests.log`, the initial failing run in `outputs/workspace-tests-initial.log`, and `outputs/workspace-clippy.log`. The root audit report explains the macOS fixture failures and the successful run's one explicit skip. `outputs/portable-tests.log` verifies the copied package with its relative crate paths using `cargo test --locked --all-targets`; the ten assertions pass on the audited baseline.
+Workspace test, Clippy, and portable-package logs are not retained (the audit report summarizes them); `outputs/` holds only the probe observations named above.

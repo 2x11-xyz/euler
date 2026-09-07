@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+# Standalone workspace root: do not remove. Without it Cargo would absorb this
+# evidence package into the production workspace and break `--locked` there.
 [workspace]
 
 [dependencies]

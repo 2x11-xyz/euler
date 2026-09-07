@@ -1,4 +1,4 @@
-   Compiling euler-managed-process v0.1.3 (/Users/eli.bressert/code/euler/crates/euler-managed-process)
+   Compiling euler-managed-process v0.1.3 (~/code/euler/crates/euler-managed-process)
    Compiling euler-audit-evidence v0.1.0 (/private/tmp/euler-audit-evidence-final)
     Finished `test` profile [unoptimized + debuginfo] target(s) in 1.21s
      Running unittests src/lib.rs (/private/tmp/euler-audit-target/debug/deps/euler_audit_evidence-36234b555dd3b150)
