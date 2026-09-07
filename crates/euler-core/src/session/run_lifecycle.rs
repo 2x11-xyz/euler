@@ -1082,14 +1082,11 @@ fn root_driver_work(event: &EventEnvelope) -> bool {
         EventKind::PERMISSION_PROMPT | EventKind::PERMISSION_DECISION => {
             !event.payload.contains_key("extension_id")
         }
-        // A `/rollback` restore records its own change, but it is a user
-        // control action outside any run — like the `workspace.restore` row
-        // it accompanies, not like a tool's write.
-        EventKind::FILE_CHANGE | EventKind::FILE_DIFF => {
-            event.payload.contains_key("tool_call_id")
-                && event.payload.get("origin").and_then(Value::as_str)
-                    != Some(EventKind::WORKSPACE_RESTORE)
-        }
+        // A `/rollback` restore's own `file.change` carries no
+        // `tool_call_id` — no tool call produced it — so this rule already
+        // treats it, like its `checkpoint.stored` and `workspace.restore`
+        // siblings, as a user control action outside any run.
+        EventKind::FILE_CHANGE | EventKind::FILE_DIFF => event.payload.contains_key("tool_call_id"),
         EventKind::ERROR => {
             event.payload.get("source").and_then(Value::as_str) != Some("extension")
         }

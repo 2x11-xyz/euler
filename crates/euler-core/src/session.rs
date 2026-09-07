@@ -411,27 +411,46 @@ pub enum SessionError {
         "`{path}` changed after the checkpointed edit; restoring would discard that change. Inspect the file, then edit it directly"
     )]
     CheckpointFileChanged { path: String },
+    #[error("`{path}` cannot be restored because {reason}")]
+    CheckpointPathUnavailable { path: String, reason: &'static str },
 }
 
 /// A restore's own `file.change`: it records what the workspace file held
 /// before and after, so the rollback baseline advances and the restore is
 /// itself restorable. `tool_call_id` is the checkpoint that was restored —
 /// no tool call produced this write.
-fn restore_file_change_payload(
-    checkpoint_event_id: &str,
-    path: &str,
-    before: &str,
-    after: &str,
-    pre_image_blob: Option<&str>,
-    checkpoint_stored_id: Option<&str>,
-) -> JsonObject {
+struct RestoreRecord<'a> {
+    checkpoint_event_id: &'a str,
+    path: &'a str,
+    action: &'static str,
+    before: &'a str,
+    after: &'a str,
+    pre_image_blob: Option<&'a str>,
+    checkpoint_stored_id: Option<&'a str>,
+    durability_warning: Option<&'a str>,
+}
+
+fn restore_file_change_payload(record: &RestoreRecord<'_>) -> JsonObject {
+    let RestoreRecord {
+        checkpoint_event_id,
+        path,
+        action,
+        before,
+        after,
+        pre_image_blob,
+        checkpoint_stored_id,
+        durability_warning,
+    } = *record;
+    // No `tool_call_id`: no tool call produced this write, and a consumer
+    // that joins on it must not be handed an id that resolves to something
+    // else. The restored checkpoint is named by its own field.
     let mut payload = object([
-        ("tool_call_id", checkpoint_event_id.to_owned().into()),
-        ("origin", EventKind::WORKSPACE_RESTORE.into()),
         (
-            "action",
-            if before.is_empty() { "add" } else { "modify" }.into(),
+            "restored_checkpoint_event_id",
+            checkpoint_event_id.to_owned().into(),
         ),
+        ("origin", EventKind::WORKSPACE_RESTORE.into()),
+        ("action", action.into()),
         ("path", path.to_owned().into()),
         ("old_path", Value::Null),
         (
@@ -455,6 +474,11 @@ fn restore_file_change_payload(
         if let Some(event_id) = checkpoint_stored_id {
             payload.insert("checkpoint_event_id".to_owned(), event_id.into());
         }
+    }
+    // Provenance and disk must not disagree: a warning that only reached the
+    // human-readable result would leave the ledger claiming a durable write.
+    if let Some(warning) = durability_warning {
+        payload.insert("durability_warning".to_owned(), warning.into());
     }
     payload
 }
@@ -481,6 +505,9 @@ pub struct WorkspaceRestoreOutcome {
     pub path: String,
     pub checkpoint_event_id: String,
     pub blob_sha256: String,
+    /// Whether this restore can itself be rolled back. Recreating a file the
+    /// user deleted has no pre-image to keep, so it cannot.
+    pub undoable: bool,
 }
 
 #[derive(Debug, Error)]
@@ -2095,6 +2122,23 @@ impl<D> Session<D> {
         self.emit_control_event_required(kind, payload).is_ok()
     }
 
+    /// [`Self::emit_control_event_required`], returning the accepted event's
+    /// id for callers that must reference it.
+    fn emit_control_event_returning_id(
+        &mut self,
+        kind: &'static str,
+        payload: JsonObject,
+    ) -> Result<String, SessionError> {
+        self.emit_control_event_required(kind, payload)?;
+        Ok(self
+            .bus
+            .events()
+            .last()
+            .expect("a control event was just accepted")
+            .id
+            .clone())
+    }
+
     fn emit_control_event_required(
         &mut self,
         kind: &'static str,
@@ -3319,26 +3363,24 @@ impl<D: PermissionDecider> Session<D> {
         &mut self,
         checkpoint_event_id: &str,
         path: &str,
-        replaced: &str,
+        replaced: Option<&str>,
         content: &str,
         expected: crate::tools::ExpectedTarget<'_>,
     ) -> Result<Option<String>, SessionError> {
+        let action = if replaced.is_some() { "modify" } else { "add" };
         let restore_checkpoint = prepare_checkpoint_for(
             self.config.root.as_path(),
             checkpoint_event_id,
             path,
-            if replaced.is_empty() { "add" } else { "modify" },
-            replaced,
+            action,
+            replaced.unwrap_or_default(),
         )
         .map_err(SessionError::CheckpointBlob)?;
         let prepared_id = match &restore_checkpoint {
-            Some(prepared) => {
-                self.emit_control_event_required(
-                    EventKind::CHECKPOINT_STORED,
-                    prepared.payload.clone(),
-                )?;
-                self.bus.events().last().map(|event| event.id.clone())
-            }
+            Some(prepared) => Some(self.emit_control_event_returning_id(
+                EventKind::CHECKPOINT_STORED,
+                prepared.payload.clone(),
+            )?),
             None => None,
         };
         // Verify and replace resolve through one confined target, so an edit
@@ -3351,20 +3393,34 @@ impl<D: PermissionDecider> Session<D> {
                 | crate::ToolError::FileAlreadyExists => SessionError::CheckpointFileChanged {
                     path: path.to_owned(),
                 },
+                crate::ToolError::ParentDirectoryMissing => {
+                    SessionError::CheckpointPathUnavailable {
+                        path: path.to_owned(),
+                        reason: "its parent directory no longer exists",
+                    }
+                }
+                crate::ToolError::Io(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    SessionError::CheckpointPathUnavailable {
+                        path: path.to_owned(),
+                        reason: "part of its path no longer exists",
+                    }
+                }
                 other => SessionError::from(other),
             })?;
         self.emit_control_event_required(
             EventKind::FILE_CHANGE,
-            restore_file_change_payload(
+            restore_file_change_payload(&RestoreRecord {
                 checkpoint_event_id,
                 path,
-                replaced,
-                content,
-                restore_checkpoint
+                action,
+                before: replaced.unwrap_or_default(),
+                after: content,
+                pre_image_blob: restore_checkpoint
                     .as_ref()
                     .map(|prepared| prepared.blob.as_str()),
-                prepared_id.as_deref(),
-            ),
+                checkpoint_stored_id: prepared_id.as_deref(),
+                durability_warning: durability_warning.as_deref(),
+            }),
         )?;
         Ok(durability_warning)
     }
@@ -3395,42 +3451,46 @@ impl<D: PermissionDecider> Session<D> {
             }
             Err(error) => return Err(SessionError::from(error)),
         };
+        // An absent file and an empty file are different facts. Recreating a
+        // deleted file replaces nothing, so there is no pre-image to keep and
+        // the restore is not itself undoable; the outcome says so.
         let replaced = match current {
             Some(current) if crate::tools::hash_bytes(current.as_bytes()) == expected_sha256 => {
-                current
+                Some(current)
             }
             Some(_) => return Err(SessionError::CheckpointFileChanged { path }),
-            None => String::new(),
+            None => None,
         };
-        let expected = if replaced.is_empty() {
-            crate::tools::ExpectedTarget::Absent
-        } else {
-            crate::tools::ExpectedTarget::Exactly(&replaced)
+        let expected = match &replaced {
+            Some(replaced) => crate::tools::ExpectedTarget::Exactly(replaced),
+            None => crate::tools::ExpectedTarget::Absent,
         };
-        let durability_warning =
-            self.perform_restore(checkpoint_event_id, &path, &replaced, &content, expected)?;
+        let durability_warning = self.perform_restore(
+            checkpoint_event_id,
+            &path,
+            replaced.as_deref(),
+            &content,
+            expected,
+        )?;
+        let undoable = replaced.is_some_and(|replaced| !replaced.is_empty());
         let mut payload = object([
             ("path", path.clone().into()),
             ("checkpoint_event_id", checkpoint_event_id.to_owned().into()),
             ("blob_sha256", blob_sha256.clone().into()),
             ("restored", true.into()),
+            ("undoable", undoable.into()),
         ]);
         if let Some(warning) = durability_warning {
             payload.insert("durability_warning".to_owned(), warning.into());
         }
-        self.emit_control_event_required(EventKind::WORKSPACE_RESTORE, payload)?;
-        let event_id = self
-            .bus
-            .events()
-            .last()
-            .expect("workspace.restore just accepted")
-            .id
-            .clone();
+        let event_id =
+            self.emit_control_event_returning_id(EventKind::WORKSPACE_RESTORE, payload)?;
         Ok(WorkspaceRestoreOutcome {
             event_id,
             path,
             checkpoint_event_id: checkpoint_event_id.to_owned(),
             blob_sha256,
+            undoable,
         })
     }
 

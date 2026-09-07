@@ -7611,3 +7611,74 @@ fn a_restore_records_itself_and_stays_undoable() {
         .count();
     assert_eq!(restore_changes, 3, "every restore records its own change");
 }
+
+#[test]
+fn a_restore_recreating_a_deleted_file_says_it_is_not_undoable() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    let before = "prefix\nalpha\nsuffix\n";
+    std::fs::write(&note, before).expect("fixture");
+    let mut session = run_note_edit(temp.path(), "alpha", "beta");
+    let checkpoint_id = session.workspace_checkpoints()[0].event_id.clone();
+    std::fs::remove_file(&note).expect("user deletes the file");
+
+    let outcome = session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect("a deleted file is recreated");
+
+    assert!(
+        !outcome.undoable,
+        "recreating a deleted file replaces nothing, so it cannot be undone"
+    );
+    let change = *events_of_kind(session.events(), EventKind::FILE_CHANGE)
+        .last()
+        .expect("the restore recorded its own change");
+    assert_eq!(
+        change.payload.get("action").and_then(Value::as_str),
+        Some("add")
+    );
+    assert!(!change.payload.contains_key("pre_image_blob"));
+    assert!(!change.payload.contains_key("tool_call_id"));
+    assert_eq!(
+        change
+            .payload
+            .get("restored_checkpoint_event_id")
+            .and_then(Value::as_str),
+        Some(checkpoint_id.as_str())
+    );
+    assert_eq!(std::fs::read_to_string(&note).expect("read"), before);
+}
+
+#[test]
+fn a_restore_into_a_removed_directory_names_the_missing_path() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let nested = temp.path().join("src");
+    std::fs::create_dir(&nested).expect("dir");
+    let note = nested.join("note.txt");
+    std::fs::write(&note, "prefix\nalpha\nsuffix\n").expect("fixture");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![
+        euler_provider::ToolCall {
+            id: "call-edit".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "src/note.txt", "old": "alpha", "new": "beta"}),
+        },
+    ])]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+    let _ = session.run_turn("edit");
+    let checkpoint_id = session.workspace_checkpoints()[0].event_id.clone();
+    std::fs::remove_dir_all(&nested).expect("user removes the directory");
+
+    let error = session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect_err("a missing parent is not a raw I/O error");
+
+    assert!(
+        matches!(&error, SessionError::CheckpointPathUnavailable { path, .. } if path == "src/note.txt"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("no longer exists"), "{error}");
+}

@@ -198,8 +198,11 @@ A restore is itself a destructive write, and is recorded as one: it
 checkpoints the content it replaces and appends its own `file.change` with
 origin `workspace.restore`. That advances the baseline the next rollback
 verifies against — so rollback is not one-shot per file — and makes the
-restore undoable like any other write. Event shapes:
-`docs/contracts/events.md`.
+restore undoable like any other write — except recreating a deleted file,
+which replaces nothing and reports that it cannot be undone. The per-path
+baseline includes changes a shell command was observed to make, so an edit
+made by `run_shell` after a checkpoint blocks a naive restore just as a user
+edit does. Event shapes: `docs/contracts/events.md`.
 
 Process launch/executor completion and process success are separate facts.
 `run_shell` and direct Git tools retain collected output and the observed exit

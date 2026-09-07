@@ -2530,34 +2530,22 @@ fn a_directory_sync_failure_does_not_undo_a_published_write() {
 
 #[cfg(unix)]
 #[test]
-fn a_stale_temporary_file_is_swept_and_never_observed_as_a_change() {
+fn a_leftover_temporary_file_is_never_observed_as_a_change() {
+    // A crash between temp create and rename leaves one of these behind.
+    // Nothing sweeps them — enumerating by path would break the fd-anchored
+    // rule and could delete a concurrent Euler's in-flight temp — so the
+    // guarantee is that observation never reports one as agent-caused.
     let temp = tempfile::tempdir().expect("temp dir");
     let target = temp.path().join("note.txt");
     fs::write(&target, "old\n").expect("target");
-    // What a crash between temp create and rename leaves behind.
-    let stale = temp.path().join(".euler-write-01ABCDEF.tmp");
-    fs::write(&stale, "orphaned").expect("stale temp");
-
     let before = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+    fs::write(temp.path().join(".euler-write-01ABCDEF.tmp"), "orphaned").expect("stale temp");
     let after = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+
     assert!(
         before.changes_to(&after).is_empty(),
         "a leftover temp is never workspace content"
     );
-
-    let registry = ToolRegistry::new(temp.path());
-    let edit = registry
-        .execute(
-            "edit_file",
-            &json!({"path": "note.txt", "old": "old", "new": "new"}),
-        )
-        .expect("prepare edit");
-    registry
-        .apply_patch(edit.patch.as_ref().expect("patch"))
-        .expect("apply");
-
-    assert!(!stale.exists(), "the next write sweeps stale temporaries");
-    assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
 }
 
 #[cfg(unix)]
@@ -2590,4 +2578,33 @@ fn an_atomic_replace_never_carries_setuid_onto_agent_content() {
         0,
         "setuid/setgid/sticky are not carried over"
     );
+}
+
+#[test]
+fn an_ordinary_write_reports_no_durability_caveat() {
+    // Regression: the Linux parent descriptor was opened `O_PATH`, on which
+    // `fsync` returns EBADF, so every structured write carried a bogus
+    // durability warning. macOS uses the walker and never saw it.
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+
+    for input in [
+        json!({"path": "created.txt", "content": "fresh"}),
+        json!({"path": "note.txt", "old": "old", "new": "new"}),
+    ] {
+        let tool = if input.get("content").is_some() {
+            "write_file"
+        } else {
+            "edit_file"
+        };
+        let execution = registry.execute(tool, &input).expect("prepare");
+        let warning = registry
+            .apply_patch_cancellable(
+                execution.patch.as_ref().expect("patch"),
+                &CancellationToken::new(),
+            )
+            .expect("apply");
+        assert!(warning.is_none(), "{tool} reported {warning:?}");
+    }
 }

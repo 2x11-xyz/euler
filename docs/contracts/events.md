@@ -519,7 +519,9 @@ extension error does not consume the later result.
   this edit. This event is metadata-only:
   `origin` is descriptive edit metadata with known values `edit_file`,
   `apply_patch`, `run_shell:apply_patch`, `run_shell`, and
-  `workspace.restore`; `action` is `add`,
+  `workspace.restore`. A row may carry `durability_warning` when the write
+  was published but its directory entry could not be made durable, so
+  provenance and disk never disagree. `action` is `add`,
   `modify`, or `delete`, `old_path` is null, and `diff_redaction` is `omitted`.
   `run_shell:apply_patch` means Euler intercepted a strict apply-patch heredoc
   before shell execution; it does not mean a shell process ran. `run_shell`
@@ -559,12 +561,17 @@ extension error does not consume the later result.
   guess whether the write happened, which is exactly the guess audit F36
   removed.
 - `workspace.restore`: `path`, `checkpoint_event_id`, `blob_sha256`,
-  `restored` (always `true` on success), and optional `durability_warning`.
-  A restore also appends its own `checkpoint.stored` and `file.change` pair
-  with origin `workspace.restore`, whose `tool_call_id` is the checkpoint
-  event that was restored — no tool call produced this write. Recording the
-  restore advances the baseline the next rollback verifies against and makes
-  the restore itself undoable. Appended when the user restores a
+  `restored` (always `true` on success), `undoable`, and optional
+  `durability_warning`. A restore also appends its own `checkpoint.stored`
+  and `file.change` pair with origin `workspace.restore`. Those rows carry no
+  `tool_call_id` — no tool call produced the write, and a consumer that joins
+  on `tool_call_id` must never be handed an id that resolves to something
+  else; the restored checkpoint is named by `restored_checkpoint_event_id`
+  instead. Recording the restore advances the baseline the next rollback
+  verifies against and makes the restore itself undoable. Recreating a file
+  the user deleted replaces nothing, so it stores no pre-image, records
+  `action: add`, and reports `undoable: false`. Appended when the user
+  restores a
   workspace file via `/rollback` to the pre-image of a prior applied
   `file.change`. A restore is refused when the target no longer holds exactly
   what the checkpointed edit wrote (`after_sha256`), so rolling back cannot

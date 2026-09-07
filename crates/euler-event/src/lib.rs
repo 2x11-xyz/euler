@@ -398,6 +398,8 @@ mod tests {
                 ("checkpoint_event_id", "evt-file-change".into()),
                 ("blob_sha256", "sha-before".into()),
                 ("restored", true.into()),
+                ("undoable", true.into()),
+                ("durability_warning", Value::Null),
             ]),
         );
         assert_round_trip(
@@ -834,7 +836,9 @@ mod tests {
                     "path": "a.txt",
                     "checkpoint_event_id": "evt-file-change",
                     "blob_sha256": "sha-before",
-                    "restored": true
+                    "restored": true,
+                    "undoable": true,
+                    "durability_warning": null
                 }),
             ),
             base(EventKind::CHECK_STARTED, json!({"name": "cargo test"})),
@@ -1070,7 +1074,13 @@ mod tests {
                 vec!["tool_call_id", "path", "action", "pre_image_blob", "status"]
             }
             EventKind::WORKSPACE_RESTORE => {
-                vec!["path", "checkpoint_event_id", "blob_sha256", "restored"]
+                vec![
+                    "path",
+                    "checkpoint_event_id",
+                    "blob_sha256",
+                    "restored",
+                    "undoable",
+                ]
             }
             EventKind::MODEL_CALL => vec!["provider", "model", "canvas_items"],
             EventKind::MODEL_RESULT => {

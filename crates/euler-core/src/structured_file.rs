@@ -22,6 +22,14 @@
 //! * Euler ships on Linux and macOS. There is no confined open for other
 //!   targets, so the structured tools fail closed there rather than quietly
 //!   opening a joined path.
+//!
+//! A crash between creating the temporary file and renaming it can leave a
+//! `.euler-write-<id>.tmp` sibling. Nothing sweeps them: enumerating the
+//! directory by path would break the fd-anchored rule, and unlinking by name
+//! could delete a concurrent Euler's in-flight temporary. Workspace
+//! observation ignores the name shape instead, so a leftover is never
+//! reported as a change; removing it is the user's, or the OS temp
+//! reaper's, business.
 
 use std::ffi::OsString;
 use std::io;
@@ -142,7 +150,6 @@ impl ConfinedTarget {
         content: &[u8],
         previous: &fs::Metadata,
     ) -> io::Result<Durability> {
-        self.remove_stale_temporaries();
         let temp_name = OsString::from(format!(
             "{}{}{}",
             crate::file_diff::STRUCTURED_WRITE_TEMP_PREFIX,
@@ -227,26 +234,6 @@ impl ConfinedTarget {
         match crate::durability::sync_directory_fd(self.directory.as_fd(), parent) {
             Ok(()) => Durability::Synced,
             Err(error) => Durability::DirectoryUnsynced(error.to_string()),
-        }
-    }
-
-    /// Remove temporary files a crashed earlier write left in this directory.
-    /// Best-effort: a name that cannot be read or unlinked is left alone.
-    fn remove_stale_temporaries(&self) {
-        let Some(parent) = self.absolute.parent() else {
-            return;
-        };
-        let Ok(entries) = fs::read_dir(parent) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name
-                .to_str()
-                .is_some_and(crate::file_diff::is_structured_write_temp)
-            {
-                let _ = unlinkat(&self.directory, &name);
-            }
         }
     }
 }
