@@ -2997,7 +2997,7 @@ fn a_git_probe_that_cannot_run_fails_the_tool_closed() {
     let registry = ToolRegistry::new(temp.path());
     let unset = registry.execute("git_status", &json!({}));
     assert!(
-        !matches!(unset, Err(ToolError::GitProbeFailed)),
+        !matches!(unset, Err(ToolError::GitProbeFailed(_))),
         "exit 1 is an answer, not a probe failure"
     );
 
@@ -3007,11 +3007,27 @@ fn a_git_probe_that_cannot_run_fails_the_tool_closed() {
     assert!(
         matches!(
             registry.execute("git_status", &json!({})),
-            Err(ToolError::GitProbeFailed
+            Err(ToolError::GitProbeFailed(_)
                 | ToolError::Io(_)
                 | ToolError::SandboxUnavailable { .. })
         ),
         "a probe that cannot run must not report no drivers"
+    );
+
+    // A timeout says so: the user waited half a minute, and the cause is
+    // almost never the repository's contents.
+    let timed_out = ToolError::GitProbeFailed(GIT_PROBE_TIMEOUT_MESSAGE).to_string();
+    assert!(
+        timed_out.contains("timed out after 30 seconds"),
+        "{timed_out}"
+    );
+    assert!(
+        timed_out.contains("slow or unresponsive filesystem"),
+        "{timed_out}"
+    );
+    assert!(
+        timed_out.contains("will not run git with repository-selected helpers live"),
+        "{timed_out}"
     );
 }
 

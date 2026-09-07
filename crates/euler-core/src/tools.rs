@@ -98,11 +98,8 @@ pub enum ToolError {
         /// attribution the session-start diagnostic did.
         cause: SandboxFailureCause,
     },
-    #[error(
-        "could not read this repository's git configuration, so Euler will not run git with \
-repository-selected helpers live"
-    )]
-    GitProbeFailed,
+    #[error("{0}, so Euler will not run git with repository-selected helpers live")]
+    GitProbeFailed(&'static str),
     #[error("tool cancelled")]
     Cancelled,
     #[error(transparent)]
@@ -1029,7 +1026,16 @@ impl ToolRegistry {
             ProcessTermination::Exited(0) => {}
             ProcessTermination::Exited(1) => return Ok(String::new()),
             ProcessTermination::Cancelled => return Err(ToolError::Cancelled),
-            _ => return Err(ToolError::GitProbeFailed),
+            // A timeout is worth separating: the wait is long enough to be
+            // felt, and the cause is almost never the repository's contents.
+            ProcessTermination::TimedOut => {
+                return Err(ToolError::GitProbeFailed(GIT_PROBE_TIMEOUT_MESSAGE))
+            }
+            ProcessTermination::Exited(_) => {
+                return Err(ToolError::GitProbeFailed(
+                    "could not read this repository's git configuration",
+                ))
+            }
         }
         if !sandboxed {
             return Ok(outcome.stdout);
@@ -1397,6 +1403,12 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
 /// probe fails the tool closed. It is deliberately generous, because a probe
 /// that expires under ordinary load would refuse the tool for no reason.
 const GIT_PROBE_TIMEOUT_MS: u64 = 30_000;
+
+/// Said instead of a generic probe failure when the bound above expires, so a
+/// user who waited that long is told what to look at.
+const GIT_PROBE_TIMEOUT_MESSAGE: &str =
+    "reading this repository's git configuration timed out after 30 seconds, which usually means \
+a slow or unresponsive filesystem rather than anything about the repository";
 
 /// The incompleteness to report for a pair of captures. A missing capture is
 /// itself an unreadable workspace: the command still ran, so the caller must
