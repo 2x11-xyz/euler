@@ -47,6 +47,11 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets
+      # Every sandbox test soft-skips when the backend is unavailable, so
+      # without this the suite could pass while testing nothing.
+      - name: The sandbox backend is actually enforced here
+        run: |
+          cargo run --locked -p euler-cli -- --check-sandbox
       - name: Test
         run: cargo nextest run --workspace
       - name: Doc tests
@@ -70,7 +75,11 @@ jobs:
       - name: Build the CLI
         run: cargo build --locked -p euler-cli
       - name: Restrict unprivileged user namespaces
-        run: sudo sysctl -w user.max_user_namespaces=0
+        run: |
+          sudo sysctl -w user.max_user_namespaces=0
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: The probe reports an actionable cause, not a bwrap error
         run: |
           set +e
@@ -80,7 +89,30 @@ jobs:
           cat probe.out probe.err
           test "$status" -ne 0
           grep -qx 'sandbox backend: unavailable' probe.out
-          grep -q 'unprivileged user namespaces are disabled' probe.err
+          grep -q 'workspace probed: ' probe.out
+          # Order-independent: the classification may name the sysctl or
+          # AppArmor, but it must always name a cause and a way out.
+          grep -qE 'user namespaces are disabled|AppArmor restricts' probe.err
+          grep -q 'To fix it: ' probe.err
           grep -q 'sysctl' probe.err
           grep -q 'fail closed' probe.err
           ! grep -qi 'bwrap:' probe.err
+      - name: A sandbox-requiring tool fails closed rather than running on the host
+        run: |
+          cat >script.json <<'JSON'
+          {"version": 1, "responses": [
+            {"events": [
+              {"tool_call": {"id": "c1", "name": "run_shell",
+                             "input": {"command": "printf escaped > escaped.txt"}}},
+              {"finished": {"stop_reason": "tool_use"}}]},
+            {"events": [{"text_delta": "done"}, {"finished": {"stop_reason": "completed"}}]}]}
+          JSON
+          mkdir -p fail-closed && cd fail-closed
+          ../target/debug/euler exec --provider fixture \
+            --provider-option "event-script=$PWD/../script.json" \
+            --extensions none --project-context off --auto-approve trusted-local \
+            --provenance events.jsonl "run a shell command"
+          cat events.jsonl
+          grep -q '"sandbox_backend":"unavailable"' events.jsonl
+          # The command must not have run on the host instead.
+          test ! -e escaped.txt

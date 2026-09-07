@@ -771,17 +771,18 @@ extension error does not consume the later result.
   Optional `session_kind` is `interactive` or `non-interactive`. It records
   how the session was launched for discovery/resume UI grouping only. Omitted
   means unknown/legacy and must not affect resume authority or canvas content.
-  Optional `sandbox_backend` records the execution boundary agent subprocesses
-  actually got, probed at session start rather than assumed (ADR 0021 row A′):
-  `bwrap` (Linux Bubblewrap enforced), `host` (no backend on this platform;
+  `sandbox_backend` records the execution boundary agent subprocesses actually
+  got, probed at session start rather than assumed (ADR 0021 row A′): `bwrap`
+  (Linux Bubblewrap enforced), `host` (no backend on this platform;
   subprocesses run under the permission decision), or `unavailable` (a backend
   was required but could not be enforced, so sandbox-requiring tools fail
-  closed). The companion optional `sandbox_unavailable_reason` is `null` unless
-  the backend is `unavailable`, and is then one of `unsupported_platform`,
-  `bubblewrap_missing`, `cannot_enforce`, `invalid_workspace`. Both are
-  provenance for the session that produced the stream; a resumed session on a
-  different host records its own. Omitted in older streams means unknown, never
-  `host`.
+  closed). The companion `sandbox_unavailable_reason` is `null` unless the
+  backend is `unavailable`, and is then one of `unsupported_platform`,
+  `bubblewrap_missing`, `cannot_enforce`, `invalid_workspace`. Current writers
+  always emit both; they are omitted only in streams written before this
+  release, where omission means unknown, never `host`. They are provenance for
+  the session that produced the stream, and `session.resumed` carries the same
+  two fields for the host that resumed it.
   Optional `permission_reviewer` is `user` or `guardian` (ADR 0011),
   recording which reviewer the session was configured with at start. Omitted
   in older streams means `user`. It is config projection for visibility, not
@@ -834,8 +835,13 @@ extension error does not consume the later result.
   malformed or unsupported object is incompatible rather than silently
   treated as legacy. More than one `session.start` is likewise invalid; a
   report or resume must not select one of several claimed identities.
-- `session.resumed`: `provider`, `model`, `events_folded`, optional
-  `resumed_from_event_id`. A durable audit marker recording that the session
+- `session.resumed`: `provider`, `model`, `events_folded`, `sandbox_backend`,
+  `sandbox_unavailable_reason`, optional
+  `resumed_from_event_id`. The two sandbox fields carry the same values and
+  meanings as on `session.start`, probed again at the resume boundary: a
+  session resumed on a different host records the boundary it actually got
+  rather than the one the original stream recorded. A durable audit marker
+  recording that the session
   lifetime was continued, against which target and from which logical parent
   frontier. Its parent must be that frontier; when `resumed_from_event_id` is
   present, it must be the same id. Audit metadata only — never user or model

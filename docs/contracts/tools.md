@@ -261,8 +261,18 @@ the `GIT_DIR` / `GIT_WORK_TREE` / `GIT_CONFIG*` / `GIT_INDEX_FILE` /
 every configured `filter.*.clean` and `filter.*.process` driver through
 `GIT_CONFIG_KEY_n`; and `git_diff` keeps `--no-ext-diff --no-textconv`.
 `core.fsmonitor` is probed and preserved only for Git's built-in daemon rather
-than blanket-disabled. A command the agent runs itself through `run_shell` is
-confined by the sandbox instead.
+than blanket-disabled, and `diff.ignoreSubmodules=dirty` stops the recursive
+submodule spawn, which would otherwise run a driver configured in a
+submodule's own config with only the superproject's blanking applied. The same
+overrides cover every git invocation Euler makes, including the `@`-mention
+picker's `git ls-files`. A command the agent runs itself through `run_shell`
+is confined by the sandbox instead and keeps the repository's configuration.
+
+A probe Euler cannot complete fails the tool closed: only `git config`'s
+"nothing configured" exit is an answer. Residual risk: the probe and the real
+command are separate processes, so a writer that adds a driver between them is
+not covered; under the Linux sandbox that driver runs inside the sandbox, and
+on a host backend it needs an agent racing its own tool call.
 
 Under ordinary host execution, agent-controlled shell and Git subprocesses
 inherit project environment variables, including `HOME` and `RUST_LOG`, but

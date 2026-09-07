@@ -40,6 +40,12 @@ pull requests that landed them; deeper design rationale lives in
   `GIT_INDEX_FILE`/`GIT_ALTERNATE_OBJECT_DIRECTORIES` family stripped from the
   environment, and `--no-ext-diff --no-textconv` on `git_diff`.
   `core.fsmonitor` is probed and preserved only for Git's built-in daemon.
+- Euler's own git is neutralized everywhere it runs, not only in the tools:
+  the TUI `@`-mention picker's `git ls-files` goes through the same overrides,
+  and the build script applies them to its own `git status`.
+- **Breaking (library):** `capture_workspace_snapshot` now takes the entry
+  bound as a second argument; pass `MAX_WORKSPACE_SNAPSHOT_FILES` for the
+  previous behavior.
 - Reaching the workspace-observation bound no longer hides changes as "no
   changes". The command runs; the tool text leads with `file observation
   incomplete: <reason>; changes may be unreported`, and the result carries an
