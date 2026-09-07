@@ -24,6 +24,10 @@ Apply `docs/contracts/boundaries.md` when ownership is unclear.
 ## Working practices
 
 - Keep each branch and PR focused on one change.
+- Build to a working version first, then remove: once tests and contracts
+  pass, strip every abstraction, branch, field, and duplicate the designed
+  behavior does not require, until nothing is left to take away. Verified
+  behavior is the boundary of that removal, never a casualty of it.
 - Use a separate Git worktree for independent concurrent writing work.
 - Prefer one canonical implementation over compatibility layers or parallel
   paths.
