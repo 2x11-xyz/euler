@@ -6,6 +6,34 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Shell command safety
+
+- Static shell approval now uses a two-parser design modeled on OpenAI
+  Codex instead of a name-keyed allowlist. A conservative grammar may prove
+  a command safe — literal words only, no shell-rewritable word for any
+  binary, per-binary argument rules, and `[sh|bash|zsh] -c` proved by
+  recursion — and a separate permissive walk may only find danger. A
+  command the danger walk flags (a forced `rm` anywhere, including inside
+  control flow, substitutions, and `sudo`/`env`/`trap`/`nohup`/`time`/
+  `xargs` wrappers) is never auto-approved by any rule: not by static
+  safety and not by any grant, scoped or unscoped. Capability modes are
+  unchanged.
+- Three auto-approvals that could act outside the workspace are gone
+  (audit F01, F02, F34). `uniq in out` truncates and writes `out`, so
+  `uniq` now allows at most one operand. Unquoted globs, `~`, and other
+  expansions are never provable for any binary — confinement used to run on
+  the literal word while the shell expanded it. `cd` left the read-only set
+  entirely, because a compound list's later segments were checked against
+  the directory the command started in. Traversal flags that dereference
+  symlinks (`ls -R`/`-L`, `grep -R`, `rg -L`/`--follow`, `find -L`/
+  `-follow`, `tail -f`) are no longer provable.
+- The sensitive-path denylist (which blocks both static shell approval and
+  blanket fs-tool grants) now covers anything under a `.git` component,
+  `.gitmodules`, `.gitattributes`, `.gitconfig`, `.cargo/config.toml`,
+  `.npmrc`, `.netrc`, and shell startup files — configuration an
+  interpreter honors on its next run, which is how a "read-only" write
+  became arbitrary execution at the next `git status`.
+
 ### Project context and skills
 
 - Skill authoring is now more interoperable: a missing or YAML null name
