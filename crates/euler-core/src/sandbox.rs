@@ -528,9 +528,21 @@ const SANDBOX_READY_WRAPPER: &str = "printf '__EULER_SANDBOX_READY__\\n'; exec \
 /// A toolchain root must be a real subtree, never `/`, a host home, or a
 /// single-component directory whose contents are unrelated to a toolchain.
 const MIN_RUNTIME_ROOT_COMPONENTS: usize = 2;
-/// Paths the profile itself mounts. Nothing else may mount over them.
+/// Paths the profile itself mounts. Nothing else may be remounted over them,
+/// which is what `read_only_parents` uses this for.
 const PROFILE_MOUNT_POINTS: &[&str] = &[
     "/tmp",
+    "/proc",
+    "/dev",
+    SANDBOX_WORKSPACE,
+    SANDBOX_HOME,
+    SANDBOX_CACHE,
+];
+
+/// The subset a toolchain root may not be, contain, or sit inside. `/tmp` is
+/// absent on purpose — see [`names_a_profile_mount_point`] — and reached
+/// anyway through the sandbox home beneath it.
+const EXCLUSIVE_PROFILE_MOUNTS: &[&str] = &[
     "/proc",
     "/dev",
     SANDBOX_WORKSPACE,
@@ -872,14 +884,19 @@ fn usable_runtime_root(root: &Path, home: Option<&Path>, explicit: bool) -> Opti
     Some(root)
 }
 
-/// Whether a path is, contains, or sits inside one of the profile's own mount
-/// points.
+/// Whether a path would collide with one of the profile's own mounts.
 ///
 /// `GOPATH=/tmp` would otherwise emit a read-only bind over the private `/tmp`
 /// the sandbox home, cache and TMPDIR live in, and the resulting probe failure
 /// would be reported as something about /usr and /etc.
+///
+/// A root merely *inside* `/tmp` is fine and is deliberately allowed: the
+/// profile lays down its tmpfs first, so the bind lands on the fresh
+/// directory and shadows nothing. Only a path that is one of these mounts, or
+/// an ancestor of one, or sits inside one, actually collides — and `/tmp`
+/// itself is caught by being an ancestor of the sandbox home.
 fn names_a_profile_mount_point(path: &Path) -> bool {
-    PROFILE_MOUNT_POINTS
+    EXCLUSIVE_PROFILE_MOUNTS
         .iter()
         .any(|mount| path.starts_with(mount) || Path::new(mount).starts_with(path))
 }
@@ -1953,6 +1970,13 @@ token = \"secret\"\n",
         );
         assert!(runtime.roots.is_empty(), "{runtime:?}");
         assert!(runtime.variables.is_empty(), "{runtime:?}");
+
+        // A root merely *inside* the private /tmp is fine: the profile lays
+        // its tmpfs down first, so the bind shadows nothing.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let inside = temp.path().join("cargo");
+        std::fs::create_dir(&inside).expect("cargo home");
+        assert!(usable_runtime_root(&inside, None, true).is_some());
     }
 
     /// A per-project toolchain home is not dropped: the directory really is
