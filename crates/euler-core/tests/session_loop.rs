@@ -1202,6 +1202,23 @@ fn lifecycle_barrier_settles_ready_shadow_usage_instead_of_discarding_it() {
     config.auto_compaction.tier = CompactionTier::Off;
     config.compaction_keep_recent = 0;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+    // The compactor's result is settled work once its physical attempt has
+    // ended, which is the boundary the lifecycle close consumes. A provider
+    // stream that has merely produced its terminal event is two thread hops
+    // short of that, so synchronize on the attempt terminal the runtime
+    // publishes rather than on the fixture's own emission.
+    let attempt_ended = Arc::clone(&gate);
+    session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+        if matches!(
+            &event,
+            ProviderRuntimeEvent::Attempt {
+                target,
+                event: ProviderAttemptEvent::Ended(_),
+            } if target.scope == ProviderRuntimeScope::Compaction
+        ) {
+            attempt_ended.mark_completed();
+        }
+    }));
 
     session
         .run_turn(&format!("read, then finish {}", "x".repeat(20_000)))
@@ -1212,7 +1229,10 @@ fn lifecycle_barrier_settles_ready_shadow_usage_instead_of_discarding_it() {
     );
     assert!(gate.wait_until_started(), "compactor never reached gate");
     gate.release();
-    assert!(gate.wait_until_completed(), "compactor never completed");
+    assert!(
+        gate.wait_until_completed(),
+        "compactor attempt never reached its terminal"
+    );
 
     assert_eq!(
         session
@@ -7173,8 +7193,8 @@ impl ModelProvider for ShadowBlockingProvider {
         if request.tools.is_empty() {
             self.gate.mark_started();
             self.gate.wait_for_release();
-            return Ok(Box::new(ShadowCompletionStream {
-                events: vec![
+            return Ok(Box::new(
+                vec![
                     Ok(ModelStreamEvent::TextDelta(test_projection().to_json())),
                     Ok(ModelStreamEvent::Finished {
                         stop_reason: StopReason::Completed,
@@ -7182,8 +7202,7 @@ impl ModelProvider for ShadowBlockingProvider {
                     }),
                 ]
                 .into_iter(),
-                gate: Arc::clone(&self.gate),
-            }));
+            ));
         }
         let call = self.root_calls.fetch_add(1, Ordering::SeqCst);
         let events = if call == 0 {
@@ -7208,23 +7227,6 @@ impl ModelProvider for ShadowBlockingProvider {
             ]
         };
         Ok(Box::new(events.into_iter()))
-    }
-}
-
-struct ShadowCompletionStream {
-    events: std::vec::IntoIter<Result<ModelStreamEvent, ProviderError>>,
-    gate: Arc<ShadowGate>,
-}
-
-impl Iterator for ShadowCompletionStream {
-    type Item = Result<ModelStreamEvent, ProviderError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let event = self.events.next()?;
-        if matches!(&event, Ok(ModelStreamEvent::Finished { .. })) {
-            self.gate.mark_completed();
-        }
-        Some(event)
     }
 }
 
