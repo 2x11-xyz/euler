@@ -947,26 +947,20 @@ fn writes_interpreter_config(path: &str) -> bool {
     sensitive_basename(Path::new(path))
 }
 
-/// Whether a word mentions a sensitive path anywhere inside it, quoting and
-/// interpreter syntax included. Deliberately a substring test: the point is
-/// to catch a path buried in program text without parsing the program.
+/// Quoting and shell/interpreter punctuation, none of which can appear in
+/// the middle of a path token this cares about.
+const PATH_TOKEN_SEPARATORS: &str = "\"'`()[]{}<>|&;=,:*?!$+\\";
+
+/// Whether a word mentions a sensitive path, quoting and interpreter syntax
+/// included (`open(".env")`, `{print > ".bashrc"}`).
+///
+/// The word is split into path-shaped tokens and each is put through
+/// [`sensitive_basename`] — one list, one rule. A raw substring test would
+/// read `os.environ` as `.env` and prompt on everyday code.
 fn mentions_sensitive_path(word: &str) -> bool {
-    let lower = word.to_ascii_lowercase();
-    if SENSITIVE_NAMES.iter().any(|name| lower.contains(name))
-        || lower.contains(".git/")
-        || lower.contains("/.git")
-        || lower == ".git"
-    {
-        return true;
-    }
-    lower.contains(".env")
-        || lower.contains("secret")
-        || lower.contains("credential")
-        || lower.contains("id_rsa")
-        || lower.contains("id_ed25519")
-        || lower.contains(".pem")
-        || lower.contains(".key")
-        || lower.contains(".cargo/config")
+    word.split(|c: char| c.is_whitespace() || PATH_TOKEN_SEPARATORS.contains(c))
+        .filter(|token| !token.is_empty())
+        .any(|token| sensitive_basename(Path::new(token)))
 }
 
 /// Destination words of every redirection attached to this command, `None`
@@ -1143,11 +1137,14 @@ fn git_is_destructive(args: &[&str]) -> bool {
         // no-op.
         "restore" => !rest.is_empty(),
         // `git checkout` is dangerous when it forces, when `--` marks
-        // paths, or when an operand looks like a path rather than a ref.
+        // paths, or when it restores paths rather than moving to a branch.
+        // Creating or switching branches is not destructive, and branch
+        // and tag names may look like paths (`feature/x`, `v2.0`), so only
+        // an unmistakable path operand counts.
         "checkout" => {
             forced("f", &["--force"])
                 || rest.contains(&"--")
-                || operands().any(|arg| looks_like_a_path(arg))
+                || (!forced("bB", &["--orphan"]) && operands().any(|arg| is_path_operand(arg)))
         }
         // `-D`, and `-d` with `-f` in any order or bundling, are all
         // force-delete.
@@ -1159,11 +1156,14 @@ fn git_is_destructive(args: &[&str]) -> bool {
     }
 }
 
-/// Whether an operand names a path rather than a ref: `.`, anything with a
-/// separator, or anything with a file extension. A single bare word like
-/// `main` reads as a branch.
-fn looks_like_a_path(arg: &str) -> bool {
-    arg == "." || arg.contains('/') || Path::new(arg).extension().is_some()
+/// Whether an operand is unmistakably a path rather than a ref: the cwd,
+/// its parent, or an explicitly relative or absolute form. `feature/x` and
+/// `v2.0` are valid branch and tag names, so they are not.
+fn is_path_operand(arg: &str) -> bool {
+    matches!(arg, "." | "..")
+        || arg.starts_with("./")
+        || arg.starts_with("../")
+        || arg.starts_with('/')
 }
 
 /// `git` global options precede the subcommand, and `-C`/`-c`/`--git-dir`
@@ -3134,6 +3134,8 @@ mod tests {
             "git restore .",
             "git restore src/lib.rs",
             "git checkout .",
+            "git checkout ./src",
+            "git checkout ..",
             "git checkout -f",
             "git checkout -f .",
             "git checkout -- src/lib.rs",
@@ -3151,6 +3153,12 @@ mod tests {
             "git checkout main",
             "git branch -d feature",
             "git branch -a",
+            // Review round 5: creating or switching branches is not
+            // destructive, and refs may look like paths.
+            "git checkout -b fix/foo",
+            "git checkout -B x",
+            "git checkout v2.0",
+            "git checkout feature/x",
         ] {
             assert!(
                 !contains_dangerous_command(command),
@@ -3197,5 +3205,37 @@ mod tests {
         ));
         assert!(contains_dangerous_command("su -m user -c 'rm -rf x'"));
         assert!(contains_dangerous_command("su --bogus user -c 'ls'"));
+    }
+
+    #[test]
+    fn sensitive_path_matching_respects_token_boundaries() {
+        // Review round 5, finding 2: a raw substring test read
+        // `os.environ` as `.env` and prompted on everyday code.
+        for command in [
+            "python3 -c 'open(\".env\")'",
+            "python3 -c 'open(\".env.local\")'",
+            "python3 -c 'open(\"foo/.env\")'",
+            "python3 -c 'open(\"id_rsa\")'",
+            "python3 -c 'open(\"deploy.pem\")'",
+            "python3 -c 'open(\".cargo/config.toml\",\"w\")'",
+            "awk '{print > \".bashrc\"}' /dev/null",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        for command in [
+            "python3 -c 'print(os.environ)'",
+            "python3 -c 'open(\"monkey.txt\")'",
+            "python3 -c 'print(keyboard)'",
+            "awk '{print $1}' data.csv",
+            "perl -e 'print 1'",
+        ] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
     }
 }

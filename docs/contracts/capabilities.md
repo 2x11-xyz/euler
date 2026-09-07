@@ -400,12 +400,16 @@ that destroy data with no undo: `rm` with `-r`/`-R`/`-f`/`--recursive`/
 `--force` or any GNU abbreviation of those (`run_shell` closes stdin, so
 `rm -r` never gets its interactive confirmation and is as destructive as
 `rm -rf`), `find` with `-delete`/`-exec`/`-execdir`/`-ok`/`-okdir`, `git
-clean -f`, `reset --hard`, `rm -f`, `checkout` that forces or names a path,
+clean -f`, `reset --hard`, `rm -f`, `checkout` that forces, marks paths with `--`, or
+restores an unmistakable path operand (branch creation and ref-shaped
+names like `feature/x` stay clean),
 `restore <path>`, `branch -D` (and `-d` with `-f`), `stash drop`/`clear`,
 `shred`, `truncate`, `wipefs`, `dd of=`, the `mkfs*` family, and any
 interpreter invocation (`sed`, `awk`, `perl`, `python`, `ruby`, `node`,
 `patch`, `ed`) whose operands — program text included — mention a sensitive
-path. Command names are matched
+path. "Mention" splits the operand into path-shaped tokens and applies the
+sensitive list to each, so `open(".env")` counts and `os.environ` does
+not. Command names are matched
 case-insensitively, because the default macOS filesystem is.
 It also flags **writes an interpreter later honors**: a redirect target or a
 `cp`/`mv`/`tee`/`install`/`ln`/`rsync` destination on the sensitive list, so
