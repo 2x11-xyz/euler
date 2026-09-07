@@ -421,6 +421,14 @@ extension error does not consume the later result.
   execution enforce the recorded `none | inherit` policy against it. This is
   distinct from the rendered-context digest recorded as
   `model.call.project_context_digest`.
+  Optional `observation` records that the workspace walk around a
+  process-backed tool could not observe everything (ADR 0021 row E):
+  `{ "status": "incomplete", "reason": <string>, "bound": <usize> }`, where
+  `reason` is `entry_bound`, `byte_bound`, or `unreadable`. It is a status of
+  its own and deliberately independent of `ok` and `exit_code`: the command
+  ran, and its own success is a separate fact. When it is present the absent
+  `file.change` events mean "not observed", never "no changes"; the same
+  statement leads the agent-visible `output`. Omitted means the walk completed.
   Optional `recovery_closure: true` marks a resume-time canonical closure; it
   records the resume observation, not the original tool outcome. The ordinary
   root path closes only its interrupted tail call. In addition, for every
@@ -763,6 +771,17 @@ extension error does not consume the later result.
   Optional `session_kind` is `interactive` or `non-interactive`. It records
   how the session was launched for discovery/resume UI grouping only. Omitted
   means unknown/legacy and must not affect resume authority or canvas content.
+  Optional `sandbox_backend` records the execution boundary agent subprocesses
+  actually got, probed at session start rather than assumed (ADR 0021 row A′):
+  `bwrap` (Linux Bubblewrap enforced), `host` (no backend on this platform;
+  subprocesses run under the permission decision), or `unavailable` (a backend
+  was required but could not be enforced, so sandbox-requiring tools fail
+  closed). The companion optional `sandbox_unavailable_reason` is `null` unless
+  the backend is `unavailable`, and is then one of `unsupported_platform`,
+  `bubblewrap_missing`, `cannot_enforce`, `invalid_workspace`. Both are
+  provenance for the session that produced the stream; a resumed session on a
+  different host records its own. Omitted in older streams means unknown, never
+  `host`.
   Optional `permission_reviewer` is `user` or `guardian` (ADR 0011),
   recording which reviewer the session was configured with at start. Omitted
   in older streams means `user`. It is config projection for visibility, not

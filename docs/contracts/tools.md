@@ -221,6 +221,49 @@ next model as failed tool output. Legacy event compatibility is owned by the
 effective-outcome rule in `docs/contracts/events.md`, not by individual tool or
 UI special cases.
 
+## Execution boundary
+
+On Linux, Bubblewrap is the default and enforced backend for `run_shell` and
+the `git_*` tools (ADR 0021 row A′). The child gets a private root tmpfs, its
+workspace bound read-write at `/workspace`, a private `/tmp`, `/proc` and
+`/dev`, a tmpfs `HOME`, no host network namespace, and a cleared environment.
+Every other platform has no backend yet, so those tools run directly on the
+host under the ordinary permission decision; the Seatbelt backend replaces
+that.
+
+Because `HOME` inside the sandbox is a private tmpfs, toolchains installed
+under the real home would otherwise be unreachable. Euler detects the
+toolchain homes the host environment implies — `CARGO_HOME`, `RUSTUP_HOME`,
+`NVM_DIR`, `PYENV_ROOT`, `ASDF_DATA_DIR`, `GOPATH`, `PNPM_HOME`, each falling
+back to its conventional location under `$HOME`, plus `/nix/store` — and binds
+them read-only at their real paths, with the sandbox `PATH` built from the
+host `PATH` entries those roots contain and caches redirected to the sandbox
+cache tmpfs. The real `$HOME` is never mounted read-write: the directory
+holding those roots is a read-only mount, so a write under the real home
+fails rather than landing in a discarded private copy.
+
+Availability is probed at session start by running a trivial sandboxed
+command, because an installed `bwrap` is not evidence that it works. The
+outcome is recorded on `session.start` as `sandbox_backend`
+(`bwrap` | `host` | `unavailable`) with `sandbox_unavailable_reason`. When the
+probe fails, sandbox-requiring tools fail closed with a concise reason; there
+is no automatic fallback to host execution. `euler --check-sandbox` runs the
+same probes and prints the diagnostic, which names the likely cause
+(user namespaces disabled by sysctl or AppArmor, a container, WSL1, `bwrap`
+missing) and the host change that fixes it.
+
+Euler's own Git invocations are neutralized before they run (ADR 0021 row G).
+`git_status` and `git_diff` set `core.hooksPath=/dev/null`,
+`safe.bareRepository=explicit`, `attr.tree=`, `core.attributesFile=`, and
+`GIT_LFS_SKIP_SMUDGE=1 GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0`; they strip
+the `GIT_DIR` / `GIT_WORK_TREE` / `GIT_CONFIG*` / `GIT_INDEX_FILE` /
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` family from the environment; they blank
+every configured `filter.*.clean` and `filter.*.process` driver through
+`GIT_CONFIG_KEY_n`; and `git_diff` keeps `--no-ext-diff --no-textconv`.
+`core.fsmonitor` is probed and preserved only for Git's built-in daemon rather
+than blanket-disabled. A command the agent runs itself through `run_shell` is
+confined by the sandbox instead.
+
 Under ordinary host execution, agent-controlled shell and Git subprocesses
 inherit project environment variables, including `HOME` and `RUST_LOG`, but
 not credential-shaped values or the owning Euler process's routing, TTY, and
@@ -248,9 +291,20 @@ ordinary descendants that remain in the group; a descendant that deliberately
 escapes it is outside this guarantee. After cancellation, Euler drains only
 immediately available pipe data within a fixed byte budget. Ordinary
 `run_shell` cancellation may then spend bounded time observing file changes
-for evidence: at most 4,096 files, 256 KiB per file, and 64 MiB total. That
-finite evidence pass can delay terminal publication after the process has
-already stopped.
+for evidence: at most 4,096 files (configurable), 256 KiB per file, and 64 MiB
+total. That finite evidence pass can delay terminal publication after the
+process has already stopped.
+
+Reaching a bound does not block the command (ADR 0021 row E). The command
+runs; when either the before or the after capture is incomplete, the tool
+result text leads with `file observation incomplete: <reason>; changes may be
+unreported`, and the result carries an `observation` object
+(`{status: "incomplete", reason, bound}`) distinct from process success. An
+incomplete capture reports no file changes, and that is "not observed", never
+"no changes" — the two are textually distinct in the agent-visible output.
+`.git`, `node_modules`, `target`, `dist`, `build`, `vendor`, the Python and
+JS cache directories, and structured-write temporary files are excluded from
+the walk.
 
 When canvas previews or stubs show `event <id>` (and optional
 `handle event:…` / `blob:…` metadata), prefer `tool_result_get` with that event

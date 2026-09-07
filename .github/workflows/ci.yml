@@ -13,9 +13,24 @@ env:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    # The Linux sandbox is the default execution boundary, so CI must actually
+    # be able to create a user namespace. Ubuntu 24.04 restricts unprivileged
+    # user namespaces through AppArmor; the step below opens them for this
+    # ephemeral runner.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Install the sandbox backend
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Enable unprivileged user namespaces
+        run: |
+          if [[ -e /proc/sys/kernel/unprivileged_userns_clone ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --unshare-net --ro-bind / / /bin/true
       - name: Provider catalog sync tests
         run: python3 -m unittest scripts.test_sync_provider_catalog
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -36,3 +51,36 @@ jobs:
         run: cargo nextest run --workspace
       - name: Doc tests
         run: cargo test --workspace --doc
+
+  sandbox-unavailable:
+    # A host that cannot create a user namespace must produce Euler's
+    # actionable diagnostic, not a raw Bubblewrap failure (ADR 0021 row A').
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-sandbox-unavailable-${{ hashFiles('Cargo.lock') }}
+      - name: Install the sandbox backend
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Build the CLI
+        run: cargo build --locked -p euler-cli
+      - name: Restrict unprivileged user namespaces
+        run: sudo sysctl -w user.max_user_namespaces=0
+      - name: The probe reports an actionable cause, not a bwrap error
+        run: |
+          set +e
+          ./target/debug/euler --check-sandbox >probe.out 2>probe.err
+          status=$?
+          set -e
+          cat probe.out probe.err
+          test "$status" -ne 0
+          grep -qx 'sandbox backend: unavailable' probe.out
+          grep -q 'unprivileged user namespaces are disabled' probe.err
+          grep -q 'sysctl' probe.err
+          grep -q 'fail closed' probe.err
+          ! grep -qi 'bwrap:' probe.err
