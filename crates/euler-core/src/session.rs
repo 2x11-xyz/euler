@@ -5858,6 +5858,16 @@ fn record_unseen_instructions(
     }
 }
 
+impl<D: PermissionDecider> Session<D> {
+    /// The execution boundary this session's agent subprocesses get, as
+    /// recorded on `session.start`. Front ends surface its diagnostic once at
+    /// startup, so an unavailable sandbox is not first discovered as a terse
+    /// failure on the agent's first command.
+    pub fn sandbox_status(&self) -> SandboxStatus {
+        self.tools.sandbox_status()
+    }
+}
+
 /// The `session.start` payload for a fresh session, including the compact
 /// project-context summary when a bootstrap is configured.
 fn session_start_payload(config: &SessionConfig, sandbox: SandboxStatus) -> JsonObject {

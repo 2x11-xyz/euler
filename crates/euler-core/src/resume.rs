@@ -706,6 +706,15 @@ pub fn resume_session_from_folded_prefix<D>(
         &active_target,
         logical_parent_frontier(&folded.events),
         events_folded,
+        // A resumed session may be on a different host than the one that
+        // wrote `session.start`, so the boundary records the backend it
+        // actually got rather than letting a reader assume the original.
+        crate::SandboxStatus::from_availability(match config.subprocess_sandbox {
+            crate::SubprocessSandbox::Host => None,
+            crate::SubprocessSandbox::Enforce(_) => {
+                Some(crate::probe_workspace_sandbox(&config.root))
+            }
+        }),
     );
     writer
         .arm_resume_marker(resume_marker)
@@ -914,18 +923,27 @@ fn verify_and_rehydrate_blobs(
 
 /// Build the durable `session.resumed` marker for a resume boundary (issue
 /// #6). Payload is audit metadata only — provider/model, the count of folded
-/// events, and the tail event id continued from — never user or model content.
+/// events, the tail event id continued from, and the execution boundary this
+/// resume got — never user or model content.
 fn session_resumed_marker(
     session_id: &str,
     agent_id: &str,
     target: &ModelTarget,
     resumed_from_event_id: Option<String>,
     events_folded: usize,
+    sandbox: crate::SandboxStatus,
 ) -> EventEnvelope {
     let mut payload = euler_event::JsonObject::new();
     payload.insert("provider".to_owned(), target.provider.clone().into());
     payload.insert("model".to_owned(), target.model.clone().into());
     payload.insert("events_folded".to_owned(), events_folded.into());
+    payload.insert("sandbox_backend".to_owned(), sandbox.backend_label().into());
+    payload.insert(
+        "sandbox_unavailable_reason".to_owned(),
+        sandbox
+            .reason()
+            .map_or(serde_json::Value::Null, |reason| reason.as_str().into()),
+    );
     if let Some(from) = &resumed_from_event_id {
         payload.insert("resumed_from_event_id".to_owned(), from.clone().into());
     }

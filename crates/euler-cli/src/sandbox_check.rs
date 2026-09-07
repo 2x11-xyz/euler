@@ -22,13 +22,21 @@ this platform has no sandbox backend yet."
         )?;
         return Ok(());
     }
+    // A session probes its own root, so say which directory this answer is
+    // about: the result can differ between workspaces.
+    let root = std::env::current_dir()?;
     let status = match backend {
-        SandboxStatus::Enforced => SandboxStatus::from_availability(Some(probe_workspace_sandbox(
-            &std::env::current_dir()?,
-        ))),
+        SandboxStatus::Enforced => {
+            SandboxStatus::from_availability(Some(probe_workspace_sandbox(&root)))
+        }
         other => other,
     };
-    writeln!(stdout, "sandbox backend: {}", status.backend_label())?;
+    writeln!(
+        stdout,
+        "sandbox backend: {}\nworkspace probed: {}",
+        status.backend_label(),
+        root.display()
+    )?;
     let Some(diagnostic) = status.diagnostic() else {
         return Ok(());
     };

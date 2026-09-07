@@ -182,8 +182,18 @@ fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
     if backend == "bwrap" {
         // The enforced profile clears the environment outright, so there is
         // no inherited `RUST_LOG` and no `EULER_HOME` to fall through from.
+        // The `printf` is a shell builtin, so these two lines are positive
+        // evidence that the sandboxed command really ran — without them the
+        // branch would pass on a command that never executed at all.
         assert!(tool_output.contains("rust-log=\n"), "{tool_output}");
         assert!(tool_output.contains("child-home=\n"), "{tool_output}");
+        // The nested Euler is outside every mount the profile makes, so it is
+        // not merely unconfigured but unreachable. That is the isolation this
+        // backend provides, and a nonzero exit is what proves it was tried.
+        assert!(
+            tool_output.starts_with("exit 127\n") || tool_output.starts_with("exit 126\n"),
+            "nested Euler should be unreachable inside the sandbox: {tool_output}"
+        );
         return;
     }
     assert!(tool_output.contains("rust-log=project_under_test=trace"));
