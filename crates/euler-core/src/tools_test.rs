@@ -2723,3 +2723,212 @@ fn a_create_publishes_atomically_and_still_refuses_a_racing_name() {
         "agent"
     );
 }
+
+/// ADR 0021 row E: a workspace larger than the observation bound must not be
+/// reported as unchanged. The command runs, the incompleteness leads the
+/// agent-visible text, and the result carries its own status.
+#[test]
+fn an_overflowing_workspace_reports_incomplete_observation_not_no_change() {
+    let temp = tempfile::tempdir().expect("temp");
+    for index in 0..=MAX_WORKSPACE_SNAPSHOT_FILES {
+        std::fs::write(temp.path().join(format!("file-{index}")), "x").expect("fixture file");
+    }
+    let registry = ToolRegistry::new(temp.path());
+
+    let execution = registry
+        .execute("run_shell", &json!({"command": "printf changed > file-0"}))
+        .expect("run_shell");
+
+    let observation = execution.observation.expect("incomplete observation");
+    assert_eq!(observation.reason, crate::ObservationLimit::EntryBound);
+    assert_eq!(observation.bound, MAX_WORKSPACE_SNAPSHOT_FILES);
+    assert!(
+        execution.output.starts_with(
+            "file observation incomplete: workspace has more than 4096 files; \
+changes may be unreported\n"
+        ),
+        "{}",
+        execution.output
+    );
+    // The real edit happened; it is unreported, which is not the same as
+    // reporting that nothing changed.
+    assert!(execution.file_changes.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("file-0")).expect("edited file"),
+        "changed"
+    );
+}
+
+/// The clean no-change result must be textually distinct from the incomplete
+/// one, because the model only ever sees the text.
+#[test]
+fn a_clean_no_change_result_is_textually_distinct_from_an_incomplete_one() {
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = ToolRegistry::new(temp.path());
+
+    let execution = registry
+        .execute("run_shell", &json!({"command": "true"}))
+        .expect("run_shell");
+
+    assert!(execution.observation.is_none());
+    assert!(execution.file_changes.is_empty());
+    assert!(
+        !execution.output.contains("file observation incomplete"),
+        "{}",
+        execution.output
+    );
+    assert!(
+        execution.output.starts_with("exit 0\n"),
+        "{}",
+        execution.output
+    );
+}
+
+/// A lowered bound is the same failure on a small workspace: the bound is
+/// configurable so "incomplete" stays rare enough to mean something.
+#[test]
+fn a_lowered_observation_bound_reports_the_bound_it_actually_used() {
+    let temp = tempfile::tempdir().expect("temp");
+    for index in 0..4 {
+        std::fs::write(temp.path().join(format!("file-{index}")), "x").expect("fixture file");
+    }
+    let registry = ToolRegistry::new(temp.path()).with_observation_bound(2);
+
+    let execution = registry
+        .execute("run_shell", &json!({"command": "true"}))
+        .expect("run_shell");
+
+    let observation = execution.observation.expect("incomplete observation");
+    assert_eq!(observation.bound, 2);
+    assert!(
+        execution
+            .output
+            .starts_with("file observation incomplete: workspace has more than 2 files;"),
+        "{}",
+        execution.output
+    );
+}
+
+/// ADR 0021 row G: `git diff` runs a repository-configured clean filter over
+/// the worktree. Euler's own git invocations must not execute it.
+#[test]
+fn git_diff_does_not_run_a_repository_configured_clean_filter() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    std::fs::write(root.join(".gitattributes"), "* filter=evil\n").expect("attributes");
+    let marker = root.join("filter-ran");
+    git(
+        root,
+        &[
+            "config",
+            "filter.evil.clean",
+            &format!("touch {}", marker.display()),
+        ],
+    );
+    std::fs::write(root.join("tracked.txt"), "changed\n").expect("edit");
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_diff", &json!({}))
+        .expect("git_diff runs");
+
+    assert!(!marker.exists(), "clean filter ran: {}", execution.output);
+}
+
+/// The same repository can also point `core.hooksPath` at a directory it
+/// controls. `git status` must not fire it.
+#[test]
+fn git_status_does_not_fire_a_repository_configured_hook() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    let hooks = root.join("planted-hooks");
+    std::fs::create_dir(&hooks).expect("hooks directory");
+    let marker = root.join("hook-ran");
+    let hook = hooks.join("post-index-change");
+    std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).expect("hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("hook mode");
+    }
+    git(root, &["config", "core.hooksPath", "planted-hooks"]);
+    std::fs::write(root.join("tracked.txt"), "changed\n").expect("edit");
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+
+    assert!(!marker.exists(), "hook fired: {}", execution.output);
+}
+
+/// A repository-local `core.fsmonitor` naming a helper is an execution
+/// channel; only Git's built-in daemon survives the probe.
+#[test]
+fn a_repository_configured_fsmonitor_helper_does_not_run() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    let marker = root.join("fsmonitor-ran");
+    let helper = root.join("fsmonitor-helper");
+    std::fs::write(
+        &helper,
+        format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
+    )
+    .expect("helper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+            .expect("helper mode");
+    }
+    git(root, &["config", "core.fsmonitor", "./fsmonitor-helper"]);
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+
+    assert!(
+        !marker.exists(),
+        "fsmonitor helper ran: {}",
+        execution.output
+    );
+}
+
+/// A repository whose HEAD Euler must resolve from the workspace root, not
+/// from an inherited `GIT_DIR` the parent process happened to carry.
+fn git_fixture() -> Option<tempfile::TempDir> {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return None;
+    }
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.email", "euler@example.invalid"]);
+    git(root, &["config", "user.name", "Euler"]);
+    std::fs::write(root.join("tracked.txt"), "original\n").expect("tracked file");
+    git(root, &["add", "tracked.txt"]);
+    git(root, &["commit", "--quiet", "-m", "seed"]);
+    Some(temp)
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .expect("git fixture command");
+    assert!(status.success(), "git {args:?}");
+}
