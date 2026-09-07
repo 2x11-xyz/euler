@@ -6116,8 +6116,20 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
     // settled replay run too.
     tui.resize(24, 72);
     tui.write("\x0f");
+    // Unlike the stable-window toggles above, this wait spans the whole
+    // debounced repaint pipeline: the size change has to be observed, the
+    // toggle's purge+replay has to re-emit a transcript taller than the
+    // screen at the narrowed width, and RESIZE_REPLAY_DEBOUNCE (450ms) then
+    // lands a second purge+replay that resets the quiet interval. The
+    // standard idle-screen ceiling leaves no headroom for that on a loaded
+    // shared runner, which is where this assertion has been observed to
+    // expire (#228). Give it a ceiling sized to the pipeline instead; the
+    // wait still returns as soon as the screen is quiet, so a fast run
+    // never pays it.
     assert!(
-        tui.wait_for_screen("tool-line-15"),
+        tui.wait_for_stable_screen(Duration::from_secs(20), |screen| {
+            screen.contains("tool-line-15")
+        }),
         "post-resize expand did not reveal folded output:\n{}",
         tui.screen_text()
     );
