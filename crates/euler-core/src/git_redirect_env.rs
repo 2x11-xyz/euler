@@ -23,6 +23,10 @@ const REDIRECTING_GIT_ENV: &[&str] = &[
     "GIT_CONFIG_SYSTEM",
     "GIT_CONFIG_NOSYSTEM",
     "GIT_CONFIG_COUNT",
+    // Git's own mechanism for handing `-c` overrides to child processes, and
+    // still honoured: an inherited value injects configuration into every
+    // invocation with exactly the power this list exists to deny.
+    "GIT_CONFIG_PARAMETERS",
 ];
 
 /// The indexed half of the `GIT_CONFIG_COUNT` family, whose indices are

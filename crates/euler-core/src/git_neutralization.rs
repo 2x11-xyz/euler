@@ -416,6 +416,7 @@ mod tests {
             "GIT_CONFIG_GLOBAL",
             "GIT_CONFIG_NOSYSTEM",
             "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG_PARAMETERS",
         ] {
             assert!(is_redirecting_git_env_name(name), "{name}");
         }
