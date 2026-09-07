@@ -1690,17 +1690,18 @@ mod tests {
     fn toolchain_roots_are_bound_read_only_between_a_tmpfs_and_its_remount() {
         let temp = tempfile::tempdir().expect("temp dir");
         let workspace = temp.path().join("workspace");
-        let home = temp.path().join("home/example");
-        let cargo = home.join(".cargo");
         std::fs::create_dir_all(&workspace).expect("workspace");
-        std::fs::create_dir_all(&cargo).expect("cargo home");
-        let runtime = RuntimeRoots::from_environment(
-            Some(home.clone()),
-            |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
-            None,
-        );
-        let home = home.canonicalize().expect("canonical home");
-        let cargo = cargo.canonicalize().expect("canonical cargo home");
+        // Synthetic roots, not a temp directory: on Linux a temp directory
+        // lives under the profile's own `/tmp`, which is deliberately never
+        // remounted, so the ordering under test would not be emitted at all.
+        let home = PathBuf::from("/home/example");
+        let cargo = home.join(".cargo");
+        let runtime = RuntimeRoots {
+            roots: vec![cargo.clone()],
+            variables: vec![(OsString::from("CARGO_HOME"), cargo.clone().into_os_string())],
+            path_entries: Vec::new(),
+            home: Some(home.clone()),
+        };
         let command = bwrap_command(
             Path::new("/usr/bin/bwrap"),
             SandboxLaunch {
