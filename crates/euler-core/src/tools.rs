@@ -5,7 +5,7 @@ use crate::git_neutralization::{
 use crate::sandbox::WorkspaceSandbox;
 use crate::structured_file;
 use crate::{
-    apply_patch_update_chunks, capture_workspace_snapshot_bounded, parse_single_file_apply_patch,
+    apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
     ApplyPatchDocument, ApplyPatchError, IncompleteObservation, ObservedFileChange,
     SandboxAvailability, SandboxStatus, SandboxUnavailableReason, SubprocessSandbox,
     WorkspaceSnapshot, MAX_WORKSPACE_SNAPSHOT_FILES,
@@ -1062,7 +1062,7 @@ impl ToolRegistry {
 
     /// Walk the workspace under the configured observation bound.
     fn observe_workspace(&self) -> Option<WorkspaceSnapshot> {
-        capture_workspace_snapshot_bounded(&self.root, self.observation_bound).ok()
+        capture_workspace_snapshot(&self.root, self.observation_bound).ok()
     }
 
     fn agent_euler_home(&self) -> Result<&Path, ToolError> {

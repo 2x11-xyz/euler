@@ -374,10 +374,12 @@ impl WorkspaceSandbox {
             .ok_or(SandboxUnavailableReason::CannotEnforce)?;
         Ok(bwrap_command(
             bwrap,
-            profile,
-            workspace,
-            &self.runtime,
-            env,
+            SandboxLaunch {
+                profile,
+                workspace,
+                runtime: &self.runtime,
+                env,
+            },
             program.as_ref(),
             args,
         ))
@@ -706,10 +708,12 @@ fn probe_profile(
     };
     let mut command = bwrap_command(
         bwrap,
-        profile,
-        workspace,
-        runtime,
-        &[],
+        SandboxLaunch {
+            profile,
+            workspace,
+            runtime,
+            env: &[],
+        },
         OsStr::new("/bin/sh"),
         ["-c", script.as_str()],
     );
@@ -775,20 +779,25 @@ fn canonical_workspace(workspace: &Path) -> Result<PathBuf, std::io::Error> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn bwrap_command<I, S>(
-    bwrap: &Path,
+/// Everything the profile mounts and exports for one launch.
+struct SandboxLaunch<'a> {
     profile: SandboxProfile,
-    workspace: &Path,
-    runtime: &RuntimeRoots,
-    env: &[(OsString, OsString)],
-    program: &OsStr,
-    args: I,
-) -> Command
+    workspace: &'a Path,
+    runtime: &'a RuntimeRoots,
+    env: &'a [(OsString, OsString)],
+}
+
+fn bwrap_command<I, S>(bwrap: &Path, launch: SandboxLaunch<'_>, program: &OsStr, args: I) -> Command
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    let SandboxLaunch {
+        profile,
+        workspace,
+        runtime,
+        env,
+    } = launch;
     let mut command = Command::new(bwrap);
     // Clear the launcher too: `--clearenv` protects the inner command, while
     // this prevents an inherited loader/configuration variable from changing
@@ -1102,10 +1111,12 @@ mod tests {
         let workspace = temp.path().canonicalize().expect("canonical workspace");
         let command = bwrap_command(
             Path::new("/usr/bin/bwrap"),
-            SandboxProfile::WorkspaceNoNetwork,
-            &workspace,
-            &RuntimeRoots::default(),
-            &[],
+            SandboxLaunch {
+                profile: SandboxProfile::WorkspaceNoNetwork,
+                workspace: &workspace,
+                runtime: &RuntimeRoots::default(),
+                env: &[],
+            },
             OsStr::new("/bin/sh"),
             ["-c", "true"],
         );
@@ -1351,10 +1362,12 @@ mod tests {
         let cargo = cargo.canonicalize().expect("canonical cargo home");
         let command = bwrap_command(
             Path::new("/usr/bin/bwrap"),
-            SandboxProfile::WorkspaceNoNetwork,
-            &workspace.canonicalize().expect("canonical workspace"),
-            &runtime,
-            &[],
+            SandboxLaunch {
+                profile: SandboxProfile::WorkspaceNoNetwork,
+                workspace: &workspace.canonicalize().expect("canonical workspace"),
+                runtime: &runtime,
+                env: &[],
+            },
             OsStr::new("/bin/sh"),
             ["-c", "true"],
         );

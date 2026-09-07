@@ -2511,9 +2511,11 @@ fn a_leftover_temporary_file_is_never_observed_as_a_change() {
     let temp = tempfile::tempdir().expect("temp dir");
     let target = temp.path().join("note.txt");
     fs::write(&target, "old\n").expect("target");
-    let before = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+    let before = crate::capture_workspace_snapshot(temp.path(), MAX_WORKSPACE_SNAPSHOT_FILES)
+        .expect("snapshot");
     fs::write(temp.path().join(".euler-write-01ABCDEF.tmp"), "orphaned").expect("stale temp");
-    let after = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+    let after = crate::capture_workspace_snapshot(temp.path(), MAX_WORKSPACE_SNAPSHOT_FILES)
+        .expect("snapshot");
 
     assert!(
         before.changes_to(&after).is_empty(),

@@ -250,16 +250,10 @@ pub fn observed_file_diff_payload(
     ])
 }
 
-pub fn capture_workspace_snapshot(root: &Path) -> io::Result<WorkspaceSnapshot> {
-    WorkspaceSnapshot::capture(root, MAX_WORKSPACE_SNAPSHOT_FILES)
-}
-
-/// Capture with an explicit entry bound. The bound is configurable so
-/// "observation incomplete" stays rare enough to mean something.
-pub fn capture_workspace_snapshot_bounded(
-    root: &Path,
-    bound: usize,
-) -> io::Result<WorkspaceSnapshot> {
+/// Walk `root` under an explicit entry bound. The bound is configurable so
+/// "observation incomplete" stays rare enough to mean something
+/// (ADR 0021 row E).
+pub fn capture_workspace_snapshot(root: &Path, bound: usize) -> io::Result<WorkspaceSnapshot> {
     WorkspaceSnapshot::capture(root, bound)
 }
 
