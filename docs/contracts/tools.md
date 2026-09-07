@@ -102,13 +102,63 @@ Semantics:
 | Tool | Capability | Notes |
 |---|---|---|
 | `read_file` | FsRead | Relative path; optional line offset / max_bytes / max_lines. A sensitive path (capabilities contract, “Sensitive-basename ask”: anything under a `.git` component, git/npm/cargo/shell configuration, `.env*`, `*secret*`, `*credential*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key` — literal or symlink-resolved) escalates the request from blanket `session-allow` to an explicit ask. |
-| `edit_file` | FsWrite | Single exact replacement |
+| `edit_file` | FsWrite | Single exact replacement. The prepared pre-image must still match at apply time (see “Structured file confinement”). |
 | `write_file` | FsWrite | Create a new file from plain `{path, content}` — no patch dialect. Create-only: fails if the file exists (use `edit_file`/`apply_patch` to modify) or the parent directory is missing. Emits the same `patch.proposed`/`patch.applied`/`file.change`/`file.diff` provenance as the add path of `apply_patch`. |
 | `apply_patch` | FsWrite | Structured single-file patch |
 | `run_shell` | ShellExec | Workspace root; timeout bounds. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
 | `git_status` / `git_diff` | FsRead | Workspace git views. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
 | `tool_result_get` | FsRead | Rehydrate a demoted, compacted, or previewed tool result from the **current session** by `event_id` (required); optional `offset_bytes` (default `0`) and `max_bytes` (default 64 KiB) select a byte window. Session-local and project-context-policy-aware for children. |
 | `code_swarm_review` | AgentSpawn | Session-level review gate over required explicit `focus` (≤7 KiB) and `context` (≤256 KiB). The calling agent gathers material first through ordinary tools, so this gate has no hidden file, git, GitHub, or network authority. It forwards only that supplied context and a small reviewer brief — never ambient session canvas — fans out the persisted reviewer set, and returns every finding for caller adjudication. Optional: `personas`, `models` (non-empty one-off override; an empty model-facing list is omission), `max_tokens`. Advertised only in the root session when the `code-swarm` extension is wired and enabled; companions never see it (depth one). Config, result shape, and failure honesty: multi-agent contract. |
+
+## Structured file confinement
+
+`read_file`, `edit_file`, `write_file`, and `apply_patch` never hand a joined
+path to the kernel. Each target is opened by walking down from the workspace
+root: on Linux one `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS`, on other Unix hosts hop by hop with
+`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. Any component replaced between path
+resolution and the open — a directory swapped for a symlink, the root itself
+substituted, a bind mount planted inside the workspace — fails the open rather
+than escaping the root. Every subsequent check runs on that descriptor, so it
+describes the inode that is actually read or written.
+
+- **Regular files only.** A target that is not a regular file when the
+  descriptor is opened is refused for reads and writes alike.
+- **Creates are exclusive.** `write_file` and the add path of `apply_patch`
+  open with `O_CREAT | O_EXCL`, so a file that appeared after the tool call
+  was prepared is reported as already existing and is never clobbered.
+- **Writes require a single link.** A write to a target with `nlink > 1` is
+  refused: a second name may be outside the workspace, which would make a
+  confined write an unconfined one. The error says the file has multiple links
+  and to copy it before editing. Reads of a multiply-linked file are still
+  allowed.
+- **The prepared pre-image must still be there.** At apply time the target's
+  current bytes are compared to the exact content the tool call was prepared
+  against. Anything else — a user edit, a `git checkout`, another agent — is a
+  refusal, not an overwrite, and the file is left alone.
+- **A write is applied only once it is durable.** The mutation is synced
+  before Euler claims it happened.
+
+A structured write that fails after opening its target reports what actually
+changed: the file is observed through the same descriptor before and after,
+and any difference is emitted as ordinary `file.change` / `file.diff`
+provenance alongside the failed `tool.result`. A rejected multiply-linked
+target is never re-read for this purpose.
+
+## Rollback checkpoints
+
+A modifying structured write stores its rollback pre-image *before* the
+destructive write and records it as `checkpoint.stored` with
+`status: prepared`. If the pre-image cannot be stored durably the write does
+not happen at all, and the tool fails saying the file was not changed. Only
+after the write completes does the `file.change` event carry
+`pre_image_blob` with `checkpoint_status: applied`.
+
+`/rollback` lists applied checkpoints only. A prepared-only record describes a
+write that never completed, so restoring it would be a destructive edit of its
+own. Before restoring, Euler verifies that the file still holds exactly what
+the checkpointed edit wrote; if it does not, the restore is refused rather
+than silently discarding the later change. Event shapes: `docs/contracts/events.md`.
 
 Process launch/executor completion and process success are separate facts.
 `run_shell` and direct Git tools retain collected output and the observed exit

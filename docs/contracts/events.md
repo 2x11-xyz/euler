@@ -49,6 +49,7 @@ authority.
 - `permission.decision`
 - `patch.proposed`
 - `patch.applied`
+- `checkpoint.stored`
 - `file.change`
 - `file.diff`
 - `workspace.restore`
@@ -513,8 +514,9 @@ extension error does not consume the later result.
   revised separately.
 - `file.change`: `tool_call_id`, `origin`, `action`, `path`, `old_path`,
   `before_sha256`, `after_sha256`, `before_byte_len`, `after_byte_len`,
-  `diff_redaction`; optional `pre_image_blob` (sha256 hex) when a workspace
-  checkpoint pre-image was stored for this edit. This event is metadata-only:
+  `diff_redaction`; optional `pre_image_blob` (sha256 hex),
+  `checkpoint_status`, and `checkpoint_event_id` when a workspace checkpoint
+  pre-image was stored for this edit. This event is metadata-only:
   `origin` is descriptive edit metadata with known values `edit_file`,
   `apply_patch`, `run_shell:apply_patch`, and `run_shell`; `action` is `add`,
   `modify`, or `delete`, `old_path` is null, and `diff_redaction` is `omitted`.
@@ -534,9 +536,25 @@ extension error does not consume the later result.
   pre-images for safe single-file `edit_file` / `apply_patch` **modify** only;
   adds, deletes, multi-file shell observations, and external disk drift are out
   of scope.
+  When `pre_image_blob` is present, `checkpoint_status` is `applied` and
+  `checkpoint_event_id` names the `checkpoint.stored` event that recorded the
+  same pre-image before the write. Rows written before this marker existed
+  carry neither field and are read as applied: they were only ever emitted
+  after their write completed.
+- `checkpoint.stored`: `tool_call_id`, `path`, `action`, `pre_image_blob`,
+  `status`. Appended **before** the destructive write it protects, with
+  `status: prepared`, so a crash can never leave a changed file with no way
+  back. If the pre-image cannot be stored durably, no `checkpoint.stored` is
+  appended and the write does not happen. A `prepared` record is not
+  restorable and is never listed by `/rollback`: it describes a write that was
+  not observed to complete, so its pre-image may already be the file's current
+  content. The write is recorded as applied only by the later `file.change`.
 - `workspace.restore`: `path`, `checkpoint_event_id`, `blob_sha256`,
   `restored` (always `true` on success). Appended when the user restores a
-  workspace file via `/rollback` to the pre-image of a prior `file.change`.
+  workspace file via `/rollback` to the pre-image of a prior applied
+  `file.change`. A restore is refused when the target no longer holds exactly
+  what the checkpointed edit wrote (`after_sha256`), so rolling back cannot
+  silently discard a later edit.
   The transcript is never rewritten: restore is new provenance; the dead-end
   history stays queryable. Rendered as
   `↩ reverted <path> → ckpt <checkpoint_event_id> · files restored, history intact`.
@@ -969,11 +987,14 @@ extension error does not consume the later result.
 - `permission.decision` parents its `permission.prompt` (or the
   `tool.call` when no prompt was emitted).
 - `patch.proposed` parents its `tool.call`; `patch.applied` parents its
-  `patch.proposed`.
+  `patch.proposed`. `checkpoint.stored` parents its `patch.proposed`, because
+  it is appended before the write that `patch.applied` records.
 - Structured `file.change` parents the `patch.applied` event that records the
   edit it summarizes. Bounded ordinary `run_shell` file observations parent the
   originating `tool.call`, because there is no canonical patch event for that
-  shell process. The final `tool.result` still parents the original
+  shell process. A structured write that failed after opening its target is
+  the same case: there is no `patch.applied`, so the observed change parents
+  the `tool.call` and is followed by a failed `tool.result`. The final `tool.result` still parents the original
   `tool.call`, not the `file.change`.
 - `file.diff` parents the same event as the matching `file.change`. It is a
   sibling display projection, not the parent of `tool.result`. Its
