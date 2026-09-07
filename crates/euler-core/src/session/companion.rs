@@ -2,12 +2,12 @@
 
 use super::{
     add_provider_error_metadata, approval_mode_str, canvas_snapshot_payload,
-    context_budget_exhausted, elapsed_ms, file_change_payload, file_diff_payload,
-    maybe_store_pre_image, model_input_item, permission_decision_payload,
-    permission_request_for_tool, tool_cancelled_payload, tool_result_payload,
-    validate_model_target_shape, ModelRoundData, ModelTarget, ProviderRuntimeContext, RoundLoop,
-    RoundLoopConfig, RoundLoopIo, RoundOutcome, Session, SessionError, TurnState,
-    SYSTEM_INSTRUCTIONS,
+    checkpoint_store_failure, checkpoint_stored_payload, context_budget_exhausted, elapsed_ms,
+    file_change_payload, file_diff_payload, maybe_store_pre_image, model_input_item,
+    permission_decision_payload, permission_request_for_tool, tool_cancelled_payload,
+    tool_result_payload, validate_model_target_shape, ModelRoundData, ModelTarget,
+    ProviderRuntimeContext, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, Session,
+    SessionError, TurnState, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
@@ -584,6 +584,31 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let patch_proposed_id = self
             .append(EventKind::PATCH_PROPOSED, payload.clone(), None)?
             .id;
+        // Audit F36: store and record the rollback pre-image before the
+        // destructive write, and abandon the write if it cannot be stored.
+        let checkpoint = match maybe_store_pre_image(self.workspace_root.as_path(), patch) {
+            Ok(blob) => blob,
+            Err(error) => {
+                self.emit_tool_failure(
+                    call.id.clone(),
+                    execution.name.clone(),
+                    checkpoint_store_failure(&error),
+                    tool_call_event_id.to_owned(),
+                )?;
+                return Ok(true);
+            }
+        };
+        let checkpoint_event_id = match checkpoint.as_deref() {
+            Some(blob) => Some(
+                self.append(
+                    EventKind::CHECKPOINT_STORED,
+                    checkpoint_stored_payload(&call.id, patch, blob),
+                    Some(patch_proposed_id.clone()),
+                )?
+                .id,
+            ),
+            None => None,
+        };
         match self
             .tools
             .apply_patch_cancellable_observed(patch, cancellation)
@@ -611,11 +636,15 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let patch_applied_id = self
             .append(EventKind::PATCH_APPLIED, payload, Some(patch_proposed_id))?
             .id;
-        let pre_image_blob = maybe_store_pre_image(self.workspace_root.as_path(), patch);
         let file_change_id = self
             .append(
                 EventKind::FILE_CHANGE,
-                file_change_payload(&call.id, patch, pre_image_blob.as_deref()),
+                file_change_payload(
+                    &call.id,
+                    patch,
+                    checkpoint.as_deref(),
+                    checkpoint_event_id.as_deref(),
+                ),
                 Some(patch_applied_id.clone()),
             )?
             .id;

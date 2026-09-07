@@ -215,6 +215,33 @@ impl<D: PermissionDecider> Session<D> {
                         payload.clone(),
                         Some(tool_call_event_id.clone()),
                     )?;
+                    // Audit F36: the rollback pre-image is stored and
+                    // recorded before the destructive write, so a crash can
+                    // never leave a changed file with no way back. The
+                    // `prepared` record is not restorable until the write
+                    // below is observed to have completed.
+                    let checkpoint = match maybe_store_pre_image(self.config.root.as_path(), patch)
+                    {
+                        Ok(blob) => blob,
+                        Err(error) => {
+                            self.emit_failed_tool_result(
+                                call.id,
+                                execution.name,
+                                checkpoint_store_failure(&error),
+                                tool_call_event_id,
+                                tool_started,
+                            )?;
+                            return Ok(());
+                        }
+                    };
+                    let checkpoint_event_id = match checkpoint.as_deref() {
+                        Some(blob) => Some(self.emit_with_parent(
+                            EventKind::CHECKPOINT_STORED,
+                            checkpoint_stored_payload(&call.id, patch, blob),
+                            Some(patch_proposed_id.clone()),
+                        )?),
+                        None => None,
+                    };
                     match self
                         .tools
                         .apply_patch_cancellable_observed(patch, cancellation)
@@ -260,10 +287,14 @@ impl<D: PermissionDecider> Session<D> {
                         payload,
                         Some(patch_proposed_id),
                     )?;
-                    let pre_image_blob = maybe_store_pre_image(self.config.root.as_path(), patch);
                     let file_change_id = self.emit_with_parent(
                         EventKind::FILE_CHANGE,
-                        file_change_payload(&call.id, patch, pre_image_blob.as_deref()),
+                        file_change_payload(
+                            &call.id,
+                            patch,
+                            checkpoint.as_deref(),
+                            checkpoint_event_id.as_deref(),
+                        ),
                         Some(patch_applied_id.clone()),
                     )?;
                     let mut diff_payload = file_diff_payload(&call.id, &file_change_id, patch);
@@ -539,6 +570,7 @@ pub(crate) fn file_change_payload(
     tool_call_id: &str,
     patch: &PatchEvents,
     pre_image_blob: Option<&str>,
+    checkpoint_event_id: Option<&str>,
 ) -> JsonObject {
     let mut payload = object([
         ("tool_call_id", tool_call_id.to_owned().into()),
@@ -560,14 +592,52 @@ pub(crate) fn file_change_payload(
     ]);
     if let Some(hash) = pre_image_blob {
         payload.insert("pre_image_blob".to_owned(), hash.into());
+        payload.insert(
+            "checkpoint_status".to_owned(),
+            crate::checkpoints::CHECKPOINT_STATUS_APPLIED.into(),
+        );
+        if let Some(event_id) = checkpoint_event_id {
+            payload.insert("checkpoint_event_id".to_owned(), event_id.into());
+        }
     }
     payload
 }
 
-pub(crate) fn maybe_store_pre_image(root: &std::path::Path, patch: &PatchEvents) -> Option<String> {
+/// The durable record that a rollback pre-image exists, emitted before the
+/// write it protects. It stays `prepared` unless a `file.change` later
+/// records the same blob as `applied`.
+pub(crate) fn checkpoint_stored_payload(
+    tool_call_id: &str,
+    patch: &PatchEvents,
+    pre_image_blob: &str,
+) -> JsonObject {
+    object([
+        ("tool_call_id", tool_call_id.to_owned().into()),
+        ("path", patch.path.clone().into()),
+        ("action", patch.action.into()),
+        ("pre_image_blob", pre_image_blob.into()),
+        (
+            "status",
+            crate::checkpoints::CHECKPOINT_STATUS_PREPARED.into(),
+        ),
+    ])
+}
+
+/// The model-visible reason a destructive write was abandoned. The write did
+/// not happen, so the message must say so rather than describe I/O.
+pub(crate) fn checkpoint_store_failure(error: &std::io::Error) -> String {
+    format!(
+        "the rollback checkpoint for this edit could not be stored ({error}); the file was not changed"
+    )
+}
+
+pub(crate) fn maybe_store_pre_image(
+    root: &std::path::Path,
+    patch: &PatchEvents,
+) -> std::io::Result<Option<String>> {
     // v0: modify-only. Adds have empty before; restore-as-delete is product debt.
     if patch.action != "modify" || patch.before.is_empty() {
-        return None;
+        return Ok(None);
     }
     crate::checkpoints::store_pre_image(root, &patch.path, &patch.before)
 }

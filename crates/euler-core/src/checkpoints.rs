@@ -13,7 +13,7 @@
 
 use euler_event::{EventEnvelope, EventKind};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,12 @@ pub const MAX_WORKSPACE_CHECKPOINT_BYTES: usize = 256 * 1024;
 
 const EULER_DIR: &str = ".euler";
 const CHECKPOINTS_DIR: &str = "checkpoints";
+
+/// A pre-image stored before its destructive write, which has not been
+/// observed to complete.
+pub const CHECKPOINT_STATUS_PREPARED: &str = "prepared";
+/// A pre-image whose destructive write completed and was made durable.
+pub const CHECKPOINT_STATUS_APPLIED: &str = "applied";
 
 /// One restorable pre-image referenced from a `file.change` event.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,22 +42,23 @@ pub struct WorkspaceCheckpointRef {
 
 /// Store `content` content-addressed under the workspace checkpoint dir.
 ///
-/// Returns `None` when the content is empty, oversize, binary, or secret-like
-/// — callers omit the `pre_image_blob` field and the edit row shows no
-/// `· ckpt` suffix.
-pub fn store_pre_image(root: &Path, path: &str, content: &str) -> Option<String> {
+/// `Ok(None)` means this content is deliberately not checkpointed — empty,
+/// oversize, binary, or secret-like — and callers omit the `pre_image_blob`
+/// field so the edit row shows no `· ckpt` suffix. `Err` means a checkpoint
+/// was owed but could not be made durable, which callers must treat as a
+/// reason to abandon the destructive write rather than proceed without a
+/// way back (audit F36).
+pub fn store_pre_image(root: &Path, path: &str, content: &str) -> io::Result<Option<String>> {
     if content.is_empty() || content.len() > MAX_WORKSPACE_CHECKPOINT_BYTES {
-        return None;
+        return Ok(None);
     }
     if !crate::file_diff::content_is_checkpoint_safe(path, content) {
-        return None;
+        return Ok(None);
     }
     let hash = hash_bytes(content.as_bytes());
     let blob_path = checkpoint_blob_path(root, &hash);
-    if write_blob_durable(&blob_path, content.as_bytes()).is_err() {
-        return None;
-    }
-    Some(hash)
+    write_blob_durable(&blob_path, content.as_bytes())?;
+    Ok(Some(hash))
 }
 
 /// Load a previously stored pre-image by sha256.
@@ -74,16 +81,32 @@ pub fn load_pre_image(root: &Path, sha256: &str) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-/// Scan session events for `file.change` rows that carry a restorable pre-image.
-/// Newest first for the `/rollback` picker.
+/// Scan session events for `file.change` rows that carry a restorable
+/// pre-image. Newest first for the `/rollback` picker.
+///
+/// `checkpoint.stored` rows are deliberately not listed: a pre-image whose
+/// write never reached `applied` describes a file that was never changed, so
+/// restoring it would itself be a destructive edit (audit F36).
 pub fn list_from_events(events: &[EventEnvelope]) -> Vec<WorkspaceCheckpointRef> {
     // Stable newest-first from rev(); keep that order.
     events
         .iter()
         .rev()
         .filter(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .filter(|event| checkpoint_is_applied(event))
         .filter_map(checkpoint_ref_from_event)
         .collect()
+}
+
+/// Whether a `file.change` row records a write that actually happened.
+/// Rows written before the status marker existed carry no `checkpoint_status`
+/// and are treated as applied: they were only ever emitted after the write.
+pub fn checkpoint_is_applied(event: &EventEnvelope) -> bool {
+    event
+        .payload
+        .get("checkpoint_status")
+        .and_then(|value| value.as_str())
+        .is_none_or(|status| status == CHECKPOINT_STATUS_APPLIED)
 }
 
 fn checkpoint_ref_from_event(event: &EventEnvelope) -> Option<WorkspaceCheckpointRef> {
@@ -136,7 +159,7 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
         && fs::read(path)? == bytes
     {
         let file = OpenOptions::new().read(true).open(path)?;
-        file.sync_data()?;
+        crate::durability::sync_file_data(&file, path)?;
         return Ok(());
     }
     // Random temp name + create_new + 0o600: a predictable temp path could
@@ -152,7 +175,7 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = options.open(&temp_path)?;
     file.write_all(bytes)?;
     file.flush()?;
-    file.sync_data()?;
+    crate::durability::sync_file_data(&file, &temp_path)?;
     drop(file);
     // rename replaces a planted symlink at the final path rather than
     // following it.
@@ -161,8 +184,7 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
         return Err(error);
     }
     if let Some(parent) = path.parent() {
-        let dir = File::open(parent)?;
-        dir.sync_data()?;
+        crate::durability::sync_dir(parent)?;
     }
     Ok(())
 }
@@ -184,8 +206,9 @@ mod tests {
     #[test]
     fn store_and_load_round_trip() {
         let temp = tempdir().expect("temp");
-        let hash =
-            store_pre_image(temp.path(), "src/lib.rs", "fn main() {}\n").expect("store succeeds");
+        let hash = store_pre_image(temp.path(), "src/lib.rs", "fn main() {}\n")
+            .expect("store succeeds")
+            .expect("content is checkpoint-eligible");
         let loaded = load_pre_image(temp.path(), &hash).expect("load");
         assert_eq!(loaded, "fn main() {}\n");
         assert!(checkpoint_blob_path(temp.path(), &hash).is_file());
@@ -194,17 +217,27 @@ mod tests {
     #[test]
     fn skips_empty_and_oversized() {
         let temp = tempdir().expect("temp");
-        assert!(store_pre_image(temp.path(), "a.rs", "").is_none());
+        assert!(store_pre_image(temp.path(), "a.rs", "")
+            .expect("skip is not a failure")
+            .is_none());
         let big = "x".repeat(MAX_WORKSPACE_CHECKPOINT_BYTES + 1);
-        assert!(store_pre_image(temp.path(), "a.rs", &big).is_none());
+        assert!(store_pre_image(temp.path(), "a.rs", &big)
+            .expect("skip is not a failure")
+            .is_none());
     }
 
     #[test]
     fn skips_secret_like_content() {
         let temp = tempdir().expect("temp");
-        assert!(store_pre_image(temp.path(), ".env", "SECRET=1\n").is_none());
-        assert!(store_pre_image(temp.path(), "src/lib.rs", "const API_KEY = \"abc\";\n").is_none());
-        assert!(store_pre_image(temp.path(), "src/lib.rs", "hello\0world").is_none());
+        for (path, content) in [
+            (".env", "SECRET=1\n"),
+            ("src/lib.rs", "const API_KEY = \"abc\";\n"),
+            ("src/lib.rs", "hello\0world"),
+        ] {
+            assert!(store_pre_image(temp.path(), path, content)
+                .expect("skip is not a failure")
+                .is_none());
+        }
     }
 
     #[test]

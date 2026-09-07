@@ -84,8 +84,8 @@ pub(crate) use permissions_gate::{
     approval_mode_str, permission_decision_payload, permission_request_for_tool, PermissionRuling,
 };
 pub(crate) use tool_dispatch::{
-    file_change_payload, file_diff_payload, maybe_store_pre_image, tool_cancelled_payload,
-    tool_result_payload,
+    checkpoint_store_failure, checkpoint_stored_payload, file_change_payload, file_diff_payload,
+    maybe_store_pre_image, tool_cancelled_payload, tool_result_payload,
 };
 const DEFAULT_COMPACTION_RESERVE_TOKENS: usize = 16_384;
 const DEFAULT_COMPACTION_KEEP_RECENT: usize = 4;
@@ -403,6 +403,22 @@ pub enum SessionError {
     CheckpointMissingBlob { event_id: String },
     #[error("checkpoint blob unavailable: {0}")]
     CheckpointBlob(String),
+    #[error(
+        "checkpoint {event_id} records a pre-image whose write never completed; there is nothing to roll back"
+    )]
+    CheckpointNotApplied { event_id: String },
+    #[error(
+        "`{path}` changed after the checkpointed edit; restoring would discard that change. Inspect the file, then edit it directly"
+    )]
+    CheckpointFileChanged { path: String },
+}
+
+/// The three facts a rollback needs from a checkpoint event: which file, the
+/// pre-image to restore, and the post-write content the file must still hold.
+struct RestorableCheckpoint {
+    path: String,
+    blob_sha256: String,
+    after_sha256: String,
 }
 
 impl From<RunLifecycleError> for SessionError {
@@ -3193,6 +3209,55 @@ impl<D: PermissionDecider> Session<D> {
         list_from_events(self.bus.events())
     }
 
+    /// Resolve one checkpoint event into the facts a restore needs, refusing
+    /// anything that does not describe a completed write.
+    fn restorable_checkpoint(
+        &self,
+        checkpoint_event_id: &str,
+    ) -> Result<RestorableCheckpoint, SessionError> {
+        let checkpoint = self
+            .bus
+            .events()
+            .iter()
+            .find(|event| {
+                event.id == checkpoint_event_id
+                    && matches!(
+                        event.kind.as_str(),
+                        EventKind::FILE_CHANGE | EventKind::CHECKPOINT_STORED
+                    )
+            })
+            .ok_or_else(|| SessionError::CheckpointNotFound {
+                event_id: checkpoint_event_id.to_owned(),
+            })?;
+        // Audit F36: a `checkpoint.stored` record, or a `file.change` that is
+        // not marked applied, describes a write that never completed. Its
+        // pre-image is the file's current content, so "restoring" it would be
+        // a destructive edit of its own.
+        if checkpoint.kind.as_str() == EventKind::CHECKPOINT_STORED
+            || !checkpoints::checkpoint_is_applied(checkpoint)
+        {
+            return Err(SessionError::CheckpointNotApplied {
+                event_id: checkpoint_event_id.to_owned(),
+            });
+        }
+        let required = |field: &str| {
+            checkpoint
+                .payload
+                .get(field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| SessionError::CheckpointMissingBlob {
+                    event_id: checkpoint_event_id.to_owned(),
+                })
+        };
+        Ok(RestorableCheckpoint {
+            path: required("path")?,
+            blob_sha256: required("pre_image_blob")?,
+            after_sha256: required("after_sha256")?,
+        })
+    }
+
     /// Restore one workspace file to the pre-image captured on a `file.change`
     /// event. Appends a new `workspace.restore` ledger event; never rewrites
     /// history.
@@ -3201,36 +3266,24 @@ impl<D: PermissionDecider> Session<D> {
         checkpoint_event_id: &str,
     ) -> Result<WorkspaceRestoreOutcome, SessionError> {
         self.ensure_no_pending_admission()?;
-        let checkpoint = self
-            .bus
-            .events()
-            .iter()
-            .find(|event| {
-                event.id == checkpoint_event_id && event.kind.as_str() == EventKind::FILE_CHANGE
-            })
-            .ok_or_else(|| SessionError::CheckpointNotFound {
-                event_id: checkpoint_event_id.to_owned(),
-            })?;
-        let path = checkpoint
-            .payload
-            .get("path")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| SessionError::CheckpointMissingBlob {
-                event_id: checkpoint_event_id.to_owned(),
-            })?
-            .to_owned();
-        let blob_sha256 = checkpoint
-            .payload
-            .get("pre_image_blob")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| SessionError::CheckpointMissingBlob {
-                event_id: checkpoint_event_id.to_owned(),
-            })?
-            .to_owned();
+        let RestorableCheckpoint {
+            path,
+            blob_sha256,
+            after_sha256,
+        } = self.restorable_checkpoint(checkpoint_event_id)?;
         let content = checkpoints::load_pre_image(self.config.root.as_path(), &blob_sha256)
             .map_err(|error| SessionError::CheckpointBlob(error.to_string()))?;
+        // The pre-image is only the right thing to restore if the file still
+        // holds exactly what the checkpointed edit wrote. Anything else — a
+        // later agent edit, a user edit, a `git checkout` — means rolling
+        // back would silently discard work nobody asked to lose.
+        let current = self
+            .tools
+            .read_workspace_file(&path)
+            .map_err(SessionError::from)?;
+        if format!("{:x}", Sha256::digest(current.as_bytes())) != after_sha256 {
+            return Err(SessionError::CheckpointFileChanged { path });
+        }
         self.tools
             .write_workspace_file(&path, &content)
             .map_err(SessionError::from)?;

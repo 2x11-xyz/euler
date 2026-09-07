@@ -1237,6 +1237,18 @@ fn normalize_events(
                         Value::String(file_change_id),
                     );
                 }
+                if let Some(checkpoint_event_id) = payload
+                    .get("checkpoint_event_id")
+                    .and_then(Value::as_str)
+                    .map(|id| mapped_id(&id_map, id))
+                {
+                    replace_allowed(
+                        payload,
+                        allowlist,
+                        "checkpoint_event_id",
+                        Value::String(checkpoint_event_id),
+                    );
+                }
                 if let Some(response_id) = payload
                     .get("response_id")
                     .and_then(Value::as_str)
@@ -1550,6 +1562,7 @@ fn nondeterministic_fields() -> BTreeSet<&'static str> {
         "selected_event_ids",
         "event_id",
         "canvas_snapshot_id",
+        "checkpoint_event_id",
         "file_change_id",
         "response_id",
         "root",

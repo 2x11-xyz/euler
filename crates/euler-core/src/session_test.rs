@@ -7266,3 +7266,144 @@ fn broadly_classified_env_secret_is_masked_in_tool_output() {
     assert!(!output.contains(canary), "{output}");
     assert!(output.contains("[redacted-secret]"), "{output}");
 }
+
+// ---------------------------------------------------------------------------
+// Rollback checkpoint ordering (audit F36). The pre-image is stored and
+// recorded before the destructive write, so the only two durable states are
+// "no checkpoint and no change" and "checkpoint and change".
+// ---------------------------------------------------------------------------
+
+/// One `edit_file` turn against `note.txt` in `root`.
+fn edit_note_session(root: &std::path::Path, old: &str, new: &str) -> Session<ScriptedDecider> {
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![
+        euler_provider::ToolCall {
+            id: "call-edit".to_owned(),
+            name: "edit_file".to_owned(),
+            input: json!({"path": "note.txt", "old": old, "new": new}),
+        },
+    ])]);
+    Session::new(
+        SessionConfig::new(root),
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    )
+}
+
+#[test]
+fn checkpoint_is_recorded_before_the_write_and_stays_prepared_when_the_write_fails() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    let before = "prefix\nalpha\nsuffix\n";
+    std::fs::write(&note, before).expect("fixture");
+    let mut session = edit_note_session(temp.path(), "alpha", "beta");
+
+    // Crash the write at its durability boundary, after the checkpoint is
+    // stored and recorded. This is the window audit F36 is about.
+    let target = note.canonicalize().expect("canonical target");
+    let guard = arm_matching(Op::FileSync, move |path| path == target);
+    let _ = session
+        .run_turn("edit")
+        .expect_err("provider ends after tools");
+    assert!(guard.fired(), "the write must have reached its sync");
+    drop(guard);
+
+    let prepared = events_of_kind(session.events(), EventKind::CHECKPOINT_STORED);
+    assert_eq!(prepared.len(), 1, "the pre-image must be recorded first");
+    assert_eq!(
+        prepared[0].payload.get("status").and_then(Value::as_str),
+        Some("prepared")
+    );
+    let blob = prepared[0]
+        .payload
+        .get("pre_image_blob")
+        .and_then(Value::as_str)
+        .expect("pre_image_blob")
+        .to_owned();
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join(".euler/checkpoints").join(&blob))
+            .expect("the pre-image is durable even though the write failed"),
+        before
+    );
+    // No completed write means no patch.applied and no restorable checkpoint.
+    assert!(events_of_kind(session.events(), EventKind::PATCH_APPLIED).is_empty());
+    assert!(session.workspace_checkpoints().is_empty());
+
+    let prepared_id = prepared[0].id.clone();
+    drop(prepared);
+    let error = session
+        .restore_workspace_checkpoint(&prepared_id)
+        .expect_err("a prepared-only checkpoint is not restorable");
+    assert!(matches!(error, SessionError::CheckpointNotApplied { .. }));
+}
+
+#[test]
+fn a_checkpoint_that_cannot_be_stored_abandons_the_write() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    let before = "prefix\nalpha\nsuffix\n";
+    std::fs::write(&note, before).expect("fixture");
+    let mut session = edit_note_session(temp.path(), "alpha", "beta");
+
+    let guard = arm_matching(Op::FileSync, |path| {
+        path.parent()
+            .is_some_and(|parent| parent.ends_with(".euler/checkpoints"))
+    });
+    let _ = session
+        .run_turn("edit")
+        .expect_err("provider ends after tools");
+    assert!(guard.fired(), "the checkpoint store must have been reached");
+    drop(guard);
+
+    assert_eq!(
+        std::fs::read_to_string(&note).expect("read note"),
+        before,
+        "an unprotected edit must not be applied"
+    );
+    assert!(events_of_kind(session.events(), EventKind::CHECKPOINT_STORED).is_empty());
+    assert!(events_of_kind(session.events(), EventKind::PATCH_APPLIED).is_empty());
+    let result = events_of_kind(session.events(), EventKind::TOOL_RESULT);
+    let message = result
+        .last()
+        .and_then(|event| event.payload.get("error"))
+        .and_then(Value::as_str)
+        .expect("failed tool result carries an error");
+    assert!(message.contains("rollback checkpoint"), "{message}");
+    assert!(message.contains("was not changed"), "{message}");
+}
+
+#[test]
+fn rollback_refuses_to_discard_an_edit_made_after_the_checkpoint() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    let before = "prefix\nalpha\nsuffix\n";
+    std::fs::write(&note, before).expect("fixture");
+    let mut session = edit_note_session(temp.path(), "alpha", "beta");
+    let _ = session
+        .run_turn("edit")
+        .expect_err("provider ends after tools");
+
+    let checkpoints = session.workspace_checkpoints();
+    assert_eq!(checkpoints.len(), 1);
+    let checkpoint_id = checkpoints[0].event_id.clone();
+    std::fs::write(&note, "prefix\nbeta\nuser addition\n").expect("intervening user edit");
+
+    let error = session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect_err("rollback must not silently discard the user's edit");
+
+    assert!(matches!(
+        error,
+        SessionError::CheckpointFileChanged { ref path } if path == "note.txt"
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&note).expect("read note"),
+        "prefix\nbeta\nuser addition\n"
+    );
+
+    // Restoring the untouched post-write content still works.
+    std::fs::write(&note, "prefix\nbeta\nsuffix\n").expect("restore post-write state");
+    session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect("an unmodified file is restorable");
+    assert_eq!(std::fs::read_to_string(&note).expect("read note"), before);
+}

@@ -179,6 +179,7 @@ fn rehashes_and_repoints_a_workspace_pre_image_checkpoint() {
     let value = "internal-hostname-eu-west-42";
     let content = format!("host = {value}\n");
     let hash = crate::checkpoints::store_pre_image(workspace.path(), "conf.toml", &content)
+        .expect("checkpoint store succeeds")
         .expect("checkpoint stored");
 
     write_events(

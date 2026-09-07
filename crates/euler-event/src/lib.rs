@@ -33,6 +33,10 @@ impl EventKind {
     pub const PATCH_PROPOSED: &'static str = "patch.proposed";
     pub const PATCH_APPLIED: &'static str = "patch.applied";
     pub const FILE_CHANGE: &'static str = "file.change";
+    /// A rollback pre-image stored durably *before* its destructive write.
+    /// Status `prepared` until the matching `file.change` records the write
+    /// as `applied`; a prepared-only record is never restorable.
+    pub const CHECKPOINT_STORED: &'static str = "checkpoint.stored";
     pub const FILE_DIFF: &'static str = "file.diff";
     pub const WORKSPACE_RESTORE: &'static str = "workspace.restore";
     pub const CHECK_STARTED: &'static str = "check.started";
@@ -112,6 +116,7 @@ impl EventKind {
         Self::PATCH_PROPOSED,
         Self::PATCH_APPLIED,
         Self::FILE_CHANGE,
+        Self::CHECKPOINT_STORED,
         Self::FILE_DIFF,
         Self::WORKSPACE_RESTORE,
         Self::CHECK_STARTED,
@@ -377,6 +382,16 @@ mod tests {
             ]),
         );
         assert_round_trip(
+            EventKind::CHECKPOINT_STORED,
+            object([
+                ("tool_call_id", "call-1".into()),
+                ("path", "file".into()),
+                ("action", "modify".into()),
+                ("pre_image_blob", "sha-before".into()),
+                ("status", "prepared".into()),
+            ]),
+        );
+        assert_round_trip(
             EventKind::WORKSPACE_RESTORE,
             object([
                 ("path", "file".into()),
@@ -599,6 +614,7 @@ mod tests {
             EventKind::PATCH_PROPOSED,
             EventKind::PATCH_APPLIED,
             EventKind::FILE_CHANGE,
+            EventKind::CHECKPOINT_STORED,
             EventKind::FILE_DIFF,
             EventKind::WORKSPACE_RESTORE,
             EventKind::CHECK_STARTED,
@@ -800,6 +816,16 @@ mod tests {
                     "truncated": false,
                     "truncation": "none",
                     "omitted_reason": null
+                }),
+            ),
+            base(
+                EventKind::CHECKPOINT_STORED,
+                json!({
+                    "tool_call_id": "call-1",
+                    "path": "a.txt",
+                    "action": "modify",
+                    "pre_image_blob": "sha-before",
+                    "status": "prepared"
                 }),
             ),
             base(
@@ -1039,6 +1065,9 @@ mod tests {
                     "truncation",
                     "omitted_reason",
                 ]
+            }
+            EventKind::CHECKPOINT_STORED => {
+                vec!["tool_call_id", "path", "action", "pre_image_blob", "status"]
             }
             EventKind::WORKSPACE_RESTORE => {
                 vec!["path", "checkpoint_event_id", "blob_sha256", "restored"]
