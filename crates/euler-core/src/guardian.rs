@@ -233,6 +233,13 @@ pub(crate) fn adjudicates_verbatim(request: &PermissionRequest) -> bool {
     if request.command_truncated {
         return false;
     }
+    if request.dangerous_command {
+        // The danger walk's verdict is not reviewable by a model: a
+        // flagged command must reach a human (or be denied under a
+        // never-prompt policy), or "never auto-approved in any mode"
+        // becomes "unless an LLM says otherwise" (ADR 0021 decision D).
+        return false;
+    }
     if request
         .command
         .as_deref()
@@ -593,6 +600,15 @@ mod tests {
             .with_command(format!("echo {}", "a".repeat(8 * 1024)));
         assert!(truncated.command_truncated);
         assert!(!adjudicates_verbatim(&truncated));
+
+        // Review round 2, finding 9: a danger-flagged command escalates to
+        // `ask`, and the guardian must not then answer that ask — an LLM
+        // Allow would auto-approve what capabilities.md says is never
+        // auto-approved in any mode.
+        let dangerous = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("rm -rf scratch");
+        assert!(dangerous.dangerous_command);
+        assert!(!adjudicates_verbatim(&dangerous));
 
         // Overlong fs-write paths would be altered by the brief bound too.
         let long_path = PermissionRequest::new(Capability::FsWrite, "tool edit_file")

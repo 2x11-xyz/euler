@@ -35,14 +35,26 @@ pub struct PermissionRequest {
     /// coverage).
     pub workspace_root: Option<PathBuf>,
     /// True when `path` names a categorically sensitive file
-    /// ([`crate::command_safety::sensitive_basename`]: `.env*`, `*secret*`,
-    /// `*credential*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`), checked on
-    /// the literal argument AND its canonicalized workspace form. Such a
+    /// ([`crate::command_safety::sensitive_basename`]: anything under a
+    /// `.git` component, git/npm/cargo/shell configuration, `.env*`,
+    /// `*secret*`, `*credential*`, `id_rsa`, `id_ed25519`, `*.pem`,
+    /// `*.key`), checked on the literal argument AND its canonicalized
+    /// workspace form. Such a
     /// request never rides a blanket `session-allow`:
     /// [`PermissionGate::mode_for_request`] escalates it to `ask`, so
     /// accessing the file takes an explicit decision or a covering grant
     /// (deep review P1-b).
     pub sensitive_path: bool,
+    /// True when the permissive danger walk
+    /// ([`crate::command_safety::contains_dangerous_command`]) flagged the
+    /// command. Walked ONCE over the full command text, in
+    /// [`PermissionRequest::with_command`].
+    ///
+    /// Such a request is auto-approved by nothing: no grant covers it
+    /// ([`PermissionGate::granted_source`]) and no capability mode short of
+    /// `always-deny` skips its prompt
+    /// ([`PermissionGate::mode_for_request`]) — ADR 0021 decision D.
+    pub dangerous_command: bool,
 }
 
 impl PermissionRequest {
@@ -55,6 +67,7 @@ impl PermissionRequest {
             path: None,
             workspace_root: None,
             sensitive_path: false,
+            dangerous_command: false,
         }
     }
 
@@ -70,6 +83,17 @@ impl PermissionRequest {
             .command
             .as_deref()
             .is_some_and(|bounded| bounded.len() < full.trim().len());
+        // Walked once here, then carried on the request: the dispatcher,
+        // grant matching, the gate, and the approval panel all read this
+        // field instead of re-parsing the command.
+        //
+        // The walk reads the FULL string, not the bounded copy: bounding
+        // first would both miss danger past the bound and make every
+        // benign multi-kilobyte command (an ordinary `apply_patch`
+        // heredoc) count as unreadable and prompt. Truncation still blocks
+        // SCOPED grant matching, which needs text nobody can show the user
+        // (`command_for_matching`).
+        self.dangerous_command = crate::command_safety::contains_dangerous_command(&full);
         self
     }
 
@@ -424,11 +448,17 @@ impl<D> PermissionGate<D> {
     /// never weakened.
     pub fn mode_for_request(&self, request: &PermissionRequest) -> ApprovalMode {
         let mode = self.mode(request.capability);
-        if mode == ApprovalMode::SessionAllow && request.sensitive_path {
-            ApprovalMode::Ask
-        } else {
-            mode
+        if mode == ApprovalMode::AlwaysDeny {
+            return mode;
         }
+        // A sensitive path never rides a blanket allow (deep review P1-b),
+        // and neither does a dangerous or unreadable command: under ADR
+        // 0021 decision D the danger veto holds in EVERY mode, so a forced
+        // `rm` prompts even under full access.
+        if request.sensitive_path || request.dangerous_command {
+            return ApprovalMode::Ask;
+        }
+        mode
     }
 
     pub fn configured_capabilities(&self) -> impl Iterator<Item = Capability> + '_ {
@@ -542,7 +572,17 @@ impl<D> PermissionGate<D> {
 
     /// Which grant store covers this request, if any (narrowest lifetime wins
     /// ties: session, then project, then user).
+    ///
+    /// A shell command the permissive danger walk flags
+    /// ([`crate::command_safety::contains_dangerous_command`]) is covered by
+    /// NO grant, scoped or unscoped: it always takes an explicit permission
+    /// decision. This is the single funnel for both grant coverage in the
+    /// dispatcher and the grant check inside `decide_detailed_cancellable`,
+    /// so the veto holds on every path.
     pub fn granted_source(&self, request: &PermissionRequest) -> Option<GrantSource> {
+        if request.dangerous_command {
+            return None;
+        }
         let command = request.command_for_matching();
         let path = request.path.as_deref();
         let root = request.workspace_root.as_deref();
@@ -1266,13 +1306,26 @@ mod tests {
         );
         assert_eq!(gate.granted_source(&request), None);
 
-        // Unscoped grants are capability-wide and unaffected by truncation.
+        // Unscoped grants are capability-wide and unaffected by truncation
+        // (review round 2, finding 10: walking the FULL string keeps this
+        // true for benign multi-kilobyte commands while still flagging a
+        // `rm -rf` hidden past the bound — asserted below).
         gate.install_grant(
             Capability::ShellExec,
             GrantScope::Session(ScopePattern::unscoped()),
         )
         .expect("install unscoped");
         assert!(gate.is_granted(&request));
+        assert!(!request.dangerous_command);
+
+        // Danger past the retention bound is still seen, because the walk
+        // reads the full text before the stored copy is bounded.
+        let hidden = format!("{}; rm -rf .", "echo padding ".repeat(400));
+        let hidden =
+            PermissionRequest::new(Capability::ShellExec, "tool run_shell").with_command(&hidden);
+        assert!(hidden.command_truncated);
+        assert!(hidden.dangerous_command);
+        assert!(!gate.is_granted(&hidden));
 
         // Non-truncated commands keep working.
         let short = PermissionRequest::new(Capability::ShellExec, "tool run_shell")

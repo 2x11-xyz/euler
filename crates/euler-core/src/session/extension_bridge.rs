@@ -290,6 +290,10 @@ impl<D> Session<D> {
     /// capabilities not covered by an existing grant share one operation
     /// prompt and retain individual decision records. A denial aborts the
     /// whole run.
+    /// `shell-exec` is refused here by construction: this entry point
+    /// carries no command line, so nothing could be walked, and a caller
+    /// must use the cancellable form and pass the command (review round 3,
+    /// finding 7).
     pub fn approve_extension_capabilities(
         &mut self,
         extension_id: &str,
@@ -299,10 +303,16 @@ impl<D> Session<D> {
     where
         D: crate::permissions::PermissionDecider,
     {
+        if required.contains(&Capability::ShellExec) {
+            return Err(ExtensionExecutionError::CapabilityDenied {
+                capability: Capability::ShellExec,
+            });
+        }
         self.approve_extension_capabilities_cancellable(
             extension_id,
             command,
             required,
+            None,
             &CancellationToken::new(),
         )
     }
@@ -311,23 +321,52 @@ impl<D> Session<D> {
         &self,
         operation: String,
         required: &[Capability],
+        shell_command: Option<&str>,
     ) -> Result<Option<PermissionRequestBatch>, ExtensionExecutionError>
     where
         D: crate::permissions::PermissionDecider,
     {
         let mut pending = Vec::new();
         for &capability in required {
-            let mode = self
+            // The request is built BEFORE the mode is consulted, so the
+            // danger walk runs on every path — under a blanket
+            // `session-allow` too. Building it inside the `ask` arm let an
+            // extension invoked with `{"command": "rm -rf scratch"}` run
+            // unprompted while `run_shell` with the same string asked.
+            let mut request = PermissionRequest::new(capability, operation.clone());
+            if capability == Capability::ShellExec {
+                match shell_command {
+                    // Walked exactly as `run_shell` is.
+                    Some(command) => request = request.with_command(command),
+                    // An extension may name its field anything (`cmd`,
+                    // `script`), so a shell request with no command line is
+                    // unreadable: it is covered by no grant and always
+                    // reaches a prompt, the same treatment a truncated
+                    // command gets.
+                    None => request.dangerous_command = true,
+                }
+            }
+            let configured = self
                 .permissions
                 .configured_mode(capability)
                 .unwrap_or(ApprovalMode::Ask);
+            // Mirrors `PermissionGate::mode_for_request` on the configured
+            // mode: `always-deny` still denies, and a dangerous or
+            // sensitive request rides no blanket allowance (ADR 0021
+            // decision D).
+            let mode = if configured == ApprovalMode::AlwaysDeny
+                || !(request.dangerous_command || request.sensitive_path)
+            {
+                configured
+            } else {
+                ApprovalMode::Ask
+            };
             match mode {
                 ApprovalMode::SessionAllow => {}
                 ApprovalMode::AlwaysDeny => {
                     return Err(ExtensionExecutionError::CapabilityDenied { capability });
                 }
                 ApprovalMode::Ask => {
-                    let request = PermissionRequest::new(capability, operation.clone());
                     if self.permissions.granted_source(&request).is_none()
                         && !pending
                             .iter()
@@ -346,6 +385,10 @@ impl<D> Session<D> {
         extension_id: &str,
         command: &str,
         required: &[Capability],
+        // Shell command line the invocation carries, when it carries one:
+        // a `shell-exec` request that names a command must go through the
+        // danger walk like `run_shell` does (review round 2, finding 7).
+        shell_command: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<(), ExtensionExecutionError>
     where
@@ -355,7 +398,8 @@ impl<D> Session<D> {
             return Err(ExtensionExecutionError::Cancelled);
         }
         let operation = format!("extension {extension_id}.{command}");
-        let Some(batch) = self.extension_permission_batch(operation, required)? else {
+        let Some(batch) = self.extension_permission_batch(operation, required, shell_command)?
+        else {
             return if cancellation.is_cancelled() {
                 Err(ExtensionExecutionError::Cancelled)
             } else {
@@ -486,6 +530,7 @@ impl<D> Session<D> {
             &extension_id,
             command,
             required,
+            input.get("command").and_then(Value::as_str),
             cancellation,
         )?;
         if cancellation.is_cancelled() {
@@ -611,5 +656,129 @@ impl<D> Session<D> {
         );
         publish?;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grants::{GrantScope, ScopePattern};
+    use crate::permissions::ScriptedDecider;
+    use crate::{Session, SessionConfig};
+    use euler_provider::ScriptedProvider;
+
+    fn session_with_unscoped_shell_grant(root: &std::path::Path) -> Session<ScriptedDecider> {
+        let mut session = Session::new(
+            SessionConfig::new(root),
+            ScriptedProvider::new(Vec::new()),
+            ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+        );
+        session
+            .permissions
+            .install_grant(
+                Capability::ShellExec,
+                GrantScope::Session(ScopePattern::unscoped()),
+            )
+            .expect("install unscoped shell grant");
+        // Installing an unscoped grant legitimately flips the mode to
+        // session-allow; the grant path under `ask` is what this pins.
+        session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
+        session
+    }
+
+    /// Review round 3, finding 7: extensions may name their command field
+    /// anything (`cmd`, `script`), and a `shell-exec` request with no
+    /// command text can be walked by nothing. It must therefore be covered
+    /// by no grant and always reach a prompt — the treatment a truncated
+    /// command gets.
+    #[test]
+    fn extension_shell_request_without_a_command_is_never_grant_covered() {
+        let temp = tempfile::tempdir().expect("temp");
+        let session = session_with_unscoped_shell_grant(temp.path());
+
+        // A walkable, harmless command still rides the unscoped grant:
+        // nothing pending, no prompt.
+        let covered = session
+            .extension_permission_batch(
+                "extension ext.run".to_owned(),
+                &[Capability::ShellExec],
+                Some("ls -la"),
+            )
+            .expect("batch");
+        assert!(
+            covered.is_none(),
+            "a walked, harmless command should ride the unscoped grant"
+        );
+
+        // No command text (the invocation called its field `cmd`): the
+        // request is unreadable, so it is pending a decision.
+        let pending = session
+            .extension_permission_batch(
+                "extension ext.run".to_owned(),
+                &[Capability::ShellExec],
+                None,
+            )
+            .expect("batch")
+            .expect("an unwalkable shell request must reach a prompt");
+        let request = &pending.requests()[0];
+        assert!(request.dangerous_command);
+        assert!(session.permissions.granted_source(request).is_none());
+    }
+
+    /// Review round 4, finding 2: the request (and therefore the walk) used
+    /// to be built only inside the `ask` arm, so a blanket `session-allow`
+    /// auto-approved an extension shell command that `run_shell` would have
+    /// prompted for.
+    #[test]
+    fn extension_shell_exec_under_session_allow_still_prompts_when_unreadable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut session = session_with_unscoped_shell_grant(temp.path());
+        session.set_permission_mode(Capability::ShellExec, ApprovalMode::SessionAllow);
+
+        for command in [Some("rm -rf scratch"), None] {
+            let pending = session
+                .extension_permission_batch(
+                    "extension ext.run".to_owned(),
+                    &[Capability::ShellExec],
+                    command,
+                )
+                .expect("batch")
+                .expect("a dangerous or unreadable command must reach a prompt");
+            assert!(pending.requests()[0].dangerous_command, "{command:?}");
+        }
+
+        // An ordinary command still rides the mode.
+        let allowed = session
+            .extension_permission_batch(
+                "extension ext.run".to_owned(),
+                &[Capability::ShellExec],
+                Some("ls -la"),
+            )
+            .expect("batch");
+        assert!(
+            allowed.is_none(),
+            "session-allow still allows ordinary work"
+        );
+    }
+
+    /// The command-less entry point cannot build a walked shell request, so
+    /// it refuses the capability outright rather than letting one through.
+    #[test]
+    fn command_less_capability_approval_refuses_shell_exec() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut session = session_with_unscoped_shell_grant(temp.path());
+        let error = session
+            .approve_extension_capabilities("ext", "run", &[Capability::ShellExec])
+            .expect_err("shell-exec has no walkable command here");
+        assert!(matches!(
+            error,
+            ExtensionExecutionError::CapabilityDenied {
+                capability: Capability::ShellExec
+            }
+        ));
+        // Other capabilities are unaffected.
+        session
+            .approve_extension_capabilities("ext", "run", &[Capability::ArtifactWrite])
+            .expect("non-shell capabilities still approve");
     }
 }

@@ -6,6 +6,51 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Shell command safety
+
+- Static shell approval now parses with `tree-sitter-bash` and uses the
+  two-parser design of OpenAI Codex instead of a name-keyed allowlist over
+  a hand-rolled tokenizer. A conservative parser may prove a command safe —
+  an allowed node-kind tree, literal words only, and an allowlist of exact
+  option spellings per binary — and a separate permissive walk may only
+  find danger. The walk visits every command node, including inside control
+  flow, substitutions, redirection arguments, and the scripts carried by
+  `sh -c`, `eval`, `env -S`, and `trap`, and unwraps `sudo`, `su`, `env`,
+  `timeout`, `nice`, `xargs`, `exec`, `command`, and the rest.
+- A command that walk flags is **never auto-approved, in any mode**: no
+  grant covers it, the guardian reviewer never adjudicates it, the approval
+  panel offers no grant for it, and every capability mode short of
+  `always-deny` is escalated to a prompt for that request, so a forced `rm`
+  asks even under a blanket session allow. The danger table is extensible and covers more
+  than forced `rm`: `run_shell` closes stdin, so `rm -r` never gets its
+  confirmation, and `find -delete`, `git clean -f`, `shred`, `truncate`,
+  `dd of=`, `wipefs`, and `mkfs*` are in it too. A command truncated at the
+  retention bound is walked in full before it is bounded, so danger hidden
+  past the bound is still seen while an ordinary multi-kilobyte command is
+  not flagged for being long. The walk also covers the write side of audit
+  F34: a redirect target or `cp`/`mv`/`tee`/`install`/`ln` destination on
+  the sensitive list asks exactly as `write_file` on that path does.
+- Auto-approvals that could act outside the workspace are gone (audit F01,
+  F02, F34). `uniq in out` writes `out`, so `uniq` allows at most one
+  operand. Shell-rewritable words (globs, `~`, `${...}`, `$'...'`) are
+  never provable for any binary. `cd` and `git` left the read-only set —
+  `cd` moves the directory confinement is checked against, and read-only
+  `git` subcommands still run repository-controlled `diff.external`,
+  `core.fsmonitor`, and filter programs. Traversal flags that dereference
+  symlinks, attached option values, and GNU long abbreviations are all
+  rejected by the allowlist rather than chased with a denylist, as are
+  recursive readers — `grep -r`, and `rg` entirely, since it recurses by
+  default — whose tree walk reads files the per-operand sensitive check
+  never saw. A backslash anywhere in the
+  line makes it unprovable, because a backslash-newline is whitespace to
+  the grammar and a line continuation to `sh`.
+- The sensitive-path denylist (which blocks both static shell approval and
+  blanket fs-tool grants) now covers anything under a `.git` component,
+  `.gitmodules`, `.gitattributes`, `.gitconfig`, `.cargo/config.toml`,
+  `.npmrc`, `.netrc`, and shell startup files, and applies to a path's
+  canonicalized form as well as its spelling, so an in-workspace symlink
+  cannot read through it.
+
 ### Project context and skills
 
 - Skill authoring is now more interoperable: a missing or YAML null name

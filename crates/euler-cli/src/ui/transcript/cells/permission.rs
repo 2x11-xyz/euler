@@ -92,6 +92,9 @@ pub(in crate::ui::transcript) struct PermissionAskView<'a> {
     /// `Some` only when the durable `u  Allow <prefix> * always` option is
     /// offerable (simple shell command + loaded user store).
     pub(in crate::ui::transcript) user_rule_prefix: Option<&'a str>,
+    /// False when the request is danger-flagged: no grant can cover it, so
+    /// the panel offers none.
+    pub(in crate::ui::transcript) grants_offerable: bool,
     pub(in crate::ui::transcript) prior_count: usize,
     pub(in crate::ui::transcript) selected_option: crate::ui::patch_approval::ApprovalOption,
     pub(in crate::ui::transcript) companion_name: Option<&'a str>,
@@ -192,6 +195,7 @@ pub(in crate::ui::transcript) fn render_permission_ask(
             ask.capability,
             ask.scope_prefix,
             ask.user_rule_prefix,
+            ask.grants_offerable,
             ask.selected_option,
         )
         .into_iter()

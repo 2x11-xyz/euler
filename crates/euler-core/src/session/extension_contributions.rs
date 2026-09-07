@@ -596,6 +596,11 @@ impl<D: PermissionDecider> Session<D> {
             &binding.extension_id,
             &binding.command,
             &binding.required_capabilities,
+            // An extension tool that names a shell command gets the same
+            // danger walk `run_shell` does (review round 2, finding 7).
+            call.input
+                .get("command")
+                .and_then(serde_json::Value::as_str),
             cancellation,
         ) {
             if matches!(error, ExtensionExecutionError::Cancelled) {
