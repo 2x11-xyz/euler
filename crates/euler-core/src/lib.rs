@@ -15,6 +15,7 @@ mod durability;
 pub mod extension_registry;
 pub mod extensions;
 pub mod file_diff;
+pub mod git_neutralization;
 pub mod grants;
 pub mod guardian;
 pub mod home;
@@ -80,10 +81,11 @@ pub use extension_registry::{
 pub use file_diff::{
     capture_workspace_snapshot, file_change_event_payload, file_diff_projection,
     observed_file_change_payload, observed_file_diff_payload, observed_file_diff_projection,
-    FileChangeRecord, FileDiffProjection, FileDiffSource, ObservedFileChange, WorkspaceSnapshot,
-    MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_SNAPSHOT_FILES, MAX_WORKSPACE_SNAPSHOT_FILE_BYTES,
-    MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
+    FileChangeRecord, FileDiffProjection, FileDiffSource, IncompleteObservation, ObservationLimit,
+    ObservedFileChange, WorkspaceSnapshot, MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_SNAPSHOT_FILES,
+    MAX_WORKSPACE_SNAPSHOT_FILE_BYTES, MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
 };
+pub use git_neutralization::host_git_command;
 pub use grants::{
     ActiveGrant, GrantScope, ProjectGrantError, ProjectGrantStore, ScopePattern, ScopePatternError,
     MAX_GRANT_COMMAND_BYTES, MAX_GRANT_INSTRUCTION_BYTES, MAX_SCOPE_PATTERN_BYTES,
@@ -121,7 +123,8 @@ pub use runtime_identity::{
     RUNTIME_IDENTITY_SCHEMA_VERSION,
 };
 pub use sandbox::{
-    probe_workspace_sandbox, SandboxAvailability, SandboxProfile, SandboxUnavailableReason,
+    probe_sandbox_backend, probe_workspace_sandbox, SandboxAvailability, SandboxBackend,
+    SandboxFailureCause, SandboxProfile, SandboxStatus, SandboxUnavailableReason,
     SubprocessSandbox,
 };
 pub use session::{

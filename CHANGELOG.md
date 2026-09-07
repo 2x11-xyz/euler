@@ -6,6 +6,55 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Subprocess sandboxing
+
+- **Linux: Bubblewrap is now the default and enforced execution boundary for
+  `run_shell` and the `git_*` tools.** The child gets a private root, its
+  workspace bound read-write, private `/tmp` `/proc` `/dev`, a tmpfs `HOME`,
+  no host network namespace, and a cleared environment. macOS is unchanged:
+  no backend exists there yet, so those tools still run on the host under the
+  ordinary permission decision. `SandboxBackend` names both so the Seatbelt
+  backend slots in without touching call sites.
+- Toolchains installed under the real home stay reachable. The toolchain homes
+  the host environment implies (`CARGO_HOME`, `RUSTUP_HOME`, `NVM_DIR`,
+  `PYENV_ROOT`, `ASDF_DATA_DIR`, `GOPATH`, `PNPM_HOME`, plus `/nix/store`) are
+  detected and bound read-only at their real paths, with the sandbox `PATH`
+  built from the host `PATH` entries inside them. The real `$HOME` is never
+  mounted read-write, and a write under it fails instead of landing in a
+  discarded private copy.
+- Availability is probed at session start by running a trivial sandboxed
+  command, because an installed `bwrap` is not evidence that it works. The
+  outcome is recorded on `session.start` as `sandbox_backend`
+  (`bwrap` | `host` | `unavailable`) with `sandbox_unavailable_reason`. A
+  failed probe fails sandbox-requiring tools closed — never a silent fallback
+  to host execution — and emits a diagnostic naming the likely cause
+  (userns disabled by sysctl or AppArmor, a container, WSL1, `bwrap` missing)
+  and the fix. New `euler --check-sandbox` runs the same probes and exits
+  nonzero with that diagnostic. Bubblewrap must be installed on the host;
+  bundling a digest-verified `bwrap` is tracked as a follow-up.
+- Euler's own Git invocations are neutralized: `core.hooksPath=/dev/null`,
+  `safe.bareRepository=explicit`, `attr.tree=`, `core.attributesFile=`,
+  `GIT_LFS_SKIP_SMUDGE=1 GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0`, every
+  configured `filter.*.clean`/`.process` driver blanked through
+  `GIT_CONFIG_KEY_n`, the `GIT_DIR`/`GIT_WORK_TREE`/`GIT_CONFIG*`/
+  `GIT_INDEX_FILE`/`GIT_ALTERNATE_OBJECT_DIRECTORIES` family stripped from the
+  environment, and `--no-ext-diff --no-textconv` on `git_diff`.
+  `core.fsmonitor` is probed and preserved only for Git's built-in daemon.
+- Euler's own git is neutralized everywhere it runs, not only in the tools:
+  the TUI `@`-mention picker's `git ls-files` goes through the same overrides,
+  and the build script applies them to its own `git status`.
+- **Breaking (library):** `capture_workspace_snapshot` now takes the entry
+  bound as a second argument; pass `MAX_WORKSPACE_SNAPSHOT_FILES` for the
+  previous behavior. `probe_workspace_sandbox` returns `SandboxStatus` rather
+  than `SandboxAvailability`, so the cause its own probe observed travels with
+  the result. `SandboxStatus::from_availability` is removed: it could only
+  re-derive a cause from the reason, which is strictly worse than what the
+  probe already knows.
+- Reaching the workspace-observation bound no longer hides changes as "no
+  changes". The command runs; the tool text leads with `file observation
+  incomplete: <reason>; changes may be unreported`, and the result carries an
+  `observation` object (`{status, reason, bound}`). The bound is configurable.
+
 ### Shell command safety
 
 - Static shell approval now parses with `tree-sitter-bash` and uses the

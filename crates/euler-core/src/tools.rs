@@ -1,9 +1,13 @@
+use crate::git_neutralization::{
+    cached_fsmonitor_daemon_support, fsmonitor_override, parse_executable_config, GitNeutralization,
+};
 use crate::sandbox::WorkspaceSandbox;
 use crate::structured_file;
 use crate::{
     apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
-    ApplyPatchDocument, ApplyPatchError, ObservedFileChange, SandboxAvailability,
-    SandboxUnavailableReason, SubprocessSandbox,
+    ApplyPatchDocument, ApplyPatchError, IncompleteObservation, ObservedFileChange,
+    SandboxAvailability, SandboxFailureCause, SandboxStatus, SandboxUnavailableReason,
+    SubprocessSandbox, WorkspaceSnapshot, MAX_WORKSPACE_SNAPSHOT_FILES,
 };
 use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use euler_provider::ToolDefinition;
@@ -12,6 +16,7 @@ use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -86,8 +91,15 @@ pub enum ToolError {
     UpdateHunkMatchCount { hunk: usize, count: usize },
     #[error("update hunk {hunk} overlaps earlier update hunk {previous_hunk}")]
     UpdateHunkOverlap { hunk: usize, previous_hunk: usize },
-    #[error("{0}")]
-    SandboxUnavailable(SandboxUnavailableReason),
+    #[error("{reason} ({cause}); run `euler --check-sandbox` for the full diagnostic")]
+    SandboxUnavailable {
+        reason: SandboxUnavailableReason,
+        /// The likely host cause, so an in-session failure carries the same
+        /// attribution the session-start diagnostic did.
+        cause: SandboxFailureCause,
+    },
+    #[error("{0}, so Euler will not run git with repository-selected helpers live")]
+    GitProbeFailed(&'static str),
     #[error("tool cancelled")]
     Cancelled,
     #[error(transparent)]
@@ -109,6 +121,10 @@ pub struct ToolExecution {
     pub exit_code: Option<i32>,
     pub patch: Option<PatchEvents>,
     pub file_changes: Vec<ObservedFileChange>,
+    /// Set when the workspace walk around this tool could not observe
+    /// everything. `file_changes` is then "not observed", never "no changes"
+    /// (ADR 0021 row E).
+    pub observation: Option<IncompleteObservation>,
 }
 
 /// Result of a tool invocation that was admitted before cancellation.
@@ -217,6 +233,7 @@ pub struct ToolRegistry {
     workspace_sandbox: Option<WorkspaceSandbox>,
     agent_euler_home: OnceLock<tempfile::TempDir>,
     skills: BTreeMap<String, FrozenSkill>,
+    observation_bound: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -254,7 +271,7 @@ pub(crate) struct ResolvedSkillActivation {
 
 impl ToolRegistry {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self::with_subprocess_sandbox(root, SubprocessSandbox::Disabled)
+        Self::with_subprocess_sandbox(root, SubprocessSandbox::Host)
     }
 
     /// Build a registry whose agent-controlled subprocesses either execute
@@ -267,7 +284,7 @@ impl ToolRegistry {
     ) -> Self {
         let root = root.into();
         let workspace_sandbox = match subprocess_sandbox {
-            SubprocessSandbox::Disabled => None,
+            SubprocessSandbox::Host => None,
             SubprocessSandbox::Enforce(profile) => Some(WorkspaceSandbox::new(&root, profile)),
         };
         Self {
@@ -275,7 +292,34 @@ impl ToolRegistry {
             workspace_sandbox,
             agent_euler_home: OnceLock::new(),
             skills: BTreeMap::new(),
+            observation_bound: MAX_WORKSPACE_SNAPSHOT_FILES,
         }
+    }
+
+    /// Override the workspace-observation entry bound (ADR 0021 row E). The
+    /// bound exists so a pathological tree cannot stall a command; a caller
+    /// working in a large repository can raise it, and tests lower it.
+    #[must_use]
+    pub fn with_observation_bound(mut self, bound: usize) -> Self {
+        self.observation_bound = bound.max(1);
+        self
+    }
+
+    /// The execution boundary that agent subprocesses actually get, as
+    /// recorded on `session.start`.
+    pub fn sandbox_status(&self) -> SandboxStatus {
+        self.workspace_sandbox
+            .as_ref()
+            .map_or(SandboxStatus::Host, WorkspaceSandbox::status)
+    }
+
+    /// Things the profile can see but cannot fix, worth saying once. Empty
+    /// unless a sandbox was requested and something is worth reporting.
+    pub fn sandbox_advisories(&self) -> Vec<String> {
+        self.workspace_sandbox
+            .as_ref()
+            .map(WorkspaceSandbox::advisories)
+            .unwrap_or_default()
     }
 
     pub fn set_frozen_skills(&mut self, skills: impl IntoIterator<Item = FrozenSkill>) {
@@ -431,8 +475,26 @@ impl ToolRegistry {
             "write_file" => self.write_file(input),
             "apply_patch" => self.apply_patch_tool(input),
             "run_shell" => return self.run_shell(input, cancellation),
-            "git_status" => return self.git(&["status", "--short"], "git_status", cancellation),
-            "git_diff" => return self.git(&["diff", "--"], "git_diff", cancellation),
+            "git_status" => {
+                return self.git(
+                    &["status", "--short", "--ignore-submodules=dirty"],
+                    "git_status",
+                    cancellation,
+                )
+            }
+            "git_diff" => {
+                return self.git(
+                    &[
+                        "diff",
+                        "--no-ext-diff",
+                        "--no-textconv",
+                        "--ignore-submodules=dirty",
+                        "--",
+                    ],
+                    "git_diff",
+                    cancellation,
+                )
+            }
             "tool_result_get" => Err(ToolError::InvalidField(
                 "tool_result_get requires session events",
             )),
@@ -557,6 +619,7 @@ impl ToolRegistry {
             exit_code: None,
             patch: None,
             file_changes: Vec::new(),
+            observation: None,
         })
     }
 
@@ -575,6 +638,7 @@ impl ToolRegistry {
             exit_code: None,
             patch: None,
             file_changes: Vec::new(),
+            observation: None,
         })
     }
 
@@ -617,6 +681,7 @@ impl ToolRegistry {
                 write_content: updated,
             }),
             file_changes: Vec::new(),
+            observation: None,
         })
     }
 
@@ -660,6 +725,7 @@ impl ToolRegistry {
                 write_content: content.to_owned(),
             }),
             file_changes: Vec::new(),
+            observation: None,
         })
     }
 
@@ -704,6 +770,7 @@ impl ToolRegistry {
                         write_content: content,
                     }),
                     file_changes: Vec::new(),
+                    observation: None,
                 })
             }
             ApplyPatchDocument::Update { path, chunks } => {
@@ -734,6 +801,7 @@ impl ToolRegistry {
                         write_content: updated,
                     }),
                     file_changes: Vec::new(),
+                    observation: None,
                 })
             }
         }
@@ -823,8 +891,8 @@ impl ToolRegistry {
                 value
             }
         };
-        let before = capture_workspace_snapshot(&self.root).ok();
-        let child = self.agent_subprocess("sh", &["-c", command])?;
+        let before = self.observe_workspace();
+        let child = self.agent_subprocess("sh", &["-c", command], &[])?;
         let sandboxed = child.sandboxed;
         let outcome = run_process(child.command, Some(timeout_ms), cancellation)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
@@ -837,27 +905,23 @@ impl ToolRegistry {
                 ProcessTermination::TimedOut | ProcessTermination::Cancelled
             ),
         )?;
-        let after = capture_workspace_snapshot(&self.root).ok();
+        let after = self.observe_workspace();
+        let observation =
+            incomplete_observation(before.as_ref(), after.as_ref(), self.observation_bound);
         let file_changes = before
             .zip(after)
             .map_or_else(Vec::new, |(before, after)| before.changes_to(&after));
-        let (status, header, cancelled) = match outcome.termination {
-            ProcessTermination::Exited(status) => (status, format!("exit {status}"), false),
-            ProcessTermination::TimedOut => (
-                -1,
-                format!(
-                    "exit -1 (command timed out after {timeout_ms} ms and was killed; \
-pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
-                ),
-                false,
+        let (status, header, cancelled) = shell_termination(outcome.termination, timeout_ms);
+        // The incompleteness leads the agent-visible text: a model that sees
+        // only "exit 0" and an empty change list would otherwise read an
+        // unobserved workspace as an unchanged one (ADR 0021 row E).
+        let output = match observation {
+            Some(observation) => format!(
+                "file observation incomplete: {}; changes may be unreported\n{header}\n{text}",
+                observation.describe()
             ),
-            ProcessTermination::Cancelled => (
-                -1,
-                "exit -1 (command cancelled and process group killed)".to_owned(),
-                true,
-            ),
+            None => format!("{header}\n{text}"),
         };
-        let output = format!("{header}\n{text}");
         let execution = ToolExecution {
             name: "run_shell".to_owned(),
             output,
@@ -869,6 +933,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             exit_code: Some(status),
             patch: None,
             file_changes,
+            observation,
         };
         Ok(if cancelled {
             ToolExecutionOutcome::Cancelled(execution)
@@ -877,15 +942,25 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
         })
     }
 
+    /// Run one of Euler's own git tools under ADR 0021 row G neutralization.
+    ///
+    /// The two probes ahead of the command discover what this repository has
+    /// configured; the neutralization then overrides exactly that, because a
+    /// blanket override cannot know which filter drivers exist and blanket
+    /// `core.fsmonitor=false` costs a full worktree scan.
     fn git(
         &self,
-        args: &[&str],
+        command: &[&str],
         name: &str,
         cancellation: &CancellationToken,
     ) -> Result<ToolExecutionOutcome, ToolError> {
-        let child = self.agent_subprocess("git", args)?;
+        let neutralization = self.git_neutralization(cancellation)?;
+        let args = neutralization.args(command);
+        let child = self.agent_subprocess("git", &args, neutralization.env())?;
         let sandboxed = child.sandboxed;
-        let outcome = run_process(child.command, None, cancellation)
+        let mut command = child.command;
+        neutralization.strip_inherited_redirects(&mut command);
+        let outcome = run_process(command, None, cancellation)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         let cancelled = outcome.termination == ProcessTermination::Cancelled;
         let text = collected_agent_output(outcome.stdout, outcome.stderr, sandboxed, cancelled)?;
@@ -893,6 +968,13 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             ProcessTermination::Exited(status) => status,
             ProcessTermination::Cancelled => -1,
             ProcessTermination::TimedOut => unreachable!("git has no timeout"),
+        };
+        // Only on a run that succeeded: a note about what a successful listing
+        // omits has nothing to say about why a command failed or was killed.
+        let text = if status == 0 {
+            format!("{text}{}", self.submodule_notice())
+        } else {
+            text
         };
         let execution = ToolExecution {
             name: name.to_owned(),
@@ -905,6 +987,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             exit_code: Some(status),
             patch: None,
             file_changes: Vec::new(),
+            observation: None,
         };
         Ok(if cancelled {
             ToolExecutionOutcome::Cancelled(execution)
@@ -913,18 +996,115 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
         })
     }
 
+    /// Say what the submodule neutralization costs, where it costs anything.
+    ///
+    /// `diff.ignoreSubmodules=dirty` is what stops the recursive spawn that
+    /// would run a driver configured in a submodule's own config, so it
+    /// stays. But it also hides worktree edits inside a submodule, and an
+    /// agent told its changes do not exist is the silent loss ADR 0021 row E
+    /// exists to prevent.
+    ///
+    /// `modules/` under the git directory is the cheap test, and the right
+    /// one: `.gitmodules` alone is a declaration, so a fresh clone before
+    /// `submodule update` would get the note on every call while nothing is
+    /// being hidden. A directory check keeps this free of an extra git spawn.
+    fn submodule_notice(&self) -> &'static str {
+        if git_directory(&self.root).join("modules").is_dir() {
+            "\nnote: changes inside submodule worktrees are not shown here, because Euler does \
+not let git recurse into submodules; run `git status` or `git diff` inside the submodule to \
+see them.\n"
+        } else {
+            ""
+        }
+    }
+
+    /// Probe this repository for the two pieces of configuration Git turns
+    /// into executable code, then build the overrides that neutralize them.
+    /// A probe that cannot run yields the strictest answer.
+    fn git_neutralization(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<GitNeutralization, ToolError> {
+        let probe = GitNeutralization::probe();
+        let config =
+            parse_executable_config(&self.git_probe(&probe, &probe.probe_args(), cancellation)?);
+        // Only a repository that configures fsmonitor pays for the second
+        // launch, and only the first such repository in this process.
+        let has_daemon = config.fsmonitor.is_some()
+            && cached_fsmonitor_daemon_support(|| {
+                self.git_probe(
+                    &probe,
+                    &probe.args(&["version", "--build-options"]),
+                    cancellation,
+                )
+                .ok()
+            });
+        let fsmonitor = fsmonitor_override(config.fsmonitor.as_deref(), has_daemon);
+        Ok(GitNeutralization::new(fsmonitor, &config.filter_drivers))
+    }
+
+    /// Run one bounded git probe and return its stdout.
+    ///
+    /// Exit 1 from `git config --get-regexp` is the legitimate answer
+    /// "nothing configured". Every other outcome — a timeout, a spawn failure,
+    /// any other status — means Euler does not know what this repository has
+    /// configured, and the command must not then run with repository-selected
+    /// helpers live.
+    fn git_probe(
+        &self,
+        neutralization: &GitNeutralization,
+        args: &[&str],
+        cancellation: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        let child = self.agent_subprocess("git", args, neutralization.env())?;
+        let sandboxed = child.sandboxed;
+        let mut command = child.command;
+        neutralization.strip_inherited_redirects(&mut command);
+        let outcome = run_process(command, Some(GIT_PROBE_TIMEOUT_MS), cancellation)
+            .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
+        match outcome.termination {
+            ProcessTermination::Exited(0) => {}
+            ProcessTermination::Exited(1) => return Ok(String::new()),
+            ProcessTermination::Cancelled => return Err(ToolError::Cancelled),
+            // A timeout is worth separating: the wait is long enough to be
+            // felt, and the cause is almost never the repository's contents.
+            ProcessTermination::TimedOut => {
+                return Err(ToolError::GitProbeFailed(GIT_PROBE_TIMEOUT_MESSAGE))
+            }
+            ProcessTermination::Exited(_) => {
+                return Err(ToolError::GitProbeFailed(
+                    "could not read this repository's git configuration",
+                ))
+            }
+        }
+        if !sandboxed {
+            return Ok(outcome.stdout);
+        }
+        crate::sandbox::strip_sandbox_ready_marker(&outcome.stdout)
+            .map(str::to_owned)
+            .map_err(sandbox_unavailable)
+    }
+
     /// Construct the child process for an agent-controlled command. The
     /// sandbox branch deliberately receives no host `current_dir`: Bubblewrap
     /// establishes `/workspace` inside its private mount namespace.
-    fn agent_subprocess(&self, program: &str, args: &[&str]) -> Result<AgentSubprocess, ToolError> {
+    fn agent_subprocess(
+        &self,
+        program: &str,
+        args: &[&str],
+        env: &[(OsString, OsString)],
+    ) -> Result<AgentSubprocess, ToolError> {
         let sandboxed = self.workspace_sandbox.is_some();
         let mut child = match &self.workspace_sandbox {
             Some(sandbox) => sandbox
-                .command(program, args)
-                .map_err(ToolError::SandboxUnavailable)?,
+                .command(program, args, env)
+                .map_err(sandbox_unavailable)?,
             None => {
                 let mut command = Command::new(program);
-                command.args(args).current_dir(&self.root);
+                command
+                    .args(args)
+                    .current_dir(&self.root)
+                    .envs(env.to_vec());
                 command
             }
         };
@@ -938,6 +1118,11 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             command: child,
             sandboxed,
         })
+    }
+
+    /// Walk the workspace under the configured observation bound.
+    fn observe_workspace(&self) -> Option<WorkspaceSnapshot> {
+        capture_workspace_snapshot(&self.root, self.observation_bound).ok()
     }
 
     fn agent_euler_home(&self) -> Result<&Path, ToolError> {
@@ -1147,12 +1332,21 @@ fn collected_agent_output(
             // ready. Raw stdout/stderr must remain hidden because neither
             // came from the agent command.
             Err(_) if interrupted => return Ok(String::new()),
-            Err(reason) => return Err(ToolError::SandboxUnavailable(reason)),
+            Err(reason) => return Err(sandbox_unavailable(reason)),
         }
     } else {
         &stdout
     };
     Ok(format!("{stdout}{stderr}"))
+}
+
+/// Attach the likely host cause to a sandbox failure, so a tool result names
+/// what the user has to change instead of only that something failed.
+fn sandbox_unavailable(reason: SandboxUnavailableReason) -> ToolError {
+    ToolError::SandboxUnavailable {
+        reason,
+        cause: SandboxFailureCause::for_reason(reason),
+    }
 }
 
 /// A selected profile must never fall back to host execution or disclose raw
@@ -1161,7 +1355,7 @@ fn collected_agent_output(
 /// readiness marker.
 fn normalize_sandbox_subprocess_error(sandboxed: bool, error: ToolError) -> ToolError {
     if sandboxed && matches!(&error, ToolError::Io(_)) {
-        ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
+        sandbox_unavailable(SandboxUnavailableReason::CannotEnforce)
     } else {
         error
     }
@@ -1185,6 +1379,13 @@ pub(crate) fn display_path(path: &str) -> String {
     sanitized
 }
 
+/// Remove inherited variables that would configure the child behind the
+/// caller's back.
+///
+/// The Git redirect family is deliberately not here: stripping it from every
+/// agent-controlled shell would change what `run_shell` sees on the host
+/// backend, and that is ADR 0021 row C's decision to make. Euler's own git
+/// invocations strip it themselves.
 fn scrub_agent_subprocess_env(command: &mut Command) {
     for (name, _) in std::env::vars_os() {
         if crate::redaction::is_secret_env_name(&name) || is_parent_control_env_name(&name) {
@@ -1212,6 +1413,93 @@ fn is_parent_control_env_name(name: &std::ffi::OsStr) -> bool {
             | "EULER_TUI_METRICS"
             | "EULER_AUTH_FILE"
     )
+}
+
+/// The exit code, the header line, and whether the shell result is a
+/// cancellation, for one process outcome.
+fn shell_termination(termination: ProcessTermination, timeout_ms: u64) -> (i32, String, bool) {
+    match termination {
+        ProcessTermination::Exited(status) => (status, format!("exit {status}"), false),
+        ProcessTermination::TimedOut => (
+            -1,
+            format!(
+                "exit -1 (command timed out after {timeout_ms} ms and was killed; \
+pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
+            ),
+            false,
+        ),
+        ProcessTermination::Cancelled => (
+            -1,
+            "exit -1 (command cancelled and process group killed)".to_owned(),
+            true,
+        ),
+    }
+}
+
+/// The git directory for a workspace root.
+///
+/// `.git` is a directory in a plain checkout, but a *file* naming another
+/// gitdir in a linked worktree or a submodule checkout — which is exactly
+/// where submodule edits are most likely to be hidden, so resolving it is the
+/// difference between the notice appearing and being silently absent.
+fn git_directory(root: &Path) -> PathBuf {
+    let git = root.join(".git");
+    // The ordinary case, and the one on every git tool call: a read that is
+    // guaranteed to fail is not worth performing.
+    if git.is_dir() {
+        return git;
+    }
+    let Ok(pointer) = fs::read_to_string(&git) else {
+        return git;
+    };
+    let Some(target) = pointer
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))
+        .map(str::trim)
+        // An empty target would join to the workspace root, and the caller
+        // would then look for a top-level `modules` directory, which plenty
+        // of projects have.
+        .filter(|target| !target.is_empty())
+    else {
+        return git;
+    };
+    let target = Path::new(target);
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        root.join(target)
+    }
+}
+
+/// The bound on Euler's own git probes.
+///
+/// A probe is a `git config` read, so this is not a budget for slow work: it
+/// is the point past which the repository is hung rather than busy, and the
+/// probe fails the tool closed. It is deliberately generous, because a probe
+/// that expires under ordinary load would refuse the tool for no reason.
+const GIT_PROBE_TIMEOUT_MS: u64 = 30_000;
+
+/// Said instead of a generic probe failure when the bound above expires, so a
+/// user who waited that long is told what to look at.
+const GIT_PROBE_TIMEOUT_MESSAGE: &str =
+    "reading this repository's git configuration timed out after 30 seconds, which usually means \
+a slow or unresponsive filesystem rather than anything about the repository";
+
+/// The incompleteness to report for a pair of captures. A missing capture is
+/// itself an unreadable workspace: the command still ran, so the caller must
+/// say the changes were not observed rather than that there were none.
+fn incomplete_observation(
+    before: Option<&WorkspaceSnapshot>,
+    after: Option<&WorkspaceSnapshot>,
+    bound: usize,
+) -> Option<IncompleteObservation> {
+    match (before, after) {
+        (Some(before), Some(after)) => before.incomplete().or_else(|| after.incomplete()),
+        _ => Some(IncompleteObservation {
+            reason: crate::ObservationLimit::Unreadable,
+            bound,
+        }),
+    }
 }
 
 fn empty_parameters() -> Value {
@@ -1894,6 +2182,7 @@ fn tool_result_get(
         exit_code: None,
         patch: None,
         file_changes: Vec::new(),
+        observation: None,
     })
 }
 

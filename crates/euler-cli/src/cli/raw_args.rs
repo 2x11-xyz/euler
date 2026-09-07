@@ -53,6 +53,7 @@ impl RawArgsParser {
                 login: false,
                 logout: false,
                 auth_status: false,
+                check_sandbox: false,
                 models: false,
                 models_command: ModelsCommand::List,
                 extension: None,
@@ -105,6 +106,10 @@ impl RawArgsParser {
             "--auth-file" => self.parse_auth_file(args),
             "--no-tty" => {
                 self.parsed.no_tty = true;
+                Ok(ArgParseFlow::Continue)
+            }
+            "--check-sandbox" => {
+                self.parsed.check_sandbox = true;
                 Ok(ArgParseFlow::Continue)
             }
             EXPERIMENTAL_TUI_LINEFEED_HISTORY_FLAG => self.parse_linefeed_history(true, &arg),

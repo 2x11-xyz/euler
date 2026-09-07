@@ -2086,8 +2086,15 @@ fn selected_sandbox_normalizes_subprocess_io_failures() {
     );
     assert!(matches!(
         sandboxed,
-        ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
+        ToolError::SandboxUnavailable {
+            reason: SandboxUnavailableReason::CannotEnforce,
+            ..
+        }
     ));
+    // The in-session failure names the cause and where to get the rest, not
+    // only that something went wrong.
+    let message = sandboxed.to_string();
+    assert!(message.contains("euler --check-sandbox"), "{message}");
 
     let host = normalize_sandbox_subprocess_error(
         false,
@@ -2511,9 +2518,11 @@ fn a_leftover_temporary_file_is_never_observed_as_a_change() {
     let temp = tempfile::tempdir().expect("temp dir");
     let target = temp.path().join("note.txt");
     fs::write(&target, "old\n").expect("target");
-    let before = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+    let before = crate::capture_workspace_snapshot(temp.path(), MAX_WORKSPACE_SNAPSHOT_FILES)
+        .expect("snapshot");
     fs::write(temp.path().join(".euler-write-01ABCDEF.tmp"), "orphaned").expect("stale temp");
-    let after = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+    let after = crate::capture_workspace_snapshot(temp.path(), MAX_WORKSPACE_SNAPSHOT_FILES)
+        .expect("snapshot");
 
     assert!(
         before.changes_to(&after).is_empty(),
@@ -2721,5 +2730,461 @@ fn a_create_publishes_atomically_and_still_refuses_a_racing_name() {
     assert_eq!(
         fs::read_to_string(temp.path().join("new.txt")).unwrap(),
         "agent"
+    );
+}
+
+/// ADR 0021 row E: a workspace larger than the observation bound must not be
+/// reported as unchanged. The command runs, the incompleteness leads the
+/// agent-visible text, and the result carries its own status.
+#[test]
+fn an_overflowing_workspace_reports_incomplete_observation_not_no_change() {
+    let temp = tempfile::tempdir().expect("temp");
+    for index in 0..=MAX_WORKSPACE_SNAPSHOT_FILES {
+        std::fs::write(temp.path().join(format!("file-{index}")), "x").expect("fixture file");
+    }
+    let registry = ToolRegistry::new(temp.path());
+
+    let execution = registry
+        .execute("run_shell", &json!({"command": "printf changed > file-0"}))
+        .expect("run_shell");
+
+    let observation = execution.observation.expect("incomplete observation");
+    assert_eq!(observation.reason, crate::ObservationLimit::EntryBound);
+    assert_eq!(observation.bound, MAX_WORKSPACE_SNAPSHOT_FILES);
+    assert!(
+        execution.output.starts_with(
+            "file observation incomplete: workspace has more than 4096 files; \
+changes may be unreported\n"
+        ),
+        "{}",
+        execution.output
+    );
+    // The real edit happened; it is unreported, which is not the same as
+    // reporting that nothing changed.
+    assert!(execution.file_changes.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("file-0")).expect("edited file"),
+        "changed"
+    );
+}
+
+/// The clean no-change result must be textually distinct from the incomplete
+/// one, because the model only ever sees the text.
+#[test]
+fn a_clean_no_change_result_is_textually_distinct_from_an_incomplete_one() {
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = ToolRegistry::new(temp.path());
+
+    let execution = registry
+        .execute("run_shell", &json!({"command": "true"}))
+        .expect("run_shell");
+
+    assert!(execution.observation.is_none());
+    assert!(execution.file_changes.is_empty());
+    assert!(
+        !execution.output.contains("file observation incomplete"),
+        "{}",
+        execution.output
+    );
+    assert!(
+        execution.output.starts_with("exit 0\n"),
+        "{}",
+        execution.output
+    );
+}
+
+/// A lowered bound is the same failure on a small workspace: the bound is
+/// configurable so "incomplete" stays rare enough to mean something.
+#[test]
+fn a_lowered_observation_bound_reports_the_bound_it_actually_used() {
+    let temp = tempfile::tempdir().expect("temp");
+    for index in 0..4 {
+        std::fs::write(temp.path().join(format!("file-{index}")), "x").expect("fixture file");
+    }
+    let registry = ToolRegistry::new(temp.path()).with_observation_bound(2);
+
+    let execution = registry
+        .execute("run_shell", &json!({"command": "true"}))
+        .expect("run_shell");
+
+    let observation = execution.observation.expect("incomplete observation");
+    assert_eq!(observation.bound, 2);
+    assert!(
+        execution
+            .output
+            .starts_with("file observation incomplete: workspace has more than 2 files;"),
+        "{}",
+        execution.output
+    );
+
+    // The capture-error branch must report the same configured bound, not the
+    // default: a reader comparing them would otherwise draw a false
+    // conclusion about how much of the workspace was walked.
+    let unreadable = incomplete_observation(None, None, 2).expect("incomplete observation");
+    assert_eq!(unreadable.reason, crate::ObservationLimit::Unreadable);
+    assert_eq!(unreadable.bound, 2);
+}
+
+/// ADR 0021 row G: `git diff` runs a repository-configured clean filter over
+/// the worktree. Euler's own git invocations must not execute it.
+#[test]
+fn git_diff_does_not_run_a_repository_configured_clean_filter() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    std::fs::write(root.join(".gitattributes"), "* filter=evil\n").expect("attributes");
+    let marker = root.join("filter-ran");
+    // Relative: git runs the driver with the worktree root as its working
+    // directory, and under an enforced sandbox the host path does not exist.
+    git(root, &["config", "filter.evil.clean", "touch filter-ran"]);
+    std::fs::write(root.join("tracked.txt"), "changed\n").expect("edit");
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_diff", &json!({}))
+        .expect("git_diff runs");
+
+    assert!(!marker.exists(), "clean filter ran: {}", execution.output);
+}
+
+/// The same repository can also point `core.hooksPath` at a directory it
+/// controls. `git status` must not fire it.
+#[test]
+fn git_status_does_not_fire_a_repository_configured_hook() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    let hooks = root.join("planted-hooks");
+    std::fs::create_dir(&hooks).expect("hooks directory");
+    let marker = root.join("hook-ran");
+    let hook = hooks.join("post-index-change");
+    std::fs::write(&hook, "#!/bin/sh\ntouch hook-ran\n").expect("hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("hook mode");
+    }
+    git(root, &["config", "core.hooksPath", "planted-hooks"]);
+    std::fs::write(root.join("tracked.txt"), "changed\n").expect("edit");
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+
+    assert!(!marker.exists(), "hook fired: {}", execution.output);
+}
+
+/// A repository-local `core.fsmonitor` naming a helper is an execution
+/// channel; only Git's built-in daemon survives the probe.
+#[test]
+fn a_repository_configured_fsmonitor_helper_does_not_run() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    let marker = root.join("fsmonitor-ran");
+    let helper = root.join("fsmonitor-helper");
+    std::fs::write(&helper, "#!/bin/sh\ntouch fsmonitor-ran\nexit 1\n").expect("helper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+            .expect("helper mode");
+    }
+    git(root, &["config", "core.fsmonitor", "./fsmonitor-helper"]);
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+
+    assert!(
+        !marker.exists(),
+        "fsmonitor helper ran: {}",
+        execution.output
+    );
+}
+
+/// A repository whose HEAD Euler must resolve from the workspace root, not
+/// from an inherited `GIT_DIR` the parent process happened to carry.
+fn git_fixture() -> Option<tempfile::TempDir> {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return None;
+    }
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path();
+    git(root, &["init", "--quiet"]);
+    git(root, &["config", "user.email", "euler@example.invalid"]);
+    git(root, &["config", "user.name", "Euler"]);
+    std::fs::write(root.join("tracked.txt"), "original\n").expect("tracked file");
+    git(root, &["add", "tracked.txt"]);
+    git(root, &["commit", "--quiet", "-m", "seed"]);
+    Some(temp)
+}
+
+fn git(root: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .expect("git fixture command");
+    assert!(status.success(), "git {args:?}");
+}
+
+/// ADR 0021 row G: a clean/process driver configured in a submodule's own
+/// config is not reachable by the superproject's blanking, so the recursive
+/// submodule spawn must never happen.
+#[test]
+fn git_status_does_not_recurse_into_a_submodule_with_its_own_clean_filter() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    let submodule = root.join("sub");
+    std::fs::create_dir(&submodule).expect("submodule directory");
+    git(&submodule, &["init", "--quiet"]);
+    git(
+        &submodule,
+        &["config", "user.email", "euler@example.invalid"],
+    );
+    git(&submodule, &["config", "user.name", "Euler"]);
+    std::fs::write(submodule.join(".gitattributes"), "* filter=evil\n").expect("attributes");
+    std::fs::write(submodule.join("inner.txt"), "original\n").expect("inner file");
+    git(&submodule, &["add", "."]);
+    git(&submodule, &["commit", "--quiet", "-m", "seed"]);
+    // The driver lives in the submodule's config, where the superproject's
+    // GIT_CONFIG_KEY_n blanking does not reach.
+    git(
+        &submodule,
+        &["config", "filter.evil.clean", "touch submodule-filter-ran"],
+    );
+    std::fs::write(submodule.join("inner.txt"), "changed\n").expect("inner edit");
+    git(root, &["add", "sub"]);
+    let registry = ToolRegistry::new(root);
+
+    let status = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+    let diff = registry
+        .execute("git_diff", &json!({}))
+        .expect("git_diff runs");
+
+    assert!(
+        !submodule.join("submodule-filter-ran").exists(),
+        "submodule clean filter ran: {}\n{}",
+        status.output,
+        diff.output
+    );
+}
+
+/// ADR 0021 row G: a probe Euler cannot complete must fail the tool, not
+/// silently become "nothing configured" and run the command with the
+/// repository's helpers live.
+#[test]
+fn a_git_probe_that_cannot_run_fails_the_tool_closed() {
+    let temp = tempfile::tempdir().expect("temp");
+    // No git repository here: `git config --get-regexp` exits 1, which is the
+    // legitimate "nothing configured" answer and must still run the command.
+    let registry = ToolRegistry::new(temp.path());
+    let unset = registry.execute("git_status", &json!({}));
+    assert!(
+        !matches!(unset, Err(ToolError::GitProbeFailed(_))),
+        "exit 1 is an answer, not a probe failure"
+    );
+
+    // A `git` that cannot be found at all is a probe Euler could not run.
+    let missing = temp.path().join("no-such-directory");
+    let registry = ToolRegistry::new(&missing);
+    assert!(
+        matches!(
+            registry.execute("git_status", &json!({})),
+            Err(ToolError::GitProbeFailed(_)
+                | ToolError::Io(_)
+                | ToolError::SandboxUnavailable { .. })
+        ),
+        "a probe that cannot run must not report no drivers"
+    );
+
+    // A timeout says so: the user waited half a minute, and the cause is
+    // almost never the repository's contents.
+    let timed_out = ToolError::GitProbeFailed(GIT_PROBE_TIMEOUT_MESSAGE).to_string();
+    assert!(
+        timed_out.contains("timed out after 30 seconds"),
+        "{timed_out}"
+    );
+    assert!(
+        timed_out.contains("slow or unresponsive filesystem"),
+        "{timed_out}"
+    );
+    assert!(
+        timed_out.contains("will not run git with repository-selected helpers live"),
+        "{timed_out}"
+    );
+}
+
+/// The fsmonitor probe must not read back its own override, or the built-in
+/// daemon is unreachable and every command pays for a full worktree scan.
+#[test]
+fn a_repository_using_the_builtin_fsmonitor_daemon_still_works() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    git(root, &["config", "core.fsmonitor", "true"]);
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs with the built-in daemon configured");
+
+    assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
+}
+
+/// ADR 0021 row E: `diff.ignoreSubmodules=dirty` closes a real execution hole,
+/// but it also hides submodule worktree edits. An agent told its changes do
+/// not exist is exactly the silent loss row E forbids, so the cost is stated.
+#[test]
+fn git_tools_say_that_submodule_worktree_changes_are_not_shown() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    std::fs::write(
+        root.join(".gitmodules"),
+        "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+    )
+    .expect("gitmodules");
+
+    // Declared but not initialized: nothing is being hidden yet, so a notice
+    // would be noise on every call of a fresh clone.
+    let registry = ToolRegistry::new(root);
+    let declared_only = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+    assert!(
+        !declared_only.output.contains("submodule"),
+        "{}",
+        declared_only.output
+    );
+
+    // `.git/modules/<name>` is what `git submodule update` creates, and is
+    // the point from which a worktree edit inside the submodule can be
+    // hidden by `--ignore-submodules=dirty`.
+    std::fs::create_dir_all(root.join(".git/modules/sub")).expect("initialized submodule");
+
+    for tool in ["git_status", "git_diff"] {
+        let execution = registry
+            .execute(tool, &json!({}))
+            .unwrap_or_else(|error| panic!("{tool}: {error}"));
+        assert!(
+            execution
+                .output
+                .contains("changes inside submodule worktrees are not shown here"),
+            "{tool}: {}",
+            execution.output
+        );
+    }
+}
+
+/// A linked worktree or submodule checkout has `.git` as a *file* naming
+/// another gitdir. That is where submodule edits are most likely to be
+/// hidden, so it is the case the notice must not miss.
+#[test]
+fn the_submodule_notice_resolves_a_gitdir_pointer_file() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    std::fs::write(
+        root.join(".gitmodules"),
+        "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+    )
+    .expect("gitmodules");
+    // Move the git directory aside and leave a pointer behind, the shape a
+    // linked worktree has.
+    let elsewhere = root.join("real-gitdir");
+    std::fs::rename(root.join(".git"), &elsewhere).expect("move gitdir");
+    std::fs::write(
+        root.join(".git"),
+        format!("gitdir: {}\n", elsewhere.display()),
+    )
+    .expect("gitdir pointer");
+    std::fs::create_dir_all(elsewhere.join("modules/sub")).expect("initialized submodule");
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+
+    assert!(
+        execution
+            .output
+            .contains("changes inside submodule worktrees are not shown here"),
+        "{}",
+        execution.output
+    );
+}
+
+/// The notice describes what a successful listing omits, so it has nothing to
+/// say about why a command failed.
+#[test]
+fn a_failed_git_command_carries_no_submodule_notice() {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    // Not a repository at all, but carrying the directory the notice keys
+    // off: `git status` fails deterministically on every git version, so
+    // there is nothing here that can quietly verify nothing.
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path();
+    std::fs::create_dir_all(root.join(".git/modules/sub")).expect("submodule directory");
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status still reports");
+
+    assert_ne!(
+        execution.exit_code,
+        Some(0),
+        "the fixture must actually fail: {}",
+        execution.output
+    );
+    assert!(
+        !execution.output.contains("submodule worktrees"),
+        "{}",
+        execution.output
+    );
+}
+
+/// The notice is only worth showing where it costs something.
+#[test]
+fn a_repository_without_submodules_gets_no_submodule_notice() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let registry = ToolRegistry::new(repository.path());
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+
+    assert!(
+        !execution.output.contains("submodule"),
+        "{}",
+        execution.output
     );
 }

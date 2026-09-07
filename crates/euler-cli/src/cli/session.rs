@@ -98,7 +98,22 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         session.set_observer_extension(extension);
     }
     wire_session_extensions(&mut session);
+    report_sandbox_status(&session);
     run_stdin_loop(&mut session, live_session.refresh.as_ref())
+}
+
+/// Surface an unavailable sandbox once, at session start.
+///
+/// Without this the first failure a user sees is a terse tool error on the
+/// agent's first command, with no cause and nothing to act on — while the
+/// backend was already known before the first prompt.
+fn report_sandbox_status<D: euler_core::PermissionDecider>(session: &Session<D>) {
+    if let Some(diagnostic) = session.sandbox_status().diagnostic() {
+        eprintln!("{diagnostic}");
+    }
+    for advisory in session.sandbox_advisories() {
+        eprintln!("{advisory}");
+    }
 }
 
 /// A short folder label for the acknowledgment card's title corner.
@@ -281,6 +296,7 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         session.set_observer_extension(extension);
     }
     wire_session_extensions(&mut session);
+    report_sandbox_status(&session);
     let mut app = App::enter_with_options(
         session,
         channels,
@@ -406,6 +422,7 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
         session.set_observer_extension(extension);
     }
     wire_session_extensions(&mut session);
+    report_sandbox_status(&session);
     SubagentDecider::apply_tier(tier, &mut session);
     let turn_result = run_turn_streaming(&mut session, &prompt);
     if let Some(refresh) = refresh.as_ref() {
@@ -805,6 +822,7 @@ where
         session.set_observer_extension(extension);
     }
     wire_session_extensions(&mut session);
+    report_sandbox_status(&session);
     Ok(ResumeCliOutcome {
         session,
         refresh,

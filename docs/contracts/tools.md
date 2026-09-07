@@ -221,6 +221,78 @@ next model as failed tool output. Legacy event compatibility is owned by the
 effective-outcome rule in `docs/contracts/events.md`, not by individual tool or
 UI special cases.
 
+## Execution boundary
+
+On Linux, Bubblewrap is the default and enforced backend for `run_shell` and
+the `git_*` tools (ADR 0021 row A′). The child gets a private root tmpfs, its
+workspace bound read-write at `/workspace`, a private `/tmp`, `/proc` and
+`/dev`, a tmpfs `HOME`, no host network namespace, and a cleared environment.
+Every other platform has no backend yet, so those tools run directly on the
+host under the ordinary permission decision; the Seatbelt backend replaces
+that.
+
+Because `HOME` inside the sandbox is a private tmpfs, toolchains installed
+under the real home would otherwise be unreachable. Euler detects the
+toolchain homes the host environment implies — `CARGO_HOME`, `RUSTUP_HOME`,
+`NVM_DIR`, `PYENV_ROOT`, `ASDF_DATA_DIR`, `GOPATH`, `PNPM_HOME`, each falling
+back to its conventional location under `$HOME`, plus `/nix/store` — and binds
+them read-only at their real paths, with the sandbox `PATH` built from the
+host `PATH` entries those roots contain and caches redirected to the sandbox
+cache tmpfs. The real `$HOME` is never mounted read-write: the directory
+holding those roots is a read-only mount, so a write under the real home
+fails rather than landing in a discarded private copy.
+
+Cargo's credential files (`credentials.toml`, `credentials`) are masked with
+an empty file wherever the sandbox can reach the Cargo home, not only where
+Euler mounts it itself — the official Rust images put `CARGO_HOME` under
+`/usr/local`, which the system runtime bind already carries. Cargo also
+accepts a registry token in its config, which is **not** masked: that file
+carries the registry sources and build settings a build needs. Euler reports
+it once at session start instead, naming the file and suggesting the token
+move to `credentials.toml`. A Cargo home *inside* the workspace is neither
+masked nor reported — the workspace is readable by design — but its variable
+and `PATH` are re-pointed at the bound workspace path so the toolchain still
+works.
+
+Availability is probed at session start by running a trivial sandboxed
+command, because an installed `bwrap` is not evidence that it works. The
+outcome is recorded on `session.start` as `sandbox_backend`
+(`bwrap` | `host` | `unavailable`) with `sandbox_unavailable_reason`. When the
+probe fails, sandbox-requiring tools fail closed with a concise reason; there
+is no automatic fallback to host execution. `euler --check-sandbox` runs the
+same probes and prints the diagnostic, which names the likely cause
+(user namespaces disabled by sysctl or AppArmor, a container, WSL1, `bwrap`
+missing) and the host change that fixes it.
+
+Euler's own Git invocations are neutralized before they run (ADR 0021 row G).
+`git_status` and `git_diff` set `core.hooksPath=/dev/null`,
+`safe.bareRepository=explicit`, `attr.tree=`, `core.attributesFile=`, and
+`GIT_LFS_SKIP_SMUDGE=1 GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0`; they strip
+the `GIT_DIR` / `GIT_WORK_TREE` / `GIT_CONFIG*` / `GIT_INDEX_FILE` /
+`GIT_ALTERNATE_OBJECT_DIRECTORIES` family from the environment; they blank
+every configured `filter.*.clean` and `filter.*.process` driver through
+`GIT_CONFIG_KEY_n`; and `git_diff` keeps `--no-ext-diff --no-textconv`.
+`core.fsmonitor` is probed and preserved only for Git's built-in daemon rather
+than blanket-disabled, and `diff.ignoreSubmodules=dirty` stops the recursive
+submodule spawn, which would otherwise run a driver configured in a
+submodule's own config with only the superproject's blanking applied. The same
+overrides cover every git invocation Euler makes, including the `@`-mention
+picker's `git ls-files`. A command the agent runs itself through `run_shell`
+is confined by the sandbox instead and keeps the repository's configuration.
+
+`diff.ignoreSubmodules=dirty` has a visible cost: worktree edits inside a
+submodule do not appear in `git_status` or `git_diff`. Hiding that would be
+the silent loss ADR 0021 row E forbids, so when the repository declares
+initialized submodules the tool output says the changes are not shown and
+where to see them, on a run that completed. The flag stays because the
+alternative is running a driver configured in a submodule's own config.
+
+A probe Euler cannot complete fails the tool closed: only `git config`'s
+"nothing configured" exit is an answer. Residual risk: the probe and the real
+command are separate processes, so a writer that adds a driver between them is
+not covered; under the Linux sandbox that driver runs inside the sandbox, and
+on a host backend it needs an agent racing its own tool call.
+
 Under ordinary host execution, agent-controlled shell and Git subprocesses
 inherit project environment variables, including `HOME` and `RUST_LOG`, but
 not credential-shaped values or the owning Euler process's routing, TTY, and
@@ -248,9 +320,20 @@ ordinary descendants that remain in the group; a descendant that deliberately
 escapes it is outside this guarantee. After cancellation, Euler drains only
 immediately available pipe data within a fixed byte budget. Ordinary
 `run_shell` cancellation may then spend bounded time observing file changes
-for evidence: at most 4,096 files, 256 KiB per file, and 64 MiB total. That
-finite evidence pass can delay terminal publication after the process has
-already stopped.
+for evidence: at most 4,096 files (configurable), 256 KiB per file, and 64 MiB
+total. That finite evidence pass can delay terminal publication after the
+process has already stopped.
+
+Reaching a bound does not block the command (ADR 0021 row E). The command
+runs; when either the before or the after capture is incomplete, the tool
+result text leads with `file observation incomplete: <reason>; changes may be
+unreported`, and the result carries an `observation` object
+(`{status: "incomplete", reason, bound}`) distinct from process success. An
+incomplete capture reports no file changes, and that is "not observed", never
+"no changes" — the two are textually distinct in the agent-visible output.
+`.git`, `node_modules`, `target`, `dist`, `build`, `vendor`, the Python and
+JS cache directories, and structured-write temporary files are excluded from
+the walk.
 
 When canvas previews or stubs show `event <id>` (and optional
 `handle event:…` / `blob:…` metadata), prefer `tool_result_get` with that event

@@ -44,8 +44,55 @@ pub struct ObservedFileChange {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkspaceSnapshot {
-    complete: bool,
+    incomplete: Option<IncompleteObservation>,
     files: BTreeMap<String, SnapshotFile>,
+}
+
+/// Why a workspace walk stopped short of observing everything (ADR 0021
+/// row E). An incomplete walk is "not observed", never "no changes": the
+/// command still runs, and the caller must say so in the agent-visible text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IncompleteObservation {
+    pub reason: ObservationLimit,
+    /// The entry bound in force for this walk, whatever stopped it.
+    pub bound: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationLimit {
+    /// More files than the configured entry bound.
+    EntryBound,
+    /// More bytes than the total-byte bound.
+    ByteBound,
+    /// A directory or file could not be read.
+    Unreadable,
+}
+
+impl ObservationLimit {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EntryBound => "entry_bound",
+            Self::ByteBound => "byte_bound",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+impl IncompleteObservation {
+    /// The reason as it appears in the agent-visible tool text.
+    pub fn describe(self) -> String {
+        match self.reason {
+            ObservationLimit::EntryBound => {
+                format!("workspace has more than {} files", self.bound)
+            }
+            ObservationLimit::ByteBound => {
+                "workspace exceeds the observation byte budget".to_owned()
+            }
+            ObservationLimit::Unreadable => {
+                "a workspace directory or file could not be read".to_owned()
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,13 +250,21 @@ pub fn observed_file_diff_payload(
     ])
 }
 
-pub fn capture_workspace_snapshot(root: &Path) -> io::Result<WorkspaceSnapshot> {
-    WorkspaceSnapshot::capture(root)
+/// Walk `root` under an explicit entry bound. The bound is configurable so
+/// "observation incomplete" stays rare enough to mean something
+/// (ADR 0021 row E).
+pub fn capture_workspace_snapshot(root: &Path, bound: usize) -> io::Result<WorkspaceSnapshot> {
+    WorkspaceSnapshot::capture(root, bound)
 }
 
 impl WorkspaceSnapshot {
+    /// The incompleteness of this capture, if any.
+    pub const fn incomplete(&self) -> Option<IncompleteObservation> {
+        self.incomplete
+    }
+
     pub fn changes_to(&self, after: &Self) -> Vec<ObservedFileChange> {
-        if !self.complete || !after.complete {
+        if self.incomplete.is_some() || after.incomplete.is_some() {
             return Vec::new();
         }
         let paths = self
@@ -228,28 +283,30 @@ impl WorkspaceSnapshot {
             .collect()
     }
 
-    fn capture(root: &Path) -> io::Result<Self> {
+    fn capture(root: &Path, bound: usize) -> io::Result<Self> {
         let root = root.canonicalize()?;
         let mut snapshot = Self {
-            complete: true,
+            incomplete: None,
             files: BTreeMap::new(),
         };
         let mut stack = vec![(root, String::new())];
         let mut total_bytes = 0usize;
         while let Some((dir, relative_dir)) = stack.pop() {
             let Some(entries) = read_sorted_dir(&dir) else {
-                return Ok(Self::incomplete());
+                return Ok(Self::stopped(ObservationLimit::Unreadable, bound));
             };
-            if !snapshot.record_entries(entries, &relative_dir, &mut stack, &mut total_bytes) {
-                return Ok(Self::incomplete());
+            if let Some(limit) =
+                snapshot.record_entries(entries, &relative_dir, &mut stack, &mut total_bytes, bound)
+            {
+                return Ok(Self::stopped(limit, bound));
             }
         }
         Ok(snapshot)
     }
 
-    fn incomplete() -> Self {
+    fn stopped(reason: ObservationLimit, bound: usize) -> Self {
         Self {
-            complete: false,
+            incomplete: Some(IncompleteObservation { reason, bound }),
             files: BTreeMap::new(),
         }
     }
@@ -260,13 +317,14 @@ impl WorkspaceSnapshot {
         relative_dir: &str,
         stack: &mut Vec<(PathBuf, String)>,
         total_bytes: &mut usize,
-    ) -> bool {
+        bound: usize,
+    ) -> Option<ObservationLimit> {
         for entry in entries {
-            if !self.record_entry(entry, relative_dir, stack, total_bytes) {
-                return false;
+            if let Some(limit) = self.record_entry(entry, relative_dir, stack, total_bytes, bound) {
+                return Some(limit);
             }
         }
-        true
+        None
     }
 
     fn record_entry(
@@ -275,33 +333,32 @@ impl WorkspaceSnapshot {
         relative_dir: &str,
         stack: &mut Vec<(PathBuf, String)>,
         total_bytes: &mut usize,
-    ) -> bool {
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            return true;
-        };
+        bound: usize,
+    ) -> Option<ObservationLimit> {
+        let name = entry.file_name().to_str().map(str::to_owned)?;
         let path = relative_path(relative_dir, &name);
         let Ok(metadata) = fs::symlink_metadata(entry.path()) else {
-            return false;
+            return Some(ObservationLimit::Unreadable);
         };
         if metadata.file_type().is_symlink() {
-            return true;
+            return None;
         }
         if metadata.is_dir() {
             if !ignored_dir(OsStr::new(&name)) {
                 stack.push((entry.path(), path));
             }
-            return true;
+            return None;
         }
         if metadata.is_file() {
             // A structured write's temporary file is never agent-authored
             // content: a crash can leave one behind, and it must not surface
             // as a change some command made.
             if is_structured_write_temp(&name) {
-                return true;
+                return None;
             }
-            return self.record_file(entry.path(), path, metadata.len(), total_bytes);
+            return self.record_file(entry.path(), path, metadata.len(), total_bytes, bound);
         }
-        true
+        None
     }
 
     fn record_file(
@@ -310,30 +367,31 @@ impl WorkspaceSnapshot {
         relative: String,
         byte_len: u64,
         total_bytes: &mut usize,
-    ) -> bool {
-        if self.files.len() >= MAX_WORKSPACE_SNAPSHOT_FILES {
-            return false;
+        bound: usize,
+    ) -> Option<ObservationLimit> {
+        if self.files.len() >= bound {
+            return Some(ObservationLimit::EntryBound);
         }
         let Ok(byte_len) = usize::try_from(byte_len) else {
-            return false;
+            return Some(ObservationLimit::ByteBound);
         };
         if byte_len > MAX_WORKSPACE_SNAPSHOT_FILE_BYTES {
             self.files
                 .insert(relative, SnapshotFile::unobserved(byte_len));
-            return true;
+            return None;
         }
         let Some(next_total) = total_bytes.checked_add(byte_len) else {
-            return false;
+            return Some(ObservationLimit::ByteBound);
         };
         if next_total > MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES {
-            return false;
+            return Some(ObservationLimit::ByteBound);
         }
         let Ok(bytes) = fs::read(path) else {
-            return false;
+            return Some(ObservationLimit::Unreadable);
         };
         *total_bytes = next_total;
         self.files.insert(relative, SnapshotFile::observed(bytes));
-        true
+        None
     }
 }
 
