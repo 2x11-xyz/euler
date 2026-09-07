@@ -1,10 +1,18 @@
 //! Linux workspace subprocess sandboxing with Bubblewrap.
 //!
 //! The profile is deliberately narrow: an agent-controlled child sees its
-//! workspace, a private runtime, and no host home or network. It is an
-//! execution boundary, not a synonym for permission approval.
+//! workspace, a private runtime, the toolchain roots its host environment
+//! implies, and no host home or network. It is an execution boundary, not a
+//! synonym for permission approval.
+//!
+//! Bubblewrap is the default and enforced backend on Linux (ADR 0021 row A′).
+//! Off Linux there is no backend yet, so agent subprocesses run on the host
+//! under the ordinary permission decider until the Seatbelt backend lands;
+//! [`SandboxBackend`] names both so a third backend slots in without touching
+//! call sites.
 
-use std::ffi::OsStr;
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -25,16 +33,50 @@ impl SandboxProfile {
     }
 }
 
+/// The execution boundary that actually ran, or would run, an agent command.
+///
+/// This is the seam the macOS Seatbelt backend slots into: call sites record
+/// and branch on the backend, never on the host operating system.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxBackend {
+    /// Linux Bubblewrap, the default and enforced backend.
+    Bwrap,
+    /// Direct host execution, gated only by the permission decider.
+    Host,
+}
+
+impl SandboxBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bwrap => "bwrap",
+            Self::Host => "host",
+        }
+    }
+}
+
 /// Whether agent-controlled subprocesses use a sandbox profile.
 ///
 /// This is a core execution choice, intentionally separate from the
-/// capability gate and its approval modes. Disabled remains the default until
-/// a user-facing mode can truthfully activate an enforced profile.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// capability gate and its approval modes. Linux defaults to the enforced
+/// no-network profile; every other platform runs on the host until its own
+/// backend exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubprocessSandbox {
-    #[default]
-    Disabled,
+    /// Agent subprocesses run directly on the host. This is not "no
+    /// confinement chosen": it is the honest state of a platform with no
+    /// backend, and it is recorded as such.
+    Host,
     Enforce(SandboxProfile),
+}
+
+impl Default for SubprocessSandbox {
+    fn default() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Enforce(SandboxProfile::WorkspaceNoNetwork)
+        } else {
+            Self::Host
+        }
+    }
 }
 
 /// A concise, non-secret reason why a requested sandbox profile cannot run.
@@ -65,11 +107,173 @@ impl SandboxUnavailableReason {
             }
         }
     }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::BubblewrapMissing => "bubblewrap_missing",
+            Self::CannotEnforce => "cannot_enforce",
+            Self::InvalidWorkspace => "invalid_workspace",
+        }
+    }
 }
 
 impl fmt::Display for SandboxUnavailableReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.message())
+    }
+}
+
+/// The most likely host cause of a failed Bubblewrap probe. Bubblewrap's own
+/// diagnostics are host-revealing and frequently unhelpful ("No permissions to
+/// create new namespace"), so Euler names the cause it can actually verify.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxFailureCause {
+    /// `bwrap` was not found at a trusted absolute path.
+    BubblewrapMissing,
+    /// A sysctl disables unprivileged user namespaces outright.
+    UserNamespacesDisabled,
+    /// Ubuntu 23.10+ AppArmor restricts unprivileged user namespaces.
+    AppArmorUserNamespaceRestriction,
+    /// The process is inside a container that does not permit nesting.
+    Container,
+    /// WSL1 has no user namespace support at all.
+    Wsl1,
+    /// Bubblewrap ran and failed for a reason Euler could not attribute.
+    Unattributed,
+}
+
+impl SandboxFailureCause {
+    /// The likely cause, in the user's terms.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::BubblewrapMissing => "`bwrap` is not installed at /usr/bin/bwrap or /bin/bwrap",
+            Self::UserNamespacesDisabled => {
+                "unprivileged user namespaces are disabled by a kernel sysctl"
+            }
+            Self::AppArmorUserNamespaceRestriction => {
+                "AppArmor restricts unprivileged user namespaces (Ubuntu 23.10 and later)"
+            }
+            Self::Container => {
+                "this process is inside a container that does not allow nested user namespaces"
+            }
+            Self::Wsl1 => "WSL1 has no user namespace support",
+            Self::Unattributed => "Bubblewrap could not create a user namespace",
+        }
+    }
+
+    /// The host change that would make the sandbox work.
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::BubblewrapMissing => "install it (Debian/Ubuntu: `sudo apt install bubblewrap`)",
+            Self::UserNamespacesDisabled => {
+                "enable them: `sudo sysctl -w kernel.unprivileged_userns_clone=1` \
+and `sudo sysctl -w user.max_user_namespaces=15000`"
+            }
+            Self::AppArmorUserNamespaceRestriction => {
+                "allow them: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`"
+            }
+            Self::Container => {
+                "run the container with `--privileged`, or with a seccomp profile that permits \
+`unshare(CLONE_NEWUSER)`"
+            }
+            Self::Wsl1 => "use WSL2 (`wsl --set-version <distro> 2`)",
+            Self::Unattributed => {
+                "check `sysctl kernel.unprivileged_userns_clone user.max_user_namespaces` and \
+run `bwrap --unshare-user --unshare-net --ro-bind / / /bin/true` by hand"
+            }
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BubblewrapMissing => "bubblewrap_missing",
+            Self::UserNamespacesDisabled => "user_namespaces_disabled",
+            Self::AppArmorUserNamespaceRestriction => "apparmor_userns_restriction",
+            Self::Container => "container",
+            Self::Wsl1 => "wsl1",
+            Self::Unattributed => "unattributed",
+        }
+    }
+}
+
+/// The session-start record of which execution boundary agent subprocesses
+/// get. It is provenance, not a decision: `Unavailable` fails sandbox-requiring
+/// commands closed rather than falling back to the host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxStatus {
+    /// Bubblewrap ran a trivial sandboxed command successfully.
+    Enforced,
+    /// No backend exists for this platform yet; commands run on the host under
+    /// the permission decider.
+    Host,
+    /// Linux with no usable Bubblewrap. Sandbox-requiring commands fail.
+    Unavailable {
+        reason: SandboxUnavailableReason,
+        cause: SandboxFailureCause,
+    },
+}
+
+impl SandboxStatus {
+    /// The value recorded as `sandbox_backend` on `session.start`.
+    pub const fn backend_label(self) -> &'static str {
+        match self {
+            Self::Enforced => SandboxBackend::Bwrap.as_str(),
+            Self::Host => SandboxBackend::Host.as_str(),
+            Self::Unavailable { .. } => "unavailable",
+        }
+    }
+
+    pub const fn backend(self) -> Option<SandboxBackend> {
+        match self {
+            Self::Enforced => Some(SandboxBackend::Bwrap),
+            Self::Host => Some(SandboxBackend::Host),
+            Self::Unavailable { .. } => None,
+        }
+    }
+
+    pub const fn reason(self) -> Option<SandboxUnavailableReason> {
+        match self {
+            Self::Enforced | Self::Host => None,
+            Self::Unavailable { reason, .. } => Some(reason),
+        }
+    }
+
+    /// Classify a probed workspace profile. `None` means no backend was
+    /// requested, which today is only the host platforms.
+    pub fn from_availability(availability: Option<SandboxAvailability>) -> Self {
+        match availability {
+            None => Self::Host,
+            Some(SandboxAvailability::Enforced(_)) => Self::Enforced,
+            Some(SandboxAvailability::Unavailable(reason)) => Self::Unavailable {
+                reason,
+                cause: match reason {
+                    SandboxUnavailableReason::BubblewrapMissing => {
+                        SandboxFailureCause::BubblewrapMissing
+                    }
+                    SandboxUnavailableReason::CannotEnforce => user_namespace_failure_cause(),
+                    SandboxUnavailableReason::UnsupportedPlatform
+                    | SandboxUnavailableReason::InvalidWorkspace => {
+                        SandboxFailureCause::Unattributed
+                    }
+                },
+            },
+        }
+    }
+
+    /// An operator-facing diagnostic naming the likely cause and the way out.
+    pub fn diagnostic(self) -> Option<String> {
+        let Self::Unavailable { cause, .. } = self else {
+            return None;
+        };
+        Some(format!(
+            "Euler could not start its Linux sandbox: {}.\nTo fix it: {}.\n\
+Until then `run_shell` and the `git_*` tools fail closed; there is no automatic \
+fallback to host execution. To run without a sandbox deliberately, choose the \
+\"Full access (unsandboxed)\" preset (ADR 0021 row D), which a later release adds.",
+            cause.description(),
+            cause.remedy(),
+        ))
     }
 }
 
@@ -92,6 +296,7 @@ impl SandboxAvailability {
 #[derive(Clone, Debug)]
 pub(crate) struct WorkspaceSandbox {
     workspace: Option<PathBuf>,
+    runtime: RuntimeRoots,
     bwrap: Option<PathBuf>,
     availability: SandboxAvailability,
 }
@@ -101,9 +306,18 @@ impl WorkspaceSandbox {
     /// falls back to host execution: callers must inspect or propagate the
     /// resulting [`SandboxAvailability`].
     pub(crate) fn new(workspace: impl AsRef<Path>, profile: SandboxProfile) -> Self {
+        Self::with_runtime_roots(workspace, profile, RuntimeRoots::detect())
+    }
+
+    fn with_runtime_roots(
+        workspace: impl AsRef<Path>,
+        profile: SandboxProfile,
+        runtime: RuntimeRoots,
+    ) -> Self {
         if !cfg!(target_os = "linux") {
             return Self {
                 workspace: None,
+                runtime,
                 bwrap: None,
                 availability: SandboxAvailability::Unavailable(
                     SandboxUnavailableReason::UnsupportedPlatform,
@@ -113,24 +327,28 @@ impl WorkspaceSandbox {
         let Ok(workspace) = canonical_workspace(workspace.as_ref()) else {
             return Self {
                 workspace: None,
+                runtime,
                 bwrap: None,
                 availability: SandboxAvailability::Unavailable(
                     SandboxUnavailableReason::InvalidWorkspace,
                 ),
             };
         };
+        let runtime = runtime.excluding(&workspace);
         let Some(bwrap) = bwrap_path() else {
             return Self {
                 workspace: Some(workspace),
+                runtime,
                 bwrap: None,
                 availability: SandboxAvailability::Unavailable(
                     SandboxUnavailableReason::BubblewrapMissing,
                 ),
             };
         };
-        let availability = probe_profile(&bwrap, &workspace, profile);
+        let availability = probe_profile(&bwrap, &workspace, &runtime, profile);
         Self {
             workspace: Some(workspace),
+            runtime,
             bwrap: Some(bwrap),
             availability,
         }
@@ -144,10 +362,16 @@ impl WorkspaceSandbox {
     /// stdio and timeout configuration on the returned command. An
     /// unavailable profile returns its concise public reason and never gives
     /// the caller an unsandboxed command.
+    ///
+    /// `env` is the single seam through which a caller adds variables to the
+    /// otherwise cleared sandbox environment. Environment *policy* (an
+    /// inheritance model and a hard denylist) is a later PR; today the profile
+    /// clears everything and sets only what the profile itself needs.
     pub(crate) fn command<I, S>(
         &self,
         program: impl AsRef<OsStr>,
         args: I,
+        env: &[(OsString, OsString)],
     ) -> Result<Command, SandboxUnavailableReason>
     where
         I: IntoIterator<Item = S>,
@@ -171,6 +395,8 @@ impl WorkspaceSandbox {
             bwrap,
             profile,
             workspace,
+            &self.runtime,
+            env,
             program.as_ref(),
             args,
         ))
@@ -182,31 +408,285 @@ const SANDBOX_WORKSPACE: &str = "/workspace";
 const SANDBOX_HOME: &str = "/tmp/home";
 const SANDBOX_CACHE: &str = "/tmp/cache";
 const RUNTIME_MOUNTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
-const SANDBOX_PATH: &str = "/usr/bin:/bin";
+const SYSTEM_SANDBOX_PATH: &str = "/usr/bin:/bin";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const SANDBOX_READY_MARKER: &str = "__EULER_SANDBOX_READY__\n";
 const SANDBOX_READY_WRAPPER: &str = "printf '__EULER_SANDBOX_READY__\\n'; exec \"$@\"";
-#[cfg(target_os = "linux")]
-const FIRST_INHERITED_FD: libc::c_uint = 3;
-#[cfg(target_os = "linux")]
-const CLOSE_RANGE_CLOEXEC: libc::c_ulong = 1 << 2;
-#[cfg(target_os = "linux")]
-const PROC_FD_DIRECTORY: &[u8] = b"/proc/self/fd\0";
-#[cfg(target_os = "linux")]
-const PROC_DIRENT64_RECLEN_OFFSET: usize = 16;
-#[cfg(target_os = "linux")]
-const PROC_DIRENT64_NAME_OFFSET: usize = 19;
-#[cfg(target_os = "linux")]
-const PROC_FD_BUFFER_LEN: usize = 4096;
+/// A toolchain root must be a real subtree, never `/`, a host home, or a
+/// single-component directory whose contents are unrelated to a toolchain.
+const MIN_RUNTIME_ROOT_COMPONENTS: usize = 2;
+
+/// Toolchain homes the host environment implies, read-only inside the
+/// sandbox at their real paths (ADR 0021 row A′).
+///
+/// `HOME` inside the sandbox is a private tmpfs, so a toolchain installed
+/// under the real home is otherwise unreachable and `cargo build` fails with
+/// command-not-found. Detection is by environment variable first and
+/// conventional location second; the real home itself is never mounted, and
+/// the directory that holds these roots is remounted read-only so a write
+/// under the real home fails rather than landing in a discarded private copy.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeRoots {
+    /// Read-only mount sources, canonical and non-overlapping.
+    roots: Vec<PathBuf>,
+    /// `NAME=value` pairs pointing at those roots, so a toolchain finds
+    /// itself at the same path it occupies on the host.
+    variables: Vec<(OsString, OsString)>,
+    /// `PATH` entries from the host that live inside a mounted root.
+    path_entries: Vec<PathBuf>,
+    /// The real home directory, when it exists and is not a mounted root.
+    home: Option<PathBuf>,
+}
+
+/// Environment variables that name a toolchain home, paired with the
+/// conventional location used when the variable is unset.
+const TOOLCHAIN_ROOTS: &[(&str, &str)] = &[
+    ("CARGO_HOME", ".cargo"),
+    ("RUSTUP_HOME", ".rustup"),
+    ("NVM_DIR", ".nvm"),
+    ("PYENV_ROOT", ".pyenv"),
+    ("ASDF_DATA_DIR", ".asdf"),
+    ("GOPATH", "go"),
+    ("PNPM_HOME", ".local/share/pnpm"),
+];
+
+/// Toolchain stores that are not under a home directory and carry no
+/// environment variable of their own.
+const SYSTEM_TOOLCHAIN_ROOTS: &[&str] = &["/nix/store"];
+
+impl RuntimeRoots {
+    /// Read the host environment. This never consults the workspace: an agent
+    /// must not be able to add a mount by writing a file.
+    pub(crate) fn detect() -> Self {
+        Self::from_environment(
+            std::env::var_os("HOME").map(PathBuf::from),
+            |name| std::env::var_os(name),
+            std::env::var_os("PATH"),
+        )
+    }
+
+    fn from_environment(
+        home: Option<PathBuf>,
+        variable: impl Fn(&str) -> Option<OsString>,
+        path: Option<OsString>,
+    ) -> Self {
+        let home = home.and_then(|home| home.canonicalize().ok());
+        let mut roots = Vec::new();
+        let mut variables = Vec::new();
+        for (name, conventional) in TOOLCHAIN_ROOTS {
+            let candidate = variable(name)
+                .map(PathBuf::from)
+                .or_else(|| home.as_ref().map(|home| home.join(conventional)));
+            let Some(root) = candidate.and_then(|root| usable_runtime_root(&root, home.as_deref()))
+            else {
+                continue;
+            };
+            variables.push((OsString::from(*name), root.clone().into_os_string()));
+            roots.push(root);
+        }
+        for root in SYSTEM_TOOLCHAIN_ROOTS {
+            if let Some(root) = usable_runtime_root(Path::new(root), home.as_deref()) {
+                roots.push(root);
+            }
+        }
+        let mut runtime = Self {
+            roots,
+            variables,
+            path_entries: Vec::new(),
+            home,
+        };
+        runtime.normalize();
+        runtime.path_entries = runtime.host_path_entries_inside_roots(path.as_deref());
+        runtime
+    }
+
+    /// Drop overlapping and duplicate roots, keeping the outermost of any
+    /// nested pair so Bubblewrap never receives two binds for one subtree.
+    fn normalize(&mut self) {
+        self.roots.sort();
+        self.roots.dedup();
+        let mut kept: Vec<PathBuf> = Vec::new();
+        for root in std::mem::take(&mut self.roots) {
+            if kept.iter().any(|existing| root.starts_with(existing)) {
+                continue;
+            }
+            kept.push(root);
+        }
+        self.roots = kept;
+        self.variables
+            .retain(|(_, value)| self.roots.iter().any(|root| root == Path::new(value)));
+    }
+
+    /// Keep only the host `PATH` entries that a mounted root actually
+    /// provides. Version-manager layouts (`~/.nvm/versions/node/*/bin`,
+    /// `~/.pyenv/shims`) are not derivable from the root alone, so the host
+    /// `PATH` is the evidence for what is reachable — filtered by containment
+    /// so nothing outside a mounted root enters the sandbox `PATH`.
+    fn host_path_entries_inside_roots(&self, path: Option<&OsStr>) -> Vec<PathBuf> {
+        let Some(path) = path else {
+            return Vec::new();
+        };
+        let mut seen = BTreeSet::new();
+        std::env::split_paths(path)
+            .filter(|entry| entry.is_absolute())
+            // Canonical form is what the sandbox mounts, so containment is
+            // decided against it: a symlinked `PATH` entry must not smuggle
+            // in a directory no root covers, nor be dropped for spelling.
+            .filter_map(|entry| entry.canonicalize().ok())
+            .filter(|entry| self.roots.iter().any(|root| entry.starts_with(root)))
+            .filter(|entry| seen.insert(entry.clone()))
+            .collect()
+    }
+
+    /// Remove any root that overlaps the writable workspace: the workspace is
+    /// mounted read-write and must not also appear read-only.
+    fn excluding(mut self, workspace: &Path) -> Self {
+        self.roots
+            .retain(|root| !root.starts_with(workspace) && !workspace.starts_with(root));
+        self.normalize();
+        self.path_entries
+            .retain(|entry| self.roots.iter().any(|root| entry.starts_with(root)));
+        self
+    }
+
+    /// Directories that must become read-only mount points so that a write
+    /// anywhere under the real home fails instead of silently landing in the
+    /// sandbox's private tmpfs.
+    fn read_only_parents(&self) -> Vec<PathBuf> {
+        let mut parents = self
+            .roots
+            .iter()
+            .filter_map(|root| root.parent())
+            .filter(|parent| parent.components().count() >= MIN_RUNTIME_ROOT_COMPONENTS)
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+        if let Some(home) = &self.home {
+            if home.components().count() >= MIN_RUNTIME_ROOT_COMPONENTS {
+                parents.push(home.clone());
+            }
+        }
+        parents.sort();
+        parents.dedup();
+        parents.retain(|parent| !RUNTIME_MOUNTS.iter().any(|mount| parent.starts_with(mount)));
+        parents
+    }
+
+    /// The `PATH` the sandbox exports: mounted toolchain directories first,
+    /// then the system runtime.
+    fn sandbox_path(&self) -> OsString {
+        let mut entries = self.path_entries.clone();
+        entries.push(PathBuf::from(SYSTEM_SANDBOX_PATH));
+        entries
+            .iter()
+            .map(|entry| entry.as_os_str().to_os_string())
+            .collect::<Vec<_>>()
+            .join(OsStr::new(":"))
+    }
+}
+
+/// Accept a toolchain root only when it is an existing directory that is
+/// neither the home itself nor a top-level directory.
+fn usable_runtime_root(root: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let root = root.canonicalize().ok()?;
+    if !root.is_dir() || root.components().count() <= MIN_RUNTIME_ROOT_COMPONENTS {
+        return None;
+    }
+    if home.is_some_and(|home| home == root || home.starts_with(&root)) {
+        return None;
+    }
+    if RUNTIME_MOUNTS.iter().any(|mount| root.starts_with(mount)) {
+        return None;
+    }
+    Some(root)
+}
 
 /// Probe whether the default profile is actually enforceable for `workspace`.
 ///
-/// The child process gets a private root, can access its workspace, cannot see
-/// `/home`, and must enter a network namespace. A failure is intentionally
-/// collapsed to a stable public reason: raw Bubblewrap diagnostics may expose
-/// host details and are not suitable for model-facing or transcript output.
+/// The child process gets a private root, can access its workspace, cannot
+/// write under the real home, and must enter a network namespace. A failure is
+/// intentionally collapsed to a stable public reason: raw Bubblewrap
+/// diagnostics may expose host details and are not suitable for model-facing
+/// or transcript output.
 pub fn probe_workspace_sandbox(workspace: &Path) -> SandboxAvailability {
     WorkspaceSandbox::new(workspace, SandboxProfile::WorkspaceNoNetwork).availability()
+}
+
+/// Probe the execution boundary itself, independent of any workspace.
+///
+/// Bubblewrap being installed is not evidence that it works: Ubuntu 23.10+
+/// AppArmor, hardened sysctls, most containers, and WSL1 all leave a working
+/// binary that cannot create a user namespace. The only reliable test is to
+/// run a trivial sandboxed command, so that is what this does.
+///
+/// Bundled `bwrap`: Codex ships a SHA256-verified `bwrap` binary. Euler
+/// requires a system `bwrap` for now — vendoring the C source would add a C
+/// toolchain to `cargo build`, and fetching a pinned release asset would add a
+/// network dependency to it. Both are disproportionate while this diagnostic
+/// tells the user exactly what to install; bundling belongs to the release
+/// workflow instead, tracked as issue #230.
+pub fn probe_sandbox_backend() -> SandboxStatus {
+    if !cfg!(target_os = "linux") {
+        return SandboxStatus::Host;
+    }
+    let Some(bwrap) = bwrap_path() else {
+        return SandboxStatus::Unavailable {
+            reason: SandboxUnavailableReason::BubblewrapMissing,
+            cause: SandboxFailureCause::BubblewrapMissing,
+        };
+    };
+    let mut command = Command::new(bwrap);
+    command.env_clear();
+    mark_inherited_fds_close_on_exec(&mut command);
+    command.args([
+        "--unshare-user",
+        "--unshare-net",
+        "--ro-bind",
+        "/",
+        "/",
+        "/bin/true",
+    ]);
+    if run_probe_to_completion(command) {
+        SandboxStatus::Enforced
+    } else {
+        SandboxStatus::Unavailable {
+            reason: SandboxUnavailableReason::CannotEnforce,
+            cause: user_namespace_failure_cause(),
+        }
+    }
+}
+
+/// Attribute a user-namespace failure to something the user can verify and
+/// change. Every branch reads a host fact rather than parsing Bubblewrap's
+/// stderr, which is unstable across versions and host-revealing.
+fn user_namespace_failure_cause() -> SandboxFailureCause {
+    if read_trimmed("/proc/sys/kernel/osrelease")
+        .is_some_and(|release| release.contains("Microsoft") && !release.contains("WSL2"))
+    {
+        return SandboxFailureCause::Wsl1;
+    }
+    if read_trimmed("/proc/sys/kernel/unprivileged_userns_clone").as_deref() == Some("0")
+        || read_trimmed("/proc/sys/user/max_user_namespaces").as_deref() == Some("0")
+    {
+        return SandboxFailureCause::UserNamespacesDisabled;
+    }
+    if read_trimmed("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").as_deref()
+        == Some("1")
+    {
+        return SandboxFailureCause::AppArmorUserNamespaceRestriction;
+    }
+    if Path::new("/.dockerenv").exists()
+        || read_trimmed("/proc/1/cgroup")
+            .is_some_and(|cgroup| cgroup.contains("docker") || cgroup.contains("lxc"))
+    {
+        return SandboxFailureCause::Container;
+    }
+    SandboxFailureCause::Unattributed
+}
+
+fn read_trimmed(path: &str) -> Option<String> {
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_owned())
 }
 
 /// Remove the private prelude emitted only after Bubblewrap has completed its
@@ -218,37 +698,62 @@ pub(crate) fn strip_sandbox_ready_marker(stdout: &str) -> Result<&str, SandboxUn
         .ok_or(SandboxUnavailableReason::CannotEnforce)
 }
 
-fn probe_profile(bwrap: &Path, workspace: &Path, profile: SandboxProfile) -> SandboxAvailability {
+fn probe_profile(
+    bwrap: &Path,
+    workspace: &Path,
+    runtime: &RuntimeRoots,
+    profile: SandboxProfile,
+) -> SandboxAvailability {
+    let script = match &runtime.home {
+        Some(home) => format!(
+            "test -w /workspace && test -d /usr && test ! -w {}",
+            shell_quote(home)
+        ),
+        None => "test -w /workspace && test ! -e /home && test -d /usr".to_owned(),
+    };
     let mut command = bwrap_command(
         bwrap,
         profile,
         workspace,
+        runtime,
+        &[],
         OsStr::new("/bin/sh"),
-        [
-            "-c",
-            "test -w /workspace && test ! -e /home && test -d /usr",
-        ],
+        ["-c", script.as_str()],
     );
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if run_probe_to_completion(command) {
+        SandboxAvailability::Enforced(profile)
+    } else {
+        SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
+    }
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Run one bounded probe. A probe that outlives its deadline is killed and
+/// treated as a failure: the sandbox must never make session start hang.
+fn run_probe_to_completion(mut command: Command) -> bool {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     let Ok(mut child) = command.spawn() else {
-        return SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce);
+        return false;
     };
     let deadline = Instant::now() + PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => {
-                return SandboxAvailability::Enforced(profile);
-            }
-            Ok(Some(_)) | Err(_) => {
-                return SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce);
-            }
+            Ok(Some(status)) => return status.success(),
+            Err(_) => return false,
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce);
+                return false;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
         }
@@ -277,10 +782,13 @@ fn canonical_workspace(workspace: &Path) -> Result<PathBuf, std::io::Error> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bwrap_command<I, S>(
     bwrap: &Path,
     profile: SandboxProfile,
     workspace: &Path,
+    runtime: &RuntimeRoots,
+    env: &[(OsString, OsString)],
     program: &OsStr,
     args: I,
 ) -> Command
@@ -305,21 +813,11 @@ where
         "--die-with-parent",
         "--new-session",
         "--clearenv",
-        "--setenv",
-        "HOME",
-        SANDBOX_HOME,
-        "--setenv",
-        "XDG_CACHE_HOME",
-        SANDBOX_CACHE,
-        "--setenv",
-        "TMPDIR",
-        "/tmp",
-        "--setenv",
-        "PATH",
-        SANDBOX_PATH,
-        "--tmpfs",
-        "/",
     ]);
+    for (name, value) in sandbox_environment(runtime, env) {
+        command.arg("--setenv").arg(name).arg(value);
+    }
+    command.args(["--tmpfs", "/"]);
     match profile {
         SandboxProfile::WorkspaceNoNetwork => command.arg("--unshare-net"),
     };
@@ -345,11 +843,10 @@ where
         SANDBOX_HOME,
         "--dir",
         SANDBOX_CACHE,
-        "--dir",
-        SANDBOX_WORKSPACE,
-        "--bind",
     ]);
+    add_runtime_root_mounts(&mut command, runtime);
     command
+        .args(["--dir", SANDBOX_WORKSPACE, "--bind"])
         .arg(workspace)
         .arg(SANDBOX_WORKSPACE)
         .args(["--chdir", SANDBOX_WORKSPACE, "--", "/bin/sh", "-c"])
@@ -358,6 +855,51 @@ where
         .arg(program)
         .args(args);
     command
+}
+
+/// Mount the toolchain roots read-only at their real paths.
+///
+/// Each holding directory becomes a tmpfs mount point first and is remounted
+/// read-only last. Without the remount the holding directory would be an
+/// ordinary writable directory in the sandbox's private root tmpfs, so a write
+/// under the real home would appear to succeed and be silently discarded.
+fn add_runtime_root_mounts(command: &mut Command, runtime: &RuntimeRoots) {
+    let parents = runtime.read_only_parents();
+    if parents.is_empty() {
+        return;
+    }
+    for parent in &parents {
+        command.arg("--tmpfs").arg(parent);
+    }
+    for root in &runtime.roots {
+        command.arg("--ro-bind").arg(root).arg(root);
+    }
+    for parent in &parents {
+        command.arg("--remount-ro").arg(parent);
+    }
+}
+
+/// The complete sandbox environment, in one place.
+///
+/// ADR 0021 row C replaces this with an inheritance model and a tiered
+/// denylist in a later PR; until then the profile clears the environment and
+/// sets exactly what it mounts, so there is one seam to change.
+fn sandbox_environment(
+    runtime: &RuntimeRoots,
+    extra: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
+    let mut environment = vec![
+        (OsString::from("HOME"), OsString::from(SANDBOX_HOME)),
+        (
+            OsString::from("XDG_CACHE_HOME"),
+            OsString::from(SANDBOX_CACHE),
+        ),
+        (OsString::from("TMPDIR"), OsString::from("/tmp")),
+        (OsString::from("PATH"), runtime.sandbox_path()),
+    ];
+    environment.extend(runtime.variables.iter().cloned());
+    environment.extend(extra.iter().cloned());
+    environment
 }
 
 /// Keep non-stdio host descriptors out of Bubblewrap and the agent command.
@@ -569,6 +1111,8 @@ mod tests {
             Path::new("/usr/bin/bwrap"),
             SandboxProfile::WorkspaceNoNetwork,
             &workspace,
+            &RuntimeRoots::default(),
+            &[],
             OsStr::new("/bin/sh"),
             ["-c", "true"],
         );
@@ -722,6 +1266,233 @@ mod tests {
     }
 
     #[test]
+    fn detected_toolchain_roots_are_read_only_and_carry_their_variables() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path().join("home/example");
+        let cargo = home.join(".cargo");
+        let rustup = home.join(".rustup");
+        std::fs::create_dir_all(cargo.join("bin")).expect("cargo bin");
+        std::fs::create_dir_all(&rustup).expect("rustup");
+        let path = std::env::join_paths([cargo.join("bin"), PathBuf::from("/usr/local/sbin")])
+            .expect("join PATH");
+        let runtime = RuntimeRoots::from_environment(
+            Some(home.clone()),
+            |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
+            Some(path),
+        );
+        let home = home.canonicalize().expect("canonical home");
+        let cargo = cargo.canonicalize().expect("canonical cargo home");
+        let rustup = rustup.canonicalize().expect("canonical rustup home");
+
+        assert!(runtime.roots.contains(&cargo), "{runtime:?}");
+        assert!(runtime.roots.contains(&rustup), "{runtime:?}");
+        assert!(runtime
+            .variables
+            .contains(&(OsString::from("CARGO_HOME"), cargo.clone().into_os_string())));
+        assert!(runtime
+            .variables
+            .contains(&(OsString::from("RUSTUP_HOME"), rustup.into_os_string())));
+        // The host PATH is the evidence for what a mounted root provides;
+        // an entry outside every root never enters the sandbox PATH.
+        assert_eq!(runtime.path_entries, vec![cargo.join("bin")]);
+        let sandbox_path = runtime.sandbox_path().to_string_lossy().into_owned();
+        assert!(
+            sandbox_path.ends_with(SYSTEM_SANDBOX_PATH),
+            "{sandbox_path}"
+        );
+        assert!(!sandbox_path.contains("/usr/local/sbin"), "{sandbox_path}");
+        // The real home is a read-only mount point, so a write under it
+        // fails instead of landing in the sandbox's private root tmpfs.
+        assert!(runtime.read_only_parents().contains(&home));
+    }
+
+    #[test]
+    fn the_real_home_is_never_a_toolchain_root() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path().join("home/example");
+        std::fs::create_dir_all(&home).expect("home");
+        let runtime = RuntimeRoots::from_environment(
+            Some(home.clone()),
+            |name| (name == "CARGO_HOME").then(|| home.clone().into_os_string()),
+            None,
+        );
+
+        let home = home.canonicalize().expect("canonical home");
+        assert!(!runtime.roots.contains(&home), "{runtime:?}");
+        assert!(runtime
+            .variables
+            .iter()
+            .all(|(name, _)| name != "CARGO_HOME"));
+    }
+
+    #[test]
+    fn a_toolchain_root_inside_the_workspace_is_not_also_mounted_read_only() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        let cargo = workspace.join(".cargo");
+        std::fs::create_dir_all(&cargo).expect("workspace cargo home");
+        let runtime = RuntimeRoots::from_environment(
+            Some(temp.path().to_path_buf()),
+            |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
+            None,
+        )
+        .excluding(&workspace.canonicalize().expect("canonical workspace"));
+
+        assert!(runtime.roots.is_empty(), "{runtime:?}");
+    }
+
+    #[test]
+    fn toolchain_roots_are_bound_read_only_between_a_tmpfs_and_its_remount() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        let home = temp.path().join("home/example");
+        let cargo = home.join(".cargo");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::create_dir_all(&cargo).expect("cargo home");
+        let runtime = RuntimeRoots::from_environment(
+            Some(home.clone()),
+            |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
+            None,
+        );
+        let home = home.canonicalize().expect("canonical home");
+        let cargo = cargo.canonicalize().expect("canonical cargo home");
+        let command = bwrap_command(
+            Path::new("/usr/bin/bwrap"),
+            SandboxProfile::WorkspaceNoNetwork,
+            &workspace.canonicalize().expect("canonical workspace"),
+            &runtime,
+            &[],
+            OsStr::new("/bin/sh"),
+            ["-c", "true"],
+        );
+        let arguments = command_arguments(&command);
+        let home = home.to_string_lossy().into_owned();
+        let cargo = cargo.to_string_lossy().into_owned();
+
+        let tmpfs = arguments
+            .windows(2)
+            .position(|pair| pair == ["--tmpfs", home.as_str()])
+            .expect("holding directory is a mount point");
+        let bind = arguments
+            .windows(3)
+            .position(|triple| triple == ["--ro-bind", cargo.as_str(), cargo.as_str()])
+            .expect("toolchain root is bound read-only");
+        let remount = arguments
+            .windows(2)
+            .position(|pair| pair == ["--remount-ro", home.as_str()])
+            .expect("holding directory is remounted read-only");
+        assert!(tmpfs < bind && bind < remount, "{arguments:?}");
+        assert!(arguments
+            .windows(2)
+            .any(|pair| pair == ["CARGO_HOME", cargo.as_str()]));
+    }
+
+    #[test]
+    fn an_unavailable_backend_names_a_cause_and_a_way_out() {
+        let status = SandboxStatus::Unavailable {
+            reason: SandboxUnavailableReason::BubblewrapMissing,
+            cause: SandboxFailureCause::BubblewrapMissing,
+        };
+        let diagnostic = status.diagnostic().expect("diagnostic");
+
+        assert_eq!(status.backend_label(), "unavailable");
+        assert!(
+            diagnostic.contains("`bwrap` is not installed"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("sudo apt install bubblewrap"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("fail closed"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("Full access (unsandboxed)"),
+            "{diagnostic}"
+        );
+        assert!(SandboxStatus::Host.diagnostic().is_none());
+        assert_eq!(SandboxStatus::Host.backend_label(), "host");
+        assert_eq!(SandboxStatus::Enforced.backend_label(), "bwrap");
+    }
+
+    #[test]
+    fn every_failure_cause_names_a_distinct_remedy() {
+        for cause in [
+            SandboxFailureCause::BubblewrapMissing,
+            SandboxFailureCause::UserNamespacesDisabled,
+            SandboxFailureCause::AppArmorUserNamespaceRestriction,
+            SandboxFailureCause::Container,
+            SandboxFailureCause::Wsl1,
+            SandboxFailureCause::Unattributed,
+        ] {
+            assert!(!cause.description().is_empty());
+            assert!(!cause.remedy().is_empty());
+        }
+    }
+
+    #[test]
+    fn the_platform_default_is_the_enforced_linux_profile() {
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                SubprocessSandbox::default(),
+                SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork)
+            );
+        } else {
+            assert_eq!(SubprocessSandbox::default(), SubprocessSandbox::Host);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn detected_toolchains_run_inside_the_sandbox_and_the_real_home_stays_read_only() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let runtime = RuntimeRoots::detect();
+        let sandbox = WorkspaceSandbox::with_runtime_roots(
+            &workspace,
+            SandboxProfile::WorkspaceNoNetwork,
+            runtime.clone(),
+        );
+        if !sandbox.availability().is_enforced() {
+            return;
+        }
+        let Some(home) = runtime.home.clone() else {
+            return;
+        };
+
+        // A write anywhere under the real home must fail, not land in a
+        // private copy that is silently discarded.
+        let script = format!(
+            "if printf bad > {}/euler-must-not-write; then exit 1; fi",
+            shell_quote(&home)
+        );
+        let output = sandbox
+            .command("/bin/sh", ["-c", script.as_str()], &[])
+            .expect("sandbox command")
+            .output()
+            .expect("run sandbox command");
+        assert!(output.status.success(), "{output:?}");
+        assert!(!home.join("euler-must-not-write").exists());
+
+        // Toolchains the host environment implies stay reachable.
+        for tool in ["cargo", "node"] {
+            if !runtime
+                .path_entries
+                .iter()
+                .any(|entry| entry.join(tool).is_file())
+            {
+                continue;
+            }
+            let output = sandbox
+                .command("/bin/sh", ["-c", format!("{tool} --version").as_str()], &[])
+                .expect("sandbox command")
+                .output()
+                .expect("run sandbox command");
+            assert!(output.status.success(), "{tool} in sandbox: {output:?}");
+        }
+    }
+
+    #[test]
     fn invalid_workspace_fails_closed_before_bubblewrap_is_invoked() {
         let temp = tempfile::tempdir().expect("temp dir");
         let missing = temp.path().join("missing");
@@ -740,7 +1511,7 @@ mod tests {
             SandboxAvailability::Unavailable(expected)
         );
         assert_eq!(
-            sandbox.command("/bin/sh", ["-c", "true"]).map(|_| ()),
+            sandbox.command("/bin/sh", ["-c", "true"], &[]).map(|_| ()),
             Err(expected)
         );
     }
@@ -767,7 +1538,7 @@ mod tests {
             "printf inside > /workspace/inside.txt; test ! -e {secret}; if echo outside > {escape}; then exit 1; fi"
         );
         let output = sandbox
-            .command("/bin/sh", ["-c", script.as_str()])
+            .command("/bin/sh", ["-c", script.as_str()], &[])
             .expect("enforced sandbox command")
             .output()
             .expect("run sandbox command");
@@ -804,7 +1575,7 @@ mod tests {
         let script =
             format!("import socket; socket.create_connection(('127.0.0.1', {port}), timeout=1)");
         let output = sandbox
-            .command("/usr/bin/python3", ["-c", script.as_str()])
+            .command("/usr/bin/python3", ["-c", script.as_str()], &[])
             .expect("enforced sandbox command")
             .output()
             .expect("run sandbox command");
@@ -818,11 +1589,6 @@ mod tests {
             listener.accept().is_err(),
             "host listener received a connection"
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    fn shell_quote(path: &Path) -> String {
-        format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
     }
 }
 

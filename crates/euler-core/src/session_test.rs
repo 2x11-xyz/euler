@@ -2520,6 +2520,52 @@ fn session_config_forwards_requested_subprocess_sandbox_to_tool_registry() {
     assert_eq!(session.tools.sandbox_availability(), Some(expected));
 }
 
+/// ADR 0021 row A′: the backend that actually ran is provenance, so a reader
+/// can tell a sandboxed session from an unsandboxed one without guessing from
+/// the platform.
+#[test]
+fn session_start_records_the_probed_sandbox_backend() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let config = SessionConfig::new(temp.path());
+    let expected = crate::SandboxStatus::from_availability(match config.subprocess_sandbox {
+        SubprocessSandbox::Host => None,
+        SubprocessSandbox::Enforce(_) => Some(probe_workspace_sandbox(temp.path())),
+    });
+
+    let session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let start = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_START)
+        .expect("session.start");
+
+    assert_eq!(
+        start.payload.get("sandbox_backend").and_then(Value::as_str),
+        Some(expected.backend_label())
+    );
+    // macOS has no backend yet, so the honest record is `host`, never a
+    // silent omission that a reader would have to interpret.
+    if !cfg!(target_os = "linux") {
+        assert_eq!(
+            start.payload.get("sandbox_backend").and_then(Value::as_str),
+            Some("host")
+        );
+    }
+    assert_eq!(
+        start
+            .payload
+            .get("sandbox_unavailable_reason")
+            .and_then(Value::as_str),
+        expected
+            .reason()
+            .map(crate::SandboxUnavailableReason::as_str)
+    );
+}
+
 /// Provider whose invoke fails with an error message echoing request
 /// fragments — models real HTTP 4xx bodies that quote what was sent.
 #[derive(Debug)]
