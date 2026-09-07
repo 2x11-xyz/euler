@@ -2821,14 +2821,9 @@ fn git_diff_does_not_run_a_repository_configured_clean_filter() {
     let root = repository.path();
     std::fs::write(root.join(".gitattributes"), "* filter=evil\n").expect("attributes");
     let marker = root.join("filter-ran");
-    git(
-        root,
-        &[
-            "config",
-            "filter.evil.clean",
-            &format!("touch {}", marker.display()),
-        ],
-    );
+    // Relative: git runs the driver with the worktree root as its working
+    // directory, and under an enforced sandbox the host path does not exist.
+    git(root, &["config", "filter.evil.clean", "touch filter-ran"]);
     std::fs::write(root.join("tracked.txt"), "changed\n").expect("edit");
     let registry = ToolRegistry::new(root);
 
@@ -2851,7 +2846,7 @@ fn git_status_does_not_fire_a_repository_configured_hook() {
     std::fs::create_dir(&hooks).expect("hooks directory");
     let marker = root.join("hook-ran");
     let hook = hooks.join("post-index-change");
-    std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", marker.display())).expect("hook");
+    std::fs::write(&hook, "#!/bin/sh\ntouch hook-ran\n").expect("hook");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2878,11 +2873,7 @@ fn a_repository_configured_fsmonitor_helper_does_not_run() {
     let root = repository.path();
     let marker = root.join("fsmonitor-ran");
     let helper = root.join("fsmonitor-helper");
-    std::fs::write(
-        &helper,
-        format!("#!/bin/sh\ntouch {}\nexit 1\n", marker.display()),
-    )
-    .expect("helper");
+    std::fs::write(&helper, "#!/bin/sh\ntouch fsmonitor-ran\nexit 1\n").expect("helper");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
