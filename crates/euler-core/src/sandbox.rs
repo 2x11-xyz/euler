@@ -481,6 +481,12 @@ const PROC_FD_BUFFER_LEN: usize = 4096;
 /// conventional location second; the real home itself is never mounted, and
 /// the directory that holds these roots is remounted read-only so a write
 /// under the real home fails rather than landing in a discarded private copy.
+///
+/// The one exception is a holding directory that is also one of the profile's
+/// own mount points (`HOME=/tmp`): remounting it would shadow the sandbox
+/// home, cache and TMPDIR, so it is left writable and a write there lands in
+/// the private tmpfs instead of failing. Nothing of the host is exposed
+/// either way.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RuntimeRoots {
     /// Read-only mount sources, canonical and non-overlapping.
@@ -1450,9 +1456,20 @@ mod tests {
             !sandbox_path.contains(unmounted.to_string_lossy().as_ref()),
             "{sandbox_path}"
         );
-        // The real home is a read-only mount point, so a write under it
-        // fails instead of landing in the sandbox's private root tmpfs.
-        assert!(runtime.read_only_parents().contains(&home));
+        // The fixture home is a temp directory, which on Linux lives under
+        // the profile's own `/tmp` and is therefore deliberately left alone —
+        // remounting it would shadow the sandbox home and cache. Assert the
+        // read-only-parent rule on a home where it applies.
+        let _ = home;
+        let elsewhere = RuntimeRoots {
+            roots: vec![PathBuf::from("/home/example/.cargo")],
+            variables: Vec::new(),
+            path_entries: Vec::new(),
+            home: Some(PathBuf::from("/home/example")),
+        };
+        assert!(elsewhere
+            .read_only_parents()
+            .contains(&PathBuf::from("/home/example")));
     }
 
     #[test]
