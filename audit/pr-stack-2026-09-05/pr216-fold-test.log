@@ -1,0 +1,9 @@
+   Compiling euler-cli v0.1.3 (/private/tmp/euler-wt/stack-216/crates/euler-cli)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.88s
+     Running tests/headless.rs (/private/tmp/euler-audit-target/debug/deps/headless-b863d661c3e749a3)
+
+running 1 test
+test tui_pty_fold_toggle_replay_after_resize_keeps_history_intact ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 107 filtered out; finished in 7.30s
+

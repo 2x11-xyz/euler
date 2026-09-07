@@ -1,0 +1,17 @@
+[package]
+name = "euler-audit-evidence"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+euler-core = { path = "../../crates/euler-core" }
+euler-event = { path = "../../crates/euler-event" }
+euler-provider = { path = "../../crates/euler-provider" }
+euler-sdk = { path = "../../crates/euler-sdk" }
+euler-agents = { path = "../../crates/euler-agents" }
+euler-managed-process = { path = "../../crates/euler-managed-process" }
+serde_json = "1"
+tempfile = "3"

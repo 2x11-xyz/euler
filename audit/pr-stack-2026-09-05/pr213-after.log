@@ -1,0 +1,2 @@
+stage=first_byte dispatched=3 retry_events=2 terminal_stage="first_byte" terminal_has_attempt_id=true
+stage=semantic_idle dispatched=1 retry_events=0 terminal_stage="semantic_idle" terminal_has_attempt_id=true

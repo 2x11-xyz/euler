@@ -1,0 +1,13 @@
+SSE malformed frame then completed: [Ok(Finished { stop_reason: Completed, usage: None })]
+SSE invalid tool JSON then completed: [Ok(ToolCall(ToolCall { id: "call-1", name: "read_file", input: Null })), Ok(Finished { stop_reason: ToolUse, usage: None })]
+SSE duplicate completed: [Ok(Finished { stop_reason: Completed, usage: None }), Ok(Finished { stop_reason: Completed, usage: None })]
+overlapping redaction: [redacted-secret]-canary-sensitive-tail
+checkpoint known-taint: redactor_detects=true, heuristic_accepts=true, stored_bytes_retain_known_value=true
+shared checkpoint scrubbed=1, session_b_hash_unchanged=true, session_b_restore=Err(Os { code: 2, kind: NotFound, message: "No such file or directory" })
+warning: auth file permissions on /private/tmp/.tmpViQwCZ/auth.json are 644; next write will repair them to 600
+legacy auth provider_load_ok=true, startup_storage_load_ok=false
+legacy provider validation secret sink calls=0
+custom config warnings=[]
+custom constructed env syntax validation=Err(ProviderError { category: Auth, message: "custom provider `probe` secret `api_key` env reference is invalid", request_outcome_unknown: false })
+custom compat flags warnings=[], request={"messages":[{"content":"System instruction","role":"system"},{"content":null,"role":"assistant","tool_calls":[{"function":{"arguments":"{\"path\":\"a\"}","name":"read_file"},"id":"c","type":"function"}]},{"content":"file text","role":"tool","tool_call_id":"c"}],"model":"m","stream":true,"stream_options":{"include_usage":true}}
+runtime catalog selected=max, adapter rejection=Some(ProviderError { category: Rejected, message: "reasoning effort `max` is not supported by chatgpt/gpt-5.5", request_outcome_unknown: false })
