@@ -179,21 +179,39 @@ fn rehashes_and_repoints_a_workspace_pre_image_checkpoint() {
     let value = "internal-hostname-eu-west-42";
     let content = format!("host = {value}\n");
     let hash = crate::checkpoints::store_pre_image(workspace.path(), "conf.toml", &content)
+        .expect("checkpoint store succeeds")
         .expect("checkpoint stored");
 
+    // Both rows reference the same blob: the `checkpoint.stored` record
+    // written before the write, and the `file.change` written after it.
     write_events(
         dir.path(),
-        &[EventEnvelope::new(
-            "session-1",
-            "agent",
-            None,
-            EventKind::new(EventKind::FILE_CHANGE),
-            object([
-                ("path", "conf.toml".into()),
-                ("action", "modify".into()),
-                ("pre_image_blob", hash.clone().into()),
-            ]),
-        )],
+        &[
+            EventEnvelope::new(
+                "session-1",
+                "agent",
+                None,
+                EventKind::new(EventKind::CHECKPOINT_STORED),
+                object([
+                    ("tool_call_id", "call-1".into()),
+                    ("path", "conf.toml".into()),
+                    ("action", "modify".into()),
+                    ("pre_image_blob", hash.clone().into()),
+                    ("status", "prepared".into()),
+                ]),
+            ),
+            EventEnvelope::new(
+                "session-1",
+                "agent",
+                None,
+                EventKind::new(EventKind::FILE_CHANGE),
+                object([
+                    ("path", "conf.toml".into()),
+                    ("action", "modify".into()),
+                    ("pre_image_blob", hash.clone().into()),
+                ]),
+            ),
+        ],
     );
 
     let report = scrub_closed_session(
@@ -207,13 +225,20 @@ fn rehashes_and_repoints_a_workspace_pre_image_checkpoint() {
     .expect("scrub");
     assert_eq!(report.checkpoints_rewritten, 1);
 
-    // The event moves to a hash-valid replacement and the old secret-bearing
-    // object is retired. Rollback remains functional after the scrub.
+    // Both events move to the same hash-valid replacement and the old
+    // secret-bearing object is retired. A `checkpoint.stored` row left
+    // pointing at the retired hash would keep a secret pre-image alive past
+    // the scrub. Rollback remains functional afterwards.
     let events = read_provenance(dir.path().join("events.jsonl")).unwrap();
-    let new_hash = events[0].payload["pre_image_blob"]
+    let new_hash = events[1].payload["pre_image_blob"]
         .as_str()
         .expect("checkpoint hash");
     assert_ne!(new_hash, hash);
+    assert_eq!(
+        events[0].payload["pre_image_blob"].as_str(),
+        Some(new_hash),
+        "the prepared record must be repointed too"
+    );
     let restored = crate::checkpoints::load_pre_image(workspace.path(), new_hash)
         .expect("scrubbed checkpoint remains loadable");
     assert!(!restored.contains(value));

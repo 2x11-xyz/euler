@@ -7881,7 +7881,24 @@ fn edit_file_modify_stores_workspace_checkpoint_and_rollback_restores() {
         fs::read_to_string(temp.path().join("note.txt")).expect("restored"),
         before
     );
-    assert_eq!(session.events().len(), prior_count + 1);
+    // A restore is recorded like any other write: it checkpoints what it
+    // replaces, appends its own file.change, then the restore ledger row.
+    let appended = &session.events()[prior_count..];
+    assert_eq!(
+        appended
+            .iter()
+            .map(|event| event.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            EventKind::CHECKPOINT_STORED,
+            EventKind::FILE_CHANGE,
+            EventKind::WORKSPACE_RESTORE,
+        ]
+    );
+    assert_eq!(
+        payload_str(&appended[1], "origin"),
+        Some("workspace.restore")
+    );
     let restore = session.events().last().expect("workspace.restore");
     assert_eq!(restore.kind.as_str(), EventKind::WORKSPACE_RESTORE);
     assert_eq!(payload_str(restore, "path"), Some("note.txt"));
@@ -7923,4 +7940,57 @@ fn edit_file_create_does_not_store_pre_image_checkpoint() {
     let file_change = find_kind(session.events(), EventKind::FILE_CHANGE);
     assert!(!file_change.payload.contains_key("pre_image_blob"));
     assert!(session.workspace_checkpoints().is_empty());
+}
+
+#[test]
+fn a_session_resumes_after_a_rollback_and_the_restore_stays_undoable() {
+    // A restore appends checkpoint.stored and file.change outside any run.
+    // Neither may be read as root-driver work, or the resume fold rejects the
+    // log and the session becomes unusable after an ordinary /rollback.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    let before = "prefix\nalpha\nsuffix\n";
+    fs::write(&note, before).expect("write fixture");
+    let log = temp.path().join("events.jsonl");
+    let provider = ScriptedProvider::new(vec![FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-edit".to_owned(),
+        name: "edit_file".to_owned(),
+        input: json!({"path": "note.txt", "old": "alpha", "new": "beta"}),
+    }])]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+    let _ = session
+        .run_turn("edit")
+        .expect_err("provider ends after tools");
+    let checkpoint_id = session.workspace_checkpoints()[0].event_id.clone();
+    let outcome = session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect("restore");
+    assert!(outcome.undoable);
+    drop(session);
+
+    let events = euler_core::read_provenance(&log).expect("resume reads the log the restore wrote");
+    let folded = euler_core::resume::fold_session(&SessionConfig::new(temp.path()), events)
+        .expect("the fold accepts the restore");
+    let checkpoints = euler_core::list_workspace_checkpoints(&folded.events);
+    assert_eq!(
+        checkpoints.first().map(|entry| entry.path.as_str()),
+        Some("note.txt"),
+        "the restore is listed as undoable after resume"
+    );
+    // The restore's own rows carry no tool_call_id: no tool call made them.
+    let restore_change = folded
+        .events
+        .iter()
+        .rfind(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
+        .expect("restore file.change");
+    assert_eq!(
+        payload_str(restore_change, "origin"),
+        Some(EventKind::WORKSPACE_RESTORE)
+    );
+    assert!(!restore_change.payload.contains_key("tool_call_id"));
 }

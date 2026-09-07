@@ -32,6 +32,7 @@ pub mod session_kind;
 mod session_name;
 mod session_root;
 pub mod session_store;
+mod structured_file;
 pub mod swarm;
 pub mod tools;
 
@@ -77,10 +78,11 @@ pub use extension_registry::{
     ExtensionRegistryError, EXTENSION_AUDIT_SCHEMA_VERSION,
 };
 pub use file_diff::{
-    capture_workspace_snapshot, file_diff_projection, observed_file_change_payload,
-    observed_file_diff_payload, observed_file_diff_projection, FileDiffProjection, FileDiffSource,
-    ObservedFileChange, WorkspaceSnapshot, MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_SNAPSHOT_FILES,
-    MAX_WORKSPACE_SNAPSHOT_FILE_BYTES, MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
+    capture_workspace_snapshot, file_change_event_payload, file_diff_projection,
+    observed_file_change_payload, observed_file_diff_payload, observed_file_diff_projection,
+    FileChangeRecord, FileDiffProjection, FileDiffSource, ObservedFileChange, WorkspaceSnapshot,
+    MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_SNAPSHOT_FILES, MAX_WORKSPACE_SNAPSHOT_FILE_BYTES,
+    MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
 };
 pub use grants::{
     ActiveGrant, GrantScope, ProjectGrantError, ProjectGrantStore, ScopePattern, ScopePatternError,

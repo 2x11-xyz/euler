@@ -29,6 +29,24 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     fault::check(fault::Op::DirSync, path)
 }
 
+/// fsync an already-open directory descriptor so a preceding create or
+/// rename within it is durable. Preferred over [`sync_dir`] wherever the
+/// descriptor is held: re-opening by path could resolve somewhere else.
+#[cfg(unix)]
+pub(crate) fn sync_directory_fd(
+    directory: std::os::fd::BorrowedFd<'_>,
+    path: &Path,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    fault::check(fault::Op::DirSync, path)?;
+    // SAFETY: the borrowed descriptor is live for the duration of the call.
+    if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// [`File::sync_data`] routed through the fault-injection seam. `path` is
 /// the file's own path, used only to match armed faults.
 pub(crate) fn sync_file_data(file: &File, path: &Path) -> io::Result<()> {

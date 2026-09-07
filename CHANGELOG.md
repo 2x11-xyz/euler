@@ -51,6 +51,36 @@ pull requests that landed them; deeper design rationale lives in
   canonicalized form as well as its spelling, so an in-workspace symlink
   cannot read through it.
 
+### Structured file writes and rollback
+
+- Structured file tools (`read_file`, `edit_file`, `write_file`,
+  `apply_patch`) now resolve their target by walking down from the workspace
+  root to the parent directory and holding that descriptor — `openat2` with
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` on Linux
+  (falling back to an `O_NOFOLLOW` hop-by-hop walk where that syscall is
+  unavailable), a hop-by-hop walk on other Unix hosts — so a directory or root
+  swapped in after the path was resolved fails the open instead of escaping
+  the workspace. Creates use `O_EXCL` and never clobber a file that appeared
+  after the call was prepared; a modify compares the target's current bytes to
+  the exact prepared pre-image and refuses a stale write rather than
+  overwriting a concurrent edit; non-regular targets are refused.
+- Structured writes are now atomic: the new bytes are written to a sibling
+  temporary file, given the target's permissions, made durable, and renamed
+  over the target. A file is only ever its complete old content or its
+  complete new content, so an interrupted write can no longer truncate it.
+  Creates publish the same way through a no-replace rename, so they stay
+  no-clobber. A write to a file or directory the user made read-only is
+  refused rather than silently published.
+- `/rollback` checkpoints are now stored and recorded *before* the destructive
+  write, as a `checkpoint.stored` event. A write whose checkpoint cannot be
+  stored durably does not happen at all. A checkpoint whose write was never
+  observed to complete is never restorable, and restoring an applied
+  checkpoint first verifies that the file still holds what the newest
+  recorded write left there — so a rollback can no longer silently discard a
+  later edit. A checkpointed file the user deleted is recreated, and a restore
+  is now recorded as a change of its own, so rollback is repeatable on the
+  same file and a restore can itself be undone.
+
 ### Project context and skills
 
 - Skill authoring is now more interoperable: a missing or YAML null name

@@ -93,6 +93,8 @@ fn skill_read_returns_only_the_frozen_body_without_a_capability() {
 use serde_json::json;
 use std::env;
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::sync::Mutex;
 
@@ -2105,4 +2107,619 @@ fn sandbox_timeout_before_readiness_hides_launcher_output() {
     .expect("timeout is not a sandbox availability failure");
 
     assert!(output.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Structured write hardening: fd-anchored opens, exact preimage comparison,
+// and the negative cases each of those exists to refuse.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn structured_write_rejects_stale_preimage_after_prepare() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("target.txt");
+    fs::write(&target, "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+    let execution = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "target.txt", "old": "old", "new": "agent"}),
+        )
+        .expect("prepare edit");
+
+    fs::write(&target, "user\n").expect("concurrent user edit");
+    let error = registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect_err("stale preimage must not be overwritten");
+
+    assert!(matches!(error, ToolError::StalePreparedWrite { .. }));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "user\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_write_rejects_parent_symlink_substitution_after_prepare() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(workspace.join("src")).expect("workspace src");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(workspace.join("src/note.txt"), "old\n").expect("workspace target");
+    fs::write(outside.join("note.txt"), "outside\n").expect("outside target");
+    let registry = ToolRegistry::new(&workspace);
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "src/note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+
+    fs::rename(workspace.join("src"), workspace.join("original-src")).expect("move parent");
+    symlink(&outside, workspace.join("src")).expect("substitute parent symlink");
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("substituted parent must fail closed");
+
+    assert!(matches!(error, ToolError::Io(_)));
+    assert_eq!(
+        fs::read_to_string(outside.join("note.txt")).unwrap(),
+        "outside\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("original-src/note.txt")).unwrap(),
+        "old\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_write_rejects_root_substitution_after_prepare() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(workspace.join("note.txt"), "old\n").expect("workspace target");
+    fs::write(outside.join("note.txt"), "outside\n").expect("outside decoy");
+    let registry = ToolRegistry::new(&workspace);
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+
+    fs::rename(&workspace, temp.path().join("original-workspace")).expect("move root");
+    symlink(&outside, &workspace).expect("substitute root");
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("substituted root must fail closed");
+
+    assert!(matches!(error, ToolError::Io(_)));
+    assert_eq!(
+        fs::read_to_string(outside.join("note.txt")).unwrap(),
+        "outside\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_tools_reject_a_fifo_target() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let fifo = temp.path().join("host.fifo");
+    let fifo_path =
+        std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+    // SAFETY: the path is a valid NUL-terminated pathname inside the fixture.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let registry = ToolRegistry::new(temp.path());
+
+    assert!(matches!(
+        registry.execute("read_file", &json!({"path": "host.fifo"})),
+        Err(ToolError::UnsupportedFileType { .. })
+    ));
+    assert!(matches!(
+        registry.execute(
+            "edit_file",
+            &json!({"path": "host.fifo", "old": "x", "new": "y"})
+        ),
+        Err(ToolError::UnsupportedFileType { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_write_leaves_an_outside_alias_on_the_old_inode() {
+    // pnpm stores, `cargo vendor`, and `cp -al` all produce multiply-linked
+    // files inside a workspace. Editing one is allowed because the atomic
+    // replace publishes a new inode: every other name still refers to the
+    // untouched old content, so the write stays confined without a rule that
+    // would break those tools.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    let outside_file = outside.join("shared.txt");
+    fs::write(&outside_file, "old\n").expect("outside file");
+    fs::hard_link(&outside_file, workspace.join("alias.txt")).expect("workspace alias");
+    let registry = ToolRegistry::new(&workspace);
+
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "alias.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect("a multiply-linked file is editable");
+
+    assert_eq!(
+        fs::read_to_string(workspace.join("alias.txt")).unwrap(),
+        "new\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&outside_file).unwrap(),
+        "old\n",
+        "the alias outside the workspace must keep the old inode"
+    );
+}
+
+#[test]
+fn structured_write_is_atomic_and_preserves_mode() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("script.sh");
+    fs::write(&target, "old\n").expect("target");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "script.sh", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect("apply");
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "an atomic replace must not reset the file mode"
+        );
+    }
+    // The replace leaves no temporary file behind.
+    let leftovers = fs::read_dir(temp.path())
+        .expect("read workspace")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".euler-write-")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+}
+
+#[test]
+fn structured_add_uses_create_new_at_apply_time() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let execution = registry
+        .execute(
+            "write_file",
+            &json!({"path": "new.txt", "content": "agent"}),
+        )
+        .expect("prepare create");
+
+    fs::write(temp.path().join("new.txt"), "user got there first").expect("racing create");
+    let error = registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect_err("O_EXCL must refuse a target that appeared after preparation");
+
+    assert!(matches!(error, ToolError::FileAlreadyExists));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("new.txt")).unwrap(),
+        "user got there first"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn structured_tools_work_across_an_in_workspace_mount() {
+    // `RESOLVE_NO_XDEV` would refuse this, and with it every ordinary
+    // devcontainer volume at `node_modules/` or tmpfs at `target/`. Planting
+    // a hostile mount inside the workspace needs privileges the same-user
+    // threat model already excludes, so the mount is crossed and the ordinary
+    // confinement rules still apply beneath it.
+    use std::ffi::CString;
+    use std::os::unix::fs::MetadataExt as _;
+
+    struct Unmount(std::path::PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            if let Ok(target) = CString::new(self.0.as_os_str().as_bytes()) {
+                // SAFETY: `target` is NUL-terminated; lazy detach keeps test
+                // cleanup reliable if an assertion still holds a descriptor.
+                unsafe {
+                    libc::umount2(target.as_ptr(), libc::MNT_DETACH);
+                }
+            }
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let source = temp.path().join("volume");
+    let nested = workspace.join("mounted");
+    for directory in [&workspace, &source, &nested] {
+        fs::create_dir(directory).expect("fixture directory");
+    }
+    fs::write(source.join("note.txt"), "old\n").expect("volume fixture");
+    assert_eq!(
+        fs::metadata(&workspace).expect("workspace metadata").dev(),
+        fs::metadata(&source).expect("source metadata").dev(),
+        "fixture must exercise a same-device bind"
+    );
+    let source_path = CString::new(source.as_os_str().as_bytes()).expect("source path");
+    let target_path = CString::new(nested.as_os_str().as_bytes()).expect("target path");
+    // SAFETY: both mount paths are live, NUL-terminated directories and the
+    // remaining pointer arguments are unused for MS_BIND.
+    let mounted = unsafe {
+        libc::mount(
+            source_path.as_ptr(),
+            target_path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if mounted != 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+            eprintln!("skipping bind-mount integration check: {error}");
+            return;
+        }
+        panic!("bind mount fixture failed: {error}");
+    }
+    let _unmount = Unmount(nested);
+    let registry = ToolRegistry::new(&workspace);
+
+    let read = registry
+        .execute("read_file", &json!({"path": "mounted/note.txt"}))
+        .expect("a mounted volume inside the workspace is readable");
+    assert_eq!(read.output, "old\n");
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "mounted/note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit through the mount");
+    registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect("apply through the mount");
+    assert_eq!(
+        fs::read_to_string(source.join("note.txt")).unwrap(),
+        "new\n"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn confinement_holds_when_openat2_is_unavailable() {
+    // Kernels before 5.6 and seccomp profiles that deny openat2 fall back to
+    // the hop-by-hop walker; it must refuse the same escapes.
+    let _without = crate::structured_file::test_support::WithoutOpenat2::arm();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(workspace.join("src")).expect("workspace src");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(workspace.join("src/note.txt"), "old\n").expect("workspace target");
+    fs::write(outside.join("note.txt"), "outside\n").expect("outside target");
+    let registry = ToolRegistry::new(&workspace);
+
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "src/note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit on the fallback walker");
+    fs::rename(workspace.join("src"), workspace.join("original-src")).expect("move parent");
+    symlink(&outside, workspace.join("src")).expect("substitute parent symlink");
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("the fallback walker must refuse a substituted parent");
+
+    assert!(matches!(error, ToolError::Io(_)), "{error}");
+    assert_eq!(
+        fs::read_to_string(outside.join("note.txt")).unwrap(),
+        "outside\n"
+    );
+}
+
+/// Unit 1 keeps the single primary-root model. Multi-root provenance,
+/// attachment roots, and resume root-identity validation are a later unit;
+/// this pins that none of that surface leaked in early.
+#[test]
+fn public_tool_surface_has_no_plural_root_symbols() {
+    let source = include_str!("tools.rs");
+    for symbol in [
+        "attached_writable_roots",
+        "writable_roots",
+        "resume_root_identity",
+    ] {
+        assert!(
+            !source.contains(symbol),
+            "`{symbol}` is Unit 4 surface and must not appear in the tool registry"
+        );
+    }
+}
+
+#[test]
+fn a_directory_sync_failure_does_not_undo_a_published_write() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("note.txt");
+    fs::write(&target, "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+
+    let guard = arm_matching(Op::DirSync, |_| true);
+    let warning = registry
+        .apply_patch_cancellable(
+            edit.patch.as_ref().expect("patch"),
+            &CancellationToken::new(),
+        )
+        .expect("a rename that succeeded is an applied write");
+    assert!(guard.fired());
+    drop(guard);
+
+    let warning = warning.expect("the durability caveat is surfaced");
+    assert!(warning.contains("could not be made durable"), "{warning}");
+    assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_leftover_temporary_file_is_never_observed_as_a_change() {
+    // A crash between temp create and rename leaves one of these behind.
+    // Nothing sweeps them — enumerating by path would break the fd-anchored
+    // rule and could delete a concurrent Euler's in-flight temp — so the
+    // guarantee is that observation never reports one as agent-caused.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("note.txt");
+    fs::write(&target, "old\n").expect("target");
+    let before = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+    fs::write(temp.path().join(".euler-write-01ABCDEF.tmp"), "orphaned").expect("stale temp");
+    let after = crate::capture_workspace_snapshot(temp.path()).expect("snapshot");
+
+    assert!(
+        before.changes_to(&after).is_empty(),
+        "a leftover temp is never workspace content"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_atomic_replace_never_carries_setuid_onto_agent_content() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("tool");
+    fs::write(&target, "old\n").expect("target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o4755)).expect("chmod setuid");
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "tool", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect("apply");
+
+    let mode = fs::metadata(&target)
+        .expect("metadata")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755, "permission bits are preserved");
+    assert_eq!(
+        mode & 0o7000,
+        0,
+        "setuid/setgid/sticky are not carried over"
+    );
+}
+
+#[test]
+fn an_ordinary_write_reports_no_durability_caveat() {
+    // Regression: the Linux parent descriptor was opened `O_PATH`, on which
+    // `fsync` returns EBADF, so every structured write carried a bogus
+    // durability warning. macOS uses the walker and never saw it.
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::write(temp.path().join("note.txt"), "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+
+    for input in [
+        json!({"path": "created.txt", "content": "fresh"}),
+        json!({"path": "note.txt", "old": "old", "new": "new"}),
+    ] {
+        let tool = if input.get("content").is_some() {
+            "write_file"
+        } else {
+            "edit_file"
+        };
+        let execution = registry.execute(tool, &input).expect("prepare");
+        let warning = registry
+            .apply_patch_cancellable(
+                execution.patch.as_ref().expect("patch"),
+                &CancellationToken::new(),
+            )
+            .expect("apply");
+        assert!(warning.is_none(), "{tool} reported {warning:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_target_is_refused_rather_than_replaced() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Publishing by rename makes the kernel check the directory, not the
+    // file, so without an explicit check `chmod a-w` would stop protecting
+    // anything — where an in-place write correctly failed EACCES.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("generated.rs");
+    fs::write(&target, "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "generated.rs", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).expect("chmod a-w");
+
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("a read-only file must not be replaced");
+
+    assert!(
+        matches!(&error, ToolError::ReadOnlyTarget { subject, .. } if *subject == "the file"),
+        "{error}"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "old\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_directory_is_refused_before_anything_is_recorded() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let nested = temp.path().join("src");
+    fs::create_dir(&nested).expect("dir");
+    fs::write(nested.join("note.txt"), "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "src/note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o555)).expect("chmod a-w dir");
+
+    let error = registry
+        .ensure_patch_writable(edit.patch.as_ref().expect("patch"))
+        .expect_err("a read-only directory cannot receive a new entry");
+
+    // Restore write permission so the fixture can be cleaned up.
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).expect("restore");
+    assert!(
+        matches!(&error, ToolError::ReadOnlyTarget { subject, .. } if *subject == "its directory"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn model_visible_paths_stay_workspace_relative_and_sanitized() {
+    // An error the model reads must not disclose the host root.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let fifo = temp.path().join("host.fifo");
+    let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+    // SAFETY: the path is a valid NUL-terminated pathname inside the fixture.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let registry = ToolRegistry::new(temp.path());
+
+    let error = registry
+        .execute("read_file", &json!({"path": "host.fifo"}))
+        .expect_err("a FIFO is not a regular file");
+    let message = error.to_string();
+
+    assert!(message.contains("host.fifo"), "{message}");
+    assert!(
+        !message.contains(&*temp.path().to_string_lossy()),
+        "the host root must not appear: {message}"
+    );
+}
+
+#[test]
+fn a_failed_checkpoint_blob_write_leaves_no_temporary() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let guard = arm_matching(Op::FileSync, |path| {
+        path.parent()
+            .is_some_and(|parent| parent.ends_with(".euler/checkpoints"))
+    });
+    let stored = crate::checkpoints::store_pre_image(temp.path(), "note.txt", "content\n");
+    assert!(guard.fired());
+    drop(guard);
+
+    assert!(stored.is_err(), "an undurable checkpoint must not succeed");
+    let leftovers = fs::read_dir(temp.path().join(".euler/checkpoints"))
+        .expect("checkpoint dir")
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(leftovers, 0, "a failed blob write must clean up its temp");
+}
+
+#[test]
+fn a_create_publishes_atomically_and_still_refuses_a_racing_name() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let execution = registry
+        .execute(
+            "write_file",
+            &json!({"path": "new.txt", "content": "agent"}),
+        )
+        .expect("prepare create");
+
+    // A crash mid-fill must leave no partial file under the real name; one
+    // would also block every retry, since the no-clobber rule would refuse
+    // the name it left behind.
+    let guard = arm_matching(Op::FileSync, |path| {
+        path.to_string_lossy().contains(".euler-write-")
+    });
+    let error = registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect_err("an undurable create is not applied");
+    assert!(guard.fired());
+    drop(guard);
+    assert!(matches!(error, ToolError::Io(_)), "{error}");
+    assert!(!temp.path().join("new.txt").exists());
+
+    // The retry succeeds, and a name that appears first still wins.
+    registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect("the retry is unobstructed");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("new.txt")).unwrap(),
+        "agent"
+    );
 }

@@ -1,4 +1,5 @@
 use crate::sandbox::WorkspaceSandbox;
+use crate::structured_file;
 use crate::{
     apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
     ApplyPatchDocument, ApplyPatchError, ObservedFileChange, SandboxAvailability,
@@ -12,6 +13,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -68,6 +70,14 @@ pub enum ToolError {
     FileAlreadyExists,
     #[error("parent directory does not exist")]
     ParentDirectoryMissing,
+    #[error("path `{path}` is not a regular file; structured file tools read and write regular files only")]
+    UnsupportedFileType { path: String },
+    #[error(
+        "file `{path}` changed after this write was prepared; read it again and prepare a new edit"
+    )]
+    StalePreparedWrite { path: String },
+    #[error("cannot write `{path}`: {subject} is read-only")]
+    ReadOnlyTarget { path: String, subject: &'static str },
     #[error("unsupported tool `{0}`")]
     Unsupported(String),
     #[error("replacement text matched {0} times; expected exactly one")]
@@ -138,8 +148,36 @@ pub struct PatchEvents {
     pub(crate) after_sha256: String,
     pub(crate) before_byte_len: usize,
     pub(crate) after_byte_len: usize,
-    write_path: PathBuf,
+    target: ResolvedWorkspacePath,
     write_content: String,
+}
+
+/// A model-supplied path already resolved against the workspace root, kept as
+/// the root plus the normalized components beneath it. The structured tools
+/// re-open the target from `root` hop by hop at apply time; the joined
+/// `absolute` form exists only for diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedWorkspacePath {
+    root: PathBuf,
+    relative: PathBuf,
+}
+
+impl ResolvedWorkspacePath {
+    fn absolute(&self) -> PathBuf {
+        self.root.join(&self.relative)
+    }
+
+    /// The model-visible form of this path: workspace-relative, control
+    /// characters scrubbed and length capped by [`display_path`]. The host
+    /// root never appears in a tool error or a durability warning.
+    fn display(&self) -> String {
+        display_path(&self.relative.to_string_lossy())
+    }
+
+    /// Resolve this target to a descriptor on its confined parent directory.
+    fn confine(&self) -> Result<structured_file::ConfinedTarget, ToolError> {
+        structured_file::confine(&self.root, &self.relative).map_err(ToolError::Io)
+    }
 }
 
 /// Per-tool consecutive-failure streaks driving rung-2 format
@@ -527,7 +565,7 @@ impl ToolRegistry {
         let offset = optional_positive_usize(input, "offset")?.unwrap_or(1);
         let max_bytes = optional_positive_usize(input, "max_bytes")?.unwrap_or(DEFAULT_MAX_BYTES);
         let max_lines = optional_positive_usize(input, "max_lines")?.unwrap_or(DEFAULT_MAX_LINES);
-        let content = fs::read_to_string(path)?;
+        let content = self.read_resolved_file(&path)?;
         let output = bound_read_file_window(&content, offset, max_bytes, max_lines);
         Ok(ToolExecution {
             name: "read_file".to_owned(),
@@ -548,7 +586,7 @@ impl ToolRegistry {
             return self.prepare_create(relative, new, "edit_file");
         }
         let path = self.resolve_path(relative)?;
-        let content = fs::read_to_string(&path)?;
+        let content = self.read_resolved_file(&path)?;
         let count = overlapping_match_count(&content, old);
         if count != 1 {
             return Err(ToolError::ReplacementMatchCount(count));
@@ -575,7 +613,7 @@ impl ToolRegistry {
                 after_sha256: after_sha,
                 before_byte_len: before_bytes_len,
                 after_byte_len: updated.len(),
-                write_path: path,
+                target: path,
                 write_content: updated,
             }),
             file_changes: Vec::new(),
@@ -599,7 +637,7 @@ impl ToolRegistry {
         origin: &'static str,
     ) -> Result<ToolExecution, ToolError> {
         let path = self.resolve_create_path(relative)?;
-        if path.exists() {
+        if path.absolute().exists() {
             return Err(ToolError::FileAlreadyExists);
         }
         Ok(ToolExecution {
@@ -618,7 +656,7 @@ impl ToolRegistry {
                 after_sha256: hash_bytes(content.as_bytes()),
                 before_byte_len: 0,
                 after_byte_len: content.len(),
-                write_path: path,
+                target: path,
                 write_content: content.to_owned(),
             }),
             file_changes: Vec::new(),
@@ -642,8 +680,8 @@ impl ToolRegistry {
         };
         match parse_single_file_apply_patch(patch).map_err(tool_error_from_apply_patch)? {
             ApplyPatchDocument::Add { path, content } => {
-                let write_path = self.resolve_create_path(&path)?;
-                if write_path.exists() {
+                let target = self.resolve_create_path(&path)?;
+                if target.absolute().exists() {
                     return Err(ToolError::FileAlreadyExists);
                 }
                 Ok(ToolExecution {
@@ -662,15 +700,15 @@ impl ToolRegistry {
                         action: "add",
                         before_sha256: None,
                         before_byte_len: 0,
-                        write_path,
+                        target,
                         write_content: content,
                     }),
                     file_changes: Vec::new(),
                 })
             }
             ApplyPatchDocument::Update { path, chunks } => {
-                let write_path = self.resolve_path(&path)?;
-                let content = fs::read_to_string(&write_path)?;
+                let target = self.resolve_path(&path)?;
+                let content = self.read_resolved_file(&target)?;
                 let updated = apply_patch_update_chunks(&content, &chunks)
                     .map_err(tool_error_from_apply_patch)?;
                 Ok(ToolExecution {
@@ -692,7 +730,7 @@ impl ToolRegistry {
                         after: updated.clone(),
                         origin,
                         action: "modify",
-                        write_path,
+                        target,
                         write_content: updated,
                     }),
                     file_changes: Vec::new(),
@@ -703,28 +741,59 @@ impl ToolRegistry {
 
     pub fn apply_patch(&self, patch: &PatchEvents) -> Result<(), ToolError> {
         self.apply_patch_cancellable(patch, &CancellationToken::new())
+            .map(|_| ())
     }
 
+    /// `Ok(Some(warning))` means the write is applied but its directory entry
+    /// could not be made durable. The write happened; the caller reports the
+    /// caveat rather than a failure.
     pub(crate) fn apply_patch_cancellable(
         &self,
         patch: &PatchEvents,
         cancellation: &CancellationToken,
-    ) -> Result<(), ToolError> {
+    ) -> Result<Option<String>, ToolError> {
         // This is the final check before the filesystem mutation. Patch
         // parsing, permission review, and `patch.proposed` emission may all
         // have taken time during which the user pressed Esc.
         if cancellation.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
-        fs::write(&patch.write_path, &patch.write_content)?;
-        Ok(())
+        let expected = if patch.action == "add" {
+            ExpectedTarget::Absent
+        } else {
+            ExpectedTarget::Exactly(&patch.before)
+        };
+        write_confined(&patch.target, &patch.write_content, expected)
     }
 
-    /// Write UTF-8 content to a workspace-relative path (used by `/rollback`).
-    pub fn write_workspace_file(&self, relative: &str, content: &str) -> Result<(), ToolError> {
-        let path = self.resolve_path(relative)?;
-        fs::write(path, content)?;
-        Ok(())
+    /// Replace a workspace-relative file whose current content is already
+    /// known, without going through a prepared patch. Used by `/rollback`.
+    pub(crate) fn write_verified_workspace_file(
+        &self,
+        relative: &str,
+        content: &str,
+        expected: ExpectedTarget<'_>,
+    ) -> Result<Option<String>, ToolError> {
+        let path = match expected {
+            ExpectedTarget::Absent => self.resolve_create_path(relative)?,
+            ExpectedTarget::Exactly(_) => self.resolve_path(relative)?,
+        };
+        write_confined(&path, content, expected)
+    }
+
+    /// Refuse a prepared patch whose target cannot be written, before any
+    /// checkpoint is stored or recorded for it.
+    pub(crate) fn ensure_patch_writable(&self, patch: &PatchEvents) -> Result<(), ToolError> {
+        if patch.action == "add" {
+            return Ok(());
+        }
+        ensure_writable(&patch.target.confine()?, &patch.target)
+    }
+
+    /// Read a workspace-relative path through the confined structured open
+    /// (used by `/rollback` to see what it is about to replace).
+    pub(crate) fn read_workspace_file(&self, relative: &str) -> Result<String, ToolError> {
+        self.read_resolved_file(&self.resolve_path(relative)?)
     }
 
     fn run_shell(
@@ -886,7 +955,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             .path())
     }
 
-    fn resolve_path(&self, relative: &str) -> Result<PathBuf, ToolError> {
+    fn resolve_path(&self, relative: &str) -> Result<ResolvedWorkspacePath, ToolError> {
         self.resolve_path_inner(relative, false)
     }
 
@@ -895,12 +964,10 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
     /// resolves them. `None` when the path cannot be resolved inside the
     /// workspace - scoped grant matching then fails closed to the ask path.
     pub fn workspace_relative_path(&self, relative: &str) -> Option<PathBuf> {
-        let canonical = self.resolve_path_inner(relative, false).ok()?;
-        let root = self.root.canonicalize().ok()?;
-        canonical.strip_prefix(&root).ok().map(Path::to_path_buf)
+        Some(self.resolve_path_inner(relative, false).ok()?.relative)
     }
 
-    fn resolve_create_path(&self, relative: &str) -> Result<PathBuf, ToolError> {
+    fn resolve_create_path(&self, relative: &str) -> Result<ResolvedWorkspacePath, ToolError> {
         self.resolve_path_inner(relative, true)
     }
 
@@ -908,7 +975,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
         &self,
         relative: &str,
         parent_must_be_directory: bool,
-    ) -> Result<PathBuf, ToolError> {
+    ) -> Result<ResolvedWorkspacePath, ToolError> {
         if relative.is_empty() {
             return Err(ToolError::InvalidField("path"));
         }
@@ -939,14 +1006,122 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             let file_name = full.file_name().ok_or(ToolError::InvalidField("path"))?;
             parent.join(file_name)
         };
-        if !canonical.starts_with(&root) {
+        let Ok(relative_path) = canonical.strip_prefix(&root) else {
             return Err(ToolError::PathOutsideWorkspace {
                 path: display_path(relative),
                 reason: "path escapes the workspace root",
             });
-        }
-        Ok(canonical)
+        };
+        let relative_path = relative_path.to_path_buf();
+        Ok(ResolvedWorkspacePath {
+            root,
+            relative: relative_path,
+        })
     }
+
+    /// Read a structured-tool target through its confined descriptor. The
+    /// regular-file check runs on the same descriptor the bytes come from.
+    fn read_resolved_file(&self, path: &ResolvedWorkspacePath) -> Result<String, ToolError> {
+        read_confined(&path.confine()?, path)
+    }
+}
+
+/// Read an already-confined target, refusing anything that is not a regular
+/// file at the moment the descriptor was opened.
+fn read_confined(
+    target: &structured_file::ConfinedTarget,
+    path: &ResolvedWorkspacePath,
+) -> Result<String, ToolError> {
+    let mut file = target.open_read()?;
+    if !file.metadata()?.is_file() {
+        return Err(ToolError::UnsupportedFileType {
+            path: path.display(),
+        });
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
+/// What the caller believes is at the target right now.
+#[derive(Clone, Copy)]
+pub(crate) enum ExpectedTarget<'a> {
+    /// Nothing: the write is a create and must fail if any name exists.
+    Absent,
+    /// Exactly these bytes, as read when the write was prepared.
+    Exactly(&'a str),
+}
+
+/// Refuse a write the filesystem would not have allowed in place.
+fn ensure_writable(
+    target: &structured_file::ConfinedTarget,
+    path: &ResolvedWorkspacePath,
+) -> Result<(), ToolError> {
+    let subject = match target.writability()? {
+        structured_file::Writability::Writable => return Ok(()),
+        structured_file::Writability::ReadOnlyFile => "the file",
+        structured_file::Writability::ReadOnlyDirectory => "its directory",
+    };
+    Err(ToolError::ReadOnlyTarget {
+        path: path.display(),
+        subject,
+    })
+}
+
+/// Perform a structured write on a confined target.
+///
+/// A create opens the final name with `O_CREAT | O_EXCL`, so a file that
+/// appeared after the call was prepared is refused rather than clobbered.
+/// A replace reads the current content through one descriptor, compares it to
+/// the exact prepared pre-image, and then publishes the new bytes by renaming
+/// a sibling temporary file over the target. The target is therefore only
+/// ever its complete old content or its complete new content, and a
+/// concurrent edit is refused instead of overwritten.
+fn write_confined(
+    path: &ResolvedWorkspacePath,
+    content: &str,
+    expected: ExpectedTarget<'_>,
+) -> Result<Option<String>, ToolError> {
+    let target = path.confine()?;
+    let durability = match expected {
+        ExpectedTarget::Absent => target.create_new(content.as_bytes()).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ToolError::FileAlreadyExists
+            } else {
+                ToolError::Io(error)
+            }
+        })?,
+        ExpectedTarget::Exactly(expected) => {
+            ensure_writable(&target, path)?;
+            let current = target.open_read()?;
+            let metadata = current.metadata()?;
+            if !metadata.is_file() {
+                return Err(ToolError::UnsupportedFileType {
+                    path: path.display(),
+                });
+            }
+            if read_to_string(current)? != expected {
+                return Err(ToolError::StalePreparedWrite {
+                    path: path.display(),
+                });
+            }
+            target.replace(content.as_bytes(), &metadata)?
+        }
+    };
+    Ok(match durability {
+        structured_file::Durability::Synced => None,
+        structured_file::Durability::DirectoryUnsynced(reason) => Some(format!(
+            "`{}` was written, but its directory entry could not be made durable ({reason}); \
+the change is present and may not survive an immediate power loss",
+            path.display()
+        )),
+    })
+}
+
+fn read_to_string(mut file: fs::File) -> Result<String, ToolError> {
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
 }
 
 /// One prepared agent-controlled process, with enough provenance to remove
@@ -1515,7 +1690,7 @@ fn overlapping_match_count(haystack: &str, needle: &str) -> usize {
         .count()
 }
 
-fn hash_bytes(bytes: &[u8]) -> String {
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("{digest:x}")
 }

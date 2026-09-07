@@ -49,6 +49,7 @@ authority.
 - `permission.decision`
 - `patch.proposed`
 - `patch.applied`
+- `checkpoint.stored`
 - `file.change`
 - `file.diff`
 - `workspace.restore`
@@ -513,10 +514,14 @@ extension error does not consume the later result.
   revised separately.
 - `file.change`: `tool_call_id`, `origin`, `action`, `path`, `old_path`,
   `before_sha256`, `after_sha256`, `before_byte_len`, `after_byte_len`,
-  `diff_redaction`; optional `pre_image_blob` (sha256 hex) when a workspace
-  checkpoint pre-image was stored for this edit. This event is metadata-only:
+  `diff_redaction`; optional `pre_image_blob` (sha256 hex) and
+  `checkpoint_event_id` when a workspace checkpoint pre-image was stored for
+  this edit. This event is metadata-only:
   `origin` is descriptive edit metadata with known values `edit_file`,
-  `apply_patch`, `run_shell:apply_patch`, and `run_shell`; `action` is `add`,
+  `apply_patch`, `run_shell:apply_patch`, `run_shell`, and
+  `workspace.restore`. A row may carry `durability_warning` when the write
+  was published but its directory entry could not be made durable, so
+  provenance and disk never disagree. `action` is `add`,
   `modify`, or `delete`, `old_path` is null, and `diff_redaction` is `omitted`.
   `run_shell:apply_patch` means Euler intercepted a strict apply-patch heredoc
   before shell execution; it does not mean a shell process ran. `run_shell`
@@ -534,9 +539,45 @@ extension error does not consume the later result.
   pre-images for safe single-file `edit_file` / `apply_patch` **modify** only;
   adds, deletes, multi-file shell observations, and external disk drift are out
   of scope.
+  When `pre_image_blob` is present, `checkpoint_event_id` names the
+  `checkpoint.stored` event that recorded the same pre-image before the write.
+  Rows written before that event existed carry no `checkpoint_event_id`; they
+  remain restorable, because a `file.change` was only ever emitted after its
+  write completed.
+- `checkpoint.stored`: `path`, `action`, `pre_image_blob`, `status`
+  (`prepared`), plus exactly one link to what caused the write —
+  `tool_call_id` for a tool call, or `restored_checkpoint_event_id` for a
+  `/rollback` restore, which no tool call produced. Appended **before** the destructive write it
+  protects, so a crash can never leave a changed file with no way back. If the
+  pre-image cannot be stored durably, no `checkpoint.stored` is appended and
+  the write does not happen. A `checkpoint.stored` row with no `file.change`
+  referencing its blob is not restorable and is never listed by `/rollback`:
+  it describes a write that was not observed to complete, so its pre-image may
+  already be the file's current content. A `file.change` referencing the same
+  blob is what records the write as applied.
+  One residual window remains and is deliberate: the write is published
+  before `patch.applied` and `file.change` are appended, so a crash in between
+  leaves a changed file whose only checkpoint record is `checkpoint.stored`.
+  `/rollback` will not offer it. The file's content is recoverable from the
+  blob under `.euler/checkpoints/` by hand; automatic recovery would have to
+  guess whether the write happened, which is exactly the guess audit F36
+  removed.
 - `workspace.restore`: `path`, `checkpoint_event_id`, `blob_sha256`,
-  `restored` (always `true` on success). Appended when the user restores a
-  workspace file via `/rollback` to the pre-image of a prior `file.change`.
+  `restored` (always `true` on success), `undoable`, and optional
+  `durability_warning`. A restore also appends its own `checkpoint.stored`
+  and `file.change` pair with origin `workspace.restore`. Those rows carry no
+  `tool_call_id` — no tool call produced the write, and a consumer that joins
+  on `tool_call_id` must never be handed an id that resolves to something
+  else; the restored checkpoint is named by `restored_checkpoint_event_id`
+  instead. Recording the restore advances the baseline the next rollback
+  verifies against and makes the restore itself undoable. Recreating a file
+  the user deleted replaces nothing, so it stores no pre-image, records
+  `action: add`, and reports `undoable: false`. Appended when the user
+  restores a
+  workspace file via `/rollback` to the pre-image of a prior applied
+  `file.change`. A restore is refused when the target no longer holds exactly
+  what the checkpointed edit wrote (`after_sha256`), so rolling back cannot
+  silently discard a later edit.
   The transcript is never rewritten: restore is new provenance; the dead-end
   history stays queryable. Rendered as
   `↩ reverted <path> → ckpt <checkpoint_event_id> · files restored, history intact`.
@@ -969,7 +1010,8 @@ extension error does not consume the later result.
 - `permission.decision` parents its `permission.prompt` (or the
   `tool.call` when no prompt was emitted).
 - `patch.proposed` parents its `tool.call`; `patch.applied` parents its
-  `patch.proposed`.
+  `patch.proposed`. `checkpoint.stored` parents its `patch.proposed`, because
+  it is appended before the write that `patch.applied` records.
 - Structured `file.change` parents the `patch.applied` event that records the
   edit it summarizes. Bounded ordinary `run_shell` file observations parent the
   originating `tool.call`, because there is no canonical patch event for that
