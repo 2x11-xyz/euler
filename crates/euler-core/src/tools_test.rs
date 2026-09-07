@@ -3138,30 +3138,35 @@ fn the_submodule_notice_resolves_a_gitdir_pointer_file() {
 /// say about why a command failed.
 #[test]
 fn a_failed_git_command_carries_no_submodule_notice() {
-    let Some(repository) = git_fixture() else {
-        return;
-    };
-    let root = repository.path();
-    std::fs::create_dir_all(root.join(".git/modules/sub")).expect("initialized submodule");
-    let registry = ToolRegistry::new(root);
-
-    // A path that does not exist makes git exit nonzero.
-    let execution = registry
-        .execute("git_diff", &json!({}))
-        .expect("git_diff runs");
-    assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
-
-    std::fs::remove_dir_all(root.join(".git/refs")).expect("break the repository");
-    let broken = registry
-        .execute("git_status", &json!({}))
-        .expect("git_status still reports");
-    if broken.exit_code == Some(0) {
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
         return;
     }
+    // Not a repository at all, but carrying the directory the notice keys
+    // off: `git status` fails deterministically on every git version, so
+    // there is nothing here that can quietly verify nothing.
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path();
+    std::fs::create_dir_all(root.join(".git/modules/sub")).expect("submodule directory");
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status still reports");
+
+    assert_ne!(
+        execution.exit_code,
+        Some(0),
+        "the fixture must actually fail: {}",
+        execution.output
+    );
     assert!(
-        !broken.output.contains("submodule worktrees"),
+        !execution.output.contains("submodule worktrees"),
         "{}",
-        broken.output
+        execution.output
     );
 }
 

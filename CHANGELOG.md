@@ -45,7 +45,11 @@ pull requests that landed them; deeper design rationale lives in
   and the build script applies them to its own `git status`.
 - **Breaking (library):** `capture_workspace_snapshot` now takes the entry
   bound as a second argument; pass `MAX_WORKSPACE_SNAPSHOT_FILES` for the
-  previous behavior.
+  previous behavior. `probe_workspace_sandbox` returns `SandboxStatus` rather
+  than `SandboxAvailability`, so the cause its own probe observed travels with
+  the result. `SandboxStatus::from_availability` is removed: it could only
+  re-derive a cause from the reason, which is strictly worse than what the
+  probe already knows.
 - Reaching the workspace-observation bound no longer hides changes as "no
   changes". The command runs; the tool text leads with `file observation
   incomplete: <reason>; changes may be unreported`, and the result carries an

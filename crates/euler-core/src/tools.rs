@@ -1444,16 +1444,26 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
 /// difference between the notice appearing and being silently absent.
 fn git_directory(root: &Path) -> PathBuf {
     let git = root.join(".git");
+    // The ordinary case, and the one on every git tool call: a read that is
+    // guaranteed to fail is not worth performing.
+    if git.is_dir() {
+        return git;
+    }
     let Ok(pointer) = fs::read_to_string(&git) else {
         return git;
     };
     let Some(target) = pointer
         .lines()
         .find_map(|line| line.trim().strip_prefix("gitdir:"))
+        .map(str::trim)
+        // An empty target would join to the workspace root, and the caller
+        // would then look for a top-level `modules` directory, which plenty
+        // of projects have.
+        .filter(|target| !target.is_empty())
     else {
         return git;
     };
-    let target = Path::new(target.trim());
+    let target = Path::new(target);
     if target.is_absolute() {
         target.to_path_buf()
     } else {

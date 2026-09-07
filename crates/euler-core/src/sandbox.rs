@@ -881,17 +881,6 @@ fn usable_runtime_root(root: &Path, home: Option<&Path>, explicit: bool) -> Opti
     Some(root)
 }
 
-/// Whether a path would collide with one of the profile's own mounts.
-///
-/// `GOPATH=/tmp` would otherwise emit a read-only bind over the private `/tmp`
-/// the sandbox home, cache and TMPDIR live in, and the resulting probe failure
-/// would be reported as something about /usr and /etc.
-///
-/// A root merely *inside* `/tmp` is fine and is deliberately allowed: the
-/// profile lays down its tmpfs first, so the bind lands on the fresh
-/// directory and shadows nothing. Only a path that is one of these mounts, or
-/// an ancestor of one, or sits inside one, actually collides — and `/tmp`
-/// itself is caught by being an ancestor of the sandbox home.
 /// Whether the workspace bind would cover this path without it being the
 /// workspace's own content.
 ///
@@ -905,6 +894,19 @@ fn shadowed_by_the_workspace_bind(path: &Path, workspace: &Path) -> bool {
     path.starts_with(SANDBOX_WORKSPACE) || Path::new(SANDBOX_WORKSPACE).starts_with(path)
 }
 
+/// Whether a path would collide with one of the fixed mounts in
+/// [`EXCLUSIVE_PROFILE_MOUNTS`]: `/proc`, `/dev`, and the sandbox home and
+/// cache. A path that is one of them, contains one, or sits inside one
+/// collides; the sandbox workspace is decided separately, by
+/// [`shadowed_by_the_workspace_bind`], once the host workspace is known.
+///
+/// `/tmp` is not in the set and is caught only indirectly, by being an
+/// ancestor of the sandbox home beneath it — which is the whole rule. A root
+/// merely *inside* `/tmp` is deliberately allowed: the profile lays down its
+/// tmpfs first, so the bind lands on the fresh directory and shadows nothing.
+/// `GOPATH=/tmp` itself is rejected, because a read-only bind there would
+/// replace the private `/tmp` the sandbox home, cache and TMPDIR live in, and
+/// the resulting probe failure would be reported as something about /usr.
 fn names_a_profile_mount_point(path: &Path) -> bool {
     EXCLUSIVE_PROFILE_MOUNTS
         .iter()
@@ -1099,7 +1101,9 @@ fn shell_quote(path: &Path) -> String {
 }
 
 /// Run one bounded probe. A probe that outlives its deadline is killed and
-/// treated as a failure: the sandbox must never make session start hang.
+/// reported as [`ProbeOutcome::TimedOut`], distinct from a refusal: the
+/// sandbox must never make session start hang, and a deadline that expired
+/// says nothing about why.
 fn run_probe_to_completion(mut command: Command) -> ProbeOutcome {
     command
         .stdin(Stdio::null())
@@ -2050,14 +2054,21 @@ token = \"secret\"\n",
         assert!(runtime.roots.is_empty(), "{runtime:?}");
         assert!(runtime.variables.is_empty(), "{runtime:?}");
 
-        // A *direct* child of the private /tmp, which is what the reasoning
-        // above turns on: a temp directory is a grandchild and would not
-        // exercise it.
-        assert!(usable_runtime_root(Path::new("/tmp/home"), None, true).is_none());
-        assert!(usable_runtime_root(Path::new("/tmp/cache"), None, true).is_none());
+        // The predicate itself, not `usable_runtime_root`: these paths do not
+        // exist on the host, so canonicalization would reject them anyway and
+        // the assertion would still pass with the predicate deleted.
+        assert!(names_a_profile_mount_point(Path::new(SANDBOX_HOME)));
+        assert!(names_a_profile_mount_point(Path::new(SANDBOX_CACHE)));
+        assert!(names_a_profile_mount_point(Path::new("/proc/1")));
+        assert!(names_a_profile_mount_point(Path::new("/dev")));
+        // `/tmp` is caught only by being an ancestor of the sandbox home.
+        assert!(names_a_profile_mount_point(Path::new("/tmp")));
 
-        // A root merely *inside* the private /tmp is fine: the profile lays
-        // its tmpfs down first, so the bind shadows nothing.
+        // A root merely *inside* the private /tmp is not a collision: the
+        // profile lays its tmpfs down first, so the bind shadows nothing.
+        // This is the direct-child case the rule turns on.
+        assert!(!names_a_profile_mount_point(Path::new("/tmp/cargo")));
+        assert!(!names_a_profile_mount_point(Path::new("/tmp/home-of-mine")));
         let temp = tempfile::tempdir().expect("temp dir");
         let inside = temp.path().join("cargo");
         std::fs::create_dir(&inside).expect("cargo home");
