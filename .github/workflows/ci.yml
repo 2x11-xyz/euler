@@ -20,8 +20,12 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: Install the sandbox backend
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install the sandbox backend and a compiler
+        # The compiler is not optional: the conformance test that proves /etc
+        # is mounted compiles and links a C program, and skips without `cc`.
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap gcc
+      - name: A compiler is present, so the /etc conformance test cannot skip
+        run: test -e /usr/bin/cc || test -L /usr/bin/cc
       - name: Enable unprivileged user namespaces
         run: |
           if [[ -e /proc/sys/kernel/unprivileged_userns_clone ]]; then

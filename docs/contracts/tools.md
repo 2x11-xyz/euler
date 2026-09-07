@@ -242,6 +242,14 @@ cache tmpfs. The real `$HOME` is never mounted read-write: the directory
 holding those roots is a read-only mount, so a write under the real home
 fails rather than landing in a discarded private copy.
 
+Credential files inside a mounted toolchain home (`credentials.toml`,
+`credentials`) are masked with an empty file, in every toolchain home the
+sandbox can reach rather than only the ones Euler mounts itself. Cargo also
+accepts a registry token in `config.toml`, which is **not** masked: that file
+carries the registry sources and build settings a build needs. Euler reports
+it once at session start instead, naming the file and suggesting the token
+move to `credentials.toml`.
+
 Availability is probed at session start by running a trivial sandboxed
 command, because an installed `bwrap` is not evidence that it works. The
 outcome is recorded on `session.start` as `sandbox_backend`
@@ -267,6 +275,13 @@ submodule's own config with only the superproject's blanking applied. The same
 overrides cover every git invocation Euler makes, including the `@`-mention
 picker's `git ls-files`. A command the agent runs itself through `run_shell`
 is confined by the sandbox instead and keeps the repository's configuration.
+
+`diff.ignoreSubmodules=dirty` has a visible cost: worktree edits inside a
+submodule do not appear in `git_status` or `git_diff`. Hiding that would be
+the silent loss ADR 0021 row E forbids, so when the repository declares
+submodules the tool output says the changes are not shown and where to see
+them. The flag stays because the alternative is running a driver configured
+in a submodule's own config.
 
 A probe Euler cannot complete fails the tool closed: only `git config`'s
 "nothing configured" exit is an answer. Residual risk: the probe and the real
