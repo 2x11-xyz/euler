@@ -2065,6 +2065,16 @@ fn auth_status_parse_accepts_minimal_command() {
     assert!(matches!(args.command, Command::AuthStatus));
 }
 
+/// `--check-sandbox` is a diagnostic command, not a session flag: it must
+/// not start a session or need a provider (ADR 0021 row A′).
+#[test]
+fn check_sandbox_parses_as_its_own_command() {
+    let args = parse_args_without_env(["--check-sandbox"]);
+
+    assert!(matches!(args.command, Command::CheckSandbox));
+    assert!(!args.default_interactive);
+}
+
 #[test]
 fn login_parse_rejects_missing_cli_provider_even_when_env_selects_chatgpt() {
     let mut args = ["login"].into_iter().map(str::to_owned);
@@ -2334,6 +2344,7 @@ fn unwrap_run(args: Args) -> RunArgs {
         Command::Login(_) => panic!("expected run args"),
         Command::Logout(_) => panic!("expected run args"),
         Command::AuthStatus => panic!("expected run args"),
+        Command::CheckSandbox => panic!("expected run args"),
         Command::Models(_) => panic!("expected run args"),
         Command::Extension(_) => panic!("expected run args"),
         Command::Scrub(_) => panic!("expected run args"),

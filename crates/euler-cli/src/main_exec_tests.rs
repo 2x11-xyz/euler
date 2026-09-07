@@ -320,6 +320,7 @@ fn unwrap_exec(args: Args) -> ExecArgs {
         Command::Login(_) => panic!("expected exec args"),
         Command::Logout(_) => panic!("expected exec args"),
         Command::AuthStatus => panic!("expected exec args"),
+        Command::CheckSandbox => panic!("expected exec args"),
         Command::Models(_) => panic!("expected exec args"),
         Command::Extension(_) => panic!("expected exec args"),
         Command::Scrub(_) => panic!("expected exec args"),
