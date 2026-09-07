@@ -35,9 +35,11 @@ pub struct PermissionRequest {
     /// coverage).
     pub workspace_root: Option<PathBuf>,
     /// True when `path` names a categorically sensitive file
-    /// ([`crate::command_safety::sensitive_basename`]: `.env*`, `*secret*`,
-    /// `*credential*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`), checked on
-    /// the literal argument AND its canonicalized workspace form. Such a
+    /// ([`crate::command_safety::sensitive_basename`]: anything under a
+    /// `.git` component, git/npm/cargo/shell configuration, `.env*`,
+    /// `*secret*`, `*credential*`, `id_rsa`, `id_ed25519`, `*.pem`,
+    /// `*.key`), checked on the literal argument AND its canonicalized
+    /// workspace form. Such a
     /// request never rides a blanket `session-allow`:
     /// [`PermissionGate::mode_for_request`] escalates it to `ask`, so
     /// accessing the file takes an explicit decision or a covering grant
@@ -542,8 +544,20 @@ impl<D> PermissionGate<D> {
 
     /// Which grant store covers this request, if any (narrowest lifetime wins
     /// ties: session, then project, then user).
+    ///
+    /// A shell command the permissive danger walk flags
+    /// ([`crate::command_safety::contains_dangerous_command`]) is covered by
+    /// NO grant, scoped or unscoped: it always takes an explicit permission
+    /// decision. This is the single funnel for both grant coverage in the
+    /// dispatcher and the grant check inside `decide_detailed_cancellable`,
+    /// so the veto holds on every path.
     pub fn granted_source(&self, request: &PermissionRequest) -> Option<GrantSource> {
         let command = request.command_for_matching();
+        if request.capability == Capability::ShellExec
+            && command.is_some_and(crate::command_safety::contains_dangerous_command)
+        {
+            return None;
+        }
         let path = request.path.as_deref();
         let root = request.workspace_root.as_deref();
         if self

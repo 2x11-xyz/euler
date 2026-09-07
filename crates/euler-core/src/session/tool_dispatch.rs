@@ -102,6 +102,18 @@ impl<D: PermissionDecider> Session<D> {
             // coverage and ask branches below apply to it like any other
             // uncovered request.
             let mode = self.permissions.mode_for_request(&request);
+            // The permissive danger walk (the second parser of
+            // `command_safety`) vetoes every auto-approval path: a command
+            // containing a forced `rm` anywhere — inside control flow, a
+            // substitution, or a `sudo`/`env`/`trap`/`xargs` wrapper —
+            // takes an explicit permission decision no matter what else
+            // would have covered it. Under `ask` that is a prompt; under a
+            // never-prompt decider the same path denies. `always-allow`
+            // and `always-deny` semantics are untouched.
+            let dangerous_command = capability == Capability::ShellExec
+                && request.command.as_deref().is_some_and(|command| {
+                    crate::command_safety::contains_dangerous_command(command)
+                });
             // Statically-safe read-only shell commands run under `ask`
             // without a prompt (issue #78): recorded as a fresh
             // permission.decision with mode "static-safe" — allowed-once
@@ -115,6 +127,7 @@ impl<D: PermissionDecider> Session<D> {
             // decomposing a truncated command is decomposing a lie.
             static_safe = mode == ApprovalMode::Ask
                 && capability == Capability::ShellExec
+                && !dangerous_command
                 && !request.command_truncated
                 && request.command.as_deref().is_some_and(|command| {
                     crate::command_safety::is_statically_safe_command(command, self.tools.root())
@@ -127,11 +140,12 @@ impl<D: PermissionDecider> Session<D> {
             // event — recording "allowed once" here would misstate what the
             // user actually granted (review v2 §8). The tool result carries a
             // `grant_source` tag so the ledger can show `· session grant`.
-            covered_grant_source = if mode == ApprovalMode::Ask && !static_safe {
-                self.permissions.granted_source(&request)
-            } else {
-                None
-            };
+            covered_grant_source =
+                if mode == ApprovalMode::Ask && !static_safe && !dangerous_command {
+                    self.permissions.granted_source(&request)
+                } else {
+                    None
+                };
             if covered_grant_source.is_none() && !static_safe {
                 let ruling = self.decide_uncovered_permission(
                     &request,
