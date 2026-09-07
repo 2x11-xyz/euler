@@ -2,12 +2,11 @@
 
 use super::{
     add_provider_error_metadata, approval_mode_str, canvas_snapshot_payload,
-    checkpoint_store_failure, checkpoint_stored_payload, context_budget_exhausted, elapsed_ms,
-    file_change_payload, file_diff_payload, maybe_store_pre_image, model_input_item,
-    permission_decision_payload, permission_request_for_tool, tool_cancelled_payload,
-    tool_result_payload, validate_model_target_shape, ModelRoundData, ModelTarget,
-    ProviderRuntimeContext, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome, Session,
-    SessionError, TurnState, SYSTEM_INSTRUCTIONS,
+    context_budget_exhausted, elapsed_ms, file_change_payload, file_diff_payload, model_input_item,
+    permission_decision_payload, permission_request_for_tool, prepare_checkpoint,
+    tool_cancelled_payload, tool_result_payload, validate_model_target_shape, ModelRoundData,
+    ModelTarget, ProviderRuntimeContext, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome,
+    Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
@@ -584,37 +583,32 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let patch_proposed_id = self
             .append(EventKind::PATCH_PROPOSED, payload.clone(), None)?
             .id;
-        // Audit F36: store and record the rollback pre-image before the
-        // destructive write, and abandon the write if it cannot be stored.
-        let checkpoint = match maybe_store_pre_image(self.workspace_root.as_path(), patch) {
-            Ok(blob) => blob,
-            Err(error) => {
+        let checkpoint = match prepare_checkpoint(self.workspace_root.as_path(), &call.id, patch) {
+            Ok(checkpoint) => checkpoint,
+            Err(reason) => {
                 self.emit_tool_failure(
                     call.id.clone(),
                     execution.name.clone(),
-                    checkpoint_store_failure(&error),
+                    reason,
                     tool_call_event_id.to_owned(),
                 )?;
                 return Ok(true);
             }
         };
-        let checkpoint_event_id = match checkpoint.as_deref() {
-            Some(blob) => Some(
+        let checkpoint_event_id = match &checkpoint {
+            Some(checkpoint) => Some(
                 self.append(
                     EventKind::CHECKPOINT_STORED,
-                    checkpoint_stored_payload(&call.id, patch, blob),
+                    checkpoint.payload.clone(),
                     Some(patch_proposed_id.clone()),
                 )?
                 .id,
             ),
             None => None,
         };
-        match self
-            .tools
-            .apply_patch_cancellable_observed(patch, cancellation)
-        {
+        match self.tools.apply_patch_cancellable(patch, cancellation) {
             Ok(()) => {}
-            Err(failure) if matches!(failure.error, crate::ToolError::Cancelled) => {
+            Err(crate::ToolError::Cancelled) => {
                 self.emit_cancelled_tool_result(
                     call.clone(),
                     tool_call_event_id.to_owned(),
@@ -622,12 +616,11 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 )?;
                 return Err(SessionError::Cancelled);
             }
-            Err(failure) => {
-                self.record_observed_file_changes(&call.id, &failure.file_changes)?;
+            Err(error) => {
                 self.emit_tool_failure(
                     call.id.clone(),
                     execution.name.clone(),
-                    failure.error.to_string(),
+                    error.to_string(),
                     tool_call_event_id.to_owned(),
                 )?;
                 return Ok(true);
@@ -642,7 +635,9 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 file_change_payload(
                     &call.id,
                     patch,
-                    checkpoint.as_deref(),
+                    checkpoint
+                        .as_ref()
+                        .map(|checkpoint| checkpoint.blob.as_str()),
                     checkpoint_event_id.as_deref(),
                 ),
                 Some(patch_applied_id.clone()),

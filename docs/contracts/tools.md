@@ -113,52 +113,63 @@ Semantics:
 ## Structured file confinement
 
 `read_file`, `edit_file`, `write_file`, and `apply_patch` never hand a joined
-path to the kernel. Each target is opened by walking down from the workspace
-root: on Linux one `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
-RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS`, on other Unix hosts hop by hop with
-`O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. Any component replaced between path
-resolution and the open — a directory swapped for a symlink, the root itself
-substituted, a bind mount planted inside the workspace — fails the open rather
-than escaping the root. Every subsequent check runs on that descriptor, so it
-describes the inode that is actually read or written.
+path to the kernel. Each target is resolved by walking down from the workspace
+root to the target's *parent directory* and holding that descriptor: on Linux
+one `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS`, falling back to a hop-by-hop `O_DIRECTORY | O_NOFOLLOW
+| O_CLOEXEC` walk when that syscall is unavailable (kernels before 5.6, or a
+seccomp profile that denies it); other Unix hosts always walk hop by hop. A
+component replaced between path resolution and the open — a directory swapped
+for a symlink, the root itself substituted — fails the walk rather than
+escaping the root. Every subsequent check runs on a descriptor obtained from
+that directory, so it describes the file that is actually read or written.
+
+Mount crossings inside the workspace are allowed. Refusing them would break
+ordinary setups (a devcontainer volume at `node_modules/`, a tmpfs at
+`target/`), while planting a hostile mount inside the workspace needs
+privileges the same-user threat model already excludes.
+
+Euler ships on Linux and macOS. There is no confined open for other targets,
+so the structured tools fail closed there rather than opening a joined path.
 
 - **Regular files only.** A target that is not a regular file when the
   descriptor is opened is refused for reads and writes alike.
 - **Creates are exclusive.** `write_file` and the add path of `apply_patch`
   open with `O_CREAT | O_EXCL`, so a file that appeared after the tool call
   was prepared is reported as already existing and is never clobbered.
-- **Writes require a single link.** A write to a target with `nlink > 1` is
-  refused: a second name may be outside the workspace, which would make a
-  confined write an unconfined one. The error says the file has multiple links
-  and to copy it before editing. Reads of a multiply-linked file are still
-  allowed.
-- **The prepared pre-image must still be there.** At apply time the target's
-  current bytes are compared to the exact content the tool call was prepared
-  against. Anything else — a user edit, a `git checkout`, another agent — is a
-  refusal, not an overwrite, and the file is left alone.
-- **A write is applied only once it is durable.** The mutation is synced
-  before Euler claims it happened.
-
-A structured write that fails after opening its target reports what actually
-changed: the file is observed through the same descriptor before and after,
-and any difference is emitted as ordinary `file.change` / `file.diff`
-provenance alongside the failed `tool.result`. A rejected multiply-linked
-target is never re-read for this purpose.
+- **The prepared pre-image must still be there.** A modifying write reads the
+  target's current bytes and compares them to the exact content the tool call
+  was prepared against. Anything else — a user edit, a `git checkout`, another
+  agent — is a refusal, not an overwrite, and the file is left alone.
+- **Writes are atomic.** The new bytes go to a temporary file created in the
+  same confined directory, are given the target's permissions, are made
+  durable, and are then renamed over the target name; the directory is synced
+  afterwards. The target is only ever its complete old content or its complete
+  new content, never a truncated intermediate, so a crash or an I/O failure
+  mid-write cannot leave a partial file. Because the replacement is a new
+  inode, any other hard link to the old file keeps the old content — editing a
+  multiply-linked file (a pnpm store, `cargo vendor`, `cp -al`) is allowed and
+  stays confined.
 
 ## Rollback checkpoints
 
 A modifying structured write stores its rollback pre-image *before* the
-destructive write and records it as `checkpoint.stored` with
-`status: prepared`. If the pre-image cannot be stored durably the write does
-not happen at all, and the tool fails saying the file was not changed. Only
-after the write completes does the `file.change` event carry
-`pre_image_blob` with `checkpoint_status: applied`.
+destructive write and records it as a `checkpoint.stored` event. If the
+pre-image cannot be stored durably the write does not happen at all, and the
+tool fails saying the file was not changed. After the write completes, the
+`file.change` event carries the same `pre_image_blob` plus
+`checkpoint_event_id`; that `file.change` existing is what makes the
+checkpoint applied and restorable.
 
-`/rollback` lists applied checkpoints only. A prepared-only record describes a
-write that never completed, so restoring it would be a destructive edit of its
-own. Before restoring, Euler verifies that the file still holds exactly what
-the checkpointed edit wrote; if it does not, the restore is refused rather
-than silently discarding the later change. Event shapes: `docs/contracts/events.md`.
+`/rollback` lists applied checkpoints only. A `checkpoint.stored` record with
+no `file.change` referencing it describes a write that was never observed to
+complete, so restoring it would be a destructive edit of its own. Before
+restoring, Euler verifies that the file still holds what the *newest* applied
+checkpoint for that path wrote — so an A→B→C chain can be rolled back to A,
+while a change made outside the ledger is refused rather than discarded. The
+verification and the replacement run against one confined target, so an edit
+landing between them is refused too. A checkpointed file the user deleted has
+nothing to discard and is recreated. Event shapes: `docs/contracts/events.md`.
 
 Process launch/executor completion and process success are separate facts.
 `run_shell` and direct Git tools retain collected output and the observed exit

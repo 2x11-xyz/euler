@@ -215,45 +215,31 @@ impl<D: PermissionDecider> Session<D> {
                         payload.clone(),
                         Some(tool_call_event_id.clone()),
                     )?;
-                    // Audit F36: the rollback pre-image is stored and
-                    // recorded before the destructive write, so a crash can
-                    // never leave a changed file with no way back. The
-                    // `prepared` record is not restorable until the write
-                    // below is observed to have completed.
-                    let checkpoint = match maybe_store_pre_image(self.config.root.as_path(), patch)
-                    {
-                        Ok(blob) => blob,
-                        Err(error) => {
-                            self.emit_failed_tool_result(
-                                call.id,
-                                execution.name,
-                                checkpoint_store_failure(&error),
-                                tool_call_event_id,
-                                tool_started,
-                            )?;
-                            return Ok(());
-                        }
-                    };
-                    let checkpoint_event_id = match checkpoint.as_deref() {
-                        Some(blob) => Some(self.emit_with_parent(
+                    let checkpoint =
+                        match prepare_checkpoint(self.config.root.as_path(), &call.id, patch) {
+                            Ok(checkpoint) => checkpoint,
+                            Err(reason) => {
+                                self.emit_failed_tool_result(
+                                    call.id,
+                                    execution.name,
+                                    reason,
+                                    tool_call_event_id,
+                                    tool_started,
+                                )?;
+                                return Ok(());
+                            }
+                        };
+                    let checkpoint_event_id = match &checkpoint {
+                        Some(checkpoint) => Some(self.emit_with_parent(
                             EventKind::CHECKPOINT_STORED,
-                            checkpoint_stored_payload(&call.id, patch, blob),
+                            checkpoint.payload.clone(),
                             Some(patch_proposed_id.clone()),
                         )?),
                         None => None,
                     };
-                    match self
-                        .tools
-                        .apply_patch_cancellable_observed(patch, cancellation)
-                    {
+                    match self.tools.apply_patch_cancellable(patch, cancellation) {
                         Ok(()) => {}
-                        Err(failure) if matches!(failure.error, ToolError::Cancelled) => {
-                            self.emit_observed_changes(
-                                &call.id,
-                                patch.origin,
-                                &failure.file_changes,
-                                &tool_call_event_id,
-                            )?;
+                        Err(ToolError::Cancelled) => {
                             self.emit_cancelled_tool_result(
                                 call,
                                 tool_call_event_id,
@@ -262,20 +248,11 @@ impl<D: PermissionDecider> Session<D> {
                             )?;
                             return Err(SessionError::Cancelled);
                         }
-                        Err(failure) => {
-                            // A write that failed part-way still changed the
-                            // file. Record what was observed through the
-                            // target descriptor before reporting the failure.
-                            self.emit_observed_changes(
-                                &call.id,
-                                patch.origin,
-                                &failure.file_changes,
-                                &tool_call_event_id,
-                            )?;
+                        Err(error) => {
                             self.emit_failed_tool_result(
                                 call.id,
                                 execution.name,
-                                failure.error.to_string(),
+                                error.to_string(),
                                 tool_call_event_id,
                                 tool_started,
                             )?;
@@ -292,7 +269,9 @@ impl<D: PermissionDecider> Session<D> {
                         file_change_payload(
                             &call.id,
                             patch,
-                            checkpoint.as_deref(),
+                            checkpoint
+                                .as_ref()
+                                .map(|checkpoint| checkpoint.blob.as_str()),
                             checkpoint_event_id.as_deref(),
                         ),
                         Some(patch_applied_id.clone()),
@@ -379,25 +358,8 @@ impl<D: PermissionDecider> Session<D> {
             return Ok(());
         }
         debug_assert_eq!(execution.name, "run_shell");
-        self.emit_observed_changes(
-            call_id,
-            "run_shell",
-            &execution.file_changes,
-            tool_call_event_id,
-        )
-    }
-
-    /// Record observed file changes that no `patch.applied` covers: a shell
-    /// command's side effects, or the partial effect of a structured write
-    /// that failed after opening its target.
-    fn emit_observed_changes(
-        &mut self,
-        call_id: &str,
-        origin: &'static str,
-        changes: &[crate::ObservedFileChange],
-        tool_call_event_id: &str,
-    ) -> Result<(), SessionError> {
-        for change in changes {
+        let origin = "run_shell";
+        for change in &execution.file_changes {
             let file_change_id = self.emit_with_parent(
                 EventKind::FILE_CHANGE,
                 observed_file_change_payload(call_id, origin, change),
@@ -592,10 +554,6 @@ pub(crate) fn file_change_payload(
     ]);
     if let Some(hash) = pre_image_blob {
         payload.insert("pre_image_blob".to_owned(), hash.into());
-        payload.insert(
-            "checkpoint_status".to_owned(),
-            crate::checkpoints::CHECKPOINT_STATUS_APPLIED.into(),
-        );
         if let Some(event_id) = checkpoint_event_id {
             payload.insert("checkpoint_event_id".to_owned(), event_id.into());
         }
@@ -603,43 +561,50 @@ pub(crate) fn file_change_payload(
     payload
 }
 
-/// The durable record that a rollback pre-image exists, emitted before the
-/// write it protects. It stays `prepared` unless a `file.change` later
-/// records the same blob as `applied`.
-pub(crate) fn checkpoint_stored_payload(
+/// A rollback pre-image that has been made durable but whose write has not
+/// happened yet.
+pub(crate) struct PreparedCheckpoint {
+    pub(crate) blob: String,
+    pub(crate) payload: JsonObject,
+}
+
+/// Store the rollback pre-image for `patch` and build the `checkpoint.stored`
+/// record for it (audit F36).
+///
+/// This is the only way to reach a destructive structured write: `Err` means
+/// a checkpoint was owed but could not be made durable, and the caller must
+/// abandon the write with the returned model-visible reason rather than
+/// change a file it cannot undo. `Ok(None)` means no checkpoint is owed —
+/// an add, or content deliberately not checkpointed.
+pub(crate) fn prepare_checkpoint(
+    root: &std::path::Path,
     tool_call_id: &str,
     patch: &PatchEvents,
-    pre_image_blob: &str,
-) -> JsonObject {
-    object([
-        ("tool_call_id", tool_call_id.to_owned().into()),
-        ("path", patch.path.clone().into()),
-        ("action", patch.action.into()),
-        ("pre_image_blob", pre_image_blob.into()),
-        (
-            "status",
-            crate::checkpoints::CHECKPOINT_STATUS_PREPARED.into(),
-        ),
-    ])
-}
-
-/// The model-visible reason a destructive write was abandoned. The write did
-/// not happen, so the message must say so rather than describe I/O.
-pub(crate) fn checkpoint_store_failure(error: &std::io::Error) -> String {
-    format!(
-        "the rollback checkpoint for this edit could not be stored ({error}); the file was not changed"
-    )
-}
-
-pub(crate) fn maybe_store_pre_image(
-    root: &std::path::Path,
-    patch: &PatchEvents,
-) -> std::io::Result<Option<String>> {
+) -> Result<Option<PreparedCheckpoint>, String> {
     // v0: modify-only. Adds have empty before; restore-as-delete is product debt.
     if patch.action != "modify" || patch.before.is_empty() {
         return Ok(None);
     }
-    crate::checkpoints::store_pre_image(root, &patch.path, &patch.before)
+    let blob =
+        crate::checkpoints::store_pre_image(root, &patch.path, &patch.before).map_err(|error| {
+            format!(
+                "the rollback checkpoint for this edit could not be stored ({error}); \
+the file was not changed"
+            )
+        })?;
+    Ok(blob.map(|blob| PreparedCheckpoint {
+        payload: object([
+            ("tool_call_id", tool_call_id.to_owned().into()),
+            ("path", patch.path.clone().into()),
+            ("action", patch.action.into()),
+            ("pre_image_blob", blob.as_str().into()),
+            (
+                "status",
+                crate::checkpoints::CHECKPOINT_STATUS_PREPARED.into(),
+            ),
+        ]),
+        blob,
+    }))
 }
 
 pub(crate) fn file_diff_payload(

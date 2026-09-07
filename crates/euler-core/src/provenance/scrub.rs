@@ -177,7 +177,15 @@ impl ProvenanceWriter {
 
         changed |= pass.reaccount_response_bytes(event, response_content_bytes);
 
-        if event.kind.as_str() == EventKind::FILE_CHANGE {
+        // Both kinds carry the same content-addressed checkpoint hash: the
+        // `checkpoint.stored` row written before the write, and the
+        // `file.change` row written after it. Rewriting only one would leave
+        // the pair pointing at different blobs, and would leave the
+        // pre-image of a write that never completed unscrubbed.
+        if matches!(
+            event.kind.as_str(),
+            EventKind::FILE_CHANGE | EventKind::CHECKPOINT_STORED
+        ) {
             if let (Some(root), Some(old_hash)) = (
                 workspace_root,
                 event

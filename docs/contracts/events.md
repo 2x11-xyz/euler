@@ -514,9 +514,9 @@ extension error does not consume the later result.
   revised separately.
 - `file.change`: `tool_call_id`, `origin`, `action`, `path`, `old_path`,
   `before_sha256`, `after_sha256`, `before_byte_len`, `after_byte_len`,
-  `diff_redaction`; optional `pre_image_blob` (sha256 hex),
-  `checkpoint_status`, and `checkpoint_event_id` when a workspace checkpoint
-  pre-image was stored for this edit. This event is metadata-only:
+  `diff_redaction`; optional `pre_image_blob` (sha256 hex) and
+  `checkpoint_event_id` when a workspace checkpoint pre-image was stored for
+  this edit. This event is metadata-only:
   `origin` is descriptive edit metadata with known values `edit_file`,
   `apply_patch`, `run_shell:apply_patch`, and `run_shell`; `action` is `add`,
   `modify`, or `delete`, `old_path` is null, and `diff_redaction` is `omitted`.
@@ -536,19 +536,27 @@ extension error does not consume the later result.
   pre-images for safe single-file `edit_file` / `apply_patch` **modify** only;
   adds, deletes, multi-file shell observations, and external disk drift are out
   of scope.
-  When `pre_image_blob` is present, `checkpoint_status` is `applied` and
-  `checkpoint_event_id` names the `checkpoint.stored` event that recorded the
-  same pre-image before the write. Rows written before this marker existed
-  carry neither field and are read as applied: they were only ever emitted
-  after their write completed.
+  When `pre_image_blob` is present, `checkpoint_event_id` names the
+  `checkpoint.stored` event that recorded the same pre-image before the write.
+  Rows written before that event existed carry no `checkpoint_event_id`; they
+  remain restorable, because a `file.change` was only ever emitted after its
+  write completed.
 - `checkpoint.stored`: `tool_call_id`, `path`, `action`, `pre_image_blob`,
-  `status`. Appended **before** the destructive write it protects, with
-  `status: prepared`, so a crash can never leave a changed file with no way
-  back. If the pre-image cannot be stored durably, no `checkpoint.stored` is
-  appended and the write does not happen. A `prepared` record is not
-  restorable and is never listed by `/rollback`: it describes a write that was
-  not observed to complete, so its pre-image may already be the file's current
-  content. The write is recorded as applied only by the later `file.change`.
+  `status` (`prepared`). Appended **before** the destructive write it
+  protects, so a crash can never leave a changed file with no way back. If the
+  pre-image cannot be stored durably, no `checkpoint.stored` is appended and
+  the write does not happen. A `checkpoint.stored` row with no `file.change`
+  referencing its blob is not restorable and is never listed by `/rollback`:
+  it describes a write that was not observed to complete, so its pre-image may
+  already be the file's current content. A `file.change` referencing the same
+  blob is what records the write as applied.
+  One residual window remains and is deliberate: the write is made durable
+  before `patch.applied` and `file.change` are appended, so a crash in between
+  leaves a changed file whose only checkpoint record is `checkpoint.stored`.
+  `/rollback` will not offer it. The file's content is recoverable from the
+  blob under `.euler/checkpoints/` by hand; automatic recovery would have to
+  guess whether the write happened, which is exactly the guess audit F36
+  removed.
 - `workspace.restore`: `path`, `checkpoint_event_id`, `blob_sha256`,
   `restored` (always `true` on success). Appended when the user restores a
   workspace file via `/rollback` to the pre-image of a prior applied
@@ -992,9 +1000,7 @@ extension error does not consume the later result.
 - Structured `file.change` parents the `patch.applied` event that records the
   edit it summarizes. Bounded ordinary `run_shell` file observations parent the
   originating `tool.call`, because there is no canonical patch event for that
-  shell process. A structured write that failed after opening its target is
-  the same case: there is no `patch.applied`, so the observed change parents
-  the `tool.call` and is followed by a failed `tool.result`. The final `tool.result` still parents the original
+  shell process. The final `tool.result` still parents the original
   `tool.call`, not the `file.change`.
 - `file.diff` parents the same event as the matching `file.change`. It is a
   sibling display projection, not the parent of `tool.result`. Its

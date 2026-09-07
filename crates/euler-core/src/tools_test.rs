@@ -2228,23 +2228,21 @@ fn structured_tools_reject_a_fifo_target() {
 
 #[cfg(unix)]
 #[test]
-fn structured_write_rejects_a_hardlinked_target_but_still_reads_it() {
+fn structured_write_leaves_an_outside_alias_on_the_old_inode() {
+    // pnpm stores, `cargo vendor`, and `cp -al` all produce multiply-linked
+    // files inside a workspace. Editing one is allowed because the atomic
+    // replace publishes a new inode: every other name still refers to the
+    // untouched old content, so the write stays confined without a rule that
+    // would break those tools.
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     let outside = temp.path().join("outside");
     fs::create_dir(&workspace).expect("workspace");
     fs::create_dir(&outside).expect("outside");
-    let outside_file = outside.join("sensitive.txt");
+    let outside_file = outside.join("shared.txt");
     fs::write(&outside_file, "old\n").expect("outside file");
     fs::hard_link(&outside_file, workspace.join("alias.txt")).expect("workspace alias");
     let registry = ToolRegistry::new(&workspace);
-
-    // Reads stay allowed: a second link is a write-confinement problem, and
-    // read policy for unsandboxed hosts is deliberately out of scope here.
-    let read = registry
-        .execute("read_file", &json!({"path": "alias.txt"}))
-        .expect("multiply-linked file remains readable");
-    assert_eq!(read.output, "old\n");
 
     let edit = registry
         .execute(
@@ -2252,58 +2250,70 @@ fn structured_write_rejects_a_hardlinked_target_but_still_reads_it() {
             &json!({"path": "alias.txt", "old": "old", "new": "new"}),
         )
         .expect("prepare edit");
-    let error = registry
+    registry
         .apply_patch(edit.patch.as_ref().expect("patch"))
-        .expect_err("multiply-linked target must not be written");
+        .expect("a multiply-linked file is editable");
 
-    let message = error.to_string();
-    assert!(matches!(error, ToolError::HardlinkedStructuredFile { .. }));
-    assert!(message.contains("multiple links"), "{message}");
-    assert!(message.contains("copy it to a new path"), "{message}");
-    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "old\n");
-}
-
-#[cfg(unix)]
-#[test]
-fn structured_write_rejects_a_hardlink_substituted_after_prepare() {
-    let temp = tempfile::tempdir().expect("temp dir");
-    let workspace = temp.path().join("workspace");
-    let outside = temp.path().join("outside");
-    fs::create_dir(&workspace).expect("workspace");
-    fs::create_dir(&outside).expect("outside");
-    let target = workspace.join("target.txt");
-    fs::write(&target, "original\n").expect("initial target");
-    let registry = ToolRegistry::new(&workspace);
-    let execution = registry
-        .execute(
-            "edit_file",
-            &json!({"path": "target.txt", "old": "original", "new": "changed"}),
-        )
-        .expect("prepare edit before substitution");
-
-    fs::remove_file(&target).expect("remove prepared target");
-    let canary = "LATE_EXTERNAL_HARDLINK_CANARY";
-    let outside_file = outside.join("sensitive.txt");
-    fs::write(&outside_file, format!("original\n{canary}\n")).expect("outside file");
-    fs::hard_link(&outside_file, &target).expect("substitute external alias");
-
-    let failure = registry
-        .apply_patch_cancellable_observed(
-            execution.patch.as_ref().expect("patch"),
-            &CancellationToken::new(),
-        )
-        .expect_err("late external alias must fail before observation");
-
-    assert!(matches!(
-        failure.error,
-        ToolError::HardlinkedStructuredFile { .. }
-    ));
-    assert!(failure.file_changes.is_empty());
-    assert!(!failure.error.to_string().contains(canary));
+    assert_eq!(
+        fs::read_to_string(workspace.join("alias.txt")).unwrap(),
+        "new\n"
+    );
     assert_eq!(
         fs::read_to_string(&outside_file).unwrap(),
-        format!("original\n{canary}\n")
+        "old\n",
+        "the alias outside the workspace must keep the old inode"
     );
+}
+
+#[test]
+fn structured_write_is_atomic_and_preserves_mode() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("script.sh");
+    fs::write(&target, "old\n").expect("target");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "script.sh", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect("apply");
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "new\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755,
+            "an atomic replace must not reset the file mode"
+        );
+    }
+    // The replace leaves no temporary file behind.
+    let leftovers = fs::read_dir(temp.path())
+        .expect("read workspace")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".euler-write-")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
 }
 
 #[test]
@@ -2331,7 +2341,12 @@ fn structured_add_uses_create_new_at_apply_time() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn structured_reads_and_writes_reject_a_same_device_nested_bind_mount() {
+fn structured_tools_work_across_an_in_workspace_mount() {
+    // `RESOLVE_NO_XDEV` would refuse this, and with it every ordinary
+    // devcontainer volume at `node_modules/` or tmpfs at `target/`. Planting
+    // a hostile mount inside the workspace needs privileges the same-user
+    // threat model already excludes, so the mount is crossed and the ordinary
+    // confinement rules still apply beneath it.
     use std::ffi::CString;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -2350,25 +2365,25 @@ fn structured_reads_and_writes_reject_a_same_device_nested_bind_mount() {
 
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
-    let outside = temp.path().join("outside");
+    let source = temp.path().join("volume");
     let nested = workspace.join("mounted");
-    for directory in [&workspace, &outside, &nested] {
+    for directory in [&workspace, &source, &nested] {
         fs::create_dir(directory).expect("fixture directory");
     }
-    fs::write(outside.join("secret.txt"), "outside").expect("outside fixture");
+    fs::write(source.join("note.txt"), "old\n").expect("volume fixture");
     assert_eq!(
         fs::metadata(&workspace).expect("workspace metadata").dev(),
-        fs::metadata(&outside).expect("outside metadata").dev(),
+        fs::metadata(&source).expect("source metadata").dev(),
         "fixture must exercise a same-device bind"
     );
-    let source = CString::new(outside.as_os_str().as_bytes()).expect("source path");
-    let target = CString::new(nested.as_os_str().as_bytes()).expect("target path");
+    let source_path = CString::new(source.as_os_str().as_bytes()).expect("source path");
+    let target_path = CString::new(nested.as_os_str().as_bytes()).expect("target path");
     // SAFETY: both mount paths are live, NUL-terminated directories and the
     // remaining pointer arguments are unused for MS_BIND.
     let mounted = unsafe {
         libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
+            source_path.as_ptr(),
+            target_path.as_ptr(),
             std::ptr::null(),
             libc::MS_BIND,
             std::ptr::null(),
@@ -2385,30 +2400,57 @@ fn structured_reads_and_writes_reject_a_same_device_nested_bind_mount() {
     let _unmount = Unmount(nested);
     let registry = ToolRegistry::new(&workspace);
 
-    for error in [
-        registry
-            .execute("read_file", &json!({"path": "mounted/secret.txt"}))
-            .expect_err("nested mount read must fail"),
-        registry
-            .execute(
-                "edit_file",
-                &json!({"path": "mounted/secret.txt", "old": "outside", "new": "changed"}),
-            )
-            .expect_err("nested mount edit must fail"),
-        registry
-            .execute(
-                "write_file",
-                &json!({"path": "mounted/created.txt", "content": "changed"}),
-            )
-            .expect_err("nested mount create must fail"),
-    ] {
-        assert!(matches!(error, ToolError::Io(_)), "{error}");
-    }
+    let read = registry
+        .execute("read_file", &json!({"path": "mounted/note.txt"}))
+        .expect("a mounted volume inside the workspace is readable");
+    assert_eq!(read.output, "old\n");
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "mounted/note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit through the mount");
+    registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect("apply through the mount");
     assert_eq!(
-        fs::read_to_string(outside.join("secret.txt")).unwrap(),
-        "outside"
+        fs::read_to_string(source.join("note.txt")).unwrap(),
+        "new\n"
     );
-    assert!(!outside.join("created.txt").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn confinement_holds_when_openat2_is_unavailable() {
+    // Kernels before 5.6 and seccomp profiles that deny openat2 fall back to
+    // the hop-by-hop walker; it must refuse the same escapes.
+    let _without = crate::structured_file::test_support::WithoutOpenat2::arm();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(workspace.join("src")).expect("workspace src");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(workspace.join("src/note.txt"), "old\n").expect("workspace target");
+    fs::write(outside.join("note.txt"), "outside\n").expect("outside target");
+    let registry = ToolRegistry::new(&workspace);
+
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "src/note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit on the fallback walker");
+    fs::rename(workspace.join("src"), workspace.join("original-src")).expect("move parent");
+    symlink(&outside, workspace.join("src")).expect("substitute parent symlink");
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("the fallback walker must refuse a substituted parent");
+
+    assert!(matches!(error, ToolError::Io(_)), "{error}");
+    assert_eq!(
+        fs::read_to_string(outside.join("note.txt")).unwrap(),
+        "outside\n"
+    );
 }
 
 /// Unit 1 keeps the single primary-root model. Multi-root provenance,

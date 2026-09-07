@@ -27,8 +27,6 @@ const CHECKPOINTS_DIR: &str = "checkpoints";
 /// A pre-image stored before its destructive write, which has not been
 /// observed to complete.
 pub const CHECKPOINT_STATUS_PREPARED: &str = "prepared";
-/// A pre-image whose destructive write completed and was made durable.
-pub const CHECKPOINT_STATUS_APPLIED: &str = "applied";
 
 /// One restorable pre-image referenced from a `file.change` event.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,29 +82,17 @@ pub fn load_pre_image(root: &Path, sha256: &str) -> io::Result<String> {
 /// Scan session events for `file.change` rows that carry a restorable
 /// pre-image. Newest first for the `/rollback` picker.
 ///
-/// `checkpoint.stored` rows are deliberately not listed: a pre-image whose
-/// write never reached `applied` describes a file that was never changed, so
-/// restoring it would itself be a destructive edit (audit F36).
+/// `checkpoint.stored` rows are deliberately not listed: a pre-image with no
+/// `file.change` referencing it describes a write that was never observed to
+/// complete, so restoring it would itself be a destructive edit (audit F36).
 pub fn list_from_events(events: &[EventEnvelope]) -> Vec<WorkspaceCheckpointRef> {
     // Stable newest-first from rev(); keep that order.
     events
         .iter()
         .rev()
         .filter(|event| event.kind.as_str() == EventKind::FILE_CHANGE)
-        .filter(|event| checkpoint_is_applied(event))
         .filter_map(checkpoint_ref_from_event)
         .collect()
-}
-
-/// Whether a `file.change` row records a write that actually happened.
-/// Rows written before the status marker existed carry no `checkpoint_status`
-/// and are treated as applied: they were only ever emitted after the write.
-pub fn checkpoint_is_applied(event: &EventEnvelope) -> bool {
-    event
-        .payload
-        .get("checkpoint_status")
-        .and_then(|value| value.as_str())
-        .is_none_or(|status| status == CHECKPOINT_STATUS_APPLIED)
 }
 
 fn checkpoint_ref_from_event(event: &EventEnvelope) -> Option<WorkspaceCheckpointRef> {

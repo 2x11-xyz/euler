@@ -54,24 +54,27 @@ pull requests that landed them; deeper design rationale lives in
 ### Structured file writes and rollback
 
 - Structured file tools (`read_file`, `edit_file`, `write_file`,
-  `apply_patch`) now open their target by walking down from the workspace root
-  — `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV |
-  RESOLVE_NO_MAGICLINKS` on Linux, an `O_NOFOLLOW` hop-by-hop walk elsewhere —
-  so a directory, root, or mount swapped in after the path was resolved fails
-  the open instead of escaping the workspace. Creates use `O_EXCL` and never
-  clobber a file that appeared after the call was prepared; an apply compares
-  the target's current bytes to the exact pre-image the call was prepared
-  against and refuses a stale write rather than overwriting a concurrent edit;
-  non-regular targets are refused; and a write to a file with more than one
-  link is refused with an error saying to copy the file before editing it.
-  A write that fails after opening its target now reports what actually
-  changed instead of claiming no change.
+  `apply_patch`) now resolve their target by walking down from the workspace
+  root to the parent directory and holding that descriptor — `openat2` with
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` on Linux
+  (falling back to an `O_NOFOLLOW` hop-by-hop walk where that syscall is
+  unavailable), a hop-by-hop walk on other Unix hosts — so a directory or root
+  swapped in after the path was resolved fails the open instead of escaping
+  the workspace. Creates use `O_EXCL` and never clobber a file that appeared
+  after the call was prepared; a modify compares the target's current bytes to
+  the exact prepared pre-image and refuses a stale write rather than
+  overwriting a concurrent edit; non-regular targets are refused.
+- Structured writes are now atomic: the new bytes are written to a sibling
+  temporary file, given the target's permissions, made durable, and renamed
+  over the target. A file is only ever its complete old content or its
+  complete new content, so an interrupted write can no longer truncate it.
 - `/rollback` checkpoints are now stored and recorded *before* the destructive
-  write, as a `checkpoint.stored` event with `status: prepared`. A write whose
-  checkpoint cannot be stored durably does not happen at all. Prepared-only
-  checkpoints are never restorable, and restoring an applied checkpoint first
-  verifies that the file still holds what the checkpointed edit wrote, so a
-  rollback can no longer silently discard a later edit.
+  write, as a `checkpoint.stored` event. A write whose checkpoint cannot be
+  stored durably does not happen at all. A checkpoint whose write was never
+  observed to complete is never restorable, and restoring an applied
+  checkpoint first verifies that the file still holds what the newest
+  checkpointed write left there — so a rollback can no longer silently discard
+  a later edit. A checkpointed file the user deleted is recreated.
 
 ### Project context and skills
 
