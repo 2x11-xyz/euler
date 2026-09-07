@@ -26,9 +26,7 @@ this platform has no sandbox backend yet."
     // about: the result can differ between workspaces.
     let root = std::env::current_dir()?;
     let status = match backend {
-        SandboxStatus::Enforced => {
-            SandboxStatus::from_availability(Some(probe_workspace_sandbox(&root)))
-        }
+        SandboxStatus::Enforced => probe_workspace_sandbox(&root),
         other => other,
     };
     writeln!(

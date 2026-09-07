@@ -5,7 +5,7 @@
 //! implies, and no host home or network. It is an execution boundary, not a
 //! synonym for permission approval.
 //!
-//! Residual: a Cargo `config.toml` in a mounted toolchain home may itself
+//! Residual: a Cargo `config.toml` in a reachable toolchain home may itself
 //! declare a registry token. That file is not masked — it carries the registry
 //! sources and build settings a build needs, and breaking the build to hide a
 //! token the user can move is strictness the user would feel. The profile
@@ -150,6 +150,8 @@ pub enum SandboxFailureCause {
     BubblewrapTooOld,
     /// Namespaces work, but this host would not give the profile its mounts.
     ProfileMountsRejected,
+    /// The probe did not finish in time, so nothing about it was learned.
+    ProbeTimedOut,
     /// The workspace root is not a directory Euler can resolve.
     InvalidWorkspace,
     /// This platform has no sandbox backend at all.
@@ -180,6 +182,7 @@ impl SandboxFailureCause {
                 "Bubblewrap can create namespaces on this host, but could not set up the \
 profile's mounts for this workspace"
             }
+            Self::ProbeTimedOut => "the sandbox probe did not finish in time",
             Self::InvalidWorkspace => "the workspace root is not an accessible directory",
             Self::UnsupportedPlatform => "this platform has no sandbox backend yet",
             Self::Unattributed => "Bubblewrap could not create a user namespace",
@@ -198,12 +201,16 @@ profile's mounts for this workspace"
             SandboxUnavailableReason::BubblewrapMissing => Self::BubblewrapMissing,
             SandboxUnavailableReason::InvalidWorkspace => Self::InvalidWorkspace,
             SandboxUnavailableReason::UnsupportedPlatform => Self::UnsupportedPlatform,
-            SandboxUnavailableReason::CannotEnforce
-                if probe_sandbox_backend() == SandboxStatus::Enforced =>
-            {
-                Self::ProfileMountsRejected
-            }
-            SandboxUnavailableReason::CannotEnforce => user_namespace_failure_cause(),
+            SandboxUnavailableReason::CannotEnforce => match probe_sandbox_backend() {
+                // Namespaces demonstrably work, so the profile's own mounts
+                // are what this host rejected.
+                SandboxStatus::Enforced => Self::ProfileMountsRejected,
+                // The backend probe already attributed this host's failure.
+                // Re-deriving would discard a better answer: an out-of-date
+                // Bubblewrap would become a lecture about namespace sysctls.
+                SandboxStatus::Unavailable { cause, .. } => cause,
+                SandboxStatus::Host => Self::UnsupportedPlatform,
+            },
         }
     }
 
@@ -230,6 +237,10 @@ https://github.com/2x11-xyz/euler/issues/230"
             Self::ProfileMountsRejected => {
                 "check that /usr, /etc and the workspace are readable and that the workspace \
 is not on a filesystem Bubblewrap cannot bind, such as an unusual FUSE mount"
+            }
+            Self::ProbeTimedOut => {
+                "try again on a less loaded machine; if it persists, run \
+`bwrap --unshare-user --unshare-net --ro-bind / / /bin/true` by hand to see where it stops"
             }
             Self::InvalidWorkspace => {
                 "start Euler in a directory that exists and that you can read"
@@ -306,8 +317,8 @@ impl SandboxStatus {
         Some(format!(
             "Euler could not start its Linux sandbox: {}.\nTo fix it: {}.\n\
 Until then `run_shell` and the `git_*` tools fail closed; there is no automatic \
-fallback to host execution. The probe runs once per session, so fixing the host \
-takes effect in a new session, not this one.",
+fallback to host execution. The probe result is cached for this process, so \
+fixing the host takes effect in a new run, not this one.",
             cause.description(),
             cause.remedy(),
         ))
@@ -336,6 +347,9 @@ pub(crate) struct WorkspaceSandbox {
     runtime: RuntimeRoots,
     bwrap: Option<PathBuf>,
     availability: SandboxAvailability,
+    /// How the profile probe ended, when one ran. `None` means the profile
+    /// was ruled out before any process started.
+    probe: Option<ProbeOutcome>,
 }
 
 impl WorkspaceSandbox {
@@ -359,6 +373,7 @@ impl WorkspaceSandbox {
                 availability: SandboxAvailability::Unavailable(
                     SandboxUnavailableReason::UnsupportedPlatform,
                 ),
+                probe: None,
             };
         }
         let Ok(workspace) = canonical_workspace(workspace.as_ref()) else {
@@ -369,6 +384,7 @@ impl WorkspaceSandbox {
                 availability: SandboxAvailability::Unavailable(
                     SandboxUnavailableReason::InvalidWorkspace,
                 ),
+                probe: None,
             };
         };
         let runtime = runtime.excluding(&workspace);
@@ -380,19 +396,38 @@ impl WorkspaceSandbox {
                 availability: SandboxAvailability::Unavailable(
                     SandboxUnavailableReason::BubblewrapMissing,
                 ),
+                probe: None,
             };
         };
-        let availability = probe_profile(&bwrap, &workspace, &runtime, profile);
+        let (availability, outcome) = probe_profile(&bwrap, &workspace, &runtime, profile);
         Self {
             workspace: Some(workspace),
             runtime,
             bwrap: Some(bwrap),
             availability,
+            probe: Some(outcome),
         }
     }
 
     pub(crate) const fn availability(&self) -> SandboxAvailability {
         self.availability
+    }
+
+    /// The availability with its cause attached, using what this sandbox's own
+    /// probe observed rather than re-deriving it from the reason alone.
+    pub(crate) fn status(&self) -> SandboxStatus {
+        let SandboxAvailability::Unavailable(reason) = self.availability else {
+            return SandboxStatus::Enforced;
+        };
+        SandboxStatus::Unavailable {
+            reason,
+            // A probe that never finished taught us nothing, so naming the
+            // mounts or the namespace would be a guess.
+            cause: match self.probe {
+                Some(ProbeOutcome::TimedOut) => SandboxFailureCause::ProbeTimedOut,
+                _ => SandboxFailureCause::for_reason(reason),
+            },
+        }
     }
 
     /// One line per toolchain config that still holds a registry token the
@@ -541,6 +576,9 @@ pub(crate) struct RuntimeRoots {
     path_entries: Vec<PathBuf>,
     /// The real home directory, when it exists and is not a mounted root.
     home: Option<PathBuf>,
+    /// The writable workspace, once known. A toolchain home inside it needs
+    /// no mount of its own, but its variable must point at the bound path.
+    workspace: Option<PathBuf>,
 }
 
 /// Environment variables that name a toolchain home, paired with the
@@ -559,10 +597,18 @@ const TOOLCHAIN_ROOTS: &[(&str, &str)] = &[
 /// environment variable of their own.
 const SYSTEM_TOOLCHAIN_ROOTS: &[&str] = &["/nix/store"];
 
-/// Credential files that live inside a toolchain home. Mounting `CARGO_HOME`
-/// read-only makes the registry token readable, where main returned ENOENT
-/// for it. `config.toml` stays visible because a build needs it.
-const MASKED_TOOLCHAIN_FILES: &[&str] = &["credentials.toml", "credentials"];
+/// Credential files inside a Cargo home. Mounting `CARGO_HOME` read-only
+/// makes the registry token readable, where main returned ENOENT for it.
+/// `config.toml` stays visible because a build needs it.
+///
+/// These names are Cargo's, so they are applied only to the Cargo home. A
+/// file called `credentials` under an unrelated toolchain root belongs to
+/// something else and is not Euler's to hide.
+const MASKED_CARGO_FILES: &[&str] = &["credentials.toml", "credentials"];
+
+/// The Cargo configuration files, in the order Cargo itself prefers. Both are
+/// read, and both can carry a registry token.
+const CARGO_CONFIG_FILES: &[&str] = &["config.toml", "config"];
 
 impl RuntimeRoots {
     /// Read the host environment. This never consults the workspace: an agent
@@ -616,6 +662,7 @@ impl RuntimeRoots {
             variables,
             path_entries: Vec::new(),
             home,
+            workspace: None,
         };
         runtime.normalize();
         runtime.path_entries = runtime.host_path_entries_inside_roots(path.as_deref());
@@ -641,32 +688,54 @@ impl RuntimeRoots {
         self.roots = kept;
     }
 
-    /// Every toolchain home the sandbox can reach, whether it mounts it or
-    /// the system runtime already carries it. Deduplicated, because a
-    /// variable's value is usually also a mounted root.
-    fn toolchain_homes(&self) -> Vec<PathBuf> {
-        let mut homes = self
-            .roots
+    /// The Cargo home the sandbox can reach, whether Euler mounts it or the
+    /// system runtime already carries it.
+    ///
+    /// A Cargo home inside the workspace is excluded: the workspace is mounted
+    /// read-write and readable by design, so nothing there was newly exposed
+    /// by a toolchain mount and masking it would only hide the user's own
+    /// project files from them.
+    fn cargo_home(&self) -> Option<PathBuf> {
+        let value = self
+            .variables
             .iter()
-            .cloned()
-            .chain(self.variables.iter().map(|(_, value)| PathBuf::from(value)))
-            .filter(|home| self.reachable(home))
-            .collect::<Vec<_>>();
-        homes.sort();
-        homes.dedup();
-        homes
+            .find(|(name, _)| name == "CARGO_HOME")
+            .map(|(_, value)| PathBuf::from(value))?;
+        (self.reachable(&value) && !self.inside_workspace(&value)).then_some(value)
     }
 
-    /// Cargo also accepts a registry token in `config.toml`, which Euler does
-    /// not mask: that file carries registry sources and build settings, so
-    /// masking it would break the build. Report it instead, so the user can
-    /// move the token to `credentials.toml`, which is masked.
+    /// Cargo also accepts a registry token in its config, which Euler does not
+    /// mask: that file carries registry sources and build settings, so masking
+    /// it would break the build. Report it instead, so the user can move the
+    /// token to `credentials.toml`, which is masked.
     pub(crate) fn config_files_holding_a_registry_token(&self) -> Vec<PathBuf> {
-        self.toolchain_homes()
-            .into_iter()
-            .map(|home| home.join("config.toml"))
-            .filter(|config| file_declares_a_registry_token(config))
+        let Some(home) = self.cargo_home() else {
+            return Vec::new();
+        };
+        CARGO_CONFIG_FILES
+            .iter()
+            .map(|name| home.join(name))
+            .filter(|config| file_declares_a_token(config))
             .collect()
+    }
+
+    fn inside_workspace(&self, path: &Path) -> bool {
+        self.workspace
+            .as_ref()
+            .is_some_and(|workspace| path.starts_with(workspace))
+    }
+
+    /// The value a path takes inside the sandbox. The workspace is bound at
+    /// [`SANDBOX_WORKSPACE`], so a toolchain home the user keeps inside their
+    /// project is reachable there rather than at its host path.
+    fn sandbox_view(&self, host: &Path) -> PathBuf {
+        self.workspace
+            .as_ref()
+            .and_then(|workspace| host.strip_prefix(workspace).ok())
+            .map_or_else(
+                || host.to_path_buf(),
+                |relative| Path::new(SANDBOX_WORKSPACE).join(relative),
+            )
     }
 
     /// Every path the sandbox can reach read-only: the roots it mounts plus
@@ -708,11 +777,20 @@ impl RuntimeRoots {
         self.roots
             .retain(|root| !root.starts_with(workspace) && !workspace.starts_with(root));
         self.normalize();
+        self.workspace = Some(workspace.to_path_buf());
+        // A toolchain home inside the workspace keeps its variable and its
+        // `PATH`: the directory really is there, bound read-write, so
+        // `CARGO_HOME=<workspace>/.cargo` would otherwise be unset inside the
+        // sandbox with the toolchain sitting in plain sight. `sandbox_view`
+        // rewrites such a value to its bound path.
         let mut variables = std::mem::take(&mut self.variables);
-        variables.retain(|(_, value)| self.reachable(Path::new(value)));
+        variables.retain(|(_, value)| {
+            let value = Path::new(value);
+            self.reachable(value) || self.inside_workspace(value)
+        });
         self.variables = variables;
         let mut path_entries = std::mem::take(&mut self.path_entries);
-        path_entries.retain(|entry| self.reachable(entry));
+        path_entries.retain(|entry| self.reachable(entry) || self.inside_workspace(entry));
         self.path_entries = path_entries;
         self
     }
@@ -751,7 +829,11 @@ impl RuntimeRoots {
     /// The `PATH` the sandbox exports: mounted toolchain directories first,
     /// then the system runtime.
     fn sandbox_path(&self) -> OsString {
-        let mut entries = self.path_entries.clone();
+        let mut entries = self
+            .path_entries
+            .iter()
+            .map(|entry| self.sandbox_view(entry))
+            .collect::<Vec<_>>();
         entries.push(PathBuf::from(SYSTEM_SANDBOX_PATH));
         entries
             .iter()
@@ -771,6 +853,11 @@ impl RuntimeRoots {
 /// accident. Neither form may be the home, and callers still exclude anything
 /// already carried by a system runtime mount.
 fn usable_runtime_root(root: &Path, home: Option<&Path>, explicit: bool) -> Option<PathBuf> {
+    // Checked before and after canonicalization: `/tmp` is a symlink on some
+    // hosts, and either spelling names the same directory.
+    if names_a_profile_mount_point(root) {
+        return None;
+    }
     let root = root.canonicalize().ok()?;
     let depth = root.components().count();
     if !root.is_dir() || depth <= 1 || (!explicit && depth <= MIN_RUNTIME_ROOT_COMPONENTS) {
@@ -779,7 +866,22 @@ fn usable_runtime_root(root: &Path, home: Option<&Path>, explicit: bool) -> Opti
     if home.is_some_and(|home| home == root || home.starts_with(&root)) {
         return None;
     }
+    if names_a_profile_mount_point(&root) {
+        return None;
+    }
     Some(root)
+}
+
+/// Whether a path is, contains, or sits inside one of the profile's own mount
+/// points.
+///
+/// `GOPATH=/tmp` would otherwise emit a read-only bind over the private `/tmp`
+/// the sandbox home, cache and TMPDIR live in, and the resulting probe failure
+/// would be reported as something about /usr and /etc.
+fn names_a_profile_mount_point(path: &Path) -> bool {
+    PROFILE_MOUNT_POINTS
+        .iter()
+        .any(|mount| path.starts_with(mount) || Path::new(mount).starts_with(path))
 }
 
 /// Probe whether the default profile is actually enforceable for `workspace`.
@@ -789,8 +891,8 @@ fn usable_runtime_root(root: &Path, home: Option<&Path>, explicit: bool) -> Opti
 /// intentionally collapsed to a stable public reason: raw Bubblewrap
 /// diagnostics may expose host details and are not suitable for model-facing
 /// or transcript output.
-pub fn probe_workspace_sandbox(workspace: &Path) -> SandboxAvailability {
-    WorkspaceSandbox::new(workspace, SandboxProfile::WorkspaceNoNetwork).availability()
+pub fn probe_workspace_sandbox(workspace: &Path) -> SandboxStatus {
+    WorkspaceSandbox::new(workspace, SandboxProfile::WorkspaceNoNetwork).status()
 }
 
 /// Probe the execution boundary itself, independent of any workspace.
@@ -833,12 +935,14 @@ fn probe_sandbox_backend_uncached() -> SandboxStatus {
     // Debian 11 predate; that is its own cause, not a userns problem.
     command.args(PROFILE_ISOLATION_FLAGS);
     command.args(["--unshare-net", "--ro-bind", "/", "/", "/bin/true"]);
-    if run_probe_to_completion(command) {
-        return SandboxStatus::Enforced;
-    }
+    let cause = match run_probe_to_completion(command) {
+        ProbeOutcome::Succeeded => return SandboxStatus::Enforced,
+        ProbeOutcome::TimedOut => SandboxFailureCause::ProbeTimedOut,
+        ProbeOutcome::Refused => attribute_isolation_failure(&bwrap),
+    };
     SandboxStatus::Unavailable {
         reason: SandboxUnavailableReason::CannotEnforce,
-        cause: attribute_isolation_failure(&bwrap),
+        cause,
     }
 }
 
@@ -850,6 +954,9 @@ fn probe_sandbox_backend_uncached() -> SandboxStatus {
 /// if the probe still fails, the namespace itself is the problem. Asking
 /// `bwrap --help` instead would depend on which stream a build prints to
 /// and on flag names appearing verbatim in prose.
+///
+/// Only reached after a refusal, never after a timeout: a retry that happened
+/// to win a race would otherwise tell a healthy host to upgrade Bubblewrap.
 fn attribute_isolation_failure(bwrap: &Path) -> SandboxFailureCause {
     let mut command = Command::new(bwrap);
     command.env_clear();
@@ -860,7 +967,7 @@ fn attribute_isolation_failure(bwrap: &Path) -> SandboxFailureCause {
             .filter(|flag| **flag != "--disable-userns"),
     );
     command.args(["--unshare-net", "--ro-bind", "/", "/", "/bin/true"]);
-    if run_probe_to_completion(command) {
+    if run_probe_to_completion(command).succeeded() {
         SandboxFailureCause::BubblewrapTooOld
     } else {
         user_namespace_failure_cause()
@@ -915,7 +1022,7 @@ fn probe_profile(
     workspace: &Path,
     runtime: &RuntimeRoots,
     profile: SandboxProfile,
-) -> SandboxAvailability {
+) -> (SandboxAvailability, ProbeOutcome) {
     // `test -d` for the workspace, not `test -w`: the mount is what the probe
     // is checking, and a read-only checkout is a workspace Euler can still
     // read. `/tmp` must be writable, because the sandbox home, cache and
@@ -949,11 +1056,13 @@ fn probe_profile(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if run_probe_to_completion(command) {
+    let outcome = run_probe_to_completion(command);
+    let availability = if outcome.succeeded() {
         SandboxAvailability::Enforced(profile)
     } else {
         SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
-    }
+    };
+    (availability, outcome)
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -962,26 +1071,45 @@ fn shell_quote(path: &Path) -> String {
 
 /// Run one bounded probe. A probe that outlives its deadline is killed and
 /// treated as a failure: the sandbox must never make session start hang.
-fn run_probe_to_completion(mut command: Command) -> bool {
+fn run_probe_to_completion(mut command: Command) -> ProbeOutcome {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let Ok(mut child) = command.spawn() else {
-        return false;
+        return ProbeOutcome::Refused;
     };
     let deadline = Instant::now() + PROBE_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Err(_) => return false,
+            Ok(Some(status)) if status.success() => return ProbeOutcome::Succeeded,
+            Ok(Some(_)) | Err(_) => return ProbeOutcome::Refused,
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return ProbeOutcome::TimedOut;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
         }
+    }
+}
+
+/// How a probe ended.
+///
+/// `Refused` and `TimedOut` are deliberately separate. A refusal is evidence —
+/// Bubblewrap looked at the request and said no — while a timeout is the
+/// absence of evidence, and attributing a cause to it would send a user on a
+/// loaded machine to fix something that is not broken.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeOutcome {
+    Succeeded,
+    Refused,
+    TimedOut,
+}
+
+impl ProbeOutcome {
+    const fn succeeded(self) -> bool {
+        matches!(self, Self::Succeeded)
     }
 }
 
@@ -1091,55 +1219,75 @@ fn add_runtime_root_mounts(command: &mut Command, runtime: &RuntimeRoots) {
     for root in &runtime.roots {
         command.arg("--ro-bind").arg(root).arg(root);
     }
-    // Every toolchain home the sandbox can reach, not only the ones it mounts
-    // itself: `CARGO_HOME=/usr/local/cargo` in the official Rust images is
-    // carried by the wholesale `/usr` bind, so masking only mounted roots
-    // would leave its token readable in exactly the common containerized case.
-    for home in runtime.toolchain_homes() {
-        mask_toolchain_credentials(command, &home);
+    // The Cargo home the sandbox can reach, not only one Euler mounts itself:
+    // `CARGO_HOME=/usr/local/cargo` in the official Rust images is carried by
+    // the wholesale `/usr` bind, so masking only mounted roots would leave its
+    // token readable in exactly the common containerized case.
+    if let Some(home) = runtime.cargo_home() {
+        mask_cargo_credentials(command, &home);
     }
     for parent in &parents {
         command.arg("--remount-ro").arg(parent);
     }
 }
 
-/// Cover the credential files inside a reachable toolchain home with an empty
+/// Whether a Cargo config declares a token of any kind.
+///
+/// Deliberately over-broad, and deliberately not a TOML parse. A token can be
+/// written as `token = …` under `[registry]`, as a dotted `registry.token` at
+/// top level, inside an inline table, or under a quoted table name — and there
+/// is no TOML parser in this workspace to tell them apart. A Cargo config has
+/// no other legitimate `token` key, so a false positive costs one extra
+/// advisory line while a false negative is a silently exposed credential.
+/// Any line whose key is `token` or ends in `.token` counts.
+///
+/// The value is never read, only the key.
+fn file_declares_a_token(config: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(config) else {
+        return false;
+    };
+    contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .any(line_assigns_a_token_key)
+}
+
+/// Whether one line assigns to a key named `token`.
+///
+/// Scans for the word rather than parsing, so `token =`, `registry.token =`
+/// and `registry = { token = … }` all count while `tokenizer =` does not. The
+/// word must start a key — preceded by nothing, whitespace, a dot, a brace, a
+/// comma or a quote — and be followed by `=`.
+fn line_assigns_a_token_key(line: &str) -> bool {
+    let mut rest = line;
+    while let Some(at) = rest.find("token") {
+        let before = rest[..at].chars().next_back();
+        let starts_key = before.is_none_or(|character| {
+            character.is_whitespace() || matches!(character, '.' | '{' | ',' | '"' | '\'')
+        });
+        let after = rest[at + "token".len()..].trim_start();
+        let after = after
+            .strip_prefix(['"', '\''])
+            .unwrap_or(after)
+            .trim_start();
+        if starts_key && after.starts_with('=') {
+            return true;
+        }
+        rest = &rest[at + "token".len()..];
+    }
+    false
+}
+
+/// Cover the credential files inside the reachable Cargo home with an empty
 /// file. Read-only is not enough: `main` returned ENOENT for a registry token
 /// that the mount would now make readable.
 ///
 /// Only files that exist on the host are masked, because Bubblewrap cannot
 /// create a mount point inside a read-only bind.
-/// Whether a Cargo config declares a registry token.
-///
-/// `[registry]` and `[registries.<name>]` both accept `token`, and Euler only
-/// needs to know that one is present — never its value, which is why this
-/// looks at key names and stops there.
-fn file_declares_a_registry_token(config: &Path) -> bool {
-    let Ok(contents) = std::fs::read_to_string(config) else {
-        return false;
-    };
-    let mut in_registry_table = false;
-    for line in contents.lines() {
-        let line = line.trim();
-        if let Some(table) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            let table = table.trim();
-            in_registry_table = table == "registry" || table.starts_with("registries.");
-            continue;
-        }
-        if in_registry_table
-            && line
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim().trim_matches('"') == "token")
-        {
-            return true;
-        }
-    }
-    false
-}
-
-fn mask_toolchain_credentials(command: &mut Command, root: &Path) {
-    for name in MASKED_TOOLCHAIN_FILES {
-        let path = root.join(name);
+fn mask_cargo_credentials(command: &mut Command, home: &Path) {
+    for name in MASKED_CARGO_FILES {
+        let path = home.join(name);
         if path.is_file() {
             command.arg("--ro-bind-try").arg("/dev/null").arg(path);
         }
@@ -1164,7 +1312,12 @@ fn sandbox_environment(
         (OsString::from("TMPDIR"), OsString::from("/tmp")),
         (OsString::from("PATH"), runtime.sandbox_path()),
     ];
-    environment.extend(runtime.variables.iter().cloned());
+    environment.extend(runtime.variables.iter().map(|(name, value)| {
+        (
+            name.clone(),
+            runtime.sandbox_view(Path::new(value)).into_os_string(),
+        )
+    }));
     environment.extend(extra.iter().cloned());
     environment
 }
@@ -1590,6 +1743,7 @@ mod tests {
             variables: Vec::new(),
             path_entries: Vec::new(),
             home: Some(PathBuf::from("/home/example")),
+            workspace: None,
         };
         assert!(elsewhere
             .read_only_parents()
@@ -1656,9 +1810,10 @@ mod tests {
             variables: vec![(OsString::from("CARGO_HOME"), cargo.clone().into_os_string())],
             path_entries: Vec::new(),
             home: None,
+            workspace: None,
         };
 
-        assert!(runtime.toolchain_homes().contains(&cargo), "{runtime:?}");
+        assert_eq!(runtime.cargo_home().as_deref(), Some(cargo.as_path()));
         assert!(runtime.roots.is_empty(), "{runtime:?}");
     }
 
@@ -1694,6 +1849,46 @@ token = \"secret\"\n",
         assert!(!arguments.contains(&config), "{arguments:?}");
     }
 
+    /// Deliberately over-broad: every spelling Cargo accepts must be caught,
+    /// and there is no TOML parser here to tell them apart.
+    #[test]
+    fn every_spelling_of_a_token_key_is_reported() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config = temp.path().join("config.toml");
+        for declaration in [
+            "[registry]\ntoken = \"secret\"\n",
+            "registry.token = \"secret\"\n",
+            "registry = { token = \"secret\" }\n",
+            "[\"registries\".\"internal\"]\ntoken = \"secret\"\n",
+            "[registries.internal]\n  token   =   \"secret\"\n",
+        ] {
+            std::fs::write(&config, declaration).expect("config");
+            assert!(
+                file_declares_a_token(&config),
+                "missed a token in {declaration:?}"
+            );
+        }
+    }
+
+    /// Cargo still reads the extensionless config, so it is scanned too.
+    #[test]
+    fn the_legacy_cargo_config_filename_is_scanned() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cargo = temp.path().join("home/example/.cargo");
+        std::fs::create_dir_all(&cargo).expect("cargo home");
+        std::fs::write(cargo.join("config"), "[registry]\ntoken = \"secret\"\n")
+            .expect("legacy config");
+        let runtime = RuntimeRoots::from_environment(
+            Some(temp.path().join("home/example")),
+            |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
+            None,
+        );
+
+        let reported = runtime.config_files_holding_a_registry_token();
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert!(reported[0].ends_with("config"), "{reported:?}");
+    }
+
     #[test]
     fn a_config_without_a_registry_token_is_not_reported() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1703,11 +1898,14 @@ token = \"secret\"\n",
             "[build]\njobs = 4\n\n[registries.internal]\nindex = \"https://example.invalid\"\n",
         )
         .expect("config");
-        assert!(!file_declares_a_registry_token(&config));
+        assert!(!file_declares_a_token(&config));
 
-        // A `token` outside a registry table is some other tool's key.
-        std::fs::write(&config, "[http]\ntoken = \"not-a-registry-token\"\n").expect("config");
-        assert!(!file_declares_a_registry_token(&config));
+        // A commented-out declaration is not one.
+        std::fs::write(&config, "# token = \"secret\"\n").expect("config");
+        assert!(!file_declares_a_token(&config));
+        // A key that merely mentions the word is not a token key.
+        std::fs::write(&config, "[build]\ntokenizer = \"x\"\n").expect("config");
+        assert!(!file_declares_a_token(&config));
     }
 
     /// The official Go images set `GOPATH=/go`. Rejecting a two-component
@@ -1734,6 +1932,67 @@ token = \"secret\"\n",
 
     /// A root nested inside another needs one mount and both variables:
     /// dropping `RUSTUP_HOME` breaks every rustup proxy.
+    /// An explicit variable naming one of the profile's own mount points
+    /// would bind over the private `/tmp` the sandbox home, cache and TMPDIR
+    /// live in, and the resulting probe failure would be blamed on /usr.
+    #[test]
+    fn a_toolchain_variable_may_not_name_a_profile_mount_point() {
+        for mount in ["/tmp", "/proc", "/dev"] {
+            if !Path::new(mount).is_dir() {
+                continue;
+            }
+            assert!(
+                usable_runtime_root(Path::new(mount), None, true).is_none(),
+                "{mount} was accepted as a toolchain root"
+            );
+        }
+        let runtime = RuntimeRoots::from_environment(
+            None,
+            |name| (name == "GOPATH").then(|| OsString::from("/tmp")),
+            None,
+        );
+        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        assert!(runtime.variables.is_empty(), "{runtime:?}");
+    }
+
+    /// A per-project toolchain home is not dropped: the directory really is
+    /// there, bound read-write, so unsetting the variable would leave the
+    /// toolchain in plain sight and unusable.
+    #[test]
+    fn a_toolchain_home_inside_the_workspace_is_re_pointed_not_dropped() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        let cargo = workspace.join(".cargo");
+        std::fs::create_dir_all(cargo.join("bin")).expect("workspace cargo home");
+        let path = std::env::join_paths([cargo.join("bin")]).expect("join PATH");
+        let workspace = workspace.canonicalize().expect("canonical workspace");
+        let runtime = RuntimeRoots::from_environment(
+            Some(temp.path().to_path_buf()),
+            |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
+            Some(path),
+        )
+        .excluding(&workspace);
+
+        // No second mount: the workspace bind already carries it.
+        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        let exported = sandbox_environment(&runtime, &[]);
+        assert!(
+            exported.contains(&(
+                OsString::from("CARGO_HOME"),
+                OsString::from("/workspace/.cargo")
+            )),
+            "{exported:?}"
+        );
+        let sandbox_path = runtime.sandbox_path().to_string_lossy().into_owned();
+        assert!(
+            sandbox_path.starts_with("/workspace/.cargo/bin:"),
+            "{sandbox_path}"
+        );
+        // Nothing in the workspace is masked or reported: it is the user's own
+        // project, readable by design.
+        assert!(runtime.cargo_home().is_none(), "{runtime:?}");
+    }
+
     #[test]
     fn a_nested_toolchain_root_keeps_its_variable_and_loses_only_its_mount() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1913,6 +2172,7 @@ token = \"secret\"\n",
             variables: vec![(OsString::from("CARGO_HOME"), cargo.clone().into_os_string())],
             path_entries: Vec::new(),
             home: Some(home.clone()),
+            workspace: None,
         };
         let command = bwrap_command(
             Path::new("/usr/bin/bwrap"),
@@ -1967,7 +2227,10 @@ token = \"secret\"\n",
         assert!(diagnostic.contains("fail closed"), "{diagnostic}");
         // The probe result is fixed for the session's lifetime, so say so
         // rather than let a user fix the host and wonder why nothing changed.
-        assert!(diagnostic.contains("once per session"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("cached for this process"),
+            "{diagnostic}"
+        );
         assert!(SandboxStatus::Host.diagnostic().is_none());
         assert_eq!(SandboxStatus::Host.backend_label(), "host");
         assert_eq!(SandboxStatus::Enforced.backend_label(), "bwrap");
@@ -2135,6 +2398,7 @@ token = \"secret\"\n",
         fs::create_dir(&workspace).expect("workspace");
         let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork);
         if !sandbox.availability().is_enforced() {
+            eprintln!("skipped: the sandbox is unavailable on this host");
             return;
         }
         fs::write(
@@ -2181,6 +2445,7 @@ token = \"secret\"\n",
         fs::create_dir(&workspace).expect("workspace");
         let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork);
         if !sandbox.availability().is_enforced() {
+            eprintln!("skipped: the sandbox is unavailable on this host");
             return;
         }
 

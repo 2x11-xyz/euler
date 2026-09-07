@@ -709,12 +709,10 @@ pub fn resume_session_from_folded_prefix<D>(
         // A resumed session may be on a different host than the one that
         // wrote `session.start`, so the boundary records the backend it
         // actually got rather than letting a reader assume the original.
-        crate::SandboxStatus::from_availability(match config.subprocess_sandbox {
-            crate::SubprocessSandbox::Host => None,
-            crate::SubprocessSandbox::Enforce(_) => {
-                Some(crate::probe_workspace_sandbox(&config.root))
-            }
-        }),
+        match config.subprocess_sandbox {
+            crate::SubprocessSandbox::Host => crate::SandboxStatus::Host,
+            crate::SubprocessSandbox::Enforce(_) => crate::probe_workspace_sandbox(&config.root),
+        },
     );
     writer
         .arm_resume_marker(resume_marker)

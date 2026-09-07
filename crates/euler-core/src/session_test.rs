@@ -2517,7 +2517,8 @@ fn session_config_forwards_requested_subprocess_sandbox_to_tool_registry() {
         ScriptedDecider::new(Vec::new()),
     );
 
-    assert_eq!(session.tools.sandbox_availability(), Some(expected));
+    assert_eq!(session.sandbox_status(), expected);
+    assert!(session.tools.sandbox_availability().is_some());
 }
 
 /// ADR 0021 row A′: the backend that actually ran is provenance, so a reader
@@ -2527,10 +2528,10 @@ fn session_config_forwards_requested_subprocess_sandbox_to_tool_registry() {
 fn session_start_records_the_probed_sandbox_backend() {
     let temp = tempfile::tempdir().expect("temp dir");
     let config = SessionConfig::new(temp.path());
-    let expected = crate::SandboxStatus::from_availability(match config.subprocess_sandbox {
-        SubprocessSandbox::Host => None,
-        SubprocessSandbox::Enforce(_) => Some(probe_workspace_sandbox(temp.path())),
-    });
+    let expected = match config.subprocess_sandbox {
+        SubprocessSandbox::Host => crate::SandboxStatus::Host,
+        SubprocessSandbox::Enforce(_) => probe_workspace_sandbox(temp.path()),
+    };
 
     let session = Session::new(
         config,
