@@ -5,6 +5,12 @@
 //! implies, and no host home or network. It is an execution boundary, not a
 //! synonym for permission approval.
 //!
+//! Residual: a Cargo `config.toml` in a mounted toolchain home may itself
+//! declare a registry token. That file is not masked — it carries the registry
+//! sources and build settings a build needs, and breaking the build to hide a
+//! token the user can move is strictness the user would feel. The profile
+//! detects it and says so once at session start instead.
+//!
 //! Bubblewrap is the default and enforced backend on Linux (ADR 0021 row A′).
 //! Off Linux there is no backend yet, so agent subprocesses run on the host
 //! under the ordinary permission decider until the Seatbelt backend lands;
@@ -142,6 +148,8 @@ pub enum SandboxFailureCause {
     Wsl1,
     /// `bwrap` predates a flag the profile requires.
     BubblewrapTooOld,
+    /// Namespaces work, but this host would not give the profile its mounts.
+    ProfileMountsRejected,
     /// The workspace root is not a directory Euler can resolve.
     InvalidWorkspace,
     /// This platform has no sandbox backend at all.
@@ -168,6 +176,10 @@ impl SandboxFailureCause {
             Self::BubblewrapTooOld => {
                 "the installed Bubblewrap is older than 0.8.0 and cannot enforce this profile"
             }
+            Self::ProfileMountsRejected => {
+                "Bubblewrap can create namespaces on this host, but could not set up the \
+profile's mounts for this workspace"
+            }
             Self::InvalidWorkspace => "the workspace root is not an accessible directory",
             Self::UnsupportedPlatform => "this platform has no sandbox backend yet",
             Self::Unattributed => "Bubblewrap could not create a user namespace",
@@ -176,11 +188,21 @@ impl SandboxFailureCause {
 
     /// The cause implied by a reason on its own, for a failure that was not
     /// classified by a probe.
+    ///
+    /// `CannotEnforce` is the ambiguous one. When the backend probe already
+    /// created a namespace, the profile's failure is about its mounts, and
+    /// sending the user to namespace sysctls that demonstrably work is the
+    /// misdiagnosis the two probes exist to avoid.
     pub fn for_reason(reason: SandboxUnavailableReason) -> Self {
         match reason {
             SandboxUnavailableReason::BubblewrapMissing => Self::BubblewrapMissing,
             SandboxUnavailableReason::InvalidWorkspace => Self::InvalidWorkspace,
             SandboxUnavailableReason::UnsupportedPlatform => Self::UnsupportedPlatform,
+            SandboxUnavailableReason::CannotEnforce
+                if probe_sandbox_backend() == SandboxStatus::Enforced =>
+            {
+                Self::ProfileMountsRejected
+            }
             SandboxUnavailableReason::CannotEnforce => user_namespace_failure_cause(),
         }
     }
@@ -204,6 +226,10 @@ and `sudo sysctl -w user.max_user_namespaces=15000`"
             Self::BubblewrapTooOld => {
                 "install bubblewrap 0.8.0 or newer, or use the bundled build tracked in \
 https://github.com/2x11-xyz/euler/issues/230"
+            }
+            Self::ProfileMountsRejected => {
+                "check that /usr, /etc and the workspace are readable and that the workspace \
+is not on a filesystem Bubblewrap cannot bind, such as an unusual FUSE mount"
             }
             Self::InvalidWorkspace => {
                 "start Euler in a directory that exists and that you can read"
@@ -367,6 +393,23 @@ impl WorkspaceSandbox {
 
     pub(crate) const fn availability(&self) -> SandboxAvailability {
         self.availability
+    }
+
+    /// One line per toolchain config that still holds a registry token the
+    /// sandbox cannot mask. Empty is the ordinary case.
+    pub(crate) fn advisories(&self) -> Vec<String> {
+        self.runtime
+            .config_files_holding_a_registry_token()
+            .into_iter()
+            .map(|config| {
+                format!(
+                    "note: {} declares a registry token, and agent commands can read it inside \
+the sandbox. Euler masks `credentials.toml` but not `config.toml`, which also carries the \
+registry and build settings a build needs. Move the token to `credentials.toml` to hide it.",
+                    config.display()
+                )
+            })
+            .collect()
     }
 
     /// Wrap one program invocation in the enforced profile. The caller owns
@@ -544,7 +587,12 @@ impl RuntimeRoots {
             let candidate = variable(name)
                 .map(PathBuf::from)
                 .or_else(|| home.as_ref().map(|home| home.join(conventional)));
-            let Some(root) = candidate.and_then(|root| usable_runtime_root(&root, home.as_deref()))
+            // A home-relative default is a guess, so it must be a real
+            // subtree; a value the user set explicitly is a statement, and
+            // the official Go images set `GOPATH=/go`.
+            let explicit = variable(name).is_some();
+            let Some(root) =
+                candidate.and_then(|root| usable_runtime_root(&root, home.as_deref(), explicit))
             else {
                 continue;
             };
@@ -557,7 +605,7 @@ impl RuntimeRoots {
             }
         }
         for root in SYSTEM_TOOLCHAIN_ROOTS {
-            if let Some(root) = usable_runtime_root(Path::new(root), home.as_deref()) {
+            if let Some(root) = usable_runtime_root(Path::new(root), home.as_deref(), false) {
                 if !RUNTIME_MOUNTS.iter().any(|mount| root.starts_with(mount)) {
                     roots.push(root);
                 }
@@ -591,6 +639,34 @@ impl RuntimeRoots {
             kept.push(root);
         }
         self.roots = kept;
+    }
+
+    /// Every toolchain home the sandbox can reach, whether it mounts it or
+    /// the system runtime already carries it. Deduplicated, because a
+    /// variable's value is usually also a mounted root.
+    fn toolchain_homes(&self) -> Vec<PathBuf> {
+        let mut homes = self
+            .roots
+            .iter()
+            .cloned()
+            .chain(self.variables.iter().map(|(_, value)| PathBuf::from(value)))
+            .filter(|home| self.reachable(home))
+            .collect::<Vec<_>>();
+        homes.sort();
+        homes.dedup();
+        homes
+    }
+
+    /// Cargo also accepts a registry token in `config.toml`, which Euler does
+    /// not mask: that file carries registry sources and build settings, so
+    /// masking it would break the build. Report it instead, so the user can
+    /// move the token to `credentials.toml`, which is masked.
+    pub(crate) fn config_files_holding_a_registry_token(&self) -> Vec<PathBuf> {
+        self.toolchain_homes()
+            .into_iter()
+            .map(|home| home.join("config.toml"))
+            .filter(|config| file_declares_a_registry_token(config))
+            .collect()
     }
 
     /// Every path the sandbox can reach read-only: the roots it mounts plus
@@ -685,11 +761,19 @@ impl RuntimeRoots {
     }
 }
 
-/// Accept a toolchain root only when it is an existing directory that is
-/// neither the home itself nor a top-level directory.
-fn usable_runtime_root(root: &Path, home: Option<&Path>) -> Option<PathBuf> {
+/// Accept a toolchain root only when it is an existing directory that is not
+/// the home itself.
+///
+/// A depth of at least two guards a *guessed* root: `$HOME/go` is a guess, and
+/// a one-component guess would be a whole top-level directory. An `explicit`
+/// root came from a toolchain variable the user or image set, so a
+/// two-component path like the Go images' `GOPATH=/go` is an answer, not an
+/// accident. Neither form may be the home, and callers still exclude anything
+/// already carried by a system runtime mount.
+fn usable_runtime_root(root: &Path, home: Option<&Path>, explicit: bool) -> Option<PathBuf> {
     let root = root.canonicalize().ok()?;
-    if !root.is_dir() || root.components().count() <= MIN_RUNTIME_ROOT_COMPONENTS {
+    let depth = root.components().count();
+    if !root.is_dir() || depth <= 1 || (!explicit && depth <= MIN_RUNTIME_ROOT_COMPONENTS) {
         return None;
     }
     if home.is_some_and(|home| home == root || home.starts_with(&root)) {
@@ -752,29 +836,35 @@ fn probe_sandbox_backend_uncached() -> SandboxStatus {
     if run_probe_to_completion(command) {
         return SandboxStatus::Enforced;
     }
-    let cause = if supports_profile_isolation_flags(&bwrap) {
-        user_namespace_failure_cause()
-    } else {
-        SandboxFailureCause::BubblewrapTooOld
-    };
     SandboxStatus::Unavailable {
         reason: SandboxUnavailableReason::CannotEnforce,
-        cause,
+        cause: attribute_isolation_failure(&bwrap),
     }
 }
 
-/// Whether this Bubblewrap accepts every isolation flag the profile requires.
-/// `bwrap --help` lists the flags it knows, so no namespace has to be created
-/// to find out.
-fn supports_profile_isolation_flags(bwrap: &Path) -> bool {
-    let Ok(output) = Command::new(bwrap).arg("--help").output() else {
-        return false;
-    };
-    let help = String::from_utf8_lossy(&output.stdout);
-    PROFILE_ISOLATION_FLAGS
-        .iter()
-        .filter(|flag| flag.starts_with("--"))
-        .all(|flag| help.contains(flag))
+/// Decide why the isolation flags failed, by trying the same probe without
+/// the newest one.
+///
+/// `--disable-userns` needs Bubblewrap 0.8.0. If dropping it makes an
+/// otherwise identical probe succeed, the flag is what this build lacks;
+/// if the probe still fails, the namespace itself is the problem. Asking
+/// `bwrap --help` instead would depend on which stream a build prints to
+/// and on flag names appearing verbatim in prose.
+fn attribute_isolation_failure(bwrap: &Path) -> SandboxFailureCause {
+    let mut command = Command::new(bwrap);
+    command.env_clear();
+    mark_inherited_fds_close_on_exec(&mut command);
+    command.args(
+        PROFILE_ISOLATION_FLAGS
+            .iter()
+            .filter(|flag| **flag != "--disable-userns"),
+    );
+    command.args(["--unshare-net", "--ro-bind", "/", "/", "/bin/true"]);
+    if run_probe_to_completion(command) {
+        SandboxFailureCause::BubblewrapTooOld
+    } else {
+        user_namespace_failure_cause()
+    }
 }
 
 /// Attribute a user-namespace failure to something the user can verify and
@@ -1000,19 +1090,53 @@ fn add_runtime_root_mounts(command: &mut Command, runtime: &RuntimeRoots) {
     }
     for root in &runtime.roots {
         command.arg("--ro-bind").arg(root).arg(root);
-        mask_toolchain_credentials(command, root);
+    }
+    // Every toolchain home the sandbox can reach, not only the ones it mounts
+    // itself: `CARGO_HOME=/usr/local/cargo` in the official Rust images is
+    // carried by the wholesale `/usr` bind, so masking only mounted roots
+    // would leave its token readable in exactly the common containerized case.
+    for home in runtime.toolchain_homes() {
+        mask_toolchain_credentials(command, &home);
     }
     for parent in &parents {
         command.arg("--remount-ro").arg(parent);
     }
 }
 
-/// Cover the credential files inside a mounted toolchain home with an empty
+/// Cover the credential files inside a reachable toolchain home with an empty
 /// file. Read-only is not enough: `main` returned ENOENT for a registry token
 /// that the mount would now make readable.
 ///
 /// Only files that exist on the host are masked, because Bubblewrap cannot
 /// create a mount point inside a read-only bind.
+/// Whether a Cargo config declares a registry token.
+///
+/// `[registry]` and `[registries.<name>]` both accept `token`, and Euler only
+/// needs to know that one is present — never its value, which is why this
+/// looks at key names and stops there.
+fn file_declares_a_registry_token(config: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(config) else {
+        return false;
+    };
+    let mut in_registry_table = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(table) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            let table = table.trim();
+            in_registry_table = table == "registry" || table.starts_with("registries.");
+            continue;
+        }
+        if in_registry_table
+            && line
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim().trim_matches('"') == "token")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn mask_toolchain_credentials(command: &mut Command, root: &Path) {
     for name in MASKED_TOOLCHAIN_FILES {
         let path = root.join(name);
@@ -1520,6 +1644,94 @@ mod tests {
         assert!(runtime.path_entries.contains(&cargo.join("bin")));
     }
 
+    /// The containerized Rust images put `CARGO_HOME` under `/usr/local`,
+    /// where the wholesale `/usr` bind carries it and no root of Euler's own
+    /// is mounted. Masking only mounted roots would leave the token readable
+    /// in exactly that common case.
+    #[test]
+    fn credentials_are_masked_in_a_toolchain_home_the_system_runtime_carries() {
+        let cargo = PathBuf::from("/usr/local/cargo");
+        let runtime = RuntimeRoots {
+            roots: Vec::new(),
+            variables: vec![(OsString::from("CARGO_HOME"), cargo.clone().into_os_string())],
+            path_entries: Vec::new(),
+            home: None,
+        };
+
+        assert!(runtime.toolchain_homes().contains(&cargo), "{runtime:?}");
+        assert!(runtime.roots.is_empty(), "{runtime:?}");
+    }
+
+    /// Cargo accepts a registry token in `config.toml` too, which is not
+    /// masked because a build needs that file. Say so rather than hide it.
+    #[test]
+    fn a_registry_token_in_config_toml_is_reported_not_masked() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cargo = temp.path().join("home/example/.cargo");
+        std::fs::create_dir_all(&cargo).expect("cargo home");
+        std::fs::write(
+            cargo.join("config.toml"),
+            "[build]\njobs = 4\n\n[registries.internal]\nindex = \"https://example.invalid\"\n\
+token = \"secret\"\n",
+        )
+        .expect("config");
+        let runtime = RuntimeRoots::from_environment(
+            Some(temp.path().join("home/example")),
+            |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
+            None,
+        );
+
+        let reported = runtime.config_files_holding_a_registry_token();
+        assert_eq!(reported.len(), 1, "{reported:?}");
+        assert!(reported[0].ends_with("config.toml"), "{reported:?}");
+
+        let mut command = Command::new("/usr/bin/bwrap");
+        add_runtime_root_mounts(&mut command, &runtime);
+        let arguments = command_arguments(&command);
+        let config = reported[0].to_string_lossy().into_owned();
+        // Reported, never masked: masking it would take the registry sources
+        // and build settings with it.
+        assert!(!arguments.contains(&config), "{arguments:?}");
+    }
+
+    #[test]
+    fn a_config_without_a_registry_token_is_not_reported() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let config = temp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[build]\njobs = 4\n\n[registries.internal]\nindex = \"https://example.invalid\"\n",
+        )
+        .expect("config");
+        assert!(!file_declares_a_registry_token(&config));
+
+        // A `token` outside a registry table is some other tool's key.
+        std::fs::write(&config, "[http]\ntoken = \"not-a-registry-token\"\n").expect("config");
+        assert!(!file_declares_a_registry_token(&config));
+    }
+
+    /// The official Go images set `GOPATH=/go`. Rejecting a two-component
+    /// explicit root leaves the toolchain unusable while the session records
+    /// `bwrap`.
+    #[test]
+    fn an_explicit_toolchain_variable_may_name_a_two_component_root() {
+        // `/usr` stands in for `/go`: two components, and a real directory
+        // on both platforms so canonicalization does not change its depth.
+        let two_component = Path::new("/usr");
+
+        assert!(
+            usable_runtime_root(two_component, None, true).is_some(),
+            "an explicit two-component root is an answer"
+        );
+        assert!(
+            usable_runtime_root(two_component, None, false).is_none(),
+            "a guessed two-component root is not"
+        );
+        // Neither form may be the home itself, or `/`.
+        assert!(usable_runtime_root(two_component, Some(two_component), true).is_none());
+        assert!(usable_runtime_root(Path::new("/"), None, true).is_none());
+    }
+
     /// A root nested inside another needs one mount and both variables:
     /// dropping `RUSTUP_HOME` breaks every rustup proxy.
     #[test]
@@ -1911,8 +2123,11 @@ mod tests {
     #[test]
     fn a_c_program_compiles_links_and_runs_inside_the_sandbox() {
         // A bare container may have no compiler at all; that is not a
-        // sandbox failure.
-        if !Path::new("/usr/bin/cc").exists() {
+        // sandbox failure. `symlink_metadata` deliberately: `cc` is itself a
+        // symlink into /etc/alternatives, so `exists` would follow it and
+        // report "no compiler" on exactly the broken-/etc host this test
+        // exists to catch.
+        if fs::symlink_metadata("/usr/bin/cc").is_err() {
             return;
         }
         let temp = tempfile::tempdir().expect("temp dir");
@@ -1980,9 +2195,16 @@ mod tests {
             "resolving the current user failed inside the sandbox: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains(&host),
-            "sandbox user name does not match the host's {host}: {output:?}"
+        // Trimmed equality, not `contains`: a sandbox that resolved every
+        // uid to `nobody` would pass a substring check whenever the host name
+        // happened to be a substring of the answer.
+        let sandboxed = String::from_utf8_lossy(&output.stdout);
+        let sandboxed = strip_sandbox_ready_marker(&sandboxed)
+            .expect("sandbox readiness marker")
+            .trim();
+        assert_eq!(
+            sandboxed, host,
+            "sandbox user name does not match the host's"
         );
     }
 

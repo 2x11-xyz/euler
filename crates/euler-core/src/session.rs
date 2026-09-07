@@ -5866,6 +5866,12 @@ impl<D: PermissionDecider> Session<D> {
     pub fn sandbox_status(&self) -> SandboxStatus {
         self.tools.sandbox_status()
     }
+
+    /// Things the sandbox profile can see but cannot fix, surfaced once at
+    /// startup beside its diagnostic.
+    pub fn sandbox_advisories(&self) -> Vec<String> {
+        self.tools.sandbox_advisories()
+    }
 }
 
 /// The `session.start` payload for a fresh session, including the compact

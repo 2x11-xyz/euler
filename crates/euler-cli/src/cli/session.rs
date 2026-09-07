@@ -111,6 +111,9 @@ fn report_sandbox_status<D: euler_core::PermissionDecider>(session: &Session<D>)
     if let Some(diagnostic) = session.sandbox_status().diagnostic() {
         eprintln!("{diagnostic}");
     }
+    for advisory in session.sandbox_advisories() {
+        eprintln!("{advisory}");
+    }
 }
 
 /// A short folder label for the acknowledgment card's title corner.

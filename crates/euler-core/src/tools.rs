@@ -311,6 +311,15 @@ impl ToolRegistry {
         SandboxStatus::from_availability(self.sandbox_availability())
     }
 
+    /// Things the profile can see but cannot fix, worth saying once. Empty
+    /// unless a sandbox was requested and something is worth reporting.
+    pub fn sandbox_advisories(&self) -> Vec<String> {
+        self.workspace_sandbox
+            .as_ref()
+            .map(WorkspaceSandbox::advisories)
+            .unwrap_or_default()
+    }
+
     pub fn set_frozen_skills(&mut self, skills: impl IntoIterator<Item = FrozenSkill>) {
         self.skills = skills
             .into_iter()
@@ -953,6 +962,7 @@ impl ToolRegistry {
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         let cancelled = outcome.termination == ProcessTermination::Cancelled;
         let text = collected_agent_output(outcome.stdout, outcome.stderr, sandboxed, cancelled)?;
+        let text = format!("{text}{}", self.submodule_notice());
         let status = match outcome.termination {
             ProcessTermination::Exited(status) => status,
             ProcessTermination::Cancelled => -1,
@@ -976,6 +986,24 @@ impl ToolRegistry {
         } else {
             ToolExecutionOutcome::Completed(execution)
         })
+    }
+
+    /// Say what the submodule neutralization costs, where it costs anything.
+    ///
+    /// `diff.ignoreSubmodules=dirty` is what stops the recursive spawn that
+    /// would run a driver configured in a submodule's own config, so it
+    /// stays. But it also hides worktree edits inside a submodule, and an
+    /// agent told its changes do not exist is the silent loss ADR 0021 row E
+    /// exists to prevent. `.gitmodules` is the declaration of submodules, so
+    /// its presence is the cheap test for "this costs something here".
+    fn submodule_notice(&self) -> &'static str {
+        if self.root.join(".gitmodules").is_file() {
+            "\nnote: changes inside submodule worktrees are not shown here, because Euler does \
+not let git recurse into submodules; run `git status` or `git diff` inside the submodule to \
+see them.\n"
+        } else {
+            ""
+        }
     }
 
     /// Probe this repository for the two pieces of configuration Git turns
