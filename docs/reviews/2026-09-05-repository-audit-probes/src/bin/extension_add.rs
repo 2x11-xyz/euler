@@ -12,6 +12,7 @@ fn main() {
             display_name: "Audit".into(),
             version: "0.0.0".into(),
             runtime_kind: "managed-process".into(),
+            request_tick: None,
             capabilities: vec![],
             commands: vec![],
             observer: None,
