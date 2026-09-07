@@ -7682,3 +7682,119 @@ fn a_restore_into_a_removed_directory_names_the_missing_path() {
     );
     assert!(error.to_string().contains("no longer exists"), "{error}");
 }
+
+#[test]
+fn a_restore_over_uncheckpointable_content_reports_it_cannot_be_undone() {
+    // Secret-like content is deliberately never stored as a pre-image, so a
+    // restore over it has no way back. Claiming `undoable` would promise an
+    // undo `/rollback` will never list.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    std::fs::write(&note, "prefix\nalpha\nsuffix\n").expect("fixture");
+    let mut session = run_note_edit(temp.path(), "alpha", "beta");
+    let checkpoint_id = session.workspace_checkpoints()[0].event_id.clone();
+    let secret = "const API_KEY = \"abc\";\n";
+    std::fs::write(&note, secret).expect("user replaces it with secret-like content");
+
+    // The ledger's newest write is what the restore verifies against, so
+    // reflect the user's edit as the recorded baseline first.
+    session.bus.push(EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::FILE_CHANGE,
+        object([
+            ("origin", "run_shell".into()),
+            ("action", "modify".into()),
+            ("path", "note.txt".into()),
+            (
+                "after_sha256",
+                crate::tools::hash_bytes(secret.as_bytes()).into(),
+            ),
+        ]),
+    ));
+
+    let outcome = session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect("the restore itself still happens");
+
+    assert!(
+        !outcome.undoable,
+        "no pre-image was stored, so this restore cannot be rolled back"
+    );
+    let restore_change = *events_of_kind(session.events(), EventKind::FILE_CHANGE)
+        .last()
+        .expect("the restore recorded its own change");
+    assert!(!restore_change.payload.contains_key("pre_image_blob"));
+    assert!(session
+        .workspace_checkpoints()
+        .iter()
+        .all(|entry| entry.event_id != restore_change.id));
+}
+
+#[test]
+fn restore_rows_link_their_checkpoint_without_a_tool_call_id() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join("note.txt"), "prefix\nalpha\nsuffix\n").expect("fixture");
+    let mut session = run_note_edit(temp.path(), "alpha", "beta");
+    let checkpoint_id = session.workspace_checkpoints()[0].event_id.clone();
+    session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect("restore");
+
+    let prepared = *events_of_kind(session.events(), EventKind::CHECKPOINT_STORED)
+        .last()
+        .expect("the restore stored its own pre-image");
+    let change = *events_of_kind(session.events(), EventKind::FILE_CHANGE)
+        .last()
+        .expect("the restore recorded its own change");
+    for row in [prepared, change] {
+        assert!(
+            !row.payload.contains_key("tool_call_id"),
+            "no tool call produced a restore: {:?}",
+            row.kind
+        );
+        assert_eq!(
+            row.payload
+                .get("restored_checkpoint_event_id")
+                .and_then(Value::as_str),
+            Some(checkpoint_id.as_str())
+        );
+    }
+}
+
+#[test]
+fn the_rollback_baseline_matches_an_equivalent_path_spelling() {
+    // `PatchEvents.path` is the model's own string, so the same file can be
+    // recorded as `note.txt` and `./note.txt`. Comparing raw strings would
+    // miss the later write and refuse the restore for no reason.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let note = temp.path().join("note.txt");
+    std::fs::write(&note, "prefix\nalpha\nsuffix\n").expect("fixture");
+    let mut session = run_note_edit(temp.path(), "alpha", "beta");
+    let checkpoint_id = session.workspace_checkpoints()[0].event_id.clone();
+    let after = "prefix\nbeta\nsuffix\n";
+    session.bus.push(EventEnvelope::new(
+        "session",
+        "agent",
+        None,
+        EventKind::FILE_CHANGE,
+        object([
+            ("origin", "run_shell".into()),
+            ("action", "modify".into()),
+            ("path", "./note.txt".into()),
+            (
+                "after_sha256",
+                crate::tools::hash_bytes(after.as_bytes()).into(),
+            ),
+        ]),
+    ));
+
+    session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect("an equivalent spelling of the same path is the same baseline");
+    assert_eq!(
+        std::fs::read_to_string(&note).expect("read"),
+        "prefix\nalpha\nsuffix\n"
+    );
+}

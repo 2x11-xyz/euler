@@ -2472,33 +2472,6 @@ fn public_tool_surface_has_no_plural_root_symbols() {
 }
 
 #[test]
-fn a_create_that_cannot_be_made_durable_leaves_no_partial_file() {
-    use crate::durability::fault::{arm_matching, Op};
-
-    let temp = tempfile::tempdir().expect("temp dir");
-    let registry = ToolRegistry::new(temp.path());
-    let execution = registry
-        .execute(
-            "write_file",
-            &json!({"path": "new.txt", "content": "agent"}),
-        )
-        .expect("prepare create");
-
-    let guard = arm_matching(Op::FileSync, |path| path.ends_with("new.txt"));
-    let error = registry
-        .apply_patch(execution.patch.as_ref().expect("patch"))
-        .expect_err("an undurable create must not be reported as applied");
-    assert!(guard.fired());
-    drop(guard);
-
-    assert!(matches!(error, ToolError::Io(_)), "{error}");
-    assert!(
-        !temp.path().join("new.txt").exists(),
-        "the created name must be removed again, not left partial"
-    );
-}
-
-#[test]
 fn a_directory_sync_failure_does_not_undo_a_published_write() {
     use crate::durability::fault::{arm_matching, Op};
 
@@ -2607,4 +2580,146 @@ fn an_ordinary_write_reports_no_durability_caveat() {
             .expect("apply");
         assert!(warning.is_none(), "{tool} reported {warning:?}");
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_target_is_refused_rather_than_replaced() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    // Publishing by rename makes the kernel check the directory, not the
+    // file, so without an explicit check `chmod a-w` would stop protecting
+    // anything — where an in-place write correctly failed EACCES.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("generated.rs");
+    fs::write(&target, "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "generated.rs", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o444)).expect("chmod a-w");
+
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("a read-only file must not be replaced");
+
+    assert!(
+        matches!(&error, ToolError::ReadOnlyTarget { subject, .. } if *subject == "the file"),
+        "{error}"
+    );
+    assert_eq!(fs::read_to_string(&target).unwrap(), "old\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_directory_is_refused_before_anything_is_recorded() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let nested = temp.path().join("src");
+    fs::create_dir(&nested).expect("dir");
+    fs::write(nested.join("note.txt"), "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "src/note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o555)).expect("chmod a-w dir");
+
+    let error = registry
+        .ensure_patch_writable(edit.patch.as_ref().expect("patch"))
+        .expect_err("a read-only directory cannot receive a new entry");
+
+    // Restore write permission so the fixture can be cleaned up.
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).expect("restore");
+    assert!(
+        matches!(&error, ToolError::ReadOnlyTarget { subject, .. } if *subject == "its directory"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn model_visible_paths_stay_workspace_relative_and_sanitized() {
+    // An error the model reads must not disclose the host root.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let fifo = temp.path().join("host.fifo");
+    let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path");
+    // SAFETY: the path is a valid NUL-terminated pathname inside the fixture.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let registry = ToolRegistry::new(temp.path());
+
+    let error = registry
+        .execute("read_file", &json!({"path": "host.fifo"}))
+        .expect_err("a FIFO is not a regular file");
+    let message = error.to_string();
+
+    assert!(message.contains("host.fifo"), "{message}");
+    assert!(
+        !message.contains(&*temp.path().to_string_lossy()),
+        "the host root must not appear: {message}"
+    );
+}
+
+#[test]
+fn a_failed_checkpoint_blob_write_leaves_no_temporary() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let guard = arm_matching(Op::FileSync, |path| {
+        path.parent()
+            .is_some_and(|parent| parent.ends_with(".euler/checkpoints"))
+    });
+    let stored = crate::checkpoints::store_pre_image(temp.path(), "note.txt", "content\n");
+    assert!(guard.fired());
+    drop(guard);
+
+    assert!(stored.is_err(), "an undurable checkpoint must not succeed");
+    let leftovers = fs::read_dir(temp.path().join(".euler/checkpoints"))
+        .expect("checkpoint dir")
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(leftovers, 0, "a failed blob write must clean up its temp");
+}
+
+#[test]
+fn a_create_publishes_atomically_and_still_refuses_a_racing_name() {
+    use crate::durability::fault::{arm_matching, Op};
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let execution = registry
+        .execute(
+            "write_file",
+            &json!({"path": "new.txt", "content": "agent"}),
+        )
+        .expect("prepare create");
+
+    // A crash mid-fill must leave no partial file under the real name; one
+    // would also block every retry, since the no-clobber rule would refuse
+    // the name it left behind.
+    let guard = arm_matching(Op::FileSync, |path| {
+        path.to_string_lossy().contains(".euler-write-")
+    });
+    let error = registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect_err("an undurable create is not applied");
+    assert!(guard.fired());
+    drop(guard);
+    assert!(matches!(error, ToolError::Io(_)), "{error}");
+    assert!(!temp.path().join("new.txt").exists());
+
+    // The retry succeeds, and a name that appears first still wins.
+    registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect("the retry is unobstructed");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("new.txt")).unwrap(),
+        "agent"
+    );
 }

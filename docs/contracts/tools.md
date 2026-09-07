@@ -153,9 +153,10 @@ so the structured tools fail closed there rather than opening a joined path.
   durable, and are then renamed over the target name; the directory is synced
   afterwards. The target is only ever its complete old content or its complete
   new content, never a truncated intermediate, so a crash or an I/O failure
-  mid-write cannot leave a partial file. A create is the same promise by a
-  different route: `O_EXCL` reserves the name, and a failure before the
-  content is durable removes it again.
+  mid-write cannot leave a partial file. A create works the same way and adds
+  a no-replace rename (`renameat2 RENAME_NOREPLACE` on Linux, `renameatx_np
+  RENAME_EXCL` on macOS), so it publishes atomically and still refuses a name
+  that appeared after the call was prepared.
   The replacement inherits the old file's permission bits masked to `0o777`
   (setuid, setgid, and the sticky bit are never carried onto agent-written
   content) and, where the process has the privilege, its ownership. Extended
@@ -166,9 +167,16 @@ so the structured tools fail closed there rather than opening a joined path.
   `cargo vendor`, `cp -al`) is allowed, stays confined, and silently breaks
   the link — the alias keeps the pre-edit bytes.
   A crash between creating the temporary file and renaming it can leave a
-  `.euler-write-<id>.tmp` sibling. The next structured write in that
-  directory removes stale ones, and workspace observation never reports them
-  as file changes.
+  `.euler-write-<id>.tmp` sibling. Nothing sweeps them: enumerating the
+  directory by path would break the fd-anchored rule, and unlinking by name
+  could delete a concurrent Euler's in-flight temporary. Workspace
+  observation ignores the name shape instead, so a leftover is never reported
+  as a change; deleting one is safe and left to the user.
+- **A read-only target is refused, not replaced.** Publishing by rename makes
+  the kernel check the directory rather than the file, so a write to a file
+  the user made read-only (`chmod a-w`), or into a read-only directory, is
+  refused before any checkpoint is recorded — matching what an in-place write
+  would have done.
 - **A published write is applied.** Once the rename succeeds the change is
   present. If the directory entry cannot then be made durable, the tool still
   succeeds and carries a durability warning; it is never reported as a failed

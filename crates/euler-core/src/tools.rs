@@ -76,6 +76,8 @@ pub enum ToolError {
         "file `{path}` changed after this write was prepared; read it again and prepare a new edit"
     )]
     StalePreparedWrite { path: String },
+    #[error("cannot write `{path}`: {subject} is read-only")]
+    ReadOnlyTarget { path: String, subject: &'static str },
     #[error("unsupported tool `{0}`")]
     Unsupported(String),
     #[error("replacement text matched {0} times; expected exactly one")]
@@ -165,8 +167,11 @@ impl ResolvedWorkspacePath {
         self.root.join(&self.relative)
     }
 
+    /// The model-visible form of this path: workspace-relative, control
+    /// characters scrubbed and length capped by [`display_path`]. The host
+    /// root never appears in a tool error or a durability warning.
     fn display(&self) -> String {
-        self.absolute().to_string_lossy().into_owned()
+        display_path(&self.relative.to_string_lossy())
     }
 
     /// Resolve this target to a descriptor on its confined parent directory.
@@ -776,6 +781,15 @@ impl ToolRegistry {
         write_confined(&path, content, expected)
     }
 
+    /// Refuse a prepared patch whose target cannot be written, before any
+    /// checkpoint is stored or recorded for it.
+    pub(crate) fn ensure_patch_writable(&self, patch: &PatchEvents) -> Result<(), ToolError> {
+        if patch.action == "add" {
+            return Ok(());
+        }
+        ensure_writable(&patch.target.confine()?, &patch.target)
+    }
+
     /// Read a workspace-relative path through the confined structured open
     /// (used by `/rollback` to see what it is about to replace).
     pub(crate) fn read_workspace_file(&self, relative: &str) -> Result<String, ToolError> {
@@ -1038,6 +1052,22 @@ pub(crate) enum ExpectedTarget<'a> {
     Exactly(&'a str),
 }
 
+/// Refuse a write the filesystem would not have allowed in place.
+fn ensure_writable(
+    target: &structured_file::ConfinedTarget,
+    path: &ResolvedWorkspacePath,
+) -> Result<(), ToolError> {
+    let subject = match target.writability()? {
+        structured_file::Writability::Writable => return Ok(()),
+        structured_file::Writability::ReadOnlyFile => "the file",
+        structured_file::Writability::ReadOnlyDirectory => "its directory",
+    };
+    Err(ToolError::ReadOnlyTarget {
+        path: path.display(),
+        subject,
+    })
+}
+
 /// Perform a structured write on a confined target.
 ///
 /// A create opens the final name with `O_CREAT | O_EXCL`, so a file that
@@ -1062,6 +1092,7 @@ fn write_confined(
             }
         })?,
         ExpectedTarget::Exactly(expected) => {
+            ensure_writable(&target, path)?;
             let current = target.open_read()?;
             let metadata = current.metadata()?;
             if !metadata.is_file() {

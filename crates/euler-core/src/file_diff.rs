@@ -86,23 +86,86 @@ pub fn observed_file_diff_projection(change: &ObservedFileChange) -> FileDiffPro
     }
 }
 
+/// One `file.change` payload, whatever produced the write.
+///
+/// Every producer — a prepared patch, an observed shell change, a `/rollback`
+/// restore — builds the row here, so the ratified key set cannot drift
+/// between them.
+pub struct FileChangeRecord<'a> {
+    /// The tool call that made the write. `None` for a write no tool call
+    /// produced: a consumer joining on `tool_call_id` must never be handed an
+    /// id that resolves to something else.
+    pub tool_call_id: Option<&'a str>,
+    /// The checkpoint a `/rollback` restore was made from.
+    pub restored_checkpoint_event_id: Option<&'a str>,
+    pub origin: &'a str,
+    pub action: &'a str,
+    pub path: &'a str,
+    pub before_sha256: Option<&'a str>,
+    pub after_sha256: Option<&'a str>,
+    pub before_byte_len: usize,
+    pub after_byte_len: usize,
+    /// The stored pre-image that makes this write undoable.
+    pub pre_image_blob: Option<&'a str>,
+    /// The `checkpoint.stored` row that recorded that pre-image.
+    pub checkpoint_event_id: Option<&'a str>,
+    /// Set when the write was published but its directory entry could not be
+    /// made durable, so provenance and disk cannot silently disagree.
+    pub durability_warning: Option<&'a str>,
+}
+
+pub fn file_change_event_payload(record: &FileChangeRecord<'_>) -> JsonObject {
+    let mut payload = object([
+        ("origin", record.origin.to_owned().into()),
+        ("action", record.action.to_owned().into()),
+        ("path", record.path.to_owned().into()),
+        ("old_path", Value::Null),
+        ("before_sha256", borrowed_string(record.before_sha256)),
+        ("after_sha256", borrowed_string(record.after_sha256)),
+        ("before_byte_len", record.before_byte_len.into()),
+        ("after_byte_len", record.after_byte_len.into()),
+        ("diff_redaction", "omitted".into()),
+    ]);
+    for (key, value) in [
+        ("tool_call_id", record.tool_call_id),
+        (
+            "restored_checkpoint_event_id",
+            record.restored_checkpoint_event_id,
+        ),
+        ("pre_image_blob", record.pre_image_blob),
+        ("checkpoint_event_id", record.checkpoint_event_id),
+        ("durability_warning", record.durability_warning),
+    ] {
+        if let Some(value) = value {
+            payload.insert(key.to_owned(), value.to_owned().into());
+        }
+    }
+    payload
+}
+
 pub fn observed_file_change_payload(
     tool_call_id: &str,
     origin: &'static str,
     change: &ObservedFileChange,
 ) -> JsonObject {
-    object([
-        ("tool_call_id", tool_call_id.to_owned().into()),
-        ("origin", origin.into()),
-        ("action", change.action.into()),
-        ("path", change.path.clone().into()),
-        ("old_path", Value::Null),
-        ("before_sha256", optional_string(&change.before_sha256)),
-        ("after_sha256", optional_string(&change.after_sha256)),
-        ("before_byte_len", change.before_byte_len.into()),
-        ("after_byte_len", change.after_byte_len.into()),
-        ("diff_redaction", "omitted".into()),
-    ])
+    file_change_event_payload(&FileChangeRecord {
+        tool_call_id: Some(tool_call_id),
+        restored_checkpoint_event_id: None,
+        origin,
+        action: change.action,
+        path: &change.path,
+        before_sha256: change.before_sha256.as_deref(),
+        after_sha256: change.after_sha256.as_deref(),
+        before_byte_len: change.before_byte_len,
+        after_byte_len: change.after_byte_len,
+        pre_image_blob: None,
+        checkpoint_event_id: None,
+        durability_warning: None,
+    })
+}
+
+fn borrowed_string(value: Option<&str>) -> Value {
+    value.map_or(Value::Null, |value| value.to_owned().into())
 }
 
 pub fn observed_file_diff_payload(

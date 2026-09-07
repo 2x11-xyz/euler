@@ -158,11 +158,13 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(&temp_path)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    crate::durability::sync_file_data(&file, &temp_path)?;
-    drop(file);
+    // Every failure below must remove the temp. A destructive write is now
+    // abandoned when its checkpoint cannot be stored, so a user who hits a
+    // full disk retries — and would otherwise accumulate orphans.
+    if let Err(error) = fill_blob_temp(&mut options, &temp_path, bytes) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
     // rename replaces a planted symlink at the final path rather than
     // following it.
     if let Err(error) = fs::rename(&temp_path, path) {
@@ -173,6 +175,13 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
         crate::durability::sync_dir(parent)?;
     }
     Ok(())
+}
+
+fn fill_blob_temp(options: &mut OpenOptions, temp_path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = options.open(temp_path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    crate::durability::sync_file_data(&file, temp_path)
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {

@@ -563,41 +563,8 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         Ok(())
     }
 
-    /// Store the rollback pre-image for a patch. When a checkpoint was owed
-    /// but could not be made durable, the tool has already been reported as
-    /// failed and the write must not proceed.
-    fn record_prepared_checkpoint(
-        &mut self,
-        call: &ToolCall,
-        execution: &crate::tools::ToolExecution,
-        tool_call_event_id: &str,
-        patch: &crate::tools::PatchEvents,
-    ) -> Result<CheckpointPreparation, SessionError> {
-        match prepare_checkpoint(self.workspace_root.as_path(), &call.id, patch) {
-            Ok(checkpoint) => Ok(CheckpointPreparation::Ready(checkpoint)),
-            Err(reason) => {
-                self.emit_tool_failure(
-                    call.id.clone(),
-                    execution.name.clone(),
-                    reason,
-                    tool_call_event_id.to_owned(),
-                )?;
-                Ok(CheckpointPreparation::WriteAbandoned)
-            }
-        }
-    }
-
-    fn record_patch_if_present(
-        &mut self,
-        call: &ToolCall,
-        tool_call_event_id: &str,
-        execution: &mut crate::tools::ToolExecution,
-        cancellation: &CancellationToken,
-    ) -> Result<bool, SessionError> {
-        let Some(patch) = execution.patch.clone() else {
-            return Ok(false);
-        };
-        let patch = &patch;
+    /// The redacted `patch.proposed` / `patch.applied` payload for a patch.
+    fn patch_payload(&self, patch: &crate::tools::PatchEvents) -> euler_event::JsonObject {
         let mut payload = object([
             ("path", patch.path.clone().into()),
             ("old", patch.before.clone().into()),
@@ -605,14 +572,43 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         ]);
         self.redactor
             .redact_payload_fields(&mut payload, &["old", "new"]);
+        payload
+    }
+
+    /// Announce the patch and store the pre-image that protects it.
+    ///
+    /// `None` means the tool has already been reported as failed and the
+    /// write must not happen.
+    fn prepare_patch_write(
+        &mut self,
+        call_id: &str,
+        tool_name: &str,
+        tool_call_event_id: &str,
+        patch: &crate::tools::PatchEvents,
+    ) -> Result<Option<PatchWriteContext>, SessionError> {
         let patch_proposed_id = self
-            .append(EventKind::PATCH_PROPOSED, payload.clone(), None)?
+            .append(EventKind::PATCH_PROPOSED, self.patch_payload(patch), None)?
             .id;
-        let checkpoint =
-            match self.record_prepared_checkpoint(call, execution, tool_call_event_id, patch)? {
-                CheckpointPreparation::Ready(checkpoint) => checkpoint,
-                CheckpointPreparation::WriteAbandoned => return Ok(true),
-            };
+        let reason = match self.tools.ensure_patch_writable(patch) {
+            Err(error) => Some(error.to_string()),
+            Ok(()) => None,
+        };
+        let checkpoint = match reason {
+            Some(reason) => Err(reason),
+            None => prepare_checkpoint(self.workspace_root.as_path(), call_id, patch),
+        };
+        let checkpoint = match checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(reason) => {
+                self.emit_tool_failure(
+                    call_id.to_owned(),
+                    tool_name.to_owned(),
+                    reason,
+                    tool_call_event_id.to_owned(),
+                )?;
+                return Ok(None);
+            }
+        };
         let checkpoint_event_id = match &checkpoint {
             Some(checkpoint) => Some(
                 self.append(
@@ -624,13 +620,43 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             ),
             None => None,
         };
-        match self.tools.apply_patch_cancellable(patch, cancellation) {
-            // A published write whose directory entry could not be synced is
-            // applied, not failed.
+        Ok(Some(PatchWriteContext {
+            patch_proposed_id,
+            checkpoint,
+            checkpoint_event_id,
+        }))
+    }
+
+    fn record_patch_if_present(
+        &mut self,
+        call: &ToolCall,
+        tool_call_event_id: &str,
+        execution: &mut crate::tools::ToolExecution,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, SessionError> {
+        let Some(patch) = execution.patch.as_ref() else {
+            return Ok(false);
+        };
+        let Some(prepared) =
+            self.prepare_patch_write(&call.id, &execution.name, tool_call_event_id, patch)?
+        else {
+            return Ok(true);
+        };
+        let PatchWriteContext {
+            patch_proposed_id,
+            checkpoint,
+            checkpoint_event_id,
+        } = prepared;
+        let checkpoint = checkpoint.as_ref();
+        let checkpoint_event_id = checkpoint_event_id.as_deref();
+        // A published write whose directory entry could not be synced is
+        // applied, not failed.
+        let durability_warning = match self.tools.apply_patch_cancellable(patch, cancellation) {
             Ok(warning) => {
-                if let Some(warning) = warning {
+                if let Some(warning) = &warning {
                     execution.output.push_str(&format!("\nwarning: {warning}"));
                 }
+                warning
             }
             Err(crate::ToolError::Cancelled) => {
                 self.emit_cancelled_tool_result(
@@ -649,7 +675,8 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 )?;
                 return Ok(true);
             }
-        }
+        };
+        let payload = self.patch_payload(patch);
         let patch_applied_id = self
             .append(EventKind::PATCH_APPLIED, payload, Some(patch_proposed_id))?
             .id;
@@ -659,10 +686,9 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 file_change_payload(
                     &call.id,
                     patch,
-                    checkpoint
-                        .as_ref()
-                        .map(|checkpoint| checkpoint.blob.as_str()),
-                    checkpoint_event_id.as_deref(),
+                    checkpoint.map(|checkpoint| checkpoint.blob.as_str()),
+                    checkpoint_event_id,
+                    durability_warning.as_deref(),
                 ),
                 Some(patch_applied_id.clone()),
             )?
@@ -1454,11 +1480,9 @@ fn insert_rate(value: &mut JsonObject, field: &str, rate: Option<u64>) {
 #[path = "companion_test.rs"]
 mod tests;
 
-/// Outcome of storing a rollback pre-image before a destructive write.
-enum CheckpointPreparation {
-    /// A checkpoint exists (or none was owed); the write may proceed.
-    Ready(Option<super::PreparedCheckpoint>),
-    /// A checkpoint was owed and could not be stored; the tool has already
-    /// been reported as failed.
-    WriteAbandoned,
+/// What a prepared, checkpointed patch write needs to record itself.
+struct PatchWriteContext {
+    patch_proposed_id: String,
+    checkpoint: Option<super::PreparedCheckpoint>,
+    checkpoint_event_id: Option<String>,
 }

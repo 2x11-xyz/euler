@@ -68,6 +68,9 @@ pull requests that landed them; deeper design rationale lives in
   temporary file, given the target's permissions, made durable, and renamed
   over the target. A file is only ever its complete old content or its
   complete new content, so an interrupted write can no longer truncate it.
+  Creates publish the same way through a no-replace rename, so they stay
+  no-clobber. A write to a file or directory the user made read-only is
+  refused rather than silently published.
 - `/rollback` checkpoints are now stored and recorded *before* the destructive
   write, as a `checkpoint.stored` event. A write whose checkpoint cannot be
   stored durably does not happen at all. A checkpoint whose write was never

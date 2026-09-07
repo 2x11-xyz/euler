@@ -943,6 +943,11 @@ enum Step {
         provider: &'static str,
         model: &'static str,
     },
+    /// `/rollback` of the newest restorable checkpoint. It appends
+    /// `checkpoint.stored` and `file.change` rows whose ids the normalizer
+    /// must map, so a resumed session's projection matches an uninterrupted
+    /// one.
+    RollbackNewest,
 }
 
 fn assert_run_cut_resume_equivalent(case: EquivalenceCase) -> EquivalenceOutcome {
@@ -1073,6 +1078,17 @@ fn drive_steps<D: PermissionDecider>(session: &mut Session<D>, steps: &[Step]) {
                 assert!(session
                     .switch_model(provider, model, "user", None)
                     .expect("switch model"));
+            }
+            Step::RollbackNewest => {
+                let newest = session
+                    .workspace_checkpoints()
+                    .first()
+                    .expect("a restorable checkpoint")
+                    .event_id
+                    .clone();
+                session
+                    .restore_workspace_checkpoint(&newest)
+                    .expect("restore the newest checkpoint");
             }
         }
     }
@@ -1235,6 +1251,18 @@ fn normalize_events(
                         allowlist,
                         "file_change_id",
                         Value::String(file_change_id),
+                    );
+                }
+                if let Some(restored) = payload
+                    .get("restored_checkpoint_event_id")
+                    .and_then(Value::as_str)
+                    .map(|id| mapped_id(&id_map, id))
+                {
+                    replace_allowed(
+                        payload,
+                        allowlist,
+                        "restored_checkpoint_event_id",
+                        Value::String(restored),
                     );
                 }
                 if let Some(checkpoint_event_id) = payload
@@ -1563,6 +1591,7 @@ fn nondeterministic_fields() -> BTreeSet<&'static str> {
         "event_id",
         "canvas_snapshot_id",
         "checkpoint_event_id",
+        "restored_checkpoint_event_id",
         "file_change_id",
         "response_id",
         "root",
@@ -2019,4 +2048,53 @@ impl ModelProvider for NamedStreamProvider {
             .ok_or_else(|| ProviderError::transport("named stream provider exhausted"))?;
         Ok(Box::new(events.into_iter()))
     }
+}
+
+#[test]
+fn workspace_rollback_resume_equivalence() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let uninterrupted_root = temp.path().join("rollback-uninterrupted");
+    let resumed_root = temp.path().join("rollback-resumed");
+    write_fixture_file(&uninterrupted_root, "note.txt", "alpha\n");
+    write_fixture_file(&resumed_root, "note.txt", "alpha\n");
+    let edit = FixtureResponse::ToolCalls(vec![ToolCall {
+        id: "call-edit-rollback".to_owned(),
+        name: "edit_file".to_owned(),
+        input: json!({"path": "note.txt", "old": "alpha", "new": "beta"}),
+    }]);
+    let case = EquivalenceCase {
+        name: "workspace_rollback",
+        uninterrupted_root,
+        resumed_root,
+        uninterrupted: RunPlan {
+            provider_plan: ProviderPlan::Fixture(vec![
+                edit.clone(),
+                FixtureResponse::Assistant("edited".to_owned()),
+                FixtureResponse::Assistant("continued".to_owned()),
+            ]),
+            decisions: vec![DeciderVerdict::Allow],
+            steps: vec![
+                Step::Turn("edit"),
+                Step::RollbackNewest,
+                Step::Turn("continue"),
+            ],
+        },
+        before_cut: RunPlan {
+            provider_plan: ProviderPlan::Fixture(vec![
+                edit,
+                FixtureResponse::Assistant("edited".to_owned()),
+            ]),
+            decisions: vec![DeciderVerdict::Allow],
+            steps: vec![Step::Turn("edit"), Step::RollbackNewest],
+        },
+        after_resume: RunPlan {
+            provider_plan: ProviderPlan::Fixture(vec![FixtureResponse::Assistant(
+                "continued".to_owned(),
+            )]),
+            decisions: vec![],
+            steps: vec![Step::Turn("continue")],
+        },
+    };
+
+    assert_run_cut_resume_equivalent(case);
 }

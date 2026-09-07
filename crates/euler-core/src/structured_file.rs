@@ -117,26 +117,15 @@ impl ConfinedTarget {
         .map(fs::File::from)
     }
 
-    /// Create the target and fill it, failing if any name already exists.
+    /// Create the target atomically, failing if any name already exists.
     ///
-    /// `O_EXCL` is the no-clobber guarantee: a file (or symlink) that
-    /// appeared after the tool call was prepared is refused, not overwritten.
-    /// A failure after the create removes the name again, so a create is
-    /// all-or-nothing like a replace.
+    /// The content is written to a sibling temporary and published with a
+    /// no-replace rename, so a create is all-or-nothing for the same reason a
+    /// replace is: a SIGKILL mid-fill cannot leave a partial file under the
+    /// real name — which would also have blocked every retry, since the
+    /// no-clobber rule would then refuse the name it left behind.
     pub(crate) fn create_new(&self, content: &[u8]) -> io::Result<Durability> {
-        let created = openat_in(
-            &self.directory,
-            &self.name,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NONBLOCK,
-            0o666,
-        )?;
-        match self.fill(created, &self.name, content) {
-            Ok(()) => Ok(self.sync_directory()),
-            Err(error) => {
-                let _ = unlinkat(&self.directory, &self.name);
-                Err(error)
-            }
-        }
+        self.publish(content, None, true)
     }
 
     /// Replace the target's content atomically: write `content` to a fresh
@@ -150,6 +139,18 @@ impl ConfinedTarget {
         content: &[u8],
         previous: &fs::Metadata,
     ) -> io::Result<Durability> {
+        self.publish(content, Some(previous), false)
+    }
+
+    /// Write `content` to a sibling temporary and rename it onto the target
+    /// name. `no_replace` makes the rename refuse an existing name instead of
+    /// overwriting it, which is what keeps a create no-clobber.
+    fn publish(
+        &self,
+        content: &[u8],
+        previous: Option<&fs::Metadata>,
+        no_replace: bool,
+    ) -> io::Result<Durability> {
         let temp_name = OsString::from(format!(
             "{}{}{}",
             crate::file_diff::STRUCTURED_WRITE_TEMP_PREFIX,
@@ -160,22 +161,68 @@ impl ConfinedTarget {
             &self.directory,
             &temp_name,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-            0o600,
+            if previous.is_some() { 0o600 } else { 0o666 },
         )?;
-        let written = self
-            .inherit_identity(&temp, previous)
+        let written = previous
+            .map_or(Ok(()), |previous| self.inherit_identity(&temp, previous))
             .and_then(|()| self.fill(temp, &temp_name, content));
-        if let Err(error) = written {
-            let _ = unlinkat(&self.directory, &temp_name);
-            return Err(error);
-        }
-        if let Err(error) = self.rename_over(&temp_name) {
+        let published = written.and_then(|()| self.rename_over(&temp_name, no_replace));
+        if let Err(error) = published {
             let _ = unlinkat(&self.directory, &temp_name);
             return Err(error);
         }
         // Past this point the new content is published: the rename cannot be
         // undone and the caller must not be told the write failed.
         Ok(self.sync_directory())
+    }
+
+    /// Whether this process can actually replace the target.
+    ///
+    /// A rename-over publishes a new directory entry, so the kernel checks
+    /// the *directory*, not the file: without this, `chmod a-w generated.rs`
+    /// would silently stop protecting the file, and a target in a read-only
+    /// directory would fail with a bare `EACCES` after a checkpoint had
+    /// already been recorded.
+    pub(crate) fn writability(&self) -> io::Result<Writability> {
+        if !self.access(Some(&self.name), libc::W_OK)? {
+            return Ok(Writability::ReadOnlyFile);
+        }
+        if !self.access(None, libc::W_OK)? {
+            return Ok(Writability::ReadOnlyDirectory);
+        }
+        Ok(Writability::Writable)
+    }
+
+    /// `faccessat` against the held directory, using the real (not effective)
+    /// answer the kernel would give this process for a write.
+    fn access(&self, name: Option<&OsStr>, mode: libc::c_int) -> io::Result<bool> {
+        let name = match name {
+            Some(name) => c_name(name)?,
+            // An empty relative path with AT_EMPTY_PATH semantics is not
+            // portable; "." names the directory the descriptor holds.
+            None => c_name(OsStr::new("."))?,
+        };
+        // SAFETY: the directory descriptor is live and the name is
+        // NUL-terminated.
+        let allowed = unsafe {
+            libc::faccessat(
+                self.directory.as_raw_fd(),
+                name.as_ptr(),
+                mode,
+                libc::AT_EACCESS,
+            )
+        };
+        if allowed == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS) => Ok(false),
+            // A missing target is not a permission answer; the caller's own
+            // open decides.
+            Some(libc::ENOENT) => Ok(true),
+            _ => Err(error),
+        }
     }
 
     /// Give the replacement the file it replaces. Permission bits are masked
@@ -205,21 +252,26 @@ impl ConfinedTarget {
         crate::durability::sync_file_data(&file, &self.absolute.with_file_name(name))
     }
 
-    fn rename_over(&self, temp_name: &OsStr) -> io::Result<()> {
+    fn rename_over(&self, temp_name: &OsStr, no_replace: bool) -> io::Result<()> {
         let from = c_name(temp_name)?;
         let to = c_name(&self.name)?;
-        // SAFETY: both names are NUL-terminated single components and the
-        // directory descriptor is live for the duration of the call.
-        if unsafe {
-            libc::renameat(
-                self.directory.as_raw_fd(),
-                from.as_ptr(),
-                self.directory.as_raw_fd(),
-                to.as_ptr(),
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
+        let from_fd = self.directory.as_raw_fd();
+        let result = if no_replace {
+            rename_no_replace(from_fd, &from, &to)
+        } else {
+            // SAFETY: both names are NUL-terminated single components and
+            // the directory descriptor is live for the duration of the call.
+            unsafe { libc::renameat(from_fd, from.as_ptr(), from_fd, to.as_ptr()) }
+        };
+        if result != 0 {
+            let error = io::Error::last_os_error();
+            // The name appeared after this call was prepared. Report it the
+            // way an `O_EXCL` create would.
+            return Err(if error.raw_os_error() == Some(libc::EEXIST) {
+                io::Error::from(io::ErrorKind::AlreadyExists)
+            } else {
+                error
+            });
         }
         Ok(())
     }
@@ -238,6 +290,17 @@ impl ConfinedTarget {
     }
 }
 
+/// Whether a structured write is permitted to replace its target.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum Writability {
+    Writable,
+    /// The file itself is not writable by this process. A rename-over would
+    /// ignore that, so it is refused instead.
+    ReadOnlyFile,
+    /// The directory is not writable, so no new entry can be published.
+    ReadOnlyDirectory,
+}
+
 /// Whether the published write reached the disk. The content itself is
 /// always durable before it is published; only the directory entry can be
 /// left unsynced, and that cannot un-publish the write.
@@ -245,6 +308,44 @@ impl ConfinedTarget {
 pub(crate) enum Durability {
     Synced,
     DirectoryUnsynced(String),
+}
+
+/// Rename that refuses an existing destination, so a create cannot clobber a
+/// name that appeared after the call was prepared. Both supported targets
+/// have a flag for it; nothing else is reachable here.
+#[cfg(target_os = "linux")]
+fn rename_no_replace(directory: libc::c_int, from: &CString, to: &CString) -> libc::c_int {
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+
+    // SAFETY: both names are NUL-terminated single components and the
+    // directory descriptor is live for the duration of the call.
+    unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory,
+            from.as_ptr(),
+            directory,
+            to.as_ptr(),
+            RENAME_NOREPLACE,
+        ) as libc::c_int
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn rename_no_replace(directory: libc::c_int, from: &CString, to: &CString) -> libc::c_int {
+    const RENAME_EXCL: libc::c_uint = 0x0000_0004;
+
+    // SAFETY: both names are NUL-terminated single components and the
+    // directory descriptor is live for the duration of the call.
+    unsafe {
+        libc::renameatx_np(
+            directory,
+            from.as_ptr(),
+            directory,
+            to.as_ptr(),
+            RENAME_EXCL,
+        )
+    }
 }
 
 #[cfg(unix)]

@@ -831,6 +831,16 @@ mod tests {
                 }),
             ),
             base(
+                EventKind::CHECKPOINT_STORED,
+                json!({
+                    "restored_checkpoint_event_id": "evt-file-change",
+                    "path": "a.txt",
+                    "action": "modify",
+                    "pre_image_blob": "sha-before",
+                    "status": "prepared"
+                }),
+            ),
+            base(
                 EventKind::WORKSPACE_RESTORE,
                 json!({
                     "path": "a.txt",
@@ -1071,7 +1081,10 @@ mod tests {
                 ]
             }
             EventKind::CHECKPOINT_STORED => {
-                vec!["tool_call_id", "path", "action", "pre_image_blob", "status"]
+                // A `/rollback` restore's row carries
+                // `restored_checkpoint_event_id` instead of `tool_call_id`,
+                // so the ratified minimum is what both shapes share.
+                vec!["path", "action", "pre_image_blob", "status"]
             }
             EventKind::WORKSPACE_RESTORE => {
                 vec![

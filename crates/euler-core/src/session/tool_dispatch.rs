@@ -202,8 +202,7 @@ impl<D: PermissionDecider> Session<D> {
                 // reasons (the streak tracks format competence, issue #94).
                 self.tool_reteach
                     .record_success(self.tools.reteach_identity(&call.name, &call.input));
-                if let Some(patch) = execution.patch.clone() {
-                    let patch = &patch;
+                if let Some(patch) = execution.patch.as_ref() {
                     let mut payload = object([
                         ("path", patch.path.clone().into()),
                         ("old", patch.before.clone().into()),
@@ -216,6 +215,19 @@ impl<D: PermissionDecider> Session<D> {
                         payload.clone(),
                         Some(tool_call_event_id.clone()),
                     )?;
+                    // Refuse a write the filesystem would not allow before
+                    // any checkpoint is stored for it: a read-only target
+                    // must not first acquire a recorded pre-image.
+                    if let Err(error) = self.tools.ensure_patch_writable(patch) {
+                        self.emit_failed_tool_result(
+                            call.id,
+                            execution.name,
+                            error.to_string(),
+                            tool_call_event_id,
+                            tool_started,
+                        )?;
+                        return Ok(());
+                    }
                     let checkpoint =
                         match prepare_checkpoint(self.config.root.as_path(), &call.id, patch) {
                             Ok(checkpoint) => checkpoint,
@@ -238,35 +250,37 @@ impl<D: PermissionDecider> Session<D> {
                         )?),
                         None => None,
                     };
-                    match self.tools.apply_patch_cancellable(patch, cancellation) {
-                        // A published write whose directory entry could not
-                        // be synced is applied, not failed: the caveat rides
-                        // the successful result.
-                        Ok(warning) => {
-                            if let Some(warning) = warning {
-                                execution.output.push_str(&format!("\nwarning: {warning}"));
+                    // A published write whose directory entry could not be
+                    // synced is applied, not failed: the caveat rides the
+                    // successful result and the `file.change` row.
+                    let durability_warning =
+                        match self.tools.apply_patch_cancellable(patch, cancellation) {
+                            Ok(warning) => {
+                                if let Some(warning) = &warning {
+                                    execution.output.push_str(&format!("\nwarning: {warning}"));
+                                }
+                                warning
                             }
-                        }
-                        Err(ToolError::Cancelled) => {
-                            self.emit_cancelled_tool_result(
-                                call,
-                                tool_call_event_id,
-                                Some(&execution),
-                                Some(tool_started),
-                            )?;
-                            return Err(SessionError::Cancelled);
-                        }
-                        Err(error) => {
-                            self.emit_failed_tool_result(
-                                call.id,
-                                execution.name,
-                                error.to_string(),
-                                tool_call_event_id,
-                                tool_started,
-                            )?;
-                            return Ok(());
-                        }
-                    }
+                            Err(ToolError::Cancelled) => {
+                                self.emit_cancelled_tool_result(
+                                    call,
+                                    tool_call_event_id,
+                                    Some(&execution),
+                                    Some(tool_started),
+                                )?;
+                                return Err(SessionError::Cancelled);
+                            }
+                            Err(error) => {
+                                self.emit_failed_tool_result(
+                                    call.id,
+                                    execution.name,
+                                    error.to_string(),
+                                    tool_call_event_id,
+                                    tool_started,
+                                )?;
+                                return Ok(());
+                            }
+                        };
                     let patch_applied_id = self.emit_with_parent(
                         EventKind::PATCH_APPLIED,
                         payload,
@@ -281,6 +295,7 @@ impl<D: PermissionDecider> Session<D> {
                                 .as_ref()
                                 .map(|checkpoint| checkpoint.blob.as_str()),
                             checkpoint_event_id.as_deref(),
+                            durability_warning.as_deref(),
                         ),
                         Some(patch_applied_id.clone()),
                     )?;
@@ -541,32 +556,22 @@ pub(crate) fn file_change_payload(
     patch: &PatchEvents,
     pre_image_blob: Option<&str>,
     checkpoint_event_id: Option<&str>,
+    durability_warning: Option<&str>,
 ) -> JsonObject {
-    let mut payload = object([
-        ("tool_call_id", tool_call_id.to_owned().into()),
-        ("origin", patch.origin.into()),
-        ("action", patch.action.into()),
-        ("path", patch.path.clone().into()),
-        ("old_path", Value::Null),
-        (
-            "before_sha256",
-            patch
-                .before_sha256
-                .as_ref()
-                .map_or(Value::Null, |sha| sha.clone().into()),
-        ),
-        ("after_sha256", patch.after_sha256.clone().into()),
-        ("before_byte_len", patch.before_byte_len.into()),
-        ("after_byte_len", patch.after_byte_len.into()),
-        ("diff_redaction", "omitted".into()),
-    ]);
-    if let Some(hash) = pre_image_blob {
-        payload.insert("pre_image_blob".to_owned(), hash.into());
-        if let Some(event_id) = checkpoint_event_id {
-            payload.insert("checkpoint_event_id".to_owned(), event_id.into());
-        }
-    }
-    payload
+    crate::file_diff::file_change_event_payload(&crate::file_diff::FileChangeRecord {
+        tool_call_id: Some(tool_call_id),
+        restored_checkpoint_event_id: None,
+        origin: patch.origin,
+        action: patch.action,
+        path: &patch.path,
+        before_sha256: patch.before_sha256.as_deref(),
+        after_sha256: Some(&patch.after_sha256),
+        before_byte_len: patch.before_byte_len,
+        after_byte_len: patch.after_byte_len,
+        pre_image_blob,
+        checkpoint_event_id: pre_image_blob.and(checkpoint_event_id),
+        durability_warning,
+    })
 }
 
 /// A rollback pre-image that has been made durable but whose write has not
@@ -574,6 +579,27 @@ pub(crate) fn file_change_payload(
 pub(crate) struct PreparedCheckpoint {
     pub(crate) blob: String,
     pub(crate) payload: JsonObject,
+}
+
+/// What caused a destructive write, for the `checkpoint.stored` record.
+#[derive(Clone, Copy)]
+pub(crate) enum CheckpointLink<'a> {
+    /// A tool call, named by its id.
+    ToolCall(&'a str),
+    /// A `/rollback` restore of the named checkpoint. Carries no
+    /// `tool_call_id`: no tool call produced this write, and a consumer that
+    /// joins on `tool_call_id` must never be handed an id that resolves to
+    /// something else.
+    RestoredCheckpoint(&'a str),
+}
+
+impl CheckpointLink<'_> {
+    fn field(self) -> (&'static str, String) {
+        match self {
+            Self::ToolCall(id) => ("tool_call_id", id.to_owned()),
+            Self::RestoredCheckpoint(id) => ("restored_checkpoint_event_id", id.to_owned()),
+        }
+    }
 }
 
 /// Store the rollback pre-image for `patch` and build the `checkpoint.stored`
@@ -593,7 +619,13 @@ pub(crate) fn prepare_checkpoint(
     if patch.action != "modify" {
         return Ok(None);
     }
-    prepare_checkpoint_for(root, tool_call_id, &patch.path, patch.action, &patch.before)
+    prepare_checkpoint_for(
+        root,
+        CheckpointLink::ToolCall(tool_call_id),
+        &patch.path,
+        patch.action,
+        &patch.before,
+    )
 }
 
 /// The same guarantee for a write that has no prepared patch behind it — a
@@ -601,7 +633,7 @@ pub(crate) fn prepare_checkpoint(
 /// own way back.
 pub(crate) fn prepare_checkpoint_for(
     root: &std::path::Path,
-    tool_call_id: &str,
+    link: CheckpointLink<'_>,
     path: &str,
     action: &'static str,
     replaced: &str,
@@ -615,18 +647,21 @@ pub(crate) fn prepare_checkpoint_for(
 the file was not changed"
         )
     })?;
-    Ok(blob.map(|blob| PreparedCheckpoint {
-        payload: object([
-            ("tool_call_id", tool_call_id.to_owned().into()),
-            ("path", path.to_owned().into()),
-            ("action", action.into()),
-            ("pre_image_blob", blob.as_str().into()),
-            (
-                "status",
-                crate::checkpoints::CHECKPOINT_STATUS_PREPARED.into(),
-            ),
-        ]),
-        blob,
+    Ok(blob.map(|blob| {
+        let (link_key, link_value) = link.field();
+        PreparedCheckpoint {
+            payload: object([
+                (link_key, link_value.into()),
+                ("path", path.to_owned().into()),
+                ("action", action.into()),
+                ("pre_image_blob", blob.as_str().into()),
+                (
+                    "status",
+                    crate::checkpoints::CHECKPOINT_STATUS_PREPARED.into(),
+                ),
+            ]),
+            blob,
+        }
     }))
 }
 

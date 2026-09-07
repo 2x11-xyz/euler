@@ -544,8 +544,10 @@ extension error does not consume the later result.
   Rows written before that event existed carry no `checkpoint_event_id`; they
   remain restorable, because a `file.change` was only ever emitted after its
   write completed.
-- `checkpoint.stored`: `tool_call_id`, `path`, `action`, `pre_image_blob`,
-  `status` (`prepared`). Appended **before** the destructive write it
+- `checkpoint.stored`: `path`, `action`, `pre_image_blob`, `status`
+  (`prepared`), plus exactly one link to what caused the write —
+  `tool_call_id` for a tool call, or `restored_checkpoint_event_id` for a
+  `/rollback` restore, which no tool call produced. Appended **before** the destructive write it
   protects, so a crash can never leave a changed file with no way back. If the
   pre-image cannot be stored durably, no `checkpoint.stored` is appended and
   the write does not happen. A `checkpoint.stored` row with no `file.change`
