@@ -1,41 +1,63 @@
 //! Static shell-command safety analysis (issue #78).
 //!
 //! `run_shell` executes via `sh -c <command>`, so any reasoning about a
-//! command line must reason about the *whole* line. This module decomposes a
-//! command line into plain pipeline/list segments and classifies each segment
-//! against a behavioral allowlist of read-only binaries with flag inspection.
-//! A command is **statically safe** iff it parses into plain segments and
-//! every segment is safe; statically-safe commands may run under `ask`
-//! without a prompt (recorded as a `permission.decision` with mode
-//! `static-safe`) and segments feed scoped-grant coverage (see
-//! `docs/contracts/capabilities.md`, "Static command safety").
+//! command line must reason about the *whole* line. This module implements
+//! the **two-parser design** Codex converged on
+//! (`codex-rs/shell-command/src/bash.rs`): one conservative parser that may
+//! prove a command safe, and one permissive walk that may only find danger.
+//! A single parser cannot be both conservative and complete, and the
+//! name-keyed allowlist this module used to carry tried to be both (audit
+//! F01/F02/F34).
 //!
-//! ## Parser limits (deliberately conservative)
+//! ## 1. Prove-safe grammar (conservative)
 //!
-//! This is a small purpose-built tokenizer, not a shell grammar. It only
-//! accepts command lines made of bare words and single/double-quoted strings
-//! joined by `&&`, `||`, `;`, `|`, or newlines. Quoted metacharacters are
-//! literal text, never operators. Everything else makes the whole command
-//! **not statically analyzable** and the caller falls back to the ask path:
+//! [`is_statically_safe_command`] returns true only for command lines that
+//! parse into a sequence of simple commands joined by `&&`, `||`, `;`, `|`,
+//! or newlines, where:
 //!
-//! - any redirect (`>`, `<`, `>>`, `<<`, fd forms — every unquoted `>`/`<`);
-//! - subshells, grouping, and brace expansion (unquoted `(`, `)`, `{`, `}`);
-//! - substitution and expansion (any unquoted or double-quoted `$` or
-//!   backtick — parameter expansion could rewrite the command);
-//! - background execution (single unquoted `&`);
-//! - comments (unquoted `#` at word start), unterminated quotes, trailing
-//!   backslashes, carriage returns, and empty segments (`;;`, leading or
-//!   trailing `&&`/`||`/`|`/`;`).
+//! - every word is a **literal**: no unquoted `* ? [ ] { } ~ $ ` \ ^ #`,
+//!   and no word beginning with `=` (zsh equals-expansion). A word whose
+//!   runtime spelling the shell may rewrite is never proof of anything;
+//! - there are no redirections (`>`, `<`, `>>`, here-docs, fd forms),
+//!   substitutions, subshells, grouping, brace expansion, background `&`,
+//!   comments, or control flow — all of these make the line unparseable;
+//! - every simple command's binary is in the read-only set below **and**
+//!   its arguments satisfy that binary's argument rule;
+//! - every argument that may name a path is confined to the workspace root
+//!   and is not a sensitive path.
 //!
-//! False negatives (safe commands classified unsafe) only cost a prompt;
-//! false positives are the failure mode this module must never have.
+//! The wrapper form `[sh|bash|zsh] -c|-lc <script>` is accepted only by
+//! recursively proving `<script>` under the same rules (depth-capped).
 //!
 //! Binary names match the first token exactly: `/bin/ls` or `env ls` do not
-//! match `ls`. Unquoted glob characters (`*`, `?`, `[`) stay literal words
-//! for the read-only binaries (their flags cannot make them write), but any
-//! unquoted glob rejects the flag-inspected binaries (`find`, `rg`,
-//! `base64`, `sed`, `git`) because runtime expansion could inject
-//! flag-shaped tokens (a file named `-delete` in `find . *`).
+//! match `ls`.
+//!
+//! ### Read-only set and per-binary argument rules
+//!
+//! | Binary | Rule |
+//! | --- | --- |
+//! | `cat` `cut` `echo` `expr` `false` `id` `nl` `paste` `pwd` `rev` `seq` `stat` `tr` `true` `uname` `wc` `which` `whoami` `head` | no flag or operand of these writes, executes, or traverses |
+//! | `ls` | no `-R`/`--recursive`, no `-L`/`--dereference` (audit F02) |
+//! | `grep` | no `-R`/`--dereference-recursive` (audit F02; `-r` does not follow symlinks) |
+//! | `tail` | no `-f`/`-F`/`--follow`/`--retry` |
+//! | `uniq` | at most one operand — the second operand is an output file (audit F01) |
+//! | `find` | no `-exec`/`-execdir`/`-ok`/`-okdir`/`-delete`/`-fls`/`-fprint*`, no `-L`/`-follow` |
+//! | `rg` | no `--pre`/`--hostname-bin`/`--search-zip`/`-z`, no `-L`/`--follow` |
+//! | `base64` | no `-o`/`--output` |
+//! | `sed` | only the print-range form `sed -n Np [file]` |
+//! | `git` | only `status`/`log`/`diff`/`show`/`branch`, no global options |
+//!
+//! Binaries outside the table are never provably safe, `sort` (`-o` writes
+//! a file) and `tee` among them. `cd` is deliberately **not** in the set: a compound list may change the
+//! directory the following commands resolve against, and confinement is
+//! checked against the root the command started in (audit F02).
+//!
+//! ## 2. Find-danger walk (permissive)
+//!
+//! [`contains_dangerous_command`] walks *every* command in the input,
+//! including inside control flow, substitutions, and wrappers, and flags
+//! dangerous invocations. It is deliberately over-inclusive and **must
+//! never be used to prove safety** — see its doc comment.
 //!
 //! ## Workspace confinement (security review F1)
 //!
@@ -49,26 +71,41 @@
 //! - a non-existing argument must pass textual rules: no absolute path, no
 //!   leading `~`, no `$` or backtick, no `..` component — a relative path
 //!   without `..` cannot leave the execution cwd;
-//! - a small sensitive-basename denylist (`.env*`, `secret`/`credential`
-//!   names, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`) rejects even inside
-//!   the workspace;
+//! - the sensitive-path denylist ([`sensitive_basename`]) rejects even
+//!   inside the workspace;
 //! - argument positions are classified conservatively: only the grep/rg
 //!   pattern position is exempt, and only when no `-e`/`-f`-style flag can
 //!   shift it; everything else — including `--flag=value` values — is
 //!   treated as a potential path.
 //!
 //! A rejected segment is simply not statically safe: the command falls to
-//! the ordinary ask path (no new denial surface).
+//! the ordinary ask path (no new denial surface). False negatives (safe
+//! commands classified unsafe) only cost a prompt; false positives are the
+//! failure mode this module must never have.
 
-use std::path::Path;
+use std::path::{Component, Path};
+
+/// Recursion cap for wrapper unwrapping, in both parsers (Codex uses the
+/// same bound). Exceeding it fails closed: unprovable for the prove-safe
+/// grammar, dangerous for the danger walk.
+const MAX_WRAPPER_DEPTH: usize = 8;
 
 /// One word of a parsed segment, quotes resolved to literal text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Word {
     text: String,
-    /// Word contained at least one unquoted glob character (`*`, `?`, `[`),
-    /// so runtime expansion may replace it with arbitrary file names.
-    has_unquoted_glob: bool,
+    /// Word contained at least one unquoted character the shell may rewrite
+    /// before the binary sees it (`* ? [ ] ~ ^ #`), so its source spelling
+    /// is not proof of the runtime argv.
+    has_unquoted_expansion: bool,
+}
+
+impl Word {
+    /// Whether this word's spelling is exactly what the binary will see.
+    fn is_literal(&self) -> bool {
+        // A leading `=` is zsh equals-expansion (`=ls` → `/bin/ls`).
+        !self.has_unquoted_expansion && !self.text.starts_with('=')
+    }
 }
 
 /// One plain command of a parsed line (a pipeline or list element).
@@ -87,32 +124,52 @@ impl CommandSegment {
 
     /// Whether this segment is a known read-only invocation whose path
     /// arguments are confined to `workspace_root` (see the module docs,
-    /// "Workspace confinement").
+    /// "Prove-safe grammar" and "Workspace confinement").
     pub fn is_statically_safe(&self, workspace_root: &Path) -> bool {
+        self.is_statically_safe_at_depth(workspace_root, 0)
+    }
+
+    fn is_statically_safe_at_depth(&self, workspace_root: &Path, depth: usize) -> bool {
+        // Every word must be a literal: an unquoted glob, `~`, or `^` is
+        // rewritten by the shell, so neither the binary name, the flag
+        // rules, nor confinement can be checked against it (audit F02).
+        if !self.words.iter().all(Word::is_literal) {
+            return false;
+        }
+        if let Some(script) = self.wrapper_script() {
+            return depth < MAX_WRAPPER_DEPTH
+                && is_statically_safe_at_depth(script, workspace_root, depth + 1);
+        }
         self.is_read_only_invocation() && self.paths_confined(workspace_root)
     }
 
-    /// Behavioral allowlist check: known read-only binary, flags inspected.
+    /// The script of a wrapper invocation `[sh|bash|zsh] -c|-lc <script>`,
+    /// which is safe exactly when the script is (checked recursively).
+    fn wrapper_script(&self) -> Option<&str> {
+        let [shell, flag, script] = self.words.as_slice() else {
+            return None;
+        };
+        let is_shell = matches!(shell.text.as_str(), "sh" | "bash" | "zsh");
+        let is_command_flag = matches!(flag.text.as_str(), "-c" | "-lc");
+        (is_shell && is_command_flag).then_some(script.text.as_str())
+    }
+
+    /// Read-only set plus the per-binary argument rule (module docs).
     fn is_read_only_invocation(&self) -> bool {
-        let first = &self.words[0];
-        // A glob in the command-name position expands to file names at
-        // runtime; never trust it.
-        if first.has_unquoted_glob {
-            return false;
-        }
-        if READ_ONLY_BINARIES.contains(&first.text.as_str()) {
-            return true;
-        }
-        // Flag-inspected binaries: unquoted globs anywhere reject the
-        // segment because expansion could inject flag-shaped tokens.
-        if self.words.iter().any(|word| word.has_unquoted_glob) {
-            return false;
-        }
         let args: Vec<&str> = self.words[1..]
             .iter()
             .map(|word| word.text.as_str())
             .collect();
-        match first.text.as_str() {
+        match self.words[0].text.as_str() {
+            // Nothing these binaries accept makes them write, execute
+            // another program, traverse out of the execution directory, or
+            // mutate state beyond the shell process.
+            "cat" | "cut" | "echo" | "expr" | "false" | "head" | "id" | "nl" | "paste" | "pwd"
+            | "rev" | "seq" | "stat" | "tr" | "true" | "uname" | "wc" | "which" | "whoami" => true,
+            "ls" => is_safe_ls(&args),
+            "grep" => is_safe_grep(&args),
+            "tail" => is_safe_tail(&args),
+            "uniq" => is_safe_uniq(&args),
             "find" => is_safe_find(&args),
             "rg" => is_safe_rg(&args),
             "base64" => is_safe_base64(&args),
@@ -198,7 +255,7 @@ fn arg_confined(arg: &str, canonical_root: &Path) -> bool {
     if path.is_absolute()
         || path
             .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
+            .any(|component| matches!(component, Component::ParentDir))
     {
         // Absolute and parent-traversing forms are rejected textually even
         // when they would resolve inside the workspace — over-rejection
@@ -216,8 +273,41 @@ fn arg_confined(arg: &str, canonical_root: &Path) -> bool {
     }
 }
 
-/// Names whose contents are categorically sensitive, denied even inside the
-/// workspace (security review F1).
+/// Basenames of files whose contents are categorically sensitive.
+const SENSITIVE_NAMES: &[&str] = &[
+    // Git metadata an interpreter honors: config selects hooks, filters,
+    // and pagers, so writing one turns a later `git status` into arbitrary
+    // execution (audit F34).
+    ".gitmodules",
+    ".gitattributes",
+    ".gitconfig",
+    // Package-manager and toolchain configuration honored on the next
+    // build or install.
+    ".npmrc",
+    ".netrc",
+    // Shell startup files, honored by the next interactive or login shell.
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zshenv",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+];
+
+/// Path components whose entire subtree is sensitive.
+const SENSITIVE_COMPONENTS: &[&str] = &[".git"];
+
+/// Whether `path` names something categorically sensitive, denied even
+/// inside the workspace (security review F1, audit F34).
+///
+/// Despite the name this inspects the whole path, not only the final
+/// component: `.git` is sensitive as a **component**, so everything under
+/// `.git/` (and the worktree pointer file itself) is covered, and
+/// `.cargo/config.toml` is sensitive only under `.cargo`.
 ///
 /// The single sensitive-name list (one list, not two): statically-safe shell
 /// analysis rejects these path arguments outright, and the fs-tool permission
@@ -225,22 +315,48 @@ fn arg_confined(arg: &str, canonical_root: &Path) -> bool {
 /// path names one (deep review P1-b — `read_file .env` must not run
 /// unprompted while `cat .env` asks).
 pub fn sensitive_basename(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+    let components: Vec<String> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => name.to_str().map(str::to_ascii_lowercase),
+            _ => None,
+        })
+        .collect();
+    if components
+        .iter()
+        .any(|component| SENSITIVE_COMPONENTS.contains(&component.as_str()))
+    {
+        return true;
+    }
+    let Some(name) = components.last() else {
         return false;
     };
-    let lower = name.to_ascii_lowercase();
-    lower.starts_with(".env")
-        || lower.contains("secret")
-        || lower.contains("credential")
-        || lower == "id_rsa"
-        || lower == "id_ed25519"
-        || lower.ends_with(".pem")
-        || lower.ends_with(".key")
+    if SENSITIVE_NAMES.contains(&name.as_str()) {
+        return true;
+    }
+    // `.cargo/config.toml` (and its extensionless form) selects the linker
+    // and build runner for the next `cargo` invocation.
+    if matches!(name.as_str(), "config.toml" | "config")
+        && components.len() >= 2
+        && components[components.len() - 2] == ".cargo"
+    {
+        return true;
+    }
+    name.starts_with(".env")
+        || name.contains("secret")
+        || name.contains("credential")
+        || name == "id_rsa"
+        || name == "id_ed25519"
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
 }
 
 /// Decompose a command line into plain segments across `&&`, `||`, `;`,
 /// `|`, and newlines. Returns `None` when the line is not statically
 /// analyzable (see the module docs for the full rejection list).
+///
+/// Words carrying shell expansion (`*`, `~`, …) still parse — grant
+/// coverage keys on the first token — but never prove safe.
 pub fn parse_plain_segments(command: &str) -> Option<Vec<CommandSegment>> {
     let mut builder = SegmentBuilder::default();
     // `&&` / `||` / `|` require a command on their right (newlines may
@@ -282,10 +398,13 @@ pub fn parse_plain_segments(command: &str) -> Option<Vec<CommandSegment>> {
                 needs_command = true;
             }
             // Comments only start at word boundaries; a mid-word `#` is
-            // literal (`file#1`).
+            // literal to `sh` but a glob operator under zsh's
+            // `extendedglob`, so it marks the word instead.
             '#' if !builder.in_word => return None,
             '>' | '<' | '(' | ')' | '{' | '}' | '`' | '$' | '\r' => return None,
-            glob @ ('*' | '?' | '[') => builder.push_glob_char(glob),
+            expansion @ ('*' | '?' | '[' | ']' | '~' | '^' | '#') => {
+                builder.push_expansion_char(expansion);
+            }
             other => builder.push_char(other),
         }
     }
@@ -303,7 +422,7 @@ struct SegmentBuilder {
     segments: Vec<CommandSegment>,
     words: Vec<Word>,
     text: String,
-    glob: bool,
+    expansion: bool,
     in_word: bool,
 }
 
@@ -313,18 +432,18 @@ impl SegmentBuilder {
         self.in_word = true;
     }
 
-    fn push_glob_char(&mut self, c: char) {
+    fn push_expansion_char(&mut self, c: char) {
         self.push_char(c);
-        self.glob = true;
+        self.expansion = true;
     }
 
     fn flush_word(&mut self) {
         if self.in_word {
             self.words.push(Word {
                 text: std::mem::take(&mut self.text),
-                has_unquoted_glob: self.glob,
+                has_unquoted_expansion: self.expansion,
             });
-            self.glob = false;
+            self.expansion = false;
             self.in_word = false;
         }
     }
@@ -395,44 +514,93 @@ fn scan_double_quoted(
 
 /// Whether `command` parses into plain segments that are ALL statically
 /// safe read-only invocations confined to `workspace_root`.
+///
+/// A command the permissive danger walk flags is never provably safe, even
+/// if the grammar would otherwise accept it (defense in depth).
 pub fn is_statically_safe_command(command: &str, workspace_root: &Path) -> bool {
+    !contains_dangerous_command(command) && is_statically_safe_at_depth(command, workspace_root, 0)
+}
+
+fn is_statically_safe_at_depth(command: &str, workspace_root: &Path, depth: usize) -> bool {
     parse_plain_segments(command).is_some_and(|segments| {
         segments
             .iter()
-            .all(|segment| segment.is_statically_safe(workspace_root))
+            .all(|segment| segment.is_statically_safe_at_depth(workspace_root, depth))
     })
 }
 
-/// Read-only regardless of flags: nothing these binaries accept makes them
-/// write, execute other programs, or mutate state beyond the shell process.
-const READ_ONLY_BINARIES: &[&str] = &[
-    "cat", "cd", "cut", "echo", "expr", "false", "grep", "head", "id", "ls", "nl", "paste", "pwd",
-    "rev", "seq", "stat", "tail", "tr", "true", "uname", "uniq", "wc", "which", "whoami",
-];
+/// True when no argument is, or bundles, one of `short` (single-dash
+/// cluster), and no argument equals or `=`-prefixes one of `long`.
+fn rejects_flags(args: &[&str], short: &[char], long: &[&str]) -> bool {
+    !args.iter().any(|arg| {
+        long.iter()
+            .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
+            || arg
+                .strip_prefix('-')
+                .is_some_and(|rest| !rest.starts_with('-') && rest.contains(short))
+    })
+}
+
+/// `ls -R` walks a tree and `ls -L` dereferences: both can report paths the
+/// confinement check never saw (audit F02).
+fn is_safe_ls(args: &[&str]) -> bool {
+    rejects_flags(args, &['R', 'L'], &["--recursive", "--dereference"])
+}
+
+/// `grep -R` follows symlinks out of the workspace; plain `-r` does not
+/// (it only dereferences command-line operands, which are confined).
+fn is_safe_grep(args: &[&str]) -> bool {
+    rejects_flags(args, &['R'], &["--dereference-recursive"])
+}
+
+/// `tail -f`/`-F` never terminates and keeps reading a file that may be
+/// replaced after the confinement check.
+fn is_safe_tail(args: &[&str]) -> bool {
+    rejects_flags(args, &['f', 'F'], &["--follow", "--retry"])
+}
+
+/// `uniq [input [output]]`: the SECOND operand is an output file that
+/// `uniq` truncates, which is how a read-only-looking binary wrote a file
+/// with no approval (audit F01). Only the stdin/one-operand forms are safe.
+/// Flags with detached values (`uniq -f 1 in`) count their value as an
+/// operand and simply fall to the ask path.
+fn is_safe_uniq(args: &[&str]) -> bool {
+    // `-` is the explicit stdin operand and occupies an operand position:
+    // `uniq - out.txt` still writes `out.txt`.
+    args.iter()
+        .filter(|arg| **arg == "-" || !arg.starts_with('-'))
+        .count()
+        <= 1
+}
 
 fn is_safe_find(args: &[&str]) -> bool {
     // Actions that execute commands, delete files, or write pathnames.
     const UNSAFE_FIND_ARGS: &[&str] = &[
         "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf",
     ];
-    !args.iter().any(|arg| UNSAFE_FIND_ARGS.contains(arg))
+    if args.iter().any(|arg| UNSAFE_FIND_ARGS.contains(arg)) {
+        return false;
+    }
+    // `-L` / `-follow` descend through symlinks out of the workspace.
+    !args.iter().any(|arg| matches!(*arg, "-L" | "-follow"))
 }
 
 fn is_safe_rg(args: &[&str]) -> bool {
     // --pre / --hostname-bin execute external commands; --search-zip / -z
-    // shell out to decompression tools. Short flags may be bundled
-    // (`-zn`), so any single-dash cluster containing `z` rejects — a
+    // shell out to decompression tools; -L / --follow descends through
+    // symlinks out of the workspace. Short flags may be bundled (`-zn`), so
+    // any single-dash cluster containing `z` or `L` rejects — a
     // false-unsafe on flag values (`-ezoo`) only costs a prompt.
     const UNSAFE_RG_VALUE_FLAGS: &[&str] = &["--pre", "--hostname-bin"];
-    !args.iter().any(|arg| {
+    if args.iter().any(|arg| {
         *arg == "--search-zip"
             || UNSAFE_RG_VALUE_FLAGS
                 .iter()
                 .any(|flag| arg == flag || arg.starts_with(&format!("{flag}=")))
-            || arg
-                .strip_prefix('-')
-                .is_some_and(|rest| !rest.starts_with('-') && rest.contains('z'))
-    })
+    }) {
+        return false;
+    }
+    rejects_flags(args, &['z', 'L'], &["--follow"])
 }
 
 fn is_safe_base64(args: &[&str]) -> bool {
@@ -510,6 +678,351 @@ fn git_branch_args_are_read_only(args: &[&str]) -> bool {
                 | "--verbose"
         ) || arg.starts_with("--format=")
     })
+}
+
+// ── Find-danger walk (permissive) ────────────────────────────────────────
+
+/// Whether any command anywhere in `command` is dangerous.
+///
+/// # This must never be used to prove that a command is safe.
+///
+/// This is the permissive half of the two-parser design (Codex
+/// `parse_shell_lc_literal_commands` + `dangerous_command_match`). Unlike
+/// [`is_statically_safe_command`] it accepts arbitrary shell syntax and
+/// looks inside control flow, command substitutions, quoted wrapper
+/// scripts, and `sudo`/`env`/`trap`/`nohup`/`time`/`xargs` wrappers. Words
+/// it cannot resolve statically are dropped rather than rejected, so
+/// `false` means only "found nothing dangerous", never "safe". It
+/// deliberately over-flags: a false positive costs one prompt.
+///
+/// Dangerous today means a forced `rm` (`-f`, `--force`, `-rf`, …), which
+/// destroys user data with no undo and no prompt, plus anything nested
+/// deeper than [`MAX_WRAPPER_DEPTH`] wrappers (unreadable, so fail closed).
+pub fn contains_dangerous_command(command: &str) -> bool {
+    script_has_dangerous_command(command, 0)
+}
+
+fn script_has_dangerous_command(script: &str, depth: usize) -> bool {
+    if depth > MAX_WRAPPER_DEPTH {
+        return true;
+    }
+    literal_commands(script)
+        .iter()
+        .any(|argv| command_is_dangerous(argv, depth))
+}
+
+/// Shell keywords that may precede a command inside a compound statement;
+/// the danger walk splits on operators, not on grammar, so they arrive as
+/// leading words.
+const LEADING_KEYWORDS: &[&str] = &[
+    "if", "then", "elif", "else", "fi", "while", "until", "do", "done", "for", "in", "case",
+    "esac", "select", "function", "!", "[[", "{", "}",
+];
+
+/// Wrappers whose operands are themselves a command to inspect.
+const COMMAND_WRAPPERS: &[&str] = &["sudo", "nohup", "time", "xargs", "doas"];
+
+fn command_is_dangerous(argv: &[String], depth: usize) -> bool {
+    if depth > MAX_WRAPPER_DEPTH {
+        return true;
+    }
+    let argv = strip_leading_keywords(argv);
+    let Some(name) = argv.first().map(|word| basename(word)) else {
+        return false;
+    };
+    if name == "rm" {
+        return rm_args_include_force(&argv[1..]);
+    }
+    if COMMAND_WRAPPERS.contains(&name) {
+        // Which operand starts the wrapped command depends on flags this
+        // walk does not model (`xargs -n 1 rm -f`), so try every suffix:
+        // over-flagging costs a prompt, missing one costs data.
+        return (1..argv.len()).any(|start| command_is_dangerous(&argv[start..], depth + 1));
+    }
+    if name == "env" {
+        return command_is_dangerous(env_wrapped_command(&argv[1..]), depth + 1);
+    }
+    if name == "trap" {
+        // A trap action is shell source stored in the first operand.
+        return trap_action(&argv[1..])
+            .is_some_and(|action| script_has_dangerous_command(action, depth + 1));
+    }
+    if matches!(name, "sh" | "bash" | "zsh" | "dash" | "ksh") {
+        return wrapper_scripts(&argv[1..])
+            .iter()
+            .any(|script| script_has_dangerous_command(script, depth + 1));
+    }
+    false
+}
+
+fn basename(raw: &str) -> &str {
+    raw.rsplit('/').next().unwrap_or(raw)
+}
+
+fn strip_leading_keywords(argv: &[String]) -> &[String] {
+    let mut rest = argv;
+    while let Some(first) = rest.first() {
+        if LEADING_KEYWORDS.contains(&first.as_str()) || is_assignment(first) {
+            rest = &rest[1..];
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
+/// `NAME=value` prefixes a command with an environment assignment.
+fn is_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Skip `env`'s own assignments and options to reach the wrapped command.
+fn env_wrapped_command(args: &[String]) -> &[String] {
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if matches!(argument.as_str(), "-i" | "--ignore-environment") || is_assignment(argument) {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    &args[index.min(args.len())..]
+}
+
+/// `trap [--] <action> <signal>…`: the action is shell source.
+fn trap_action(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    if args.first().is_some_and(|argument| argument == "--") {
+        index = 1;
+    }
+    args.get(index)
+        .filter(|action| !action.starts_with('-'))
+        .map(String::as_str)
+}
+
+/// Scripts passed to a shell as `-c`/`-lc` operands.
+fn wrapper_scripts(args: &[String]) -> Vec<&str> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, argument)| {
+            argument
+                .strip_prefix('-')
+                .is_some_and(|rest| !rest.starts_with('-') && rest.ends_with('c'))
+        })
+        .filter_map(|(index, _)| args.get(index + 1).map(String::as_str))
+        .collect()
+}
+
+fn rm_args_include_force(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| {
+            arg == "--force"
+                || arg
+                    .strip_prefix('-')
+                    .is_some_and(|flags| !flags.starts_with('-') && flags.contains('f'))
+        })
+}
+
+/// Permissively collect the statically known words of every command in a
+/// script, including commands nested in control flow, substitutions, and
+/// quoted wrapper scripts. Words whose runtime value is dynamic are
+/// dropped, so a returned command is a SUBSET of what will run — usable
+/// only for finding danger.
+fn literal_commands(script: &str) -> Vec<Vec<String>> {
+    let mut walk = DangerWalk::default();
+    walk.scan(&script.chars().collect::<Vec<char>>());
+    walk.finish()
+}
+
+#[derive(Default)]
+struct DangerWalk {
+    commands: Vec<Vec<String>>,
+    argv: Vec<String>,
+    text: String,
+    in_word: bool,
+    dynamic: bool,
+}
+
+impl DangerWalk {
+    fn push_char(&mut self, c: char) {
+        self.text.push(c);
+        self.in_word = true;
+    }
+
+    fn mark_dynamic(&mut self) {
+        self.dynamic = true;
+        self.in_word = true;
+    }
+
+    fn flush_word(&mut self) {
+        if self.in_word {
+            let word = std::mem::take(&mut self.text);
+            // A word the shell rewrites is unknowable, so it is dropped
+            // rather than guessed at: `$SUDO rm -f x` still shows `rm -f`.
+            if !self.dynamic {
+                self.argv.push(word);
+            }
+            self.dynamic = false;
+            self.in_word = false;
+        }
+    }
+
+    fn flush_command(&mut self) {
+        self.flush_word();
+        let argv = std::mem::take(&mut self.argv);
+        if !argv.is_empty() {
+            self.commands.push(argv);
+        }
+    }
+
+    fn scan(&mut self, chars: &[char]) {
+        let mut index = 0;
+        while index < chars.len() {
+            let c = chars[index];
+            index += 1;
+            match c {
+                '\'' => {
+                    self.in_word = true;
+                    let (literal, next) = capture_until(chars, index, '\'');
+                    self.text.push_str(&literal);
+                    index = next;
+                }
+                '"' => {
+                    self.in_word = true;
+                    index = self.scan_double_quoted(chars, index);
+                }
+                '\\' => {
+                    if let Some(&escaped) = chars.get(index) {
+                        if escaped != '\n' {
+                            self.push_char(escaped);
+                        }
+                        index += 1;
+                    }
+                }
+                '$' => index = self.scan_expansion(chars, index),
+                '`' => {
+                    let (inner, next) = capture_until(chars, index, '`');
+                    self.commands.extend(literal_commands(&inner));
+                    self.mark_dynamic();
+                    index = next;
+                }
+                ' ' | '\t' => self.flush_word(),
+                ';' | '\n' | '&' | '|' | '(' | ')' => self.flush_command(),
+                '{' | '}' if !self.in_word => self.flush_command(),
+                other => self.push_char(other),
+            }
+        }
+        self.flush_command();
+    }
+
+    /// Inside double quotes only expansions matter; everything else is
+    /// literal text of the current word.
+    fn scan_double_quoted(&mut self, chars: &[char], start: usize) -> usize {
+        let mut index = start;
+        while index < chars.len() {
+            let c = chars[index];
+            index += 1;
+            match c {
+                '"' => return index,
+                '\\' => {
+                    if let Some(&escaped) = chars.get(index) {
+                        self.push_char(escaped);
+                        index += 1;
+                    }
+                }
+                '$' => index = self.scan_expansion(chars, index),
+                '`' => {
+                    let (inner, next) = capture_until(chars, index, '`');
+                    self.commands.extend(literal_commands(&inner));
+                    self.mark_dynamic();
+                    index = next;
+                }
+                other => self.push_char(other),
+            }
+        }
+        index
+    }
+
+    /// `start` points just past a `$`. Command substitutions are walked for
+    /// nested commands; every form marks the enclosing word dynamic.
+    fn scan_expansion(&mut self, chars: &[char], start: usize) -> usize {
+        self.mark_dynamic();
+        match chars.get(start) {
+            Some('(') => {
+                let (inner, next) = capture_balanced(chars, start, '(', ')');
+                self.commands.extend(literal_commands(&inner));
+                next
+            }
+            Some('{') => {
+                let (_, next) = capture_balanced(chars, start, '{', '}');
+                next
+            }
+            Some(_) => {
+                let mut index = start + 1;
+                while chars
+                    .get(index)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                {
+                    index += 1;
+                }
+                index
+            }
+            None => start,
+        }
+    }
+
+    fn finish(mut self) -> Vec<Vec<String>> {
+        self.flush_command();
+        self.commands
+    }
+}
+
+/// Text from `start` up to the next `end`, and the index just past it.
+fn capture_until(chars: &[char], start: usize, end: char) -> (String, usize) {
+    let mut index = start;
+    let mut text = String::new();
+    while index < chars.len() && chars[index] != end {
+        text.push(chars[index]);
+        index += 1;
+    }
+    (text, (index + 1).min(chars.len()))
+}
+
+/// Text inside a balanced `open`/`close` pair beginning at `start`, and the
+/// index just past the closing delimiter.
+fn capture_balanced(chars: &[char], start: usize, open: char, close: char) -> (String, usize) {
+    let mut depth = 0usize;
+    let mut index = start;
+    let mut text = String::new();
+    while index < chars.len() {
+        let c = chars[index];
+        index += 1;
+        if c == open {
+            depth += 1;
+            if depth == 1 {
+                continue;
+            }
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return (text, index);
+            }
+        }
+        text.push(c);
+    }
+    (text, index)
 }
 
 #[cfg(test)]
@@ -650,14 +1163,18 @@ mod tests {
             "ls",
             "ls -la --color=always",
             "cat Cargo.toml",
-            "grep -R Cargo.toml -n",
+            // Audit F02: `-r` only dereferences command-line operands
+            // (which confinement already checked); `-R` follows symlinks
+            // out of the workspace and is rejected below.
+            "grep -r Cargo.toml -n",
             "head -n 50 src/lib.rs",
+            "tail -n 20 src/lib.rs",
+            "uniq input.txt",
             "wc -l file",
             "which cargo",
             "nl -nrz Cargo.toml",
             "echo hello world",
             "true",
-            "cd src",
         ] {
             assert!(safe(command), "expected safe: {command}");
         }
@@ -776,10 +1293,10 @@ mod tests {
         for command in [
             "ls | wc -l",
             "find . -name file.txt | head",
-            "grep -R Cargo.toml -n || true",
+            "grep -r Cargo.toml -n || true",
             "ls && pwd",
             "echo hi ; ls",
-            "cd src && ls\nwc -l lib.rs",
+            "ls src\nwc -l src/lib.rs",
         ] {
             assert!(safe(command), "expected safe: {command}");
         }
@@ -915,20 +1432,34 @@ mod tests {
     }
 
     #[test]
-    fn glob_rules_differ_by_binary_class() {
-        // Read-only binaries stay read-only whatever expansion produces.
-        assert!(safe("ls *.rs"));
-        assert!(safe("wc -l src/*.rs"));
-        // Flag-inspected binaries reject unquoted globs: expansion could
-        // inject flag-shaped tokens (a file literally named `-delete`).
-        assert!(!safe("find . -name *.rs"));
-        assert!(!safe("rg pattern *"));
-        assert!(!safe("git status *"));
-        // Quoted globs are literal text.
+    fn unquoted_expansion_is_never_provably_safe() {
+        // Audit F02: confinement used to run on the LITERAL word, so
+        // `cat *.txt` was approved against the spelling `*.txt` while the
+        // shell expanded it to whatever the directory held — including a
+        // symlink pointing outside the workspace. A word the shell may
+        // rewrite is not proof of anything, for ANY binary.
+        for command in [
+            "ls *.rs",
+            "wc -l src/*.rs",
+            "cat *.txt",
+            "cat file?.txt",
+            "cat [abc].txt",
+            "cat ~/notes.txt",
+            "find . -name *.rs",
+            "rg pattern *",
+            "git status *",
+            // A glob in the command-name position never matches anything.
+            "l? -la",
+            // zsh equals-expansion resolves `=ls` to a binary path.
+            "=ls",
+            // zsh extendedglob treats `#` as an operator.
+            "cat file#1",
+        ] {
+            assert!(!safe(command), "expected unsafe: {command}");
+        }
+        // Quoted globs are literal text the binary receives verbatim.
         assert!(safe("find . -name '*.rs'"));
         assert!(safe("rg pattern \"*.rs\""));
-        // A glob in the command-name position never matches anything.
-        assert!(!safe("l? -la"));
     }
 
     #[test]
@@ -936,5 +1467,265 @@ mod tests {
         assert!(safe("find . -name '*.rs' | head -3"));
         assert!(!safe("find . -delete | head -3"));
         assert!(!safe("ls | base64 -o out"));
+    }
+
+    #[test]
+    fn cd_is_never_provably_safe() {
+        // Audit F02: `cd` changed the directory every LATER segment
+        // resolved against, while confinement kept checking the ORIGINAL
+        // root — `cd nested && cat view.txt` was approved against
+        // `<root>/view.txt` and read `<root>/nested/view.txt`. The segment
+        // grammar has no notion of a moving cwd, so `cd` leaves the
+        // read-only set entirely.
+        for command in [
+            "cd src",
+            "cd .",
+            "cd nested && cat view.txt",
+            "ls && cd src",
+        ] {
+            assert!(!safe(command), "expected unsafe: {command}");
+        }
+    }
+
+    #[test]
+    fn uniq_output_operand_is_never_safe() {
+        // Audit F01: `uniq in out` TRUNCATES and writes `out`, and `uniq`
+        // used to sit in the flagless read-only list.
+        assert!(safe("uniq input.txt"));
+        assert!(safe("uniq -c input.txt"));
+        assert!(safe("uniq"));
+        for command in [
+            "uniq input.txt output.txt",
+            "uniq -c input.txt output.txt",
+            "ls | uniq - output.txt",
+        ] {
+            assert!(!safe(command), "expected unsafe: {command}");
+        }
+    }
+
+    #[test]
+    fn write_and_traversal_flags_are_never_safe() {
+        for command in [
+            // Output operands and in-place writes: `sort -o` and `tee`
+            // are simply not in the read-only set.
+            "sort -o out.txt in.txt",
+            "sort -n in.txt",
+            "tee out.txt",
+            "sed -i s/a/b/ file.txt",
+            // Audit F02: traversal that dereferences symlinks can read
+            // files the confinement check never saw.
+            "ls -R",
+            "ls -laR",
+            "ls -L link",
+            "ls --recursive",
+            "grep -R pattern .",
+            "grep --dereference-recursive pattern .",
+            "rg --follow pattern .",
+            "rg -L pattern .",
+            "find -L . -name x",
+            "find . -follow -name x",
+            "tail -f log.txt",
+            "tail --follow log.txt",
+        ] {
+            assert!(!safe(command), "expected unsafe: {command}");
+        }
+        // The non-dereferencing forms stay safe.
+        for command in ["grep -r pattern .", "rg pattern .", "find . -name x"] {
+            assert!(safe(command), "expected safe: {command}");
+        }
+    }
+
+    #[test]
+    fn shell_wrapper_is_safe_exactly_when_its_script_is() {
+        for command in [
+            "sh -c 'ls -la'",
+            "bash -lc 'cat Cargo.toml | wc -l'",
+            "zsh -c 'sh -c pwd'",
+        ] {
+            assert!(safe(command), "expected safe: {command}");
+        }
+        for command in [
+            "sh -c 'cat /etc/passwd'",
+            "bash -lc 'rm -rf .'",
+            "sh -c 'cat *.txt'",
+            "sh -c 'uniq in out'",
+            // Only the three-word wrapper form is recognized.
+            "sh -c ls extra",
+            "sh -x -c ls",
+            "/bin/sh -c ls",
+            "sh --norc -c ls",
+        ] {
+            assert!(!safe(command), "expected unsafe: {command}");
+        }
+    }
+
+    #[test]
+    fn git_metadata_and_interpreter_config_are_sensitive() {
+        // Audit F34: `.git/config` selects hooks, filters, and pagers, so
+        // writing one turns a later `git status` into arbitrary execution.
+        for path in [
+            ".git",
+            ".git/config",
+            ".git/hooks/pre-commit",
+            "vendor/.git/config",
+            ".gitmodules",
+            ".gitattributes",
+            ".gitconfig",
+            ".cargo/config.toml",
+            ".cargo/config",
+            ".npmrc",
+            ".netrc",
+            ".bashrc",
+            ".zshrc",
+            ".zshenv",
+            ".profile",
+            ".env",
+            "config/secrets.yaml",
+        ] {
+            assert!(
+                sensitive_basename(Path::new(path)),
+                "expected sensitive: {path}"
+            );
+        }
+        for path in [
+            "Cargo.toml",
+            "config.toml",
+            "src/config",
+            "README.md",
+            ".gitignore",
+        ] {
+            assert!(
+                !sensitive_basename(Path::new(path)),
+                "expected ordinary: {path}"
+            );
+        }
+        assert!(!safe("cat .git/config"));
+        assert!(!safe("grep -r url .git"));
+    }
+
+    /// Fixture from `audit/2026-09-05` `reproduces_uniq_write_without_approval`,
+    /// asserting the FIXED behavior: the write never reaches static
+    /// approval, so it takes an ordinary permission decision (audit F01).
+    #[test]
+    fn audit_f01_uniq_write_fixture_now_requires_approval() {
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let root = temp.path();
+        std::fs::write(root.join("input.txt"), "a\na\nb\n").expect("seed input");
+        std::fs::write(root.join("output.txt"), "user-owned original\n").expect("seed output");
+        assert!(!is_statically_safe_command(
+            "uniq input.txt output.txt",
+            root
+        ));
+        assert!(is_statically_safe_command("uniq input.txt", root));
+        // Nothing ran: the user's file is untouched by the analysis.
+        assert_eq!(
+            std::fs::read_to_string(root.join("output.txt")).expect("read output"),
+            "user-owned original\n"
+        );
+    }
+
+    /// Fixture from `audit/2026-09-05`
+    /// `reproduces_glob_and_cd_read_scope_bypass`, asserting the FIXED
+    /// behavior: each of the three approved reads of a file outside the
+    /// workspace now falls to the ask path (audit F02).
+    #[test]
+    #[cfg(unix)]
+    fn audit_f02_glob_cd_and_follow_fixture_now_requires_approval() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(root.join("nested")).expect("workspace");
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, "SYNTHETIC_OUTSIDE_MARKER\n").expect("seed outside");
+        std::os::unix::fs::symlink(&outside, root.join("public.txt")).expect("symlink");
+        std::os::unix::fs::symlink(&outside, root.join("nested/view.txt")).expect("symlink");
+        std::fs::write(root.join("view.txt"), "inside\n").expect("seed inside");
+
+        assert!(!is_statically_safe_command("cat public.txt", &root));
+        for command in [
+            "cat *.txt",
+            "cd nested && cat view.txt",
+            "rg --follow SYNTHETIC .",
+        ] {
+            assert!(
+                !is_statically_safe_command(command, &root),
+                "expected unsafe: {command}"
+            );
+        }
+        // The confined read of the real file inside the workspace still
+        // runs without a prompt.
+        assert!(is_statically_safe_command("cat view.txt", &root));
+    }
+
+    #[test]
+    fn danger_walk_finds_forced_rm_through_wrappers_and_control_flow() {
+        for command in [
+            "rm -f file",
+            "rm -rf /",
+            "rm --force file",
+            "sudo rm -f file",
+            "sudo -u root rm -rf .",
+            "env FOO=1 rm -f file",
+            "env -i -- rm -rf .",
+            "nohup rm -f file",
+            "time rm -rf .",
+            "find . -name x | xargs rm -f",
+            "ls | xargs -n 1 rm -f",
+            "trap 'rm -rf .' EXIT",
+            "sh -c 'rm -f file'",
+            "bash -lc \"rm -rf .\"",
+            "if true; then rm -f file; fi",
+            "for f in *; do rm -f $f; done",
+            "echo $(rm -f file)",
+            "echo `rm -f file`",
+            "FOO=bar rm -f file",
+            "ls && rm -f file",
+            "/bin/rm -f file",
+            "$SUDO rm -f file",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn danger_walk_leaves_ordinary_commands_alone() {
+        for command in [
+            "ls -la",
+            "rm file",
+            "rm -r directory",
+            "rm -- -f",
+            "git status",
+            "cargo test --all-features",
+            "echo rm -f",
+            "grep -rf patterns.txt .",
+            "find . -name x | xargs ls",
+            "sh -c 'ls -la'",
+        ] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn danger_walk_fails_closed_past_the_wrapper_depth_cap() {
+        let deep = "sudo ".repeat(MAX_WRAPPER_DEPTH + 2) + "ls";
+        assert!(contains_dangerous_command(&deep));
+        let shallow = "sudo sudo ls";
+        assert!(!contains_dangerous_command(shallow));
+    }
+
+    #[test]
+    fn dangerous_commands_are_never_statically_safe() {
+        // Defense in depth: the grammar already rejects `rm`, but a
+        // dangerous command must never be provable by any future rule.
+        let temp = tempfile::tempdir().expect("temp workspace");
+        assert!(!is_statically_safe_command(
+            "sh -c 'rm -f file'",
+            temp.path()
+        ));
     }
 }
