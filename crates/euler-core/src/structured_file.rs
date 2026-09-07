@@ -288,10 +288,11 @@ fn unlinkat(directory: &OwnedFd, name: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
-/// A directory handle used only to anchor `*at` calls needs no read access.
-#[cfg(target_os = "linux")]
-const DIRECTORY_FLAGS: libc::c_int = libc::O_PATH | libc::O_DIRECTORY;
-#[cfg(all(unix, not(target_os = "linux")))]
+/// Flags for a held directory descriptor.
+///
+/// `O_PATH` would be enough to anchor `*at` calls, but `fsync` on an `O_PATH`
+/// descriptor fails with `EBADF`, and a published write must be able to make
+/// its directory entry durable through the very descriptor it wrote through.
 const DIRECTORY_FLAGS: libc::c_int = libc::O_RDONLY | libc::O_DIRECTORY;
 
 /// Open the workspace root itself. This is the one absolute-path open; the
