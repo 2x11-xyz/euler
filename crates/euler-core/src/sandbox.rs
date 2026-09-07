@@ -16,6 +16,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 /// The first Linux profile Euler intends to advertise to users.
@@ -139,6 +140,12 @@ pub enum SandboxFailureCause {
     Container,
     /// WSL1 has no user namespace support at all.
     Wsl1,
+    /// `bwrap` predates a flag the profile requires.
+    BubblewrapTooOld,
+    /// The workspace root is not a directory Euler can resolve.
+    InvalidWorkspace,
+    /// This platform has no sandbox backend at all.
+    UnsupportedPlatform,
     /// Bubblewrap ran and failed for a reason Euler could not attribute.
     Unattributed,
 }
@@ -158,7 +165,23 @@ impl SandboxFailureCause {
                 "this process is inside a container that does not allow nested user namespaces"
             }
             Self::Wsl1 => "WSL1 has no user namespace support",
+            Self::BubblewrapTooOld => {
+                "the installed Bubblewrap is older than 0.8.0 and cannot enforce this profile"
+            }
+            Self::InvalidWorkspace => "the workspace root is not an accessible directory",
+            Self::UnsupportedPlatform => "this platform has no sandbox backend yet",
             Self::Unattributed => "Bubblewrap could not create a user namespace",
+        }
+    }
+
+    /// The cause implied by a reason on its own, for a failure that was not
+    /// classified by a probe.
+    pub fn for_reason(reason: SandboxUnavailableReason) -> Self {
+        match reason {
+            SandboxUnavailableReason::BubblewrapMissing => Self::BubblewrapMissing,
+            SandboxUnavailableReason::InvalidWorkspace => Self::InvalidWorkspace,
+            SandboxUnavailableReason::UnsupportedPlatform => Self::UnsupportedPlatform,
+            SandboxUnavailableReason::CannotEnforce => user_namespace_failure_cause(),
         }
     }
 
@@ -178,11 +201,27 @@ and `sudo sysctl -w user.max_user_namespaces=15000`"
 `unshare(CLONE_NEWUSER)`"
             }
             Self::Wsl1 => "use WSL2 (`wsl --set-version <distro> 2`)",
+            Self::BubblewrapTooOld => {
+                "install bubblewrap 0.8.0 or newer, or use the bundled build tracked in \
+https://github.com/2x11-xyz/euler/issues/230"
+            }
+            Self::InvalidWorkspace => {
+                "start Euler in a directory that exists and that you can read"
+            }
+            Self::UnsupportedPlatform => {
+                "nothing on this host: the macOS Seatbelt backend is the next unit of ADR 0021"
+            }
             Self::Unattributed => {
                 "check `sysctl kernel.unprivileged_userns_clone user.max_user_namespaces` and \
 run `bwrap --unshare-user --unshare-net --ro-bind / / /bin/true` by hand"
             }
         }
+    }
+}
+
+impl fmt::Display for SandboxFailureCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.description())
     }
 }
 
@@ -228,16 +267,7 @@ impl SandboxStatus {
             Some(SandboxAvailability::Enforced(_)) => Self::Enforced,
             Some(SandboxAvailability::Unavailable(reason)) => Self::Unavailable {
                 reason,
-                cause: match reason {
-                    SandboxUnavailableReason::BubblewrapMissing => {
-                        SandboxFailureCause::BubblewrapMissing
-                    }
-                    SandboxUnavailableReason::CannotEnforce => user_namespace_failure_cause(),
-                    SandboxUnavailableReason::UnsupportedPlatform
-                    | SandboxUnavailableReason::InvalidWorkspace => {
-                        SandboxFailureCause::Unattributed
-                    }
-                },
+                cause: SandboxFailureCause::for_reason(reason),
             },
         }
     }
@@ -250,8 +280,8 @@ impl SandboxStatus {
         Some(format!(
             "Euler could not start its Linux sandbox: {}.\nTo fix it: {}.\n\
 Until then `run_shell` and the `git_*` tools fail closed; there is no automatic \
-fallback to host execution. To run without a sandbox deliberately, choose the \
-\"Full access (unsandboxed)\" preset (ADR 0021 row D), which a later release adds.",
+fallback to host execution. The probe runs once per session, so fixing the host \
+takes effect in a new session, not this one.",
             cause.description(),
             cause.remedy(),
         ))
@@ -386,18 +416,49 @@ impl WorkspaceSandbox {
     }
 }
 
+/// The isolation flags both probes and every launch share. A host that
+/// satisfies these in the trivial probe satisfies them in the profile, so the
+/// two can never disagree about why the sandbox is unavailable.
+const PROFILE_ISOLATION_FLAGS: &[&str] = &[
+    "--unshare-user",
+    "--unshare-pid",
+    "--unshare-ipc",
+    "--unshare-uts",
+    "--disable-userns",
+    "--cap-drop",
+    "ALL",
+];
+
 const BWRAP_PATHS: &[&str] = &["/usr/bin/bwrap", "/bin/bwrap"];
 const SANDBOX_WORKSPACE: &str = "/workspace";
 const SANDBOX_HOME: &str = "/tmp/home";
 const SANDBOX_CACHE: &str = "/tmp/cache";
-const RUNTIME_MOUNTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64"];
-const SYSTEM_SANDBOX_PATH: &str = "/usr/bin:/bin";
+/// The host system runtime, read-only.
+///
+/// `/etc` is not optional on Debian and Ubuntu: every update-alternatives
+/// command in `/usr/bin` (`cc`, `c++`, `awk`, `editor`, `java`) is a symlink
+/// into `/etc/alternatives`, and `getpwuid` needs `/etc/passwd`, so without it
+/// linking fails with "linker `cc` not found" and the child has no user name.
+/// Unix permissions still apply inside the user namespace, so this exposes
+/// only what the user's own login can already read; `/home` stays invisible
+/// (ADR 0014).
+const RUNTIME_MOUNTS: &[&str] = &["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"];
+const SYSTEM_SANDBOX_PATH: &str = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const SANDBOX_READY_MARKER: &str = "__EULER_SANDBOX_READY__\n";
 const SANDBOX_READY_WRAPPER: &str = "printf '__EULER_SANDBOX_READY__\\n'; exec \"$@\"";
 /// A toolchain root must be a real subtree, never `/`, a host home, or a
 /// single-component directory whose contents are unrelated to a toolchain.
 const MIN_RUNTIME_ROOT_COMPONENTS: usize = 2;
+/// Paths the profile itself mounts. Nothing else may mount over them.
+const PROFILE_MOUNT_POINTS: &[&str] = &[
+    "/tmp",
+    "/proc",
+    "/dev",
+    SANDBOX_WORKSPACE,
+    SANDBOX_HOME,
+    SANDBOX_CACHE,
+];
 #[cfg(target_os = "linux")]
 const FIRST_INHERITED_FD: libc::c_uint = 3;
 #[cfg(target_os = "linux")]
@@ -449,6 +510,11 @@ const TOOLCHAIN_ROOTS: &[(&str, &str)] = &[
 /// environment variable of their own.
 const SYSTEM_TOOLCHAIN_ROOTS: &[&str] = &["/nix/store"];
 
+/// Credential files that live inside a toolchain home. Mounting `CARGO_HOME`
+/// read-only makes the registry token readable, where main returned ENOENT
+/// for it. `config.toml` stays visible because a build needs it.
+const MASKED_TOOLCHAIN_FILES: &[&str] = &["credentials.toml", "credentials"];
+
 impl RuntimeRoots {
     /// Read the host environment. This never consults the workspace: an agent
     /// must not be able to add a mount by writing a file.
@@ -477,11 +543,18 @@ impl RuntimeRoots {
                 continue;
             };
             variables.push((OsString::from(*name), root.clone().into_os_string()));
-            roots.push(root);
+            // A toolchain inside the system runtime is already reachable
+            // (the Rust images put CARGO_HOME at /usr/local/cargo). Mounting
+            // it again would shadow the bind that already carries it.
+            if !RUNTIME_MOUNTS.iter().any(|mount| root.starts_with(mount)) {
+                roots.push(root);
+            }
         }
         for root in SYSTEM_TOOLCHAIN_ROOTS {
             if let Some(root) = usable_runtime_root(Path::new(root), home.as_deref()) {
-                roots.push(root);
+                if !RUNTIME_MOUNTS.iter().any(|mount| root.starts_with(mount)) {
+                    roots.push(root);
+                }
             }
         }
         let mut runtime = Self {
@@ -495,8 +568,12 @@ impl RuntimeRoots {
         runtime
     }
 
-    /// Drop overlapping and duplicate roots, keeping the outermost of any
+    /// Drop overlapping and duplicate *mounts*, keeping the outermost of any
     /// nested pair so Bubblewrap never receives two binds for one subtree.
+    ///
+    /// Variables are never dropped with them. `RUSTUP_HOME=$CARGO_HOME/rustup`
+    /// needs only one mount but both variables; losing `RUSTUP_HOME` breaks
+    /// every rustup proxy.
     fn normalize(&mut self) {
         self.roots.sort();
         self.roots.dedup();
@@ -508,8 +585,15 @@ impl RuntimeRoots {
             kept.push(root);
         }
         self.roots = kept;
-        self.variables
-            .retain(|(_, value)| self.roots.iter().any(|root| root == Path::new(value)));
+    }
+
+    /// Every path the sandbox can reach read-only: the roots it mounts plus
+    /// the system runtime it already binds. A toolchain inside the system
+    /// runtime (`CARGO_HOME=/usr/local/cargo` in the official Rust images)
+    /// needs no mount of its own but still needs its variable and its `PATH`.
+    fn reachable(&self, path: &Path) -> bool {
+        self.roots.iter().any(|root| path.starts_with(root))
+            || RUNTIME_MOUNTS.iter().any(|mount| path.starts_with(mount))
     }
 
     /// Keep only the host `PATH` entries that a mounted root actually
@@ -528,19 +612,26 @@ impl RuntimeRoots {
             // decided against it: a symlinked `PATH` entry must not smuggle
             // in a directory no root covers, nor be dropped for spelling.
             .filter_map(|entry| entry.canonicalize().ok())
-            .filter(|entry| self.roots.iter().any(|root| entry.starts_with(root)))
+            .filter(|entry| self.reachable(entry))
             .filter(|entry| seen.insert(entry.clone()))
             .collect()
     }
 
     /// Remove any root that overlaps the writable workspace: the workspace is
     /// mounted read-write and must not also appear read-only.
+    ///
+    /// The variables and `PATH` entries of a dropped root survive only when
+    /// something else still makes the path reachable.
     fn excluding(mut self, workspace: &Path) -> Self {
         self.roots
             .retain(|root| !root.starts_with(workspace) && !workspace.starts_with(root));
         self.normalize();
-        self.path_entries
-            .retain(|entry| self.roots.iter().any(|root| entry.starts_with(root)));
+        let mut variables = std::mem::take(&mut self.variables);
+        variables.retain(|(_, value)| self.reachable(Path::new(value)));
+        self.variables = variables;
+        let mut path_entries = std::mem::take(&mut self.path_entries);
+        path_entries.retain(|entry| self.reachable(entry));
+        self.path_entries = path_entries;
         self
     }
 
@@ -562,7 +653,16 @@ impl RuntimeRoots {
         }
         parents.sort();
         parents.dedup();
-        parents.retain(|parent| !RUNTIME_MOUNTS.iter().any(|mount| parent.starts_with(mount)));
+        // A holding directory that is also one of the profile's own mount
+        // points must not be re-mounted: `CARGO_HOME=/tmp/cargo` would
+        // otherwise put a second tmpfs over `/tmp` after the sandbox home and
+        // cache were created there, and then remount it read-only.
+        parents.retain(|parent| {
+            !RUNTIME_MOUNTS.iter().any(|mount| parent.starts_with(mount))
+                && !PROFILE_MOUNT_POINTS
+                    .iter()
+                    .any(|mount| parent.starts_with(mount) || Path::new(mount).starts_with(parent))
+        });
         parents
     }
 
@@ -587,9 +687,6 @@ fn usable_runtime_root(root: &Path, home: Option<&Path>) -> Option<PathBuf> {
         return None;
     }
     if home.is_some_and(|home| home == root || home.starts_with(&root)) {
-        return None;
-    }
-    if RUNTIME_MOUNTS.iter().any(|mount| root.starts_with(mount)) {
         return None;
     }
     Some(root)
@@ -620,6 +717,14 @@ pub fn probe_workspace_sandbox(workspace: &Path) -> SandboxAvailability {
 /// tells the user exactly what to install; bundling belongs to the release
 /// workflow instead, tracked as issue #230.
 pub fn probe_sandbox_backend() -> SandboxStatus {
+    // The backend is a property of the host, not of a workspace, and cannot
+    // change under a running process: probe it once. The per-workspace profile
+    // probe still runs for every registry.
+    static BACKEND: OnceLock<SandboxStatus> = OnceLock::new();
+    *BACKEND.get_or_init(probe_sandbox_backend_uncached)
+}
+
+fn probe_sandbox_backend_uncached() -> SandboxStatus {
     if !cfg!(target_os = "linux") {
         return SandboxStatus::Host;
     }
@@ -629,25 +734,41 @@ pub fn probe_sandbox_backend() -> SandboxStatus {
             cause: SandboxFailureCause::BubblewrapMissing,
         };
     };
-    let mut command = Command::new(bwrap);
+    let mut command = Command::new(&bwrap);
     command.env_clear();
     mark_inherited_fds_close_on_exec(&mut command);
-    command.args([
-        "--unshare-user",
-        "--unshare-net",
-        "--ro-bind",
-        "/",
-        "/",
-        "/bin/true",
-    ]);
+    // The same isolation flags the profile uses, so a host that passes here
+    // cannot fail the profile probe and be told to fix its userns sysctls.
+    // `--disable-userns` needs Bubblewrap 0.8.0, which Ubuntu 22.04 and
+    // Debian 11 predate; that is its own cause, not a userns problem.
+    command.args(PROFILE_ISOLATION_FLAGS);
+    command.args(["--unshare-net", "--ro-bind", "/", "/", "/bin/true"]);
     if run_probe_to_completion(command) {
-        SandboxStatus::Enforced
-    } else {
-        SandboxStatus::Unavailable {
-            reason: SandboxUnavailableReason::CannotEnforce,
-            cause: user_namespace_failure_cause(),
-        }
+        return SandboxStatus::Enforced;
     }
+    let cause = if supports_profile_isolation_flags(&bwrap) {
+        user_namespace_failure_cause()
+    } else {
+        SandboxFailureCause::BubblewrapTooOld
+    };
+    SandboxStatus::Unavailable {
+        reason: SandboxUnavailableReason::CannotEnforce,
+        cause,
+    }
+}
+
+/// Whether this Bubblewrap accepts every isolation flag the profile requires.
+/// `bwrap --help` lists the flags it knows, so no namespace has to be created
+/// to find out.
+fn supports_profile_isolation_flags(bwrap: &Path) -> bool {
+    let Ok(output) = Command::new(bwrap).arg("--help").output() else {
+        return false;
+    };
+    let help = String::from_utf8_lossy(&output.stdout);
+    PROFILE_ISOLATION_FLAGS
+        .iter()
+        .filter(|flag| flag.starts_with("--"))
+        .all(|flag| help.contains(flag))
 }
 
 /// Attribute a user-namespace failure to something the user can verify and
@@ -699,13 +820,24 @@ fn probe_profile(
     runtime: &RuntimeRoots,
     profile: SandboxProfile,
 ) -> SandboxAvailability {
-    let script = match &runtime.home {
-        Some(home) => format!(
-            "test -w /workspace && test -d /usr && test ! -w {}",
-            shell_quote(home)
-        ),
-        None => "test -w /workspace && test ! -e /home && test -d /usr".to_owned(),
-    };
+    // `test -d` for the workspace, not `test -w`: the mount is what the probe
+    // is checking, and a read-only checkout is a workspace Euler can still
+    // read. `/tmp` must be writable, because the sandbox home, cache and
+    // TMPDIR all live there and a stray mount over it would be silent.
+    let mut script = String::from("test -d /workspace && test -d /usr && test -w /tmp");
+    // Assert the real home is read-only only where the profile actually
+    // remounted it. A one-component home is never a mount point of its own,
+    // and a home that is itself a profile mount point (`HOME=/tmp`) is
+    // deliberately left writable, so asserting either would fail a working
+    // sandbox and send the user to the user-namespace diagnostic.
+    let read_only_parents = runtime.read_only_parents();
+    if let Some(home) = runtime
+        .home
+        .as_ref()
+        .filter(|home| read_only_parents.contains(home))
+    {
+        script.push_str(&format!(" && test ! -w {}", shell_quote(home)));
+    }
     let mut command = bwrap_command(
         bwrap,
         SandboxLaunch {
@@ -804,18 +936,8 @@ where
     // Bubblewrap before it establishes the namespace.
     command.env_clear();
     mark_inherited_fds_close_on_exec(&mut command);
-    command.args([
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--disable-userns",
-        "--cap-drop",
-        "ALL",
-        "--die-with-parent",
-        "--new-session",
-        "--clearenv",
-    ]);
+    command.args(PROFILE_ISOLATION_FLAGS);
+    command.args(["--die-with-parent", "--new-session", "--clearenv"]);
     for (name, value) in sandbox_environment(runtime, env) {
         command.arg("--setenv").arg(name).arg(value);
     }
@@ -867,17 +989,30 @@ where
 /// under the real home would appear to succeed and be silently discarded.
 fn add_runtime_root_mounts(command: &mut Command, runtime: &RuntimeRoots) {
     let parents = runtime.read_only_parents();
-    if parents.is_empty() {
-        return;
-    }
     for parent in &parents {
         command.arg("--tmpfs").arg(parent);
     }
     for root in &runtime.roots {
         command.arg("--ro-bind").arg(root).arg(root);
+        mask_toolchain_credentials(command, root);
     }
     for parent in &parents {
         command.arg("--remount-ro").arg(parent);
+    }
+}
+
+/// Cover the credential files inside a mounted toolchain home with an empty
+/// file. Read-only is not enough: `main` returned ENOENT for a registry token
+/// that the mount would now make readable.
+///
+/// Only files that exist on the host are masked, because Bubblewrap cannot
+/// create a mount point inside a read-only bind.
+fn mask_toolchain_credentials(command: &mut Command, root: &Path) {
+    for name in MASKED_TOOLCHAIN_FILES {
+        let path = root.join(name);
+        if path.is_file() {
+            command.arg("--ro-bind-try").arg("/dev/null").arg(path);
+        }
     }
 }
 
@@ -1149,9 +1284,15 @@ mod tests {
         assert!(!arguments
             .windows(3)
             .any(|triple| triple == ["--ro-bind", "/", "/"]));
-        assert!(!arguments
+        // `/etc` is mounted read-only on purpose: without it `cc` is a
+        // dangling symlink into /etc/alternatives and getpwuid has no passwd
+        // file. `/home` is what stays invisible (ADR 0014).
+        assert!(arguments
             .windows(3)
             .any(|triple| triple == ["--ro-bind", "/etc", "/etc"]));
+        assert!(!arguments
+            .windows(3)
+            .any(|triple| triple == ["--ro-bind", "/home", "/home"]));
         assert_eq!(
             arguments
                 .iter()
@@ -1277,8 +1418,9 @@ mod tests {
         let rustup = home.join(".rustup");
         std::fs::create_dir_all(cargo.join("bin")).expect("cargo bin");
         std::fs::create_dir_all(&rustup).expect("rustup");
-        let path = std::env::join_paths([cargo.join("bin"), PathBuf::from("/usr/local/sbin")])
-            .expect("join PATH");
+        let unmounted = temp.path().join("elsewhere/bin");
+        std::fs::create_dir_all(&unmounted).expect("bin outside every root");
+        let path = std::env::join_paths([cargo.join("bin"), unmounted.clone()]).expect("join PATH");
         let runtime = RuntimeRoots::from_environment(
             Some(home.clone()),
             |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
@@ -1304,7 +1446,10 @@ mod tests {
             sandbox_path.ends_with(SYSTEM_SANDBOX_PATH),
             "{sandbox_path}"
         );
-        assert!(!sandbox_path.contains("/usr/local/sbin"), "{sandbox_path}");
+        assert!(
+            !sandbox_path.contains(unmounted.to_string_lossy().as_ref()),
+            "{sandbox_path}"
+        );
         // The real home is a read-only mount point, so a write under it
         // fails instead of landing in the sandbox's private root tmpfs.
         assert!(runtime.read_only_parents().contains(&home));
@@ -1327,6 +1472,185 @@ mod tests {
             .variables
             .iter()
             .all(|(name, _)| name != "CARGO_HOME"));
+    }
+
+    /// Rust's official images put `CARGO_HOME` at `/usr/local/cargo`, inside
+    /// the system runtime the profile already binds. Mounting it again would
+    /// shadow that bind; dropping its variable and `PATH` makes `cargo`
+    /// command-not-found while the session still records `bwrap`.
+    #[test]
+    fn a_toolchain_inside_the_system_runtime_keeps_its_variable_without_a_second_mount() {
+        let usr_local = Path::new("/usr/local");
+        if !usr_local.is_dir() {
+            return;
+        }
+        let cargo = usr_local.join("cargo");
+        let exists = cargo.is_dir();
+        let runtime = RuntimeRoots::from_environment(
+            None,
+            |name| (name == "CARGO_HOME" && exists).then(|| cargo.clone().into_os_string()),
+            exists.then(|| cargo.join("bin").into_os_string()),
+        );
+        if !exists {
+            return;
+        }
+
+        let cargo = cargo.canonicalize().expect("canonical cargo home");
+        assert!(!runtime.roots.contains(&cargo), "{runtime:?}");
+        assert!(runtime
+            .variables
+            .contains(&(OsString::from("CARGO_HOME"), cargo.clone().into_os_string())));
+        assert!(runtime.path_entries.contains(&cargo.join("bin")));
+    }
+
+    /// A root nested inside another needs one mount and both variables:
+    /// dropping `RUSTUP_HOME` breaks every rustup proxy.
+    #[test]
+    fn a_nested_toolchain_root_keeps_its_variable_and_loses_only_its_mount() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cargo = temp.path().join("home/example/.cargo");
+        let rustup = cargo.join("rustup");
+        std::fs::create_dir_all(&rustup).expect("nested rustup home");
+        let runtime = RuntimeRoots::from_environment(
+            Some(temp.path().join("home/example")),
+            |name| match name {
+                "CARGO_HOME" => Some(cargo.clone().into_os_string()),
+                "RUSTUP_HOME" => Some(rustup.clone().into_os_string()),
+                _ => None,
+            },
+            None,
+        );
+        let cargo = cargo.canonicalize().expect("canonical cargo home");
+        let rustup = rustup.canonicalize().expect("canonical rustup home");
+
+        assert_eq!(runtime.roots, vec![cargo.clone()]);
+        assert!(runtime
+            .variables
+            .contains(&(OsString::from("CARGO_HOME"), cargo.into_os_string())));
+        assert!(runtime
+            .variables
+            .contains(&(OsString::from("RUSTUP_HOME"), rustup.into_os_string())));
+    }
+
+    /// A toolchain home under the profile's own `/tmp` must not put a second
+    /// tmpfs over it and then remount it read-only: the sandbox home, cache
+    /// and TMPDIR all live there.
+    #[test]
+    fn a_toolchain_root_under_a_profile_mount_point_never_remounts_it() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cargo = temp.path().join("cargo");
+        std::fs::create_dir_all(&cargo).expect("cargo home");
+        let mut runtime = RuntimeRoots::from_environment(
+            Some(PathBuf::from("/tmp")),
+            |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
+            None,
+        );
+        // Stand in for a host whose temporary directory is literally `/tmp`.
+        runtime.roots = vec![PathBuf::from("/tmp/cargo")];
+        runtime.home = Some(PathBuf::from("/tmp"));
+
+        let parents = runtime.read_only_parents();
+
+        assert!(
+            !parents.iter().any(|parent| parent == Path::new("/tmp")),
+            "{parents:?}"
+        );
+    }
+
+    /// Mounting a toolchain home read-only makes files inside it readable that
+    /// `main` returned ENOENT for. The registry token is one of them.
+    #[test]
+    fn cargo_credentials_are_masked_inside_a_mounted_toolchain_home() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let cargo = temp.path().join("home/example/.cargo");
+        std::fs::create_dir_all(&cargo).expect("cargo home");
+        std::fs::write(cargo.join("credentials.toml"), "token = \"secret\"").expect("token");
+        std::fs::write(cargo.join("config.toml"), "[net]").expect("config");
+        let runtime = RuntimeRoots::from_environment(
+            Some(temp.path().join("home/example")),
+            |name| (name == "CARGO_HOME").then(|| cargo.clone().into_os_string()),
+            None,
+        );
+        let mut command = Command::new("/usr/bin/bwrap");
+        add_runtime_root_mounts(&mut command, &runtime);
+        let arguments = command_arguments(&command);
+        let cargo = cargo.canonicalize().expect("canonical cargo home");
+        let credentials = cargo
+            .join("credentials.toml")
+            .to_string_lossy()
+            .into_owned();
+        let config = cargo.join("config.toml").to_string_lossy().into_owned();
+
+        assert!(
+            arguments
+                .windows(3)
+                .any(|triple| triple == ["--ro-bind-try", "/dev/null", credentials.as_str()]),
+            "{arguments:?}"
+        );
+        // A build needs the config; only the credential files are covered.
+        assert!(!arguments.contains(&config), "{arguments:?}");
+    }
+
+    /// `/etc` is not optional on Debian and Ubuntu: `cc` is a symlink into
+    /// `/etc/alternatives` and `getpwuid` needs `/etc/passwd`.
+    #[test]
+    fn the_profile_mounts_the_system_runtime_a_toolchain_actually_needs() {
+        assert!(RUNTIME_MOUNTS.contains(&"/etc"), "{RUNTIME_MOUNTS:?}");
+        assert!(RUNTIME_MOUNTS.contains(&"/opt"), "{RUNTIME_MOUNTS:?}");
+        for entry in ["/usr/local/bin", "/usr/sbin"] {
+            assert!(
+                SYSTEM_SANDBOX_PATH.split(':').any(|part| part == entry),
+                "{SYSTEM_SANDBOX_PATH}"
+            );
+        }
+    }
+
+    /// The two probes must agree, or a host that passes the trivial one and
+    /// fails the profile is told to fix the wrong thing.
+    #[test]
+    fn both_probes_use_the_same_isolation_flags() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().canonicalize().expect("canonical workspace");
+        let command = bwrap_command(
+            Path::new("/usr/bin/bwrap"),
+            SandboxLaunch {
+                profile: SandboxProfile::WorkspaceNoNetwork,
+                workspace: &workspace,
+                runtime: &RuntimeRoots::default(),
+                env: &[],
+            },
+            OsStr::new("/bin/sh"),
+            ["-c", "true"],
+        );
+        let arguments = command_arguments(&command);
+
+        for flag in PROFILE_ISOLATION_FLAGS {
+            assert!(
+                arguments.iter().any(|argument| argument == flag),
+                "{flag} missing from {arguments:?}"
+            );
+        }
+    }
+
+    /// Every reason has to name something the user can act on; mapping three
+    /// of them onto the user-namespace text sends people to the wrong sysctl.
+    #[test]
+    fn each_unavailable_reason_maps_to_its_own_cause() {
+        assert_eq!(
+            SandboxFailureCause::for_reason(SandboxUnavailableReason::InvalidWorkspace),
+            SandboxFailureCause::InvalidWorkspace
+        );
+        assert_eq!(
+            SandboxFailureCause::for_reason(SandboxUnavailableReason::UnsupportedPlatform),
+            SandboxFailureCause::UnsupportedPlatform
+        );
+        assert_eq!(
+            SandboxFailureCause::for_reason(SandboxUnavailableReason::BubblewrapMissing),
+            SandboxFailureCause::BubblewrapMissing
+        );
+        assert!(SandboxFailureCause::BubblewrapTooOld
+            .remedy()
+            .contains("0.8.0"));
     }
 
     #[test]
@@ -1411,10 +1735,9 @@ mod tests {
             "{diagnostic}"
         );
         assert!(diagnostic.contains("fail closed"), "{diagnostic}");
-        assert!(
-            diagnostic.contains("Full access (unsandboxed)"),
-            "{diagnostic}"
-        );
+        // The probe result is fixed for the session's lifetime, so say so
+        // rather than let a user fix the host and wonder why nothing changed.
+        assert!(diagnostic.contains("once per session"), "{diagnostic}");
         assert!(SandboxStatus::Host.diagnostic().is_none());
         assert_eq!(SandboxStatus::Host.backend_label(), "host");
         assert_eq!(SandboxStatus::Enforced.backend_label(), "bwrap");

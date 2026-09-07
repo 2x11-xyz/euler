@@ -79,7 +79,7 @@ fn requested_but_invalid_profile_fails_closed_before_shell_execution() {
         .expect_err("unavailable sandbox must not fall back to host shell");
 
     assert!(
-        matches!(error, ToolError::SandboxUnavailable(reason) if reason == expected),
+        matches!(error, ToolError::SandboxUnavailable { reason, .. } if reason == expected),
         "run_shell must refuse with the sandbox's own reason, got: {error:?}"
     );
 }
@@ -133,11 +133,11 @@ fn selected_workspace_profile_routes_shell_and_git_or_fails_closed() {
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 shell,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
             assert!(matches!(
                 git,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }
@@ -174,7 +174,7 @@ fn sandboxed_shell_uses_only_the_profile_environment() {
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 result,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }
@@ -224,7 +224,7 @@ fn sandboxed_shell_cannot_read_an_inherited_host_descriptor() {
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 result,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }
@@ -305,7 +305,7 @@ fn sandboxed_agent_git_cannot_read_an_inherited_host_descriptor() {
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 result,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }
@@ -383,7 +383,7 @@ fn sandboxed_shell_cannot_use_an_inherited_host_socket() {
         let result = registry.execute("run_shell", &json!({"command": "printf should-not-run"}));
         assert!(matches!(
             result,
-            Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+            Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
         ));
         return;
     }
@@ -463,7 +463,7 @@ fn sandboxed_shell_timeout_kills_the_bubblewrap_process_group() {
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 result,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }
