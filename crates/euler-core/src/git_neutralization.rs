@@ -31,7 +31,7 @@ const EXECUTABLE_FILTER_PATTERN: &str = r"^filter\..*\.(clean|process)$";
 /// Environment that redirects Git at another repository, another index, or
 /// another configuration file. Euler resolves the repository from the
 /// workspace root, so every one of these is removed before Git starts.
-pub(crate) const REDIRECTING_GIT_ENV_PREFIXES: &[&str] = &[
+const REDIRECTING_GIT_ENV_PREFIXES: &[&str] = &[
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_COMMON_DIR",
@@ -72,7 +72,7 @@ impl FsmonitorOverride {
 
 /// One neutralized Git invocation: the `-c` overrides that precede the
 /// subcommand, and the environment the child receives.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct GitNeutralization {
     config_args: Vec<String>,
     env: Vec<(OsString, OsString)>,

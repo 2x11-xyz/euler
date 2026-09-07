@@ -184,17 +184,6 @@ run `bwrap --unshare-user --unshare-net --ro-bind / / /bin/true` by hand"
             }
         }
     }
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::BubblewrapMissing => "bubblewrap_missing",
-            Self::UserNamespacesDisabled => "user_namespaces_disabled",
-            Self::AppArmorUserNamespaceRestriction => "apparmor_userns_restriction",
-            Self::Container => "container",
-            Self::Wsl1 => "wsl1",
-            Self::Unattributed => "unattributed",
-        }
-    }
 }
 
 /// The session-start record of which execution boundary agent subprocesses
@@ -221,14 +210,6 @@ impl SandboxStatus {
             Self::Enforced => SandboxBackend::Bwrap.as_str(),
             Self::Host => SandboxBackend::Host.as_str(),
             Self::Unavailable { .. } => "unavailable",
-        }
-    }
-
-    pub const fn backend(self) -> Option<SandboxBackend> {
-        match self {
-            Self::Enforced => Some(SandboxBackend::Bwrap),
-            Self::Host => Some(SandboxBackend::Host),
-            Self::Unavailable { .. } => None,
         }
     }
 
@@ -415,6 +396,18 @@ const SANDBOX_READY_WRAPPER: &str = "printf '__EULER_SANDBOX_READY__\\n'; exec \
 /// A toolchain root must be a real subtree, never `/`, a host home, or a
 /// single-component directory whose contents are unrelated to a toolchain.
 const MIN_RUNTIME_ROOT_COMPONENTS: usize = 2;
+#[cfg(target_os = "linux")]
+const FIRST_INHERITED_FD: libc::c_uint = 3;
+#[cfg(target_os = "linux")]
+const CLOSE_RANGE_CLOEXEC: libc::c_ulong = 1 << 2;
+#[cfg(target_os = "linux")]
+const PROC_FD_DIRECTORY: &[u8] = b"/proc/self/fd\0";
+#[cfg(target_os = "linux")]
+const PROC_DIRENT64_RECLEN_OFFSET: usize = 16;
+#[cfg(target_os = "linux")]
+const PROC_DIRENT64_NAME_OFFSET: usize = 19;
+#[cfg(target_os = "linux")]
+const PROC_FD_BUFFER_LEN: usize = 4096;
 
 /// Toolchain homes the host environment implies, read-only inside the
 /// sandbox at their real paths (ADR 0021 row A′).
