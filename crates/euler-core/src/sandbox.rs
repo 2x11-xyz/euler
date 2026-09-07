@@ -296,19 +296,6 @@ impl SandboxStatus {
         }
     }
 
-    /// Classify a probed workspace profile. `None` means no backend was
-    /// requested, which today is only the host platforms.
-    pub fn from_availability(availability: Option<SandboxAvailability>) -> Self {
-        match availability {
-            None => Self::Host,
-            Some(SandboxAvailability::Enforced(_)) => Self::Enforced,
-            Some(SandboxAvailability::Unavailable(reason)) => Self::Unavailable {
-                reason,
-                cause: SandboxFailureCause::for_reason(reason),
-            },
-        }
-    }
-
     /// An operator-facing diagnostic naming the likely cause and the way out.
     pub fn diagnostic(self) -> Option<String> {
         let Self::Unavailable { cause, .. } = self else {
@@ -539,16 +526,16 @@ const PROFILE_MOUNT_POINTS: &[&str] = &[
     SANDBOX_CACHE,
 ];
 
-/// The subset a toolchain root may not be, contain, or sit inside. `/tmp` is
-/// absent on purpose — see [`names_a_profile_mount_point`] — and reached
-/// anyway through the sandbox home beneath it.
-const EXCLUSIVE_PROFILE_MOUNTS: &[&str] = &[
-    "/proc",
-    "/dev",
-    SANDBOX_WORKSPACE,
-    SANDBOX_HOME,
-    SANDBOX_CACHE,
-];
+/// The subset a toolchain root may not be, contain, or sit inside, at
+/// detection time.
+///
+/// `/tmp` is absent on purpose — see [`names_a_profile_mount_point`] — and
+/// reached anyway through the sandbox home beneath it. The sandbox workspace
+/// is absent because whether it collides depends on where the host workspace
+/// is: a container that mounts the project at `/workspace` has a real
+/// `CARGO_HOME=/workspace/.cargo`, which is re-pointed rather than mounted.
+/// [`RuntimeRoots::excluding`] decides that once it knows the workspace.
+const EXCLUSIVE_PROFILE_MOUNTS: &[&str] = &["/proc", "/dev", SANDBOX_HOME, SANDBOX_CACHE];
 #[cfg(target_os = "linux")]
 const FIRST_INHERITED_FD: libc::c_uint = 3;
 #[cfg(target_os = "linux")]
@@ -731,6 +718,17 @@ impl RuntimeRoots {
             .collect()
     }
 
+    /// Whether a path is still usable once the workspace is known: reachable
+    /// through a mount, or inside the workspace and therefore re-pointed —
+    /// and in neither case shadowed by the workspace bind.
+    fn usable_after_workspace(&self, path: &Path) -> bool {
+        let Some(workspace) = self.workspace.as_deref() else {
+            return self.reachable(path);
+        };
+        (self.reachable(path) || self.inside_workspace(path))
+            && !shadowed_by_the_workspace_bind(path, workspace)
+    }
+
     fn inside_workspace(&self, path: &Path) -> bool {
         self.workspace
             .as_ref()
@@ -788,6 +786,8 @@ impl RuntimeRoots {
     fn excluding(mut self, workspace: &Path) -> Self {
         self.roots
             .retain(|root| !root.starts_with(workspace) && !workspace.starts_with(root));
+        self.roots
+            .retain(|root| !shadowed_by_the_workspace_bind(root, workspace));
         self.normalize();
         self.workspace = Some(workspace.to_path_buf());
         // A toolchain home inside the workspace keeps its variable and its
@@ -796,13 +796,10 @@ impl RuntimeRoots {
         // sandbox with the toolchain sitting in plain sight. `sandbox_view`
         // rewrites such a value to its bound path.
         let mut variables = std::mem::take(&mut self.variables);
-        variables.retain(|(_, value)| {
-            let value = Path::new(value);
-            self.reachable(value) || self.inside_workspace(value)
-        });
+        variables.retain(|(_, value)| self.usable_after_workspace(Path::new(value)));
         self.variables = variables;
         let mut path_entries = std::mem::take(&mut self.path_entries);
-        path_entries.retain(|entry| self.reachable(entry) || self.inside_workspace(entry));
+        path_entries.retain(|entry| self.usable_after_workspace(entry));
         self.path_entries = path_entries;
         self
     }
@@ -895,6 +892,19 @@ fn usable_runtime_root(root: &Path, home: Option<&Path>, explicit: bool) -> Opti
 /// directory and shadows nothing. Only a path that is one of these mounts, or
 /// an ancestor of one, or sits inside one, actually collides — and `/tmp`
 /// itself is caught by being an ancestor of the sandbox home.
+/// Whether the workspace bind would cover this path without it being the
+/// workspace's own content.
+///
+/// A path inside the host workspace is re-pointed to [`SANDBOX_WORKSPACE`] and
+/// really is there, so it is not shadowed. Anything else that occupies the
+/// sandbox workspace path would simply disappear under the bind.
+fn shadowed_by_the_workspace_bind(path: &Path, workspace: &Path) -> bool {
+    if path.starts_with(workspace) {
+        return false;
+    }
+    path.starts_with(SANDBOX_WORKSPACE) || Path::new(SANDBOX_WORKSPACE).starts_with(path)
+}
+
 fn names_a_profile_mount_point(path: &Path) -> bool {
     EXCLUSIVE_PROFILE_MOUNTS
         .iter()
@@ -984,10 +994,12 @@ fn attribute_isolation_failure(bwrap: &Path) -> SandboxFailureCause {
             .filter(|flag| **flag != "--disable-userns"),
     );
     command.args(["--unshare-net", "--ro-bind", "/", "/", "/bin/true"]);
-    if run_probe_to_completion(command).succeeded() {
-        SandboxFailureCause::BubblewrapTooOld
-    } else {
-        user_namespace_failure_cause()
+    match run_probe_to_completion(command) {
+        ProbeOutcome::Succeeded => SandboxFailureCause::BubblewrapTooOld,
+        // The retry taught us nothing either, so naming the namespace would
+        // be the same guess the outcome split exists to prevent.
+        ProbeOutcome::TimedOut => SandboxFailureCause::ProbeTimedOut,
+        ProbeOutcome::Refused => user_namespace_failure_cause(),
     }
 }
 
@@ -1947,6 +1959,73 @@ token = \"secret\"\n",
         assert!(usable_runtime_root(Path::new("/"), None, true).is_none());
     }
 
+    /// A container that mounts the project at `/workspace` has a real
+    /// `CARGO_HOME=/workspace/.cargo`. Rejecting it for colliding with the
+    /// sandbox workspace path would leave cargo missing while the session
+    /// records `bwrap`.
+    #[test]
+    fn a_toolchain_home_under_a_host_workspace_named_workspace_survives() {
+        let workspace = Path::new(SANDBOX_WORKSPACE);
+        let cargo = workspace.join(".cargo");
+
+        // Detection no longer rules it out: whether it collides depends on
+        // where the host workspace is, which detection does not know.
+        assert!(!names_a_profile_mount_point(&cargo));
+        assert!(!shadowed_by_the_workspace_bind(&cargo, workspace));
+        // The same path is shadowed when the workspace is somewhere else.
+        assert!(shadowed_by_the_workspace_bind(
+            &cargo,
+            Path::new("/home/example/project")
+        ));
+
+        let runtime = RuntimeRoots {
+            roots: vec![cargo.clone()],
+            variables: vec![(OsString::from("CARGO_HOME"), cargo.clone().into_os_string())],
+            path_entries: vec![cargo.join("bin")],
+            home: None,
+            workspace: None,
+        }
+        .excluding(workspace);
+
+        // No second mount — the workspace bind carries it — but the variable
+        // and PATH survive, already at their bound path.
+        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        let exported = sandbox_environment(&runtime, &[]);
+        assert!(
+            exported.contains(&(
+                OsString::from("CARGO_HOME"),
+                OsString::from("/workspace/.cargo")
+            )),
+            "{exported:?}"
+        );
+        let sandbox_path = runtime.sandbox_path().to_string_lossy().into_owned();
+        assert!(
+            sandbox_path.starts_with("/workspace/.cargo/bin:"),
+            "{sandbox_path}"
+        );
+    }
+
+    /// The mirror image: something occupying the sandbox workspace path that
+    /// is not the workspace would simply vanish under the bind.
+    #[test]
+    fn a_root_shadowed_by_the_workspace_bind_is_dropped() {
+        let runtime = RuntimeRoots {
+            roots: vec![PathBuf::from("/workspace/cargo")],
+            variables: vec![(
+                OsString::from("CARGO_HOME"),
+                OsString::from("/workspace/cargo"),
+            )],
+            path_entries: vec![PathBuf::from("/workspace/cargo/bin")],
+            home: None,
+            workspace: None,
+        }
+        .excluding(Path::new("/home/example/project"));
+
+        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        assert!(runtime.variables.is_empty(), "{runtime:?}");
+        assert!(runtime.path_entries.is_empty(), "{runtime:?}");
+    }
+
     /// A root nested inside another needs one mount and both variables:
     /// dropping `RUSTUP_HOME` breaks every rustup proxy.
     /// An explicit variable naming one of the profile's own mount points
@@ -1970,6 +2049,12 @@ token = \"secret\"\n",
         );
         assert!(runtime.roots.is_empty(), "{runtime:?}");
         assert!(runtime.variables.is_empty(), "{runtime:?}");
+
+        // A *direct* child of the private /tmp, which is what the reasoning
+        // above turns on: a temp directory is a grandchild and would not
+        // exercise it.
+        assert!(usable_runtime_root(Path::new("/tmp/home"), None, true).is_none());
+        assert!(usable_runtime_root(Path::new("/tmp/cache"), None, true).is_none());
 
         // A root merely *inside* the private /tmp is fine: the profile lays
         // its tmpfs down first, so the bind shadows nothing.
