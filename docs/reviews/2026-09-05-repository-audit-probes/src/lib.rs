@@ -3,18 +3,16 @@
 
 #[cfg(test)]
 mod tests {
-    use euler_core::command_safety::is_statically_safe_command;
     use euler_core::{
         assemble_canvas, read_provenance, ApprovalMode, AutoCompactionPolicy, CanvasItem,
         DeciderVerdict, PermissionDecider, PermissionRequest, ProvenanceWriter, Session,
-        SessionConfig, ToolRegistry,
+        SessionConfig,
     };
     use euler_provider::{FixtureResponse, ProviderSet, ScriptedProvider, ToolCall};
     use euler_sdk::Capability;
     use serde_json::json;
     use std::{
         fs,
-        process::Command,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -36,113 +34,6 @@ mod tests {
             name: name.into(),
             input,
         }
-    }
-
-    #[test]
-    fn reproduces_uniq_write_without_approval() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("input.txt"), "a\na\nb\n").unwrap();
-        fs::write(tmp.path().join("output.txt"), "user-owned original\n").unwrap();
-        let decider = Deny::default();
-        let asks = decider.0.clone();
-        let provider = ScriptedProvider::new(vec![
-            FixtureResponse::ToolCalls(vec![call(
-                "c1",
-                "run_shell",
-                json!({"command":"uniq input.txt output.txt"}),
-            )]),
-            FixtureResponse::Assistant("finished".into()),
-        ]);
-        let mut session = Session::new(SessionConfig::new(tmp.path()), provider, decider);
-        session.set_permission_mode(Capability::FsWrite, ApprovalMode::AlwaysDeny);
-        session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
-        session.run_turn("audit fixture").unwrap();
-        assert_eq!(asks.load(Ordering::Relaxed), 0);
-        assert_eq!(
-            fs::read_to_string(tmp.path().join("output.txt")).unwrap(),
-            "a\nb\n"
-        );
-        assert!(session
-            .events()
-            .iter()
-            .any(|e| e.payload.get("mode") == Some(&json!("static-safe"))));
-        println!("CONFIRMED: uniq overwrote output.txt with FsWrite=AlwaysDeny and ShellExec=Ask; decider calls=0");
-    }
-
-    #[test]
-    fn reproduces_glob_and_cd_read_scope_bypass() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("workspace");
-        fs::create_dir_all(root.join("nested")).unwrap();
-        let outside = tmp.path().join("outside.txt");
-        fs::write(&outside, "SYNTHETIC_OUTSIDE_MARKER\n").unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("public.txt")).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("nested/view.txt")).unwrap();
-        fs::write(root.join("view.txt"), "inside\n").unwrap();
-        assert!(!is_statically_safe_command("cat public.txt", &root));
-        for command in [
-            "cat *.txt",
-            "cd nested && cat view.txt",
-            "rg --follow SYNTHETIC .",
-        ] {
-            assert!(is_statically_safe_command(command, &root), "{command}");
-            let output = Command::new("sh")
-                .args(["-c", command])
-                .current_dir(&root)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{command}: status {:?}, stderr {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(String::from_utf8_lossy(&output.stdout).contains("SYNTHETIC_OUTSIDE_MARKER"));
-            println!(
-                "CONFIRMED: statically approved {command:?} read synthetic file outside workspace"
-            );
-        }
-    }
-
-    #[test]
-    fn reproduces_prepared_create_overwriting_intervening_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolRegistry::new(tmp.path());
-        let prepared = tools
-            .execute(
-                "write_file",
-                &json!({"path":"new.txt", "content":"agent\n"}),
-            )
-            .unwrap();
-        fs::write(tmp.path().join("new.txt"), "intervening user creation\n").unwrap();
-        tools.apply_patch(prepared.patch.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            fs::read_to_string(tmp.path().join("new.txt")).unwrap(),
-            "agent\n"
-        );
-        println!(
-            "CONFIRMED: create-only write overwrites a file created between prepare and apply"
-        );
-    }
-
-    #[test]
-    fn reproduces_prepared_edit_losing_intervening_change() {
-        let tmp = tempfile::tempdir().unwrap();
-        let tools = ToolRegistry::new(tmp.path());
-        fs::write(tmp.path().join("existing.txt"), "before\n").unwrap();
-        let prepared = tools
-            .execute(
-                "edit_file",
-                &json!({"path":"existing.txt", "old":"before", "new":"after"}),
-            )
-            .unwrap();
-        fs::write(tmp.path().join("existing.txt"), "intervening user edit\n").unwrap();
-        tools.apply_patch(prepared.patch.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            fs::read_to_string(tmp.path().join("existing.txt")).unwrap(),
-            "after\n"
-        );
-        println!("CONFIRMED: prepared edit silently overwrites an intervening user edit");
     }
 
     #[test]
@@ -312,15 +203,20 @@ mod tests {
             Deny::default(),
         );
         assert!(session.run_turn("finish the task").is_ok());
-        assert_eq!(
-            session.events().last().unwrap().kind.as_str(),
-            "assistant.message"
-        );
+        // Since #218 every turn ends with a `run.terminal` event; the defect is
+        // that a partial MaxTokens stop still terminalizes as `completed`.
+        assert!(session
+            .events()
+            .iter()
+            .any(|event| event.kind.as_str() == "assistant.message"));
+        let terminal = session.events().last().unwrap();
+        assert_eq!(terminal.kind.as_str(), "run.terminal");
+        assert_eq!(terminal.payload.get("status"), Some(&json!("completed")));
         assert!(!session
             .events()
             .iter()
             .any(|event| event.kind.as_str() == "error"));
-        println!("CONFIRMED: MaxTokens with partial text returns Ok with final assistant.message and no error event");
+        println!("CONFIRMED: MaxTokens with partial text returns Ok with an assistant.message and a completed run.terminal, no error event");
     }
 
     struct EmptyStopProvider;
@@ -368,51 +264,5 @@ mod tests {
             euler_core::ResumeError::DuplicateModelTerminal { .. }
         ));
         println!("CONFIRMED RESUME FAILURE after empty non-success stop: {error}");
-    }
-
-    struct PartialFailureProvider;
-    impl euler_provider::ModelProvider for PartialFailureProvider {
-        fn name(&self) -> &'static str {
-            "fixture"
-        }
-        fn invoke(
-            &self,
-            _: euler_provider::ModelRequest,
-        ) -> Result<euler_provider::ProviderStream, euler_provider::ProviderError> {
-            Ok(Box::new(
-                vec![
-                    Ok(euler_provider::ModelStreamEvent::TextDelta(
-                        "PARTIAL_RESEARCH_EVIDENCE_CANARY".into(),
-                    )),
-                    Err(euler_provider::ProviderError::transport(
-                        "synthetic interrupted connection",
-                    )),
-                ]
-                .into_iter(),
-            ))
-        }
-    }
-
-    #[test]
-    fn reproduces_partial_stream_content_missing_from_durable_record() {
-        let tmp = tempfile::tempdir().unwrap();
-        let log = tmp.path().join("events.jsonl");
-        let mut session = Session::new(
-            SessionConfig::new(tmp.path()),
-            PartialFailureProvider,
-            Deny::default(),
-        )
-        .with_provenance(ProvenanceWriter::new(&log).unwrap());
-        assert!(session.run_turn("research fixture").is_err());
-        assert!(session
-            .events()
-            .iter()
-            .any(|event| event.payload.get("delta")
-                == Some(&json!("PARTIAL_RESEARCH_EVIDENCE_CANARY"))));
-        let durable = read_provenance(&log).unwrap();
-        assert!(!serde_json::to_string(&durable)
-            .unwrap()
-            .contains("PARTIAL_RESEARCH_EVIDENCE_CANARY"));
-        println!("CONFIRMED: visible partial model output exists in memory but disappears from durable provenance after transport failure");
     }
 }
