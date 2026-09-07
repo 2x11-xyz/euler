@@ -74,11 +74,30 @@ fn main() {
     }
 }
 
+/// The same neutralization `src/git_neutralization.rs` applies to Euler's own
+/// git, repeated here because a build script cannot depend on the crate it
+/// builds. `git status` below runs hooks and a `core.fsmonitor` helper
+/// otherwise (ADR 0021 row G).
+const NEUTRALIZED_CONFIG: &[&str] = &[
+    "core.hooksPath=/dev/null",
+    "safe.bareRepository=explicit",
+    "attr.tree=",
+    "core.attributesFile=",
+    "diff.ignoreSubmodules=dirty",
+    "core.fsmonitor=false",
+];
+
 fn git_output(workspace: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(workspace)
+    let mut command = Command::new("git");
+    command.arg("-C").arg(workspace);
+    for config in NEUTRALIZED_CONFIG {
+        command.arg("-c").arg(config);
+    }
+    let output = command
         .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
         .output()
         .ok()?;
     if !output.status.success() {

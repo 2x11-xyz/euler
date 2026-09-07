@@ -2086,8 +2086,15 @@ fn selected_sandbox_normalizes_subprocess_io_failures() {
     );
     assert!(matches!(
         sandboxed,
-        ToolError::SandboxUnavailable(SandboxUnavailableReason::CannotEnforce)
+        ToolError::SandboxUnavailable {
+            reason: SandboxUnavailableReason::CannotEnforce,
+            ..
+        }
     ));
+    // The in-session failure names the cause and where to get the rest, not
+    // only that something went wrong.
+    let message = sandboxed.to_string();
+    assert!(message.contains("euler --check-sandbox"), "{message}");
 
     let host = normalize_sandbox_subprocess_error(
         false,
@@ -2809,6 +2816,13 @@ fn a_lowered_observation_bound_reports_the_bound_it_actually_used() {
         "{}",
         execution.output
     );
+
+    // The capture-error branch must report the same configured bound, not the
+    // default: a reader comparing them would otherwise draw a false
+    // conclusion about how much of the workspace was walked.
+    let unreadable = incomplete_observation(None, None, 2).expect("incomplete observation");
+    assert_eq!(unreadable.reason, crate::ObservationLimit::Unreadable);
+    assert_eq!(unreadable.bound, 2);
 }
 
 /// ADR 0021 row G: `git diff` runs a repository-configured clean filter over
@@ -2924,4 +2938,97 @@ fn git(root: &Path, args: &[&str]) {
         .status()
         .expect("git fixture command");
     assert!(status.success(), "git {args:?}");
+}
+
+/// ADR 0021 row G: a clean/process driver configured in a submodule's own
+/// config is not reachable by the superproject's blanking, so the recursive
+/// submodule spawn must never happen.
+#[test]
+fn git_status_does_not_recurse_into_a_submodule_with_its_own_clean_filter() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    let submodule = root.join("sub");
+    std::fs::create_dir(&submodule).expect("submodule directory");
+    git(&submodule, &["init", "--quiet"]);
+    git(
+        &submodule,
+        &["config", "user.email", "euler@example.invalid"],
+    );
+    git(&submodule, &["config", "user.name", "Euler"]);
+    std::fs::write(submodule.join(".gitattributes"), "* filter=evil\n").expect("attributes");
+    std::fs::write(submodule.join("inner.txt"), "original\n").expect("inner file");
+    git(&submodule, &["add", "."]);
+    git(&submodule, &["commit", "--quiet", "-m", "seed"]);
+    // The driver lives in the submodule's config, where the superproject's
+    // GIT_CONFIG_KEY_n blanking does not reach.
+    git(
+        &submodule,
+        &["config", "filter.evil.clean", "touch submodule-filter-ran"],
+    );
+    std::fs::write(submodule.join("inner.txt"), "changed\n").expect("inner edit");
+    git(root, &["add", "sub"]);
+    let registry = ToolRegistry::new(root);
+
+    let status = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+    let diff = registry
+        .execute("git_diff", &json!({}))
+        .expect("git_diff runs");
+
+    assert!(
+        !submodule.join("submodule-filter-ran").exists(),
+        "submodule clean filter ran: {}\n{}",
+        status.output,
+        diff.output
+    );
+}
+
+/// ADR 0021 row G: a probe Euler cannot complete must fail the tool, not
+/// silently become "nothing configured" and run the command with the
+/// repository's helpers live.
+#[test]
+fn a_git_probe_that_cannot_run_fails_the_tool_closed() {
+    let temp = tempfile::tempdir().expect("temp");
+    // No git repository here: `git config --get-regexp` exits 1, which is the
+    // legitimate "nothing configured" answer and must still run the command.
+    let registry = ToolRegistry::new(temp.path());
+    let unset = registry.execute("git_status", &json!({}));
+    assert!(
+        !matches!(unset, Err(ToolError::GitProbeFailed)),
+        "exit 1 is an answer, not a probe failure"
+    );
+
+    // A `git` that cannot be found at all is a probe Euler could not run.
+    let missing = temp.path().join("no-such-directory");
+    let registry = ToolRegistry::new(&missing);
+    assert!(
+        matches!(
+            registry.execute("git_status", &json!({})),
+            Err(ToolError::GitProbeFailed
+                | ToolError::Io(_)
+                | ToolError::SandboxUnavailable { .. })
+        ),
+        "a probe that cannot run must not report no drivers"
+    );
+}
+
+/// The fsmonitor probe must not read back its own override, or the built-in
+/// daemon is unreachable and every command pays for a full worktree scan.
+#[test]
+fn a_repository_using_the_builtin_fsmonitor_daemon_still_works() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    git(root, &["config", "core.fsmonitor", "true"]);
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs with the built-in daemon configured");
+
+    assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
 }

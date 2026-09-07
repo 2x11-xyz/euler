@@ -15,7 +15,7 @@ mod durability;
 pub mod extension_registry;
 pub mod extensions;
 pub mod file_diff;
-mod git_neutralization;
+pub mod git_neutralization;
 pub mod grants;
 pub mod guardian;
 pub mod home;
@@ -85,6 +85,7 @@ pub use file_diff::{
     ObservedFileChange, WorkspaceSnapshot, MAX_FILE_DIFF_BYTES, MAX_WORKSPACE_SNAPSHOT_FILES,
     MAX_WORKSPACE_SNAPSHOT_FILE_BYTES, MAX_WORKSPACE_SNAPSHOT_TOTAL_BYTES,
 };
+pub use git_neutralization::host_git_command;
 pub use grants::{
     ActiveGrant, GrantScope, ProjectGrantError, ProjectGrantStore, ScopePattern, ScopePatternError,
     MAX_GRANT_COMMAND_BYTES, MAX_GRANT_INSTRUCTION_BYTES, MAX_SCOPE_PATTERN_BYTES,
