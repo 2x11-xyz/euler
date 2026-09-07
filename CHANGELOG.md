@@ -39,8 +39,9 @@ pull requests that landed them; deeper design rationale lives in
   `core.fsmonitor`, and filter programs. Traversal flags that dereference
   symlinks, attached option values, and GNU long abbreviations are all
   rejected by the allowlist rather than chased with a denylist, as are
-  recursive readers (`grep -r`, `rg --hidden`) whose tree walk reads files
-  the per-operand sensitive check never saw. A backslash anywhere in the
+  recursive readers — `grep -r`, and `rg` entirely, since it recurses by
+  default — whose tree walk reads files the per-operand sensitive check
+  never saw. A backslash anywhere in the
   line makes it unprovable, because a backslash-newline is whitespace to
   the grammar and a line continuation to `sh`.
 - The sensitive-path denylist (which blocks both static shell approval and

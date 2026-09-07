@@ -538,6 +538,8 @@ const MATRIX: &[Case] = &[
     // ADR 0021 decision D (review round 2, findings 10 and 12): the danger
     // veto holds in EVERY mode short of always-deny, and a command nobody
     // can read counts as dangerous.
+    // The ordinary-command counterpart lives in "shell / session-allow /
+    // mode is capability-wide" above; only the escalation is new here.
     Case { name: "shell / session-allow / dangerous command still prompts",
         capability: ShellExec, mode: Set(SessionAllow), grants: &[],
         tool: "run_shell", subject: "rm -rf scratch", expected: Asks },

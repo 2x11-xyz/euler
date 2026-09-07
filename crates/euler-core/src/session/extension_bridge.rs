@@ -290,6 +290,10 @@ impl<D> Session<D> {
     /// capabilities not covered by an existing grant share one operation
     /// prompt and retain individual decision records. A denial aborts the
     /// whole run.
+    /// `shell-exec` is refused here by construction: this entry point
+    /// carries no command line, so nothing could be walked, and a caller
+    /// must use the cancellable form and pass the command (review round 3,
+    /// finding 7).
     pub fn approve_extension_capabilities(
         &mut self,
         extension_id: &str,
@@ -299,6 +303,11 @@ impl<D> Session<D> {
     where
         D: crate::permissions::PermissionDecider,
     {
+        if required.contains(&Capability::ShellExec) {
+            return Err(ExtensionExecutionError::CapabilityDenied {
+                capability: Capability::ShellExec,
+            });
+        }
         self.approve_extension_capabilities_cancellable(
             extension_id,
             command,
@@ -331,8 +340,15 @@ impl<D> Session<D> {
                 ApprovalMode::Ask => {
                     let mut request = PermissionRequest::new(capability, operation.clone());
                     if capability == Capability::ShellExec {
-                        if let Some(command) = shell_command {
-                            request = request.with_command(command);
+                        match shell_command {
+                            // Walked exactly as `run_shell` is.
+                            Some(command) => request = request.with_command(command),
+                            // An extension may name its field anything
+                            // (`cmd`, `script`), so a shell request with no
+                            // command line is unreadable: it is covered by
+                            // no grant and always reaches a prompt, the
+                            // same treatment a truncated command gets.
+                            None => request.dangerous_command = true,
                         }
                     }
                     if self.permissions.granted_source(&request).is_none()

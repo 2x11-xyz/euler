@@ -334,14 +334,15 @@ distinct nodes.
   every harmful spelling on every platform and misses one; this polarity
   cannot.
 - **Read-only set.** `true false pwd whoami id uname echo expr seq which
-  cat head tail wc ls nl paste rev cut tr stat uniq grep rg base64`, plus
+  cat head tail wc ls nl paste rev cut tr stat uniq grep base64`, plus
   `find` (only the enumerated read-only predicates, so `-exec`, `-delete`,
   `-L`, `-follow` are rejected by omission) and `sed` (only the print-range
-  form `sed -n Np [file]`). Recursive readers are excluded — no `grep -r`,
-  no `rg --hidden`/`--no-ignore`/`-u` — because a tree walk reads files the
-  per-operand sensitive check never saw (`grep -r PASSWORD .` printed
-  `.env`). Under ADR 0021 row P the sandbox auto-allows these later; until
-  then they prompt. `uniq` accepts at most one operand, because the
+  form `sed -n Np [file]`). Recursive readers are excluded: no `grep -r`, and no
+  `rg` at all, since `rg` recurses by default. A tree walk reads files the
+  per-operand sensitive check never saw — `grep -r PASSWORD .` printed
+  `.env`, and `rg PASSWORD` reads `deploy.pem`, `id_rsa`, and
+  `credentials.json`. Under ADR 0021 row P the sandbox auto-allows these
+  later; until then they prompt. `uniq` accepts at most one operand, because the
   second operand is an output file it truncates. Binaries outside the set
   are never provable — `sort` (`-o` writes a file), `tee`, and every
   interpreter included.
@@ -399,11 +400,21 @@ that destroy data with no undo: `rm` with `-r`/`-R`/`-f`/`--recursive`/
 `--force` or any GNU abbreviation of those (`run_shell` closes stdin, so
 `rm -r` never gets its interactive confirmation and is as destructive as
 `rm -rf`), `find` with `-delete`/`-exec`/`-execdir`/`-ok`/`-okdir`, `git
-clean -f`, `shred`, `truncate`, `wipefs`, `dd of=`, and the `mkfs*` family.
+clean -f`, `reset --hard`, `rm -f`, `checkout -- <path>`, `restore`,
+`branch -D`, `stash drop`/`clear`, `shred`, `truncate`, `wipefs`, `dd of=`,
+the `mkfs*` family, and an in-place editor (`sed -i`, `perl -pi`, `patch`,
+`awk -i inplace`) pointed at a sensitive path. Command names are matched
+case-insensitively, because the default macOS filesystem is.
 It also flags **writes an interpreter later honors**: a redirect target or a
 `cp`/`mv`/`tee`/`install`/`ln`/`rsync` destination on the sensitive list, so
 `printf x > .git/hooks/pre-commit` and `echo x > .bashrc` ask exactly as
-`write_file` on those paths does (audit F34, write side).
+`write_file` on those paths does (audit F34, write side), including when
+the redirection hangs off a compound statement
+(`{ printf x; } > .bashrc`).
+
+An extension-declared `shell-exec` request is walked like `run_shell` when
+the invocation names a command, and treated as unreadable — never
+grant-covered, always prompted — when it does not.
 
 A **truncated** command still blocks scoped grant matching, but the walk
 itself reads the full command text, so an ordinary multi-kilobyte command is

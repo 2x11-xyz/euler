@@ -37,6 +37,11 @@
 //! Binary names match the command word exactly: `/bin/ls` or `env ls` do
 //! not match `ls`.
 //!
+//! `rg` is absent for the same reason `grep -r` is: it recurses by
+//! default, so `rg PASSWORD` reads every non-ignored file in the tree —
+//! `deploy.pem`, `id_rsa`, `credentials.json` — none of which ever faces
+//! the per-operand sensitive check.
+//!
 //! `git` is deliberately absent even for read-only subcommands: `git
 //! status`/`diff`/`log` still execute repository-controlled programs
 //! through `diff.external`, `core.fsmonitor`, `core.pager`, and clean and
@@ -558,43 +563,6 @@ const READ_ONLY_BINARIES: &[(&str, BinaryRule)] = &[
             None,
         ),
     ),
-    // No `-L`/`--follow`, no `--pre`/`--hostname-bin`, no `-z`.
-    (
-        "rg",
-        rule(
-            &[
-                "--line-number",
-                "--ignore-case",
-                "--files-with-matches",
-                "--count",
-                "--count-matches",
-                "--word-regexp",
-                "--line-regexp",
-                "--fixed-strings",
-                "--invert-match",
-                "--no-heading",
-                "--with-filename",
-                "--no-filename",
-                "--only-matching",
-                "--files",
-                "--json",
-                "--quiet",
-                "--smart-case",
-                "--case-sensitive",
-            ],
-            &[
-                "--glob",
-                "--type",
-                "--max-count",
-                "--max-depth",
-                "--context",
-            ],
-            &["--color"],
-            "nilcwxFvHhoqSs",
-            "",
-            None,
-        ),
-    ),
     // No `-o`/`--output`, and no attached values (`-Do`, `-i.env`).
     (
         "base64",
@@ -699,7 +667,7 @@ fn scan_args(rule: &BinaryRule, args: &[String]) -> Option<Vec<String>> {
 fn find_checked_words(args: &[String]) -> Option<Vec<String>> {
     const BOOL_PREDICATES: &[&str] = &[
         "-print", "-print0", "-empty", "-not", "-o", "-a", "-or", "-and", "-true", "-false",
-        "-type", "-depth",
+        "-depth",
     ];
     const VALUE_PREDICATES: &[&str] = &[
         "-name",
@@ -940,6 +908,13 @@ fn script_is_dangerous(script: &str, depth: usize) -> bool {
         if visits > MAX_NODE_VISITS {
             return true;
         }
+        // A redirection may hang off a compound statement rather than a
+        // command (`{ printf x; } > .git/hooks/pre-commit`), so the
+        // write-side check visits every `redirected_statement`, not only a
+        // command's own parent.
+        if node.kind() == "redirected_statement" && redirect_targets_are_sensitive(node, script) {
+            return true;
+        }
         if node.kind() == "command" && command_node_is_dangerous(node, script, depth) {
             return true;
         }
@@ -952,17 +927,17 @@ fn script_is_dangerous(script: &str, depth: usize) -> bool {
 }
 
 fn command_node_is_dangerous(node: Node<'_>, src: &str, depth: usize) -> bool {
-    if redirect_targets(node, src)
-        .iter()
-        .any(|target| target.as_deref().is_none_or(writes_interpreter_config))
-    {
-        // `printf x > .git/hooks/pre-commit` is the shell twin of
-        // `write_file .git/hooks/pre-commit`, which asks (audit F34). An
-        // unreadable target is unreadable.
-        return true;
-    }
     let words = literal_or_dynamic_words(node, src);
     words_are_dangerous(&words, depth)
+}
+
+/// `printf x > .git/hooks/pre-commit` is the shell twin of `write_file
+/// .git/hooks/pre-commit`, which asks (audit F34). An unreadable target is
+/// unreadable, so it counts too.
+fn redirect_targets_are_sensitive(redirected: Node<'_>, src: &str) -> bool {
+    targets_of_redirects(redirected, src)
+        .iter()
+        .any(|target| target.as_deref().is_none_or(writes_interpreter_config))
 }
 
 /// Whether writing `path` hands an interpreter new instructions: the
@@ -978,15 +953,20 @@ fn writes_interpreter_config(path: &str) -> bool {
 /// up there too, so this over-collects; for the danger table that is the
 /// safe direction.
 fn redirect_targets(node: Node<'_>, src: &str) -> Vec<Option<String>> {
-    let mut targets = Vec::new();
     let Some(parent) = node.parent() else {
-        return targets;
+        return Vec::new();
     };
     if parent.kind() != "redirected_statement" {
-        return targets;
+        return Vec::new();
     }
-    let mut cursor = parent.walk();
-    for redirect in parent.named_children(&mut cursor) {
+    targets_of_redirects(parent, src)
+}
+
+/// Every word carried by the redirections of one `redirected_statement`.
+fn targets_of_redirects(redirected: Node<'_>, src: &str) -> Vec<Option<String>> {
+    let mut targets = Vec::new();
+    let mut cursor = redirected.walk();
+    for redirect in redirected.named_children(&mut cursor) {
         if !redirect.kind().ends_with("redirect") {
             continue;
         }
@@ -1046,6 +1026,10 @@ fn words_are_dangerous(words: &[Option<String>], depth: usize) -> bool {
         Some((_, base)) => base,
         None => name,
     };
+    // The default macOS filesystem is case-insensitive, so `RM -rf .`
+    // executes `rm`. Match the way `sensitive_basename` does.
+    let name = name.to_ascii_lowercase();
+    let name = name.as_str();
     let dynamic_args = words[1..].iter().any(Option::is_none);
     let literal: Vec<&str> = words[1..].iter().filter_map(Option::as_deref).collect();
     if let Some(destructive) = destructive_verdict(name, &literal) {
@@ -1090,13 +1074,23 @@ fn destructive_verdict(name: &str, args: &[&str]) -> Option<bool> {
             )
         }),
         // Global options come before the subcommand: `git -C . clean -fdx`.
-        "git" => {
-            let rest = skip_git_global_options(args);
-            rest.first() == Some(&"clean")
-                && rest.iter().any(|arg| {
-                    is_short_cluster_with(arg, "f") || is_long_abbreviation(arg, &["--force"])
-                })
+        "git" => git_is_destructive(&skip_git_global_options(args)),
+        // In-place editors: rewriting a file an interpreter later honors is
+        // the same act as writing it (audit F34, write side).
+        "sed" => {
+            args.iter().any(|arg| {
+                is_short_cluster_with(arg, "iI") || is_long_abbreviation(arg, &["--in-place"])
+            }) && args.iter().any(|arg| writes_interpreter_config(arg))
         }
+        "perl" | "ruby" => {
+            args.iter().any(|arg| is_short_cluster_with(arg, "i"))
+                && args.iter().any(|arg| writes_interpreter_config(arg))
+        }
+        "awk" | "gawk" => {
+            args.iter().any(|arg| arg.contains("inplace"))
+                && args.iter().any(|arg| writes_interpreter_config(arg))
+        }
+        "patch" | "ed" => args.iter().any(|arg| writes_interpreter_config(arg)),
         // Write-position operands: a copy, move, link, or tee onto a file an
         // interpreter later honors is the shell twin of `write_file` on it.
         "cp" | "mv" | "tee" | "install" | "ln" | "rsync" | "mktemp" => {
@@ -1113,6 +1107,32 @@ fn destructive_verdict(name: &str, args: &[&str]) -> Option<bool> {
 }
 
 const RM_LONGS: &[&str] = &["--force", "--recursive", "--dir"];
+
+/// `git` subcommands that destroy work with no undo and no prompt, judged
+/// by the same criterion as `rm -r`.
+fn git_is_destructive(args: &[&str]) -> bool {
+    let Some((subcommand, rest)) = args.split_first() else {
+        return false;
+    };
+    let forced = |letters: &str, longs: &[&str]| {
+        rest.iter()
+            .any(|arg| is_short_cluster_with(arg, letters) || is_long_abbreviation(arg, longs))
+    };
+    match *subcommand {
+        "clean" => forced("f", &["--force"]),
+        "reset" => forced("", &["--hard"]),
+        // `git rm` deletes tracked files; `-f`/`-r` skips every safety net.
+        "rm" => forced("fr", &["--force"]),
+        // `git checkout -- path` and `git restore` discard uncommitted work.
+        "checkout" => rest.contains(&"--"),
+        "restore" => forced("W", &["--worktree", "--staged"]) || rest.contains(&"--"),
+        "branch" => forced("D", &["--delete"]),
+        "stash" => rest
+            .first()
+            .is_some_and(|arg| matches!(*arg, "drop" | "clear")),
+        _ => false,
+    }
+}
 
 /// `git` global options precede the subcommand, and `-C`/`-c`/`--git-dir`
 /// and friends may carry a detached value.
@@ -1208,8 +1228,8 @@ const WRAPPERS: &[(&str, WrapperSpec)] = &[
     (
         "su",
         WrapperSpec {
-            short_value: "ugCpUhDRT",
-            short_bool: "EHnPkKAb",
+            short_value: "ugCpUhDRTs",
+            short_bool: "EHnPkKAbl",
             short_script: "c",
             long_value: &["--user", "--group", "--prompt", "--chdir", "--login"],
             long_bool: &["--preserve-env", "--set-home", "--non-interactive"],
@@ -1687,7 +1707,9 @@ fn scan_wrapper_options<'a>(spec: &WrapperSpec, args: &[&'a str]) -> Option<Wrap
             index += 1;
             break;
         }
-        if !arg.starts_with('-') || arg == "-" {
+        // A bare `-` is `su`'s login-shell marker, not an operand: it must
+        // not consume the slot the user name occupies.
+        if !arg.starts_with('-') {
             if spec.tail == WrapperTail::Env && is_assignment(arg) {
                 index += 1;
                 continue;
@@ -2142,17 +2164,15 @@ mod tests {
     }
 
     #[test]
-    fn rg_flag_rules() {
-        assert!(safe("rg Cargo.toml -n"));
-        assert!(safe("rg -n pattern src"));
+    fn rg_is_never_provably_safe() {
+        // `rg` recurses by default (review round 3 blocker): every form is
+        // unprovable now, not just the `--pre`/`-z`/`--follow` ones.
         for command in [
+            "rg Cargo.toml -n",
+            "rg -n pattern src",
             "rg --pre pwned files",
-            "rg --pre=pwned files",
-            "rg --hostname-bin pwned files",
-            "rg --hostname-bin=pwned files",
             "rg --search-zip files",
-            "rg -z files",
-            "rg -zn files", // bundled short flags
+            "rg --follow pattern .",
         ] {
             assert!(!safe(command), "expected unsafe: {command}");
         }
@@ -2269,7 +2289,7 @@ mod tests {
         }
         // Quoted globs are literal text the binary receives verbatim.
         assert!(safe("find . -name '*.rs'"));
-        assert!(safe("rg pattern \"*.rs\""));
+        assert!(!safe("rg pattern \"*.rs\""));
     }
 
     #[test]
@@ -2342,11 +2362,7 @@ mod tests {
             assert!(!safe(command), "expected unsafe: {command}");
         }
         // The non-dereferencing forms stay safe.
-        for command in [
-            "grep -n pattern README.md",
-            "rg pattern .",
-            "find . -name x",
-        ] {
+        for command in ["grep -n pattern README.md", "find . -name x"] {
             assert!(safe(command), "expected safe: {command}");
         }
     }
@@ -2866,6 +2882,8 @@ mod tests {
             "grep -r PASSWORD .",
             "grep -rn PASSWORD .",
             "grep --recursive PASSWORD .",
+            "rg PASSWORD .",
+            "rg PASSWORD",
             "rg -uu PASSWORD .",
             "rg --hidden PASSWORD .",
             "rg --no-ignore PASSWORD .",
@@ -2874,7 +2892,6 @@ mod tests {
         }
         // Non-recursive reads of a named operand still prove.
         assert!(safe("grep -n PASSWORD Cargo.toml"));
-        assert!(safe("rg -n PASSWORD Cargo.toml"));
     }
 
     #[test]
@@ -2917,5 +2934,148 @@ mod tests {
             "danger walk took {elapsed:?} for a {} byte input",
             command.len()
         );
+    }
+
+    #[test]
+    fn recursive_default_readers_cannot_prove_safe() {
+        // Review round 3, blocker: `rg` recurses by DEFAULT, so
+        // `rg PASSWORD .` (and the bare form) reads every non-ignored file
+        // in the tree — none of which faces the per-operand sensitive
+        // check. Same class as `grep -r`; `rg` leaves the read-only set
+        // and returns in Unit 2 behind the sandbox.
+        let temp = tempfile::tempdir().expect("temp workspace");
+        let root = temp.path();
+        std::fs::write(root.join("deploy.pem"), "PRIVATE KEY\n").expect("seed pem");
+        std::fs::write(root.join("id_rsa"), "PRIVATE KEY\n").expect("seed key");
+        std::fs::write(root.join("credentials.json"), "{}\n").expect("seed creds");
+        for command in [
+            "rg PASSWORD .",
+            "rg PASSWORD",
+            "rg -n PASSWORD src",
+            "rg --files",
+        ] {
+            assert!(
+                !is_statically_safe_command(command, root),
+                "expected unsafe: {command}"
+            );
+        }
+        // Naming the sensitive file directly was already refused, and a
+        // named ordinary operand still proves through `grep`.
+        assert!(!is_statically_safe_command("cat deploy.pem", root));
+        assert!(is_statically_safe_command(
+            "grep -n PASSWORD Cargo.toml",
+            root
+        ));
+    }
+
+    #[test]
+    fn redirects_on_compound_statements_are_checked() {
+        // Review round 3, finding 2: the target hangs off the compound
+        // statement, not off any command node inside it.
+        for command in [
+            "{ printf 'x'; } > .git/hooks/pre-commit",
+            "if true; then :; fi > .bashrc",
+            "(echo x) > .zshrc",
+            "for i in 1; do echo x; done > .bashrc",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        assert!(!contains_dangerous_command("{ printf 'x'; } > out.txt"));
+    }
+
+    #[test]
+    fn command_names_match_case_insensitively() {
+        // Review round 3, finding 3: the default macOS filesystem is
+        // case-insensitive, so `RM -rf .` executes `rm`.
+        for command in [
+            "RM -rf scratch",
+            "GIT clean -f",
+            "SHRED x",
+            "Sudo Rm -rf x",
+            "SH -c 'rm -rf x'",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn su_login_forms_are_unwrapped() {
+        // Review round 3, finding 4: the bare `-` is a login marker, not
+        // the user-name operand.
+        for command in [
+            "su - user -c 'rm -rf x'",
+            "su -l user -c 'rm -rf x'",
+            "su user -c 'rm -rf x'",
+            "su -c 'rm -rf x'",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        assert!(!contains_dangerous_command("su - user -c 'ls -la'"));
+    }
+
+    #[test]
+    fn in_place_editors_on_interpreter_config_are_dangerous() {
+        // Review round 3, finding 5: rewriting a file an interpreter later
+        // honors is the same act as writing it.
+        for command in [
+            "sed -i 's/^/alias g=evil;/' .bashrc",
+            "sed -i.bak s/a/b/ .zshrc",
+            "sed --in-place s/a/b/ .bashrc",
+            "perl -pi -e 's/a/b/' .bashrc",
+            "patch .bashrc",
+            "awk -i inplace '{print}' .zshrc",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        for command in ["sed -i s/a/b/ src/lib.rs", "sed -n 1p .bashrc"] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_destructive_subcommands_beyond_clean() {
+        // Review round 3, finding 6: same "no undo, no prompt" criterion
+        // as `rm -r`.
+        for command in [
+            "git reset --hard HEAD~1",
+            "git rm -f src/lib.rs",
+            "git checkout -- src/lib.rs",
+            "git restore --worktree src",
+            "git branch -D feature",
+            "git stash drop",
+            "git stash clear",
+            "git -C . reset --hard",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        for command in [
+            "git status",
+            "git log -n 1",
+            "git stash list",
+            "git branch -a",
+        ] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
     }
 }
