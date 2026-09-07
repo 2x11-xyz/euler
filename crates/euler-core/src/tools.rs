@@ -969,12 +969,12 @@ impl ToolRegistry {
             ProcessTermination::Cancelled => -1,
             ProcessTermination::TimedOut => unreachable!("git has no timeout"),
         };
-        // Only on a run that completed: a note about what a successful listing
+        // Only on a run that succeeded: a note about what a successful listing
         // omits has nothing to say about why a command failed or was killed.
-        let text = if cancelled {
-            text
-        } else {
+        let text = if status == 0 {
             format!("{text}{}", self.submodule_notice())
+        } else {
+            text
         };
         let execution = ToolExecution {
             name: name.to_owned(),
@@ -1004,12 +1004,12 @@ impl ToolRegistry {
     /// agent told its changes do not exist is the silent loss ADR 0021 row E
     /// exists to prevent.
     ///
-    /// `.git/modules` is the cheap test, and the right one: `.gitmodules`
-    /// alone is a declaration, so a fresh clone before `submodule update`
-    /// would get the note on every call while nothing is being hidden. A
-    /// directory check keeps this free of an extra git spawn.
+    /// `modules/` under the git directory is the cheap test, and the right
+    /// one: `.gitmodules` alone is a declaration, so a fresh clone before
+    /// `submodule update` would get the note on every call while nothing is
+    /// being hidden. A directory check keeps this free of an extra git spawn.
     fn submodule_notice(&self) -> &'static str {
-        if self.root.join(".git/modules").is_dir() {
+        if git_directory(&self.root).join("modules").is_dir() {
             "\nnote: changes inside submodule worktrees are not shown here, because Euler does \
 not let git recurse into submodules; run `git status` or `git diff` inside the submodule to \
 see them.\n"
@@ -1433,6 +1433,31 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             "exit -1 (command cancelled and process group killed)".to_owned(),
             true,
         ),
+    }
+}
+
+/// The git directory for a workspace root.
+///
+/// `.git` is a directory in a plain checkout, but a *file* naming another
+/// gitdir in a linked worktree or a submodule checkout — which is exactly
+/// where submodule edits are most likely to be hidden, so resolving it is the
+/// difference between the notice appearing and being silently absent.
+fn git_directory(root: &Path) -> PathBuf {
+    let git = root.join(".git");
+    let Ok(pointer) = fs::read_to_string(&git) else {
+        return git;
+    };
+    let Some(target) = pointer
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))
+    else {
+        return git;
+    };
+    let target = Path::new(target.trim());
+    if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        root.join(target)
     }
 }
 

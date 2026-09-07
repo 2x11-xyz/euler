@@ -3095,6 +3095,76 @@ fn git_tools_say_that_submodule_worktree_changes_are_not_shown() {
     }
 }
 
+/// A linked worktree or submodule checkout has `.git` as a *file* naming
+/// another gitdir. That is where submodule edits are most likely to be
+/// hidden, so it is the case the notice must not miss.
+#[test]
+fn the_submodule_notice_resolves_a_gitdir_pointer_file() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    std::fs::write(
+        root.join(".gitmodules"),
+        "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+    )
+    .expect("gitmodules");
+    // Move the git directory aside and leave a pointer behind, the shape a
+    // linked worktree has.
+    let elsewhere = root.join("real-gitdir");
+    std::fs::rename(root.join(".git"), &elsewhere).expect("move gitdir");
+    std::fs::write(
+        root.join(".git"),
+        format!("gitdir: {}\n", elsewhere.display()),
+    )
+    .expect("gitdir pointer");
+    std::fs::create_dir_all(elsewhere.join("modules/sub")).expect("initialized submodule");
+    let registry = ToolRegistry::new(root);
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+
+    assert!(
+        execution
+            .output
+            .contains("changes inside submodule worktrees are not shown here"),
+        "{}",
+        execution.output
+    );
+}
+
+/// The notice describes what a successful listing omits, so it has nothing to
+/// say about why a command failed.
+#[test]
+fn a_failed_git_command_carries_no_submodule_notice() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    std::fs::create_dir_all(root.join(".git/modules/sub")).expect("initialized submodule");
+    let registry = ToolRegistry::new(root);
+
+    // A path that does not exist makes git exit nonzero.
+    let execution = registry
+        .execute("git_diff", &json!({}))
+        .expect("git_diff runs");
+    assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
+
+    std::fs::remove_dir_all(root.join(".git/refs")).expect("break the repository");
+    let broken = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status still reports");
+    if broken.exit_code == Some(0) {
+        return;
+    }
+    assert!(
+        !broken.output.contains("submodule worktrees"),
+        "{}",
+        broken.output
+    );
+}
+
 /// The notice is only worth showing where it costs something.
 #[test]
 fn a_repository_without_submodules_gets_no_submodule_notice() {
