@@ -1901,6 +1901,91 @@ mod tests {
         assert!(!outside.join("escape").exists());
     }
 
+    /// Prevents "linker `cc` not found" for every crate that links.
+    ///
+    /// On Debian and Ubuntu `cc` in /usr/bin is a symlink into
+    /// /etc/alternatives, so without /etc mounted it dangles and no crate
+    /// that links can build. Only a real compile-and-link exercises that;
+    /// `cargo --version` runs happily with a dangling `cc`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_c_program_compiles_links_and_runs_inside_the_sandbox() {
+        // A bare container may have no compiler at all; that is not a
+        // sandbox failure.
+        if !Path::new("/usr/bin/cc").exists() {
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork);
+        if !sandbox.availability().is_enforced() {
+            return;
+        }
+        fs::write(
+            workspace.join("hello.c"),
+            "#include <stdio.h>\nint main(void) { printf(\"linked-and-ran\\n\"); return 0; }\n",
+        )
+        .expect("source file");
+
+        let output = sandbox
+            .command("/bin/sh", ["-c", "cc hello.c -o hello && ./hello"], &[])
+            .expect("sandbox command")
+            .output()
+            .expect("run sandbox command");
+
+        assert!(
+            output.status.success(),
+            "compile and link failed inside the sandbox: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("linked-and-ran"),
+            "{output:?}"
+        );
+    }
+
+    /// Prevents a sandbox with a uid but no user name.
+    ///
+    /// `getpwuid` reads /etc/passwd. Without it anything that resolves the
+    /// current user — git's fallback identity, ssh, a build script asking who
+    /// it runs as — fails, and the uid maps unchanged so the answer must be
+    /// the host's own user.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_current_user_resolves_by_name_inside_the_sandbox() {
+        let Ok(host) = Command::new("/usr/bin/id").arg("-un").output() else {
+            return;
+        };
+        if !host.status.success() {
+            return;
+        }
+        let host = String::from_utf8_lossy(&host.stdout).trim().to_owned();
+        let temp = tempfile::tempdir().expect("temp dir");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).expect("workspace");
+        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork);
+        if !sandbox.availability().is_enforced() {
+            return;
+        }
+
+        let output = sandbox
+            .command("/bin/sh", ["-c", "id -un"], &[])
+            .expect("sandbox command")
+            .output()
+            .expect("run sandbox command");
+
+        assert!(
+            output.status.success(),
+            "resolving the current user failed inside the sandbox: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(&host),
+            "sandbox user name does not match the host's {host}: {output:?}"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn enforced_profile_cannot_connect_to_a_host_listener() {
