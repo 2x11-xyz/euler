@@ -290,13 +290,20 @@ pub(crate) fn fsmonitor_override(configured: Option<&str>, has_daemon: bool) -> 
 /// The answer is a property of the binary, so it is asked once per process.
 pub(crate) fn cached_fsmonitor_daemon_support(probe: impl FnOnce() -> Option<String>) -> bool {
     static SUPPORT: OnceLock<bool> = OnceLock::new();
-    *SUPPORT.get_or_init(|| {
-        probe().is_some_and(|build_options| {
-            build_options
-                .lines()
-                .any(|line| line.trim() == "feature: fsmonitor--daemon")
-        })
-    })
+    if let Some(support) = SUPPORT.get() {
+        return *support;
+    }
+    // Only a completed probe is remembered. A probe that timed out says
+    // nothing about this Git build, and caching its failure would make one
+    // slow moment cost every later repository a full worktree scan.
+    let Some(build_options) = probe() else {
+        return false;
+    };
+    let support = build_options
+        .lines()
+        .any(|line| line.trim() == "feature: fsmonitor--daemon");
+    let _ = SUPPORT.set(support);
+    support
 }
 
 /// Build one of Euler's own git invocations that runs directly on the host.

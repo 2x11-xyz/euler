@@ -3048,3 +3048,52 @@ fn a_repository_using_the_builtin_fsmonitor_daemon_still_works() {
 
     assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
 }
+
+/// ADR 0021 row E: `diff.ignoreSubmodules=dirty` closes a real execution hole,
+/// but it also hides submodule worktree edits. An agent told its changes do
+/// not exist is exactly the silent loss row E forbids, so the cost is stated.
+#[test]
+fn git_tools_say_that_submodule_worktree_changes_are_not_shown() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let root = repository.path();
+    std::fs::write(
+        root.join(".gitmodules"),
+        "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+    )
+    .expect("gitmodules");
+    let registry = ToolRegistry::new(root);
+
+    for tool in ["git_status", "git_diff"] {
+        let execution = registry
+            .execute(tool, &json!({}))
+            .unwrap_or_else(|error| panic!("{tool}: {error}"));
+        assert!(
+            execution
+                .output
+                .contains("changes inside submodule worktrees are not shown here"),
+            "{tool}: {}",
+            execution.output
+        );
+    }
+}
+
+/// The notice is only worth showing where it costs something.
+#[test]
+fn a_repository_without_submodules_gets_no_submodule_notice() {
+    let Some(repository) = git_fixture() else {
+        return;
+    };
+    let registry = ToolRegistry::new(repository.path());
+
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("git_status runs");
+
+    assert!(
+        !execution.output.contains("submodule"),
+        "{}",
+        execution.output
+    );
+}

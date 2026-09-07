@@ -78,6 +78,11 @@ fn main() {
 /// git, repeated here because a build script cannot depend on the crate it
 /// builds. `git status` below runs hooks and a `core.fsmonitor` helper
 /// otherwise (ADR 0021 row G).
+///
+/// It stops at the static overrides: there is no filter-driver probe here,
+/// because building this crate already runs the repository's own build
+/// scripts. The boundary a build script sits behind is the decision to build
+/// the checkout at all, not the agent's tool call.
 const NEUTRALIZED_CONFIG: &[&str] = &[
     "core.hooksPath=/dev/null",
     "safe.bareRepository=explicit",
@@ -87,9 +92,38 @@ const NEUTRALIZED_CONFIG: &[&str] = &[
     "core.fsmonitor=false",
 ];
 
+/// Environment that points Git at another repository, index, or config file.
+/// A developer with `GIT_DIR` set would otherwise stamp this build with
+/// another checkout's revision.
+const REDIRECTING_GIT_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_COUNT",
+];
+
 fn git_output(workspace: &Path, args: &[&str]) -> Option<String> {
     let mut command = Command::new("git");
     command.arg("-C").arg(workspace);
+    for name in REDIRECTING_GIT_ENV {
+        command.env_remove(name);
+    }
+    for (name, _) in env::vars_os() {
+        if name.to_str().is_some_and(|name| {
+            name.starts_with("GIT_CONFIG_KEY_") || name.starts_with("GIT_CONFIG_VALUE_")
+        }) {
+            command.env_remove(name);
+        }
+    }
     for config in NEUTRALIZED_CONFIG {
         command.arg("-c").arg(config);
     }
