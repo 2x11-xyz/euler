@@ -400,10 +400,12 @@ that destroy data with no undo: `rm` with `-r`/`-R`/`-f`/`--recursive`/
 `--force` or any GNU abbreviation of those (`run_shell` closes stdin, so
 `rm -r` never gets its interactive confirmation and is as destructive as
 `rm -rf`), `find` with `-delete`/`-exec`/`-execdir`/`-ok`/`-okdir`, `git
-clean -f`, `reset --hard`, `rm -f`, `checkout -- <path>`, `restore`,
-`branch -D`, `stash drop`/`clear`, `shred`, `truncate`, `wipefs`, `dd of=`,
-the `mkfs*` family, and an in-place editor (`sed -i`, `perl -pi`, `patch`,
-`awk -i inplace`) pointed at a sensitive path. Command names are matched
+clean -f`, `reset --hard`, `rm -f`, `checkout` that forces or names a path,
+`restore <path>`, `branch -D` (and `-d` with `-f`), `stash drop`/`clear`,
+`shred`, `truncate`, `wipefs`, `dd of=`, the `mkfs*` family, and any
+interpreter invocation (`sed`, `awk`, `perl`, `python`, `ruby`, `node`,
+`patch`, `ed`) whose operands — program text included — mention a sensitive
+path. Command names are matched
 case-insensitively, because the default macOS filesystem is.
 It also flags **writes an interpreter later honors**: a redirect target or a
 `cp`/`mv`/`tee`/`install`/`ln`/`rsync` destination on the sensitive list, so
@@ -414,7 +416,9 @@ the redirection hangs off a compound statement
 
 An extension-declared `shell-exec` request is walked like `run_shell` when
 the invocation names a command, and treated as unreadable — never
-grant-covered, always prompted — when it does not.
+grant-covered, always prompted — when it does not. The walk runs before the
+capability mode is consulted, so a blanket `session-allow` does not skip
+it.
 
 A **truncated** command still blocks scoped grant matching, but the walk
 itself reads the full command text, so an ordinary multi-kilobyte command is

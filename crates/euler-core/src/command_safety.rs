@@ -947,6 +947,28 @@ fn writes_interpreter_config(path: &str) -> bool {
     sensitive_basename(Path::new(path))
 }
 
+/// Whether a word mentions a sensitive path anywhere inside it, quoting and
+/// interpreter syntax included. Deliberately a substring test: the point is
+/// to catch a path buried in program text without parsing the program.
+fn mentions_sensitive_path(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    if SENSITIVE_NAMES.iter().any(|name| lower.contains(name))
+        || lower.contains(".git/")
+        || lower.contains("/.git")
+        || lower == ".git"
+    {
+        return true;
+    }
+    lower.contains(".env")
+        || lower.contains("secret")
+        || lower.contains("credential")
+        || lower.contains("id_rsa")
+        || lower.contains("id_ed25519")
+        || lower.contains(".pem")
+        || lower.contains(".key")
+        || lower.contains(".cargo/config")
+}
+
 /// Destination words of every redirection attached to this command, `None`
 /// where the destination is dynamic. `tree-sitter-bash` hangs redirects off
 /// a `redirected_statement` parent, and every word after the operator ends
@@ -1075,22 +1097,14 @@ fn destructive_verdict(name: &str, args: &[&str]) -> Option<bool> {
         }),
         // Global options come before the subcommand: `git -C . clean -fdx`.
         "git" => git_is_destructive(&skip_git_global_options(args)),
-        // In-place editors: rewriting a file an interpreter later honors is
-        // the same act as writing it (audit F34, write side).
-        "sed" => {
-            args.iter().any(|arg| {
-                is_short_cluster_with(arg, "iI") || is_long_abbreviation(arg, &["--in-place"])
-            }) && args.iter().any(|arg| writes_interpreter_config(arg))
-        }
-        "perl" | "ruby" => {
-            args.iter().any(|arg| is_short_cluster_with(arg, "i"))
-                && args.iter().any(|arg| writes_interpreter_config(arg))
-        }
-        "awk" | "gawk" => {
-            args.iter().any(|arg| arg.contains("inplace"))
-                && args.iter().any(|arg| writes_interpreter_config(arg))
-        }
-        "patch" | "ed" => args.iter().any(|arg| writes_interpreter_config(arg)),
+        // Interpreters take their program as an operand, so a write can
+        // hide in the program text: `awk '{print > ".bashrc"}'`,
+        // `perl -e 'open(F,">",".bashrc")'`. Any operand that so much as
+        // MENTIONS a sensitive path is dangerous — reading one deserves the
+        // same prompt as writing it, and this needs no interpreter
+        // semantics at all.
+        "sed" | "perl" | "ruby" | "awk" | "gawk" | "python" | "python3" | "node" | "patch"
+        | "ed" => args.iter().any(|arg| mentions_sensitive_path(arg)),
         // Write-position operands: a copy, move, link, or tee onto a file an
         // interpreter later honors is the shell twin of `write_file` on it.
         "cp" | "mv" | "tee" | "install" | "ln" | "rsync" | "mktemp" => {
@@ -1118,20 +1132,38 @@ fn git_is_destructive(args: &[&str]) -> bool {
         rest.iter()
             .any(|arg| is_short_cluster_with(arg, letters) || is_long_abbreviation(arg, longs))
     };
+    let operands = || rest.iter().filter(|arg| !arg.starts_with('-'));
     match *subcommand {
         "clean" => forced("f", &["--force"]),
         "reset" => forced("", &["--hard"]),
         // `git rm` deletes tracked files; `-f`/`-r` skips every safety net.
         "rm" => forced("fr", &["--force"]),
-        // `git checkout -- path` and `git restore` discard uncommitted work.
-        "checkout" => rest.contains(&"--"),
-        "restore" => forced("W", &["--worktree", "--staged"]) || rest.contains(&"--"),
-        "branch" => forced("D", &["--delete"]),
+        // `git restore <path>` IS a worktree restore: it discards
+        // uncommitted work with no flag at all. Bare `git restore` is a
+        // no-op.
+        "restore" => !rest.is_empty(),
+        // `git checkout` is dangerous when it forces, when `--` marks
+        // paths, or when an operand looks like a path rather than a ref.
+        "checkout" => {
+            forced("f", &["--force"])
+                || rest.contains(&"--")
+                || operands().any(|arg| looks_like_a_path(arg))
+        }
+        // `-D`, and `-d` with `-f` in any order or bundling, are all
+        // force-delete.
+        "branch" => forced("D", &[]) || (forced("d", &["--delete"]) && forced("f", &["--force"])),
         "stash" => rest
             .first()
             .is_some_and(|arg| matches!(*arg, "drop" | "clear")),
         _ => false,
     }
+}
+
+/// Whether an operand names a path rather than a ref: `.`, anything with a
+/// separator, or anything with a file extension. A single bare word like
+/// `main` reads as a branch.
+fn looks_like_a_path(arg: &str) -> bool {
+    arg == "." || arg.contains('/') || Path::new(arg).extension().is_some()
 }
 
 /// `git` global options precede the subcommand, and `-C`/`-c`/`--git-dir`
@@ -1228,11 +1260,23 @@ const WRAPPERS: &[(&str, WrapperSpec)] = &[
     (
         "su",
         WrapperSpec {
-            short_value: "ugCpUhDRTs",
-            short_bool: "EHnPkKAbl",
+            // su's own grammar, not sudo's: `-s/-g/-G/-w` take values,
+            // `-l/-m/-p` do not, `-c` carries the command.
+            short_value: "sgGw",
+            short_bool: "lmp",
             short_script: "c",
-            long_value: &["--user", "--group", "--prompt", "--chdir", "--login"],
-            long_bool: &["--preserve-env", "--set-home", "--non-interactive"],
+            long_value: &[
+                "--shell",
+                "--group",
+                "--supp-group",
+                "--whitelist-environment",
+            ],
+            long_bool: &[
+                "--login",
+                "--preserve-environment",
+                "--fast",
+                "--session-command",
+            ],
             long_script: &["--command"],
             skip_operands: 1,
             tail: WrapperTail::Command,
@@ -3039,7 +3083,9 @@ mod tests {
                 "expected dangerous: {command}"
             );
         }
-        for command in ["sed -i s/a/b/ src/lib.rs", "sed -n 1p .bashrc"] {
+        // Reading one deserves the same prompt as writing it.
+        assert!(contains_dangerous_command("sed -n 1p .bashrc"));
+        for command in ["sed -i s/a/b/ src/lib.rs", "sed -n 1p src/lib.rs"] {
             assert!(
                 !contains_dangerous_command(command),
                 "expected not dangerous: {command}"
@@ -3077,5 +3123,79 @@ mod tests {
                 "expected not dangerous: {command}"
             );
         }
+    }
+
+    #[test]
+    fn git_worktree_and_force_delete_forms_are_dangerous() {
+        // Review round 4, finding 1: `git restore <path>` discards
+        // uncommitted work with no flag, `git checkout .` and `-f` do the
+        // same, and `-d` with `-f` is `-D` spelled out.
+        for command in [
+            "git restore .",
+            "git restore src/lib.rs",
+            "git checkout .",
+            "git checkout -f",
+            "git checkout -f .",
+            "git checkout -- src/lib.rs",
+            "git branch -df feature",
+            "git branch -d -f feature",
+            "git branch -fd feature",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        for command in [
+            "git restore",
+            "git checkout main",
+            "git branch -d feature",
+            "git branch -a",
+        ] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn interpreter_program_text_naming_a_sensitive_path_is_dangerous() {
+        // Review round 4, finding 3: the write hides in the program, not
+        // in a flag.
+        for command in [
+            "awk '{print > \".bashrc\"}' /dev/null",
+            "perl -e 'open(F,\">\",\".bashrc\")'",
+            "python3 -c 'open(\".git/config\",\"w\")'",
+            "node -e 'require(\"fs\").writeFileSync(\".npmrc\",\"x\")'",
+            "ruby -e 'File.write(\".zshrc\", \"x\")'",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        for command in [
+            "awk '{print $1}' data.csv",
+            "perl -e 'print 1'",
+            "python3 -c 'print(1)'",
+        ] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn su_uses_its_own_option_grammar() {
+        // Review round 4, finding 4: su carried sudo's options, so `-m`
+        // read as unknown and fail-closed.
+        assert!(!contains_dangerous_command("su -m user -c 'ls'"));
+        assert!(!contains_dangerous_command(
+            "su -s /bin/sh user -c 'ls -la'"
+        ));
+        assert!(contains_dangerous_command("su -m user -c 'rm -rf x'"));
+        assert!(contains_dangerous_command("su --bogus user -c 'ls'"));
     }
 }

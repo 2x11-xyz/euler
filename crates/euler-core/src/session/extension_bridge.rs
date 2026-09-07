@@ -328,29 +328,45 @@ impl<D> Session<D> {
     {
         let mut pending = Vec::new();
         for &capability in required {
-            let mode = self
+            // The request is built BEFORE the mode is consulted, so the
+            // danger walk runs on every path — under a blanket
+            // `session-allow` too. Building it inside the `ask` arm let an
+            // extension invoked with `{"command": "rm -rf scratch"}` run
+            // unprompted while `run_shell` with the same string asked.
+            let mut request = PermissionRequest::new(capability, operation.clone());
+            if capability == Capability::ShellExec {
+                match shell_command {
+                    // Walked exactly as `run_shell` is.
+                    Some(command) => request = request.with_command(command),
+                    // An extension may name its field anything (`cmd`,
+                    // `script`), so a shell request with no command line is
+                    // unreadable: it is covered by no grant and always
+                    // reaches a prompt, the same treatment a truncated
+                    // command gets.
+                    None => request.dangerous_command = true,
+                }
+            }
+            let configured = self
                 .permissions
                 .configured_mode(capability)
                 .unwrap_or(ApprovalMode::Ask);
+            // Mirrors `PermissionGate::mode_for_request` on the configured
+            // mode: `always-deny` still denies, and a dangerous or
+            // sensitive request rides no blanket allowance (ADR 0021
+            // decision D).
+            let mode = if configured == ApprovalMode::AlwaysDeny
+                || !(request.dangerous_command || request.sensitive_path)
+            {
+                configured
+            } else {
+                ApprovalMode::Ask
+            };
             match mode {
                 ApprovalMode::SessionAllow => {}
                 ApprovalMode::AlwaysDeny => {
                     return Err(ExtensionExecutionError::CapabilityDenied { capability });
                 }
                 ApprovalMode::Ask => {
-                    let mut request = PermissionRequest::new(capability, operation.clone());
-                    if capability == Capability::ShellExec {
-                        match shell_command {
-                            // Walked exactly as `run_shell` is.
-                            Some(command) => request = request.with_command(command),
-                            // An extension may name its field anything
-                            // (`cmd`, `script`), so a shell request with no
-                            // command line is unreadable: it is covered by
-                            // no grant and always reaches a prompt, the
-                            // same treatment a truncated command gets.
-                            None => request.dangerous_command = true,
-                        }
-                    }
                     if self.permissions.granted_source(&request).is_none()
                         && !pending
                             .iter()
@@ -707,6 +723,42 @@ mod tests {
         let request = &pending.requests()[0];
         assert!(request.dangerous_command);
         assert!(session.permissions.granted_source(request).is_none());
+    }
+
+    /// Review round 4, finding 2: the request (and therefore the walk) used
+    /// to be built only inside the `ask` arm, so a blanket `session-allow`
+    /// auto-approved an extension shell command that `run_shell` would have
+    /// prompted for.
+    #[test]
+    fn extension_shell_exec_under_session_allow_still_prompts_when_unreadable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut session = session_with_unscoped_shell_grant(temp.path());
+        session.set_permission_mode(Capability::ShellExec, ApprovalMode::SessionAllow);
+
+        for command in [Some("rm -rf scratch"), None] {
+            let pending = session
+                .extension_permission_batch(
+                    "extension ext.run".to_owned(),
+                    &[Capability::ShellExec],
+                    command,
+                )
+                .expect("batch")
+                .expect("a dangerous or unreadable command must reach a prompt");
+            assert!(pending.requests()[0].dangerous_command, "{command:?}");
+        }
+
+        // An ordinary command still rides the mode.
+        let allowed = session
+            .extension_permission_batch(
+                "extension ext.run".to_owned(),
+                &[Capability::ShellExec],
+                Some("ls -la"),
+            )
+            .expect("batch");
+        assert!(
+            allowed.is_none(),
+            "session-allow still allows ordinary work"
+        );
     }
 
     /// The command-less entry point cannot build a walked shell request, so
