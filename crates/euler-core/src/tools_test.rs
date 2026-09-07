@@ -93,6 +93,8 @@ fn skill_read_returns_only_the_frozen_body_without_a_capability() {
 use serde_json::json;
 use std::env;
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
 use std::os::unix::fs::symlink;
 use std::sync::Mutex;
 
@@ -2105,4 +2107,324 @@ fn sandbox_timeout_before_readiness_hides_launcher_output() {
     .expect("timeout is not a sandbox availability failure");
 
     assert!(output.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Structured write hardening: fd-anchored opens, exact preimage comparison,
+// and the negative cases each of those exists to refuse.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn structured_write_rejects_stale_preimage_after_prepare() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let target = temp.path().join("target.txt");
+    fs::write(&target, "old\n").expect("target");
+    let registry = ToolRegistry::new(temp.path());
+    let execution = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "target.txt", "old": "old", "new": "agent"}),
+        )
+        .expect("prepare edit");
+
+    fs::write(&target, "user\n").expect("concurrent user edit");
+    let error = registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect_err("stale preimage must not be overwritten");
+
+    assert!(matches!(error, ToolError::StalePreparedWrite { .. }));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "user\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_write_rejects_parent_symlink_substitution_after_prepare() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(workspace.join("src")).expect("workspace src");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(workspace.join("src/note.txt"), "old\n").expect("workspace target");
+    fs::write(outside.join("note.txt"), "outside\n").expect("outside target");
+    let registry = ToolRegistry::new(&workspace);
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "src/note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+
+    fs::rename(workspace.join("src"), workspace.join("original-src")).expect("move parent");
+    symlink(&outside, workspace.join("src")).expect("substitute parent symlink");
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("substituted parent must fail closed");
+
+    assert!(matches!(error, ToolError::Io(_)));
+    assert_eq!(
+        fs::read_to_string(outside.join("note.txt")).unwrap(),
+        "outside\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("original-src/note.txt")).unwrap(),
+        "old\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_write_rejects_root_substitution_after_prepare() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    fs::write(workspace.join("note.txt"), "old\n").expect("workspace target");
+    fs::write(outside.join("note.txt"), "outside\n").expect("outside decoy");
+    let registry = ToolRegistry::new(&workspace);
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "note.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+
+    fs::rename(&workspace, temp.path().join("original-workspace")).expect("move root");
+    symlink(&outside, &workspace).expect("substitute root");
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("substituted root must fail closed");
+
+    assert!(matches!(error, ToolError::Io(_)));
+    assert_eq!(
+        fs::read_to_string(outside.join("note.txt")).unwrap(),
+        "outside\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_tools_reject_a_fifo_target() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let fifo = temp.path().join("host.fifo");
+    let fifo_path =
+        std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("FIFO path has no NUL");
+    // SAFETY: the path is a valid NUL-terminated pathname inside the fixture.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    let registry = ToolRegistry::new(temp.path());
+
+    assert!(matches!(
+        registry.execute("read_file", &json!({"path": "host.fifo"})),
+        Err(ToolError::UnsupportedFileType { .. })
+    ));
+    assert!(matches!(
+        registry.execute(
+            "edit_file",
+            &json!({"path": "host.fifo", "old": "x", "new": "y"})
+        ),
+        Err(ToolError::UnsupportedFileType { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_write_rejects_a_hardlinked_target_but_still_reads_it() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    let outside_file = outside.join("sensitive.txt");
+    fs::write(&outside_file, "old\n").expect("outside file");
+    fs::hard_link(&outside_file, workspace.join("alias.txt")).expect("workspace alias");
+    let registry = ToolRegistry::new(&workspace);
+
+    // Reads stay allowed: a second link is a write-confinement problem, and
+    // read policy for unsandboxed hosts is deliberately out of scope here.
+    let read = registry
+        .execute("read_file", &json!({"path": "alias.txt"}))
+        .expect("multiply-linked file remains readable");
+    assert_eq!(read.output, "old\n");
+
+    let edit = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "alias.txt", "old": "old", "new": "new"}),
+        )
+        .expect("prepare edit");
+    let error = registry
+        .apply_patch(edit.patch.as_ref().expect("patch"))
+        .expect_err("multiply-linked target must not be written");
+
+    let message = error.to_string();
+    assert!(matches!(error, ToolError::HardlinkedStructuredFile { .. }));
+    assert!(message.contains("multiple links"), "{message}");
+    assert!(message.contains("copy it to a new path"), "{message}");
+    assert_eq!(fs::read_to_string(&outside_file).unwrap(), "old\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn structured_write_rejects_a_hardlink_substituted_after_prepare() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&outside).expect("outside");
+    let target = workspace.join("target.txt");
+    fs::write(&target, "original\n").expect("initial target");
+    let registry = ToolRegistry::new(&workspace);
+    let execution = registry
+        .execute(
+            "edit_file",
+            &json!({"path": "target.txt", "old": "original", "new": "changed"}),
+        )
+        .expect("prepare edit before substitution");
+
+    fs::remove_file(&target).expect("remove prepared target");
+    let canary = "LATE_EXTERNAL_HARDLINK_CANARY";
+    let outside_file = outside.join("sensitive.txt");
+    fs::write(&outside_file, format!("original\n{canary}\n")).expect("outside file");
+    fs::hard_link(&outside_file, &target).expect("substitute external alias");
+
+    let failure = registry
+        .apply_patch_cancellable_observed(
+            execution.patch.as_ref().expect("patch"),
+            &CancellationToken::new(),
+        )
+        .expect_err("late external alias must fail before observation");
+
+    assert!(matches!(
+        failure.error,
+        ToolError::HardlinkedStructuredFile { .. }
+    ));
+    assert!(failure.file_changes.is_empty());
+    assert!(!failure.error.to_string().contains(canary));
+    assert_eq!(
+        fs::read_to_string(&outside_file).unwrap(),
+        format!("original\n{canary}\n")
+    );
+}
+
+#[test]
+fn structured_add_uses_create_new_at_apply_time() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::new(temp.path());
+    let execution = registry
+        .execute(
+            "write_file",
+            &json!({"path": "new.txt", "content": "agent"}),
+        )
+        .expect("prepare create");
+
+    fs::write(temp.path().join("new.txt"), "user got there first").expect("racing create");
+    let error = registry
+        .apply_patch(execution.patch.as_ref().expect("patch"))
+        .expect_err("O_EXCL must refuse a target that appeared after preparation");
+
+    assert!(matches!(error, ToolError::FileAlreadyExists));
+    assert_eq!(
+        fs::read_to_string(temp.path().join("new.txt")).unwrap(),
+        "user got there first"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn structured_reads_and_writes_reject_a_same_device_nested_bind_mount() {
+    use std::ffi::CString;
+    use std::os::unix::fs::MetadataExt as _;
+
+    struct Unmount(std::path::PathBuf);
+    impl Drop for Unmount {
+        fn drop(&mut self) {
+            if let Ok(target) = CString::new(self.0.as_os_str().as_bytes()) {
+                // SAFETY: `target` is NUL-terminated; lazy detach keeps test
+                // cleanup reliable if an assertion still holds a descriptor.
+                unsafe {
+                    libc::umount2(target.as_ptr(), libc::MNT_DETACH);
+                }
+            }
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let outside = temp.path().join("outside");
+    let nested = workspace.join("mounted");
+    for directory in [&workspace, &outside, &nested] {
+        fs::create_dir(directory).expect("fixture directory");
+    }
+    fs::write(outside.join("secret.txt"), "outside").expect("outside fixture");
+    assert_eq!(
+        fs::metadata(&workspace).expect("workspace metadata").dev(),
+        fs::metadata(&outside).expect("outside metadata").dev(),
+        "fixture must exercise a same-device bind"
+    );
+    let source = CString::new(outside.as_os_str().as_bytes()).expect("source path");
+    let target = CString::new(nested.as_os_str().as_bytes()).expect("target path");
+    // SAFETY: both mount paths are live, NUL-terminated directories and the
+    // remaining pointer arguments are unused for MS_BIND.
+    let mounted = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    if mounted != 0 {
+        let error = std::io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES)) {
+            eprintln!("skipping bind-mount integration check: {error}");
+            return;
+        }
+        panic!("bind mount fixture failed: {error}");
+    }
+    let _unmount = Unmount(nested);
+    let registry = ToolRegistry::new(&workspace);
+
+    for error in [
+        registry
+            .execute("read_file", &json!({"path": "mounted/secret.txt"}))
+            .expect_err("nested mount read must fail"),
+        registry
+            .execute(
+                "edit_file",
+                &json!({"path": "mounted/secret.txt", "old": "outside", "new": "changed"}),
+            )
+            .expect_err("nested mount edit must fail"),
+        registry
+            .execute(
+                "write_file",
+                &json!({"path": "mounted/created.txt", "content": "changed"}),
+            )
+            .expect_err("nested mount create must fail"),
+    ] {
+        assert!(matches!(error, ToolError::Io(_)), "{error}");
+    }
+    assert_eq!(
+        fs::read_to_string(outside.join("secret.txt")).unwrap(),
+        "outside"
+    );
+    assert!(!outside.join("created.txt").exists());
+}
+
+/// Unit 1 keeps the single primary-root model. Multi-root provenance,
+/// attachment roots, and resume root-identity validation are a later unit;
+/// this pins that none of that surface leaked in early.
+#[test]
+fn public_tool_surface_has_no_plural_root_symbols() {
+    let source = include_str!("tools.rs");
+    for symbol in [
+        "attached_writable_roots",
+        "writable_roots",
+        "resume_root_identity",
+    ] {
+        assert!(
+            !source.contains(symbol),
+            "`{symbol}` is Unit 4 surface and must not appear in the tool registry"
+        );
+    }
 }

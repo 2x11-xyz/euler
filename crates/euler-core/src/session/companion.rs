@@ -584,9 +584,12 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let patch_proposed_id = self
             .append(EventKind::PATCH_PROPOSED, payload.clone(), None)?
             .id;
-        match self.tools.apply_patch_cancellable(patch, cancellation) {
+        match self
+            .tools
+            .apply_patch_cancellable_observed(patch, cancellation)
+        {
             Ok(()) => {}
-            Err(crate::ToolError::Cancelled) => {
+            Err(failure) if matches!(failure.error, crate::ToolError::Cancelled) => {
                 self.emit_cancelled_tool_result(
                     call.clone(),
                     tool_call_event_id.to_owned(),
@@ -594,11 +597,12 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 )?;
                 return Err(SessionError::Cancelled);
             }
-            Err(error) => {
+            Err(failure) => {
+                self.record_observed_file_changes(&call.id, &failure.file_changes)?;
                 self.emit_tool_failure(
                     call.id.clone(),
                     execution.name.clone(),
-                    error.to_string(),
+                    failure.error.to_string(),
                     tool_call_event_id.to_owned(),
                 )?;
                 return Ok(true);

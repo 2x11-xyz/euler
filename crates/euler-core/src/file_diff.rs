@@ -5,8 +5,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, DirEntry};
-use std::io;
+use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 pub const MAX_FILE_DIFF_BYTES: usize = 64 * 1024;
 pub const MAX_WORKSPACE_SNAPSHOT_FILES: usize = 4_096;
@@ -138,6 +139,93 @@ pub fn observed_file_diff_payload(
                 .map_or(Value::Null, std::convert::Into::into),
         ),
     ])
+}
+
+/// Why a structured-write observation could not be completed. A structured
+/// write that cannot be observed is reported as an incomplete observation
+/// rather than as a silent success or a silent loss of provenance.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum StructuredObservationError {
+    #[error("the open descriptor no longer refers to a regular file")]
+    MetadataRead,
+    #[error("the file could not be read completely and consistently")]
+    FileRead,
+}
+
+/// A single fd-anchored regular-file observation, used to preserve provenance
+/// when a structured write fails after opening or creating its target.
+///
+/// The observation reads through the same descriptor the write uses, so it
+/// describes the inode that was actually mutated rather than whatever the
+/// path resolves to afterwards.
+pub(crate) struct StructuredFileSnapshot {
+    path: String,
+    file: Option<SnapshotFile>,
+}
+
+impl StructuredFileSnapshot {
+    /// The pre-image of a create: the target did not exist.
+    pub(crate) fn absent(path: &str) -> Self {
+        Self {
+            path: path.to_owned(),
+            file: None,
+        }
+    }
+
+    pub(crate) fn capture_open_regular(
+        path: &str,
+        file: &fs::File,
+    ) -> Result<Self, StructuredObservationError> {
+        let mut reader = file
+            .try_clone()
+            .map_err(|_| StructuredObservationError::FileRead)?;
+        // `try_clone` duplicates the descriptor and therefore shares its open
+        // file description (including the seek offset) on Unix. Restore that
+        // offset on every path so observation cannot change write semantics.
+        let original_position = reader
+            .stream_position()
+            .map_err(|_| StructuredObservationError::FileRead)?;
+        let captured = Self::read_regular(path, &mut reader);
+        reader
+            .seek(io::SeekFrom::Start(original_position))
+            .map_err(|_| StructuredObservationError::FileRead)?;
+        captured
+    }
+
+    fn read_regular(path: &str, reader: &mut fs::File) -> Result<Self, StructuredObservationError> {
+        reader
+            .seek(io::SeekFrom::Start(0))
+            .map_err(|_| StructuredObservationError::FileRead)?;
+        let metadata = reader
+            .metadata()
+            .map_err(|_| StructuredObservationError::MetadataRead)?;
+        if !metadata.is_file() {
+            return Err(StructuredObservationError::MetadataRead);
+        }
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .map_err(|_| StructuredObservationError::FileRead)?;
+        let settled = reader
+            .metadata()
+            .map_err(|_| StructuredObservationError::MetadataRead)?;
+        if !settled.is_file() || usize::try_from(settled.len()).ok() != Some(bytes.len()) {
+            return Err(StructuredObservationError::FileRead);
+        }
+        Ok(Self {
+            path: path.to_owned(),
+            file: Some(SnapshotFile::observed(bytes)),
+        })
+    }
+
+    /// The observed change between two snapshots of the same path, or `None`
+    /// when nothing changed.
+    pub(crate) fn change_to(&self, after: &Self) -> Option<ObservedFileChange> {
+        if self.path != after.path {
+            return None;
+        }
+        observed_change(self.path.clone(), self.file.as_ref(), after.file.as_ref())
+    }
 }
 
 pub fn capture_workspace_snapshot(root: &Path) -> io::Result<WorkspaceSnapshot> {

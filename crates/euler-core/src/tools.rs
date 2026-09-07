@@ -1,4 +1,6 @@
+use crate::file_diff::{StructuredFileSnapshot, StructuredObservationError};
 use crate::sandbox::WorkspaceSandbox;
+use crate::structured_file;
 use crate::{
     apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
     ApplyPatchDocument, ApplyPatchError, ObservedFileChange, SandboxAvailability,
@@ -12,6 +14,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::{Read as _, Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -68,6 +71,20 @@ pub enum ToolError {
     FileAlreadyExists,
     #[error("parent directory does not exist")]
     ParentDirectoryMissing,
+    #[error("path `{path}` is not a regular file; structured file tools read and write regular files only")]
+    UnsupportedFileType { path: String },
+    #[error("file `{path}` has multiple links, so another name for it may be outside the workspace; copy it to a new path, then edit the copy")]
+    HardlinkedStructuredFile { path: String },
+    #[error(
+        "file `{path}` changed after this write was prepared; read it again and prepare a new edit"
+    )]
+    StalePreparedWrite { path: String },
+    #[error("structured write observation was incomplete {phase} ({reason}); {consequence}")]
+    StructuredWriteObservationIncomplete {
+        phase: &'static str,
+        reason: StructuredObservationError,
+        consequence: &'static str,
+    },
     #[error("unsupported tool `{0}`")]
     Unsupported(String),
     #[error("replacement text matched {0} times; expected exactly one")]
@@ -113,6 +130,25 @@ pub(crate) enum ToolExecutionOutcome {
     Cancelled(ToolExecution),
 }
 
+/// A structured write that failed after its target was opened. The error is
+/// what the model is told; `file_changes` is what Euler observed through the
+/// same descriptor, so a partially applied write is never reported as "no
+/// change".
+#[derive(Debug)]
+pub(crate) struct StructuredWriteFailure {
+    pub(crate) error: ToolError,
+    pub(crate) file_changes: Vec<ObservedFileChange>,
+}
+
+impl StructuredWriteFailure {
+    fn without_change(error: ToolError) -> Self {
+        Self {
+            error,
+            file_changes: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ToolResultAccess<'a> {
     All,
@@ -138,8 +174,25 @@ pub struct PatchEvents {
     pub(crate) after_sha256: String,
     pub(crate) before_byte_len: usize,
     pub(crate) after_byte_len: usize,
-    write_path: PathBuf,
+    target: ResolvedWorkspacePath,
     write_content: String,
+}
+
+/// A model-supplied path already resolved against the workspace root, kept as
+/// the root plus the normalized components beneath it. The structured tools
+/// re-open the target from `root` hop by hop at apply time; the joined
+/// `absolute` form exists only for diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedWorkspacePath {
+    root: PathBuf,
+    relative: PathBuf,
+    absolute: PathBuf,
+}
+
+impl ResolvedWorkspacePath {
+    fn display(&self) -> String {
+        self.absolute.to_string_lossy().into_owned()
+    }
 }
 
 /// Per-tool consecutive-failure streaks driving rung-2 format
@@ -527,7 +580,7 @@ impl ToolRegistry {
         let offset = optional_positive_usize(input, "offset")?.unwrap_or(1);
         let max_bytes = optional_positive_usize(input, "max_bytes")?.unwrap_or(DEFAULT_MAX_BYTES);
         let max_lines = optional_positive_usize(input, "max_lines")?.unwrap_or(DEFAULT_MAX_LINES);
-        let content = fs::read_to_string(path)?;
+        let content = self.read_resolved_file(&path)?;
         let output = bound_read_file_window(&content, offset, max_bytes, max_lines);
         Ok(ToolExecution {
             name: "read_file".to_owned(),
@@ -548,7 +601,7 @@ impl ToolRegistry {
             return self.prepare_create(relative, new, "edit_file");
         }
         let path = self.resolve_path(relative)?;
-        let content = fs::read_to_string(&path)?;
+        let content = self.read_resolved_file(&path)?;
         let count = overlapping_match_count(&content, old);
         if count != 1 {
             return Err(ToolError::ReplacementMatchCount(count));
@@ -575,7 +628,7 @@ impl ToolRegistry {
                 after_sha256: after_sha,
                 before_byte_len: before_bytes_len,
                 after_byte_len: updated.len(),
-                write_path: path,
+                target: path,
                 write_content: updated,
             }),
             file_changes: Vec::new(),
@@ -599,7 +652,7 @@ impl ToolRegistry {
         origin: &'static str,
     ) -> Result<ToolExecution, ToolError> {
         let path = self.resolve_create_path(relative)?;
-        if path.exists() {
+        if path.absolute.exists() {
             return Err(ToolError::FileAlreadyExists);
         }
         Ok(ToolExecution {
@@ -618,7 +671,7 @@ impl ToolRegistry {
                 after_sha256: hash_bytes(content.as_bytes()),
                 before_byte_len: 0,
                 after_byte_len: content.len(),
-                write_path: path,
+                target: path,
                 write_content: content.to_owned(),
             }),
             file_changes: Vec::new(),
@@ -642,8 +695,8 @@ impl ToolRegistry {
         };
         match parse_single_file_apply_patch(patch).map_err(tool_error_from_apply_patch)? {
             ApplyPatchDocument::Add { path, content } => {
-                let write_path = self.resolve_create_path(&path)?;
-                if write_path.exists() {
+                let target = self.resolve_create_path(&path)?;
+                if target.absolute.exists() {
                     return Err(ToolError::FileAlreadyExists);
                 }
                 Ok(ToolExecution {
@@ -662,15 +715,15 @@ impl ToolRegistry {
                         action: "add",
                         before_sha256: None,
                         before_byte_len: 0,
-                        write_path,
+                        target,
                         write_content: content,
                     }),
                     file_changes: Vec::new(),
                 })
             }
             ApplyPatchDocument::Update { path, chunks } => {
-                let write_path = self.resolve_path(&path)?;
-                let content = fs::read_to_string(&write_path)?;
+                let target = self.resolve_path(&path)?;
+                let content = self.read_resolved_file(&target)?;
                 let updated = apply_patch_update_chunks(&content, &chunks)
                     .map_err(tool_error_from_apply_patch)?;
                 Ok(ToolExecution {
@@ -692,7 +745,7 @@ impl ToolRegistry {
                         after: updated.clone(),
                         origin,
                         action: "modify",
-                        write_path,
+                        target,
                         write_content: updated,
                     }),
                     file_changes: Vec::new(),
@@ -710,21 +763,98 @@ impl ToolRegistry {
         patch: &PatchEvents,
         cancellation: &CancellationToken,
     ) -> Result<(), ToolError> {
+        self.apply_patch_cancellable_observed(patch, cancellation)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Apply a prepared patch, preserving what was observed through the
+    /// target descriptor when the write fails part-way.
+    pub(crate) fn apply_patch_cancellable_observed(
+        &self,
+        patch: &PatchEvents,
+        cancellation: &CancellationToken,
+    ) -> Result<(), StructuredWriteFailure> {
         // This is the final check before the filesystem mutation. Patch
         // parsing, permission review, and `patch.proposed` emission may all
         // have taken time during which the user pressed Esc.
         if cancellation.is_cancelled() {
-            return Err(ToolError::Cancelled);
+            return Err(StructuredWriteFailure::without_change(ToolError::Cancelled));
         }
-        fs::write(&patch.write_path, &patch.write_content)?;
-        Ok(())
+        let create_new = patch.action == "add";
+        let expected_before = (!create_new).then_some(patch.before.as_str());
+        self.write_resolved_file_observed(
+            &patch.target,
+            &patch.path,
+            &patch.write_content,
+            create_new,
+            expected_before,
+        )
+    }
+
+    /// Read a workspace-relative path through the confined structured open
+    /// (used by `/rollback` to verify what it is about to overwrite).
+    pub fn read_workspace_file(&self, relative: &str) -> Result<String, ToolError> {
+        let path = self.resolve_path(relative)?;
+        self.read_resolved_file(&path)
     }
 
     /// Write UTF-8 content to a workspace-relative path (used by `/rollback`).
     pub fn write_workspace_file(&self, relative: &str, content: &str) -> Result<(), ToolError> {
         let path = self.resolve_path(relative)?;
-        fs::write(path, content)?;
-        Ok(())
+        self.write_resolved_file_observed(&path, relative, content, false, None)
+            .map_err(|failure| failure.error)
+    }
+
+    fn write_resolved_file_observed(
+        &self,
+        path: &ResolvedWorkspacePath,
+        display: &str,
+        content: &str,
+        create_new: bool,
+        expected_before: Option<&str>,
+    ) -> Result<(), StructuredWriteFailure> {
+        let mut file = open_workspace_write_file(path, create_new)
+            .map_err(StructuredWriteFailure::without_change)?;
+        // Validate before the provenance pre-image reads this descriptor: an
+        // in-workspace hardlink to an out-of-workspace inode must not become
+        // a read channel just because the later write check refuses it.
+        validate_open_writable_file(&file, path).map_err(StructuredWriteFailure::without_change)?;
+        let before = if create_new {
+            StructuredFileSnapshot::absent(display)
+        } else {
+            StructuredFileSnapshot::capture_open_regular(display, &file).map_err(|reason| {
+                StructuredWriteFailure::without_change(
+                    ToolError::StructuredWriteObservationIncomplete {
+                        phase: "before the write",
+                        reason,
+                        consequence: "the file was not changed",
+                    },
+                )
+            })?
+        };
+        let Err(error) = write_open_file(&mut file, path, content, expected_before) else {
+            return Ok(());
+        };
+        // A link-count rejection happens before this tool mutates the
+        // descriptor. Do not turn the rejected alias into a second read.
+        if matches!(&error, ToolError::HardlinkedStructuredFile { .. }) {
+            return Err(StructuredWriteFailure::without_change(error));
+        }
+        let after =
+            StructuredFileSnapshot::capture_open_regular(display, &file).map_err(|reason| {
+                StructuredWriteFailure::without_change(
+                    ToolError::StructuredWriteObservationIncomplete {
+                        phase: "after the write failed",
+                        reason,
+                        consequence:
+                            "the file may have changed; Euler will not claim a complete change",
+                    },
+                )
+            })?;
+        Err(StructuredWriteFailure {
+            error,
+            file_changes: before.change_to(&after).into_iter().collect(),
+        })
     }
 
     fn run_shell(
@@ -886,7 +1016,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             .path())
     }
 
-    fn resolve_path(&self, relative: &str) -> Result<PathBuf, ToolError> {
+    fn resolve_path(&self, relative: &str) -> Result<ResolvedWorkspacePath, ToolError> {
         self.resolve_path_inner(relative, false)
     }
 
@@ -895,12 +1025,10 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
     /// resolves them. `None` when the path cannot be resolved inside the
     /// workspace - scoped grant matching then fails closed to the ask path.
     pub fn workspace_relative_path(&self, relative: &str) -> Option<PathBuf> {
-        let canonical = self.resolve_path_inner(relative, false).ok()?;
-        let root = self.root.canonicalize().ok()?;
-        canonical.strip_prefix(&root).ok().map(Path::to_path_buf)
+        Some(self.resolve_path_inner(relative, false).ok()?.relative)
     }
 
-    fn resolve_create_path(&self, relative: &str) -> Result<PathBuf, ToolError> {
+    fn resolve_create_path(&self, relative: &str) -> Result<ResolvedWorkspacePath, ToolError> {
         self.resolve_path_inner(relative, true)
     }
 
@@ -908,7 +1036,7 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
         &self,
         relative: &str,
         parent_must_be_directory: bool,
-    ) -> Result<PathBuf, ToolError> {
+    ) -> Result<ResolvedWorkspacePath, ToolError> {
         if relative.is_empty() {
             return Err(ToolError::InvalidField("path"));
         }
@@ -939,14 +1067,129 @@ pass timeout_ms up to {MAX_SHELL_TIMEOUT_MS} for longer runs)"
             let file_name = full.file_name().ok_or(ToolError::InvalidField("path"))?;
             parent.join(file_name)
         };
-        if !canonical.starts_with(&root) {
+        let Ok(relative_path) = canonical.strip_prefix(&root) else {
             return Err(ToolError::PathOutsideWorkspace {
                 path: display_path(relative),
                 reason: "path escapes the workspace root",
             });
-        }
-        Ok(canonical)
+        };
+        let relative_path = relative_path.to_path_buf();
+        Ok(ResolvedWorkspacePath {
+            root,
+            relative: relative_path,
+            absolute: canonical,
+        })
     }
+
+    /// Open an existing structured-tool target for reading and validate it.
+    /// Both steps are fd-anchored: the descriptor the checks run against is
+    /// the descriptor the caller reads from.
+    fn open_resolved_read(&self, path: &ResolvedWorkspacePath) -> Result<fs::File, ToolError> {
+        let file = structured_file::open_read(&path.root, &path.relative)?;
+        validate_open_structured_file(&file, path)?;
+        Ok(file)
+    }
+
+    fn read_resolved_file(&self, path: &ResolvedWorkspacePath) -> Result<String, ToolError> {
+        let mut file = self.open_resolved_read(path)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    }
+}
+
+/// Open a structured-tool target for writing, confined to its workspace root.
+/// `create_new` uses `O_EXCL`, so a create can never clobber a file that
+/// appeared between preparation and apply.
+fn open_workspace_write_file(
+    path: &ResolvedWorkspacePath,
+    create_new: bool,
+) -> Result<fs::File, ToolError> {
+    structured_file::open_write(&path.root, &path.relative, create_new).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            ToolError::FileAlreadyExists
+        } else {
+            ToolError::Io(error)
+        }
+    })
+}
+
+/// Perform the mutation on an already-confined descriptor.
+///
+/// `expected_before` is the exact preimage the tool call was prepared
+/// against. Comparing it here, on the descriptor about to be truncated,
+/// is what makes a concurrent user edit a refusal instead of a silent
+/// overwrite.
+fn write_open_file(
+    file: &mut fs::File,
+    path: &ResolvedWorkspacePath,
+    content: &str,
+    expected_before: Option<&str>,
+) -> Result<(), ToolError> {
+    // Recheck immediately before mutation: a same-user host actor may have
+    // introduced a new alias since the pre-image validation.
+    validate_open_writable_file(file, path)?;
+    if let Some(expected) = expected_before {
+        let read_limit = u64::try_from(expected.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut current = Vec::with_capacity(expected.len().saturating_add(1));
+        std::io::Read::by_ref(&mut *file)
+            .take(read_limit)
+            .read_to_end(&mut current)?;
+        if current != expected.as_bytes() {
+            return Err(ToolError::StalePreparedWrite {
+                path: path.display(),
+            });
+        }
+        file.seek(std::io::SeekFrom::Start(0))?;
+    }
+    validate_open_writable_file(file, path)?;
+    file.set_len(0)?;
+    file.write_all(content.as_bytes())?;
+    // The write is claimed applied — and checkpointed as applied — only once
+    // it is durable.
+    crate::durability::sync_file_data(file, &path.absolute)?;
+    Ok(())
+}
+
+/// Structured file tools read and write regular files only. The check runs on
+/// the open descriptor, so it describes the inode that will actually be read
+/// rather than whatever the path resolved to earlier: a FIFO, device, or
+/// directory swapped in after resolution fails here.
+fn validate_open_structured_file(
+    file: &fs::File,
+    path: &ResolvedWorkspacePath,
+) -> Result<(), ToolError> {
+    if !file.metadata()?.is_file() {
+        return Err(ToolError::UnsupportedFileType {
+            path: path.display(),
+        });
+    }
+    Ok(())
+}
+
+/// A structured write additionally requires that the target inode have
+/// exactly one name. A second link may name the same inode from outside the
+/// workspace, which would make a confined write an unconfined one. Reads are
+/// deliberately not restricted this way; a multiply-linked file inside the
+/// workspace is still readable.
+fn validate_open_writable_file(
+    file: &fs::File,
+    path: &ResolvedWorkspacePath,
+) -> Result<(), ToolError> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(ToolError::UnsupportedFileType {
+            path: path.display(),
+        });
+    }
+    if structured_file::hardlink_count(&metadata) > 1 {
+        return Err(ToolError::HardlinkedStructuredFile {
+            path: path.display(),
+        });
+    }
+    Ok(())
 }
 
 /// One prepared agent-controlled process, with enough provenance to remove

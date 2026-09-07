@@ -215,9 +215,18 @@ impl<D: PermissionDecider> Session<D> {
                         payload.clone(),
                         Some(tool_call_event_id.clone()),
                     )?;
-                    match self.tools.apply_patch_cancellable(patch, cancellation) {
+                    match self
+                        .tools
+                        .apply_patch_cancellable_observed(patch, cancellation)
+                    {
                         Ok(()) => {}
-                        Err(ToolError::Cancelled) => {
+                        Err(failure) if matches!(failure.error, ToolError::Cancelled) => {
+                            self.emit_observed_changes(
+                                &call.id,
+                                patch.origin,
+                                &failure.file_changes,
+                                &tool_call_event_id,
+                            )?;
                             self.emit_cancelled_tool_result(
                                 call,
                                 tool_call_event_id,
@@ -226,11 +235,20 @@ impl<D: PermissionDecider> Session<D> {
                             )?;
                             return Err(SessionError::Cancelled);
                         }
-                        Err(error) => {
+                        Err(failure) => {
+                            // A write that failed part-way still changed the
+                            // file. Record what was observed through the
+                            // target descriptor before reporting the failure.
+                            self.emit_observed_changes(
+                                &call.id,
+                                patch.origin,
+                                &failure.file_changes,
+                                &tool_call_event_id,
+                            )?;
                             self.emit_failed_tool_result(
                                 call.id,
                                 execution.name,
-                                error.to_string(),
+                                failure.error.to_string(),
                                 tool_call_event_id,
                                 tool_started,
                             )?;
@@ -330,14 +348,32 @@ impl<D: PermissionDecider> Session<D> {
             return Ok(());
         }
         debug_assert_eq!(execution.name, "run_shell");
-        for change in &execution.file_changes {
+        self.emit_observed_changes(
+            call_id,
+            "run_shell",
+            &execution.file_changes,
+            tool_call_event_id,
+        )
+    }
+
+    /// Record observed file changes that no `patch.applied` covers: a shell
+    /// command's side effects, or the partial effect of a structured write
+    /// that failed after opening its target.
+    fn emit_observed_changes(
+        &mut self,
+        call_id: &str,
+        origin: &'static str,
+        changes: &[crate::ObservedFileChange],
+        tool_call_event_id: &str,
+    ) -> Result<(), SessionError> {
+        for change in changes {
             let file_change_id = self.emit_with_parent(
                 EventKind::FILE_CHANGE,
-                observed_file_change_payload(call_id, "run_shell", change),
+                observed_file_change_payload(call_id, origin, change),
                 Some(tool_call_event_id.to_owned()),
             )?;
             let mut observed_diff =
-                observed_file_diff_payload(call_id, &file_change_id, "run_shell", change);
+                observed_file_diff_payload(call_id, &file_change_id, origin, change);
             self.redactor
                 .redact_payload_fields(&mut observed_diff, &["diff"]);
             self.emit_with_parent(
