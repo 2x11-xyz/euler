@@ -642,3 +642,91 @@ impl<D> Session<D> {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grants::{GrantScope, ScopePattern};
+    use crate::permissions::ScriptedDecider;
+    use crate::{Session, SessionConfig};
+    use euler_provider::ScriptedProvider;
+
+    fn session_with_unscoped_shell_grant(root: &std::path::Path) -> Session<ScriptedDecider> {
+        let mut session = Session::new(
+            SessionConfig::new(root),
+            ScriptedProvider::new(Vec::new()),
+            ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+        );
+        session
+            .permissions
+            .install_grant(
+                Capability::ShellExec,
+                GrantScope::Session(ScopePattern::unscoped()),
+            )
+            .expect("install unscoped shell grant");
+        // Installing an unscoped grant legitimately flips the mode to
+        // session-allow; the grant path under `ask` is what this pins.
+        session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
+        session
+    }
+
+    /// Review round 3, finding 7: extensions may name their command field
+    /// anything (`cmd`, `script`), and a `shell-exec` request with no
+    /// command text can be walked by nothing. It must therefore be covered
+    /// by no grant and always reach a prompt — the treatment a truncated
+    /// command gets.
+    #[test]
+    fn extension_shell_request_without_a_command_is_never_grant_covered() {
+        let temp = tempfile::tempdir().expect("temp");
+        let session = session_with_unscoped_shell_grant(temp.path());
+
+        // A walkable, harmless command still rides the unscoped grant:
+        // nothing pending, no prompt.
+        let covered = session
+            .extension_permission_batch(
+                "extension ext.run".to_owned(),
+                &[Capability::ShellExec],
+                Some("ls -la"),
+            )
+            .expect("batch");
+        assert!(
+            covered.is_none(),
+            "a walked, harmless command should ride the unscoped grant"
+        );
+
+        // No command text (the invocation called its field `cmd`): the
+        // request is unreadable, so it is pending a decision.
+        let pending = session
+            .extension_permission_batch(
+                "extension ext.run".to_owned(),
+                &[Capability::ShellExec],
+                None,
+            )
+            .expect("batch")
+            .expect("an unwalkable shell request must reach a prompt");
+        let request = &pending.requests()[0];
+        assert!(request.dangerous_command);
+        assert!(session.permissions.granted_source(request).is_none());
+    }
+
+    /// The command-less entry point cannot build a walked shell request, so
+    /// it refuses the capability outright rather than letting one through.
+    #[test]
+    fn command_less_capability_approval_refuses_shell_exec() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut session = session_with_unscoped_shell_grant(temp.path());
+        let error = session
+            .approve_extension_capabilities("ext", "run", &[Capability::ShellExec])
+            .expect_err("shell-exec has no walkable command here");
+        assert!(matches!(
+            error,
+            ExtensionExecutionError::CapabilityDenied {
+                capability: Capability::ShellExec
+            }
+        ));
+        // Other capabilities are unaffected.
+        session
+            .approve_extension_capabilities("ext", "run", &[Capability::ArtifactWrite])
+            .expect("non-shell capabilities still approve");
+    }
+}
