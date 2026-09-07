@@ -1,0 +1,11 @@
+Synthetic local timings; relative scaling, not production SLOs; debug_assertions=true
+pagination events=1000 pages=4 median_ms=14.609
+pagination events=5000 pages=20 median_ms=225.496
+pagination events=10000 pages=40 median_ms=897.895
+pagination events=20000 pages=79 median_ms=3461.287
+canvas rounds=100 events=411 swaps=10 median_ms=1.224
+canvas rounds=500 events=2051 swaps=50 median_ms=11.556
+canvas rounds=1000 events=4101 swaps=100 median_ms=37.277
+snapshot files=1000 bytes_per_file=16384 one_capture_ms=508.568
+snapshot files=4097 actual_changes=1 reported_changes=0
+read_file file_bytes=33554432 returned_bytes=96 elapsed_ms=60.480

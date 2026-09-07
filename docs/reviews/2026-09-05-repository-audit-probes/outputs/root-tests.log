@@ -1,0 +1,31 @@
+   Compiling euler-managed-process v0.1.3 (~/code/euler/crates/euler-managed-process)
+   Compiling euler-audit-evidence v0.1.0 (/private/tmp/euler-audit-evidence-final)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.21s
+     Running unittests src/lib.rs (/private/tmp/euler-audit-target/debug/deps/euler_audit_evidence-36234b555dd3b150)
+
+running 10 tests
+CONFIRMED: create-only write overwrites a file created between prepare and apply
+CONFIRMED: prepared edit silently overwrites an intervening user edit
+test tests::reproduces_prepared_edit_losing_intervening_change ... ok
+test tests::reproduces_prepared_create_overwriting_intervening_file ... ok
+CONFIRMED: MaxTokens with partial text returns Ok with final assistant.message and no error event
+CONFIRMED: provenance contains 2 tool results; canvas retains only first when provider call ID repeats
+test tests::reproduces_reused_provider_tool_id_disappearing_from_canvas ... ok
+test tests::reproduces_partial_max_tokens_as_normal_completion ... ok
+CONFIRMED: statically approved "cat *.txt" read synthetic file outside workspace
+CONFIRMED: replay/resume cannot read a valid prefix before torn UTF-8 tail, while query_provenance can
+CONFIRMED: statically approved "cd nested && cat view.txt" read synthetic file outside workspace
+test tests::reproduces_utf8_torn_tail_rejecting_valid_prefix ... ok
+CONFIRMED: uniq overwrote output.txt with FsWrite=AlwaysDeny and ShellExec=Ask; decider calls=0
+test tests::reproduces_uniq_write_without_approval ... ok
+CONFIRMED: statically approved "rg --follow SYNTHETIC ." read synthetic file outside workspace
+test tests::reproduces_glob_and_cd_read_scope_bypass ... ok
+CONFIRMED: visible partial model output exists in memory but disappears from durable provenance after transport failure
+test tests::reproduces_partial_stream_content_missing_from_durable_record ... ok
+CONFIRMED RESUME FAILURE after empty non-success stop: resume incompatible: terminal event 01M1R8C3BR0RMZBDACGS5M8J00 duplicates the closed model call 01M1R8C3AK03SEH7075E7TGMAJ for agent root
+test tests::checks_resume_after_empty_non_success_stop ... ok
+CONFIRMED: revoked fs-write session grant silently restored on resume; subsequent write bypasses denying decider
+test tests::reproduces_revoked_session_grant_restored_on_resume ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+

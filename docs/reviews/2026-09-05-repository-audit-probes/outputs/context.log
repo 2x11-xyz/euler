@@ -1,0 +1,3 @@
+own-history child_ok=true model_rounds=2 second_request_items=1 own_tool_outputs=0
+sequential-context-limit child_ok=true provider_calls=1 context_limit_tokens=10 explicit_context_bytes=8192
+parallel-context-limit child_ok=false provider_calls=0 error=Some("reviewer request exceeds context limit: 2339 tokens required > 10")

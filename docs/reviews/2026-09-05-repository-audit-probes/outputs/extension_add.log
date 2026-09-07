@@ -1,0 +1,3 @@
+link=Ok(Linked)
+install=Err(ModeConflict { id: "audit-add", existing_mode: "linked", requested_mode: "installed" })
+remaining_materialization=Linked

@@ -1,0 +1,14 @@
+   Compiling euler-audit-probes v0.1.0 (/private/tmp/euler-repo-audit)
+    Finished `release` profile [optimized] target(s) in 0.46s
+     Running `/private/tmp/euler-audit-target/release/scaling`
+Synthetic local timings; relative scaling, not production SLOs; debug_assertions=false
+pagination events=1000 pages=4 median_ms=1.691
+pagination events=5000 pages=20 median_ms=24.514
+pagination events=10000 pages=40 median_ms=81.489
+pagination events=20000 pages=79 median_ms=311.193
+canvas rounds=100 events=411 swaps=10 median_ms=0.228
+canvas rounds=500 events=2051 swaps=50 median_ms=1.748
+canvas rounds=1000 events=4101 swaps=100 median_ms=5.187
+snapshot files=1000 bytes_per_file=16384 one_capture_ms=47.050
+snapshot files=4097 actual_changes=1 reported_changes=0
+read_file file_bytes=33554432 returned_bytes=96 elapsed_ms=23.503

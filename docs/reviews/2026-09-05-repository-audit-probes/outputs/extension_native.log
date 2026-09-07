@@ -1,0 +1,8 @@
+registration=Err(RegistrationFailed("audit-ext", Message("command `invalid` requires undeclared capability fs-write")))
+command_after_failed_registration=Ok(Object {"executed": Bool(true)})
+retry=Err(DuplicateExtensionId("audit-ext"))
+
+thread 'main' (29483046) panicked at src/bin/extension_native.rs:15:72:
+SYNTHETIC_DESCRIPTOR_PANIC
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+descriptor_panic_escaped=true
