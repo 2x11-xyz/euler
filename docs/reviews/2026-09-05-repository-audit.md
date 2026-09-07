@@ -1,6 +1,6 @@
 # Euler repository audit
 
-Audit date: **2026-09-05**. Baseline: **`main` at `9dfb881`**, version 0.1.3. Companion record: [REPO_AUDIT_LOG.md](REPO_AUDIT_LOG.md).
+Audit date: **2026-09-05**. Baseline: **`main` at `9dfb881`**, version 0.1.3. The working log was not retained; the PR threads for #211 through #224 carry the integration history.
 
 > **Second-pass verification (2026-09-05, independent agent).** All 33 original findings were re-verified against the source by six parallel reviewers and the ten root probes were rebuilt and rerun. None were refuted. Priority changes: F08, F13, F28, F29 lowered; F12 raised. Amendments are marked **Second pass:** inside the affected findings. Five new findings F34–F38 were added, and the implementation order was revised to include them. See [Second-pass verification](#second-pass-verification) for the record.
 
@@ -77,7 +77,7 @@ Priority definitions: **P1** = address first because of authorization, confident
 
 ### F01 — Automatic safe approval permits a file-writing command
 
-**P1 · Reproduced.** [`command_safety.rs`](crates/euler-core/src/command_safety.rs), lines 398–411; [`session/tool_dispatch.rs`](crates/euler-core/src/session/tool_dispatch.rs), lines 100–160.
+**P1 · Reproduced.** [`command_safety.rs`](../../crates/euler-core/src/command_safety.rs), lines 398–411; [`session/tool_dispatch.rs`](../../crates/euler-core/src/session/tool_dispatch.rs), lines 100–160.
 
 `uniq` is classified as read-only regardless of arguments. `uniq input.txt output.txt` creates or truncates the output file. With `FsWrite=AlwaysDeny` and `ShellExec=Ask`, the probe overwrote `output.txt`, called the permission decider zero times, and recorded `static-safe`.
 
@@ -91,7 +91,7 @@ This is a failure of the automatic read-only classification. It **does not bypas
 
 ### F02 — Static path checking does not match shell execution scope
 
-**P1 · Reproduced.** [`command_safety.rs`](crates/euler-core/src/command_safety.rs), lines 91–184, 398, and 421.
+**P1 · Reproduced.** [`command_safety.rs`](../../crates/euler-core/src/command_safety.rs), lines 91–184, 398, and 421.
 
 Three automatically approved commands read a synthetic file outside the workspace through symlinks: `cat *.txt`, `cd nested && cat view.txt`, and `rg --follow SYNTHETIC .`. A direct `cat public.txt` correctly rejected the same outside symlink. Glob words are checked before expansion, segments reuse the original root rather than the shell's changed directory, and recursive traversal is not equivalent to checking the supplied directory argument.
 
@@ -101,7 +101,7 @@ Three automatically approved commands read a synthetic file outside the workspac
 
 ### F03 — A revoked session grant returns after resume
 
-**P1 · Reproduced.** [`session.rs`](crates/euler-core/src/session.rs), line 1598; [`resume.rs`](crates/euler-core/src/resume.rs), lines 408–440.
+**P1 · Reproduced.** [`session.rs`](../../crates/euler-core/src/session.rs), line 1598; [`resume.rs`](../../crates/euler-core/src/resume.rs), lines 408–440.
 
 `Session::revoke_grant` updates permission state, but an unscoped session revocation is not represented in provenance. Resume folds the earlier session-scoped allow back into active permissions. The probe granted filesystem writes, revoked the grant, resumed with a denying decider, and successfully wrote again without consulting that decider.
 
@@ -113,7 +113,7 @@ Three automatically approved commands read a synthetic file outside the workspac
 
 ### F04 — Prepared writes overwrite changes made after preparation
 
-**P1 · Reproduced.** [`tools.rs`](crates/euler-core/src/tools.rs), lines 620–684.
+**P1 · Reproduced.** [`tools.rs`](../../crates/euler-core/src/tools.rs), lines 620–684.
 
 Preparation records a path and intended contents; application later calls `fs::write` without validating the preimage or create-only condition. A prepared create overwrote an intervening user-created file. A prepared edit silently discarded an intervening user edit. A changed directory/symlink path is a related source-backed confinement concern; that race was not separately reproduced.
 
@@ -125,7 +125,7 @@ Preparation records a path and intended contents; application later calls `fs::w
 
 ### F05 — Credential resolution and refresh bypass known-value redaction
 
-**P1 · Reproduced schema/sink gap; refresh consequences source-backed.** [`session_lifecycle.rs`](crates/euler-cli/src/session_lifecycle.rs), lines 127–145; [`provider/lib.rs`](crates/euler-provider/src/lib.rs), lines 530–534; [`auth_validation.rs`](crates/euler-cli/src/auth_validation.rs), lines 100–108 and 149–160; [`chatgpt.rs`](crates/euler-provider/src/chatgpt.rs), lines 93–109.
+**P1 · Reproduced schema/sink gap; refresh consequences source-backed.** [`session_lifecycle.rs`](../../crates/euler-cli/src/session_lifecycle.rs), lines 127–145; [`provider/lib.rs`](../../crates/euler-provider/src/lib.rs), lines 530–534; [`auth_validation.rs`](../../crates/euler-cli/src/auth_validation.rs), lines 100–108 and 149–160; [`chatgpt.rs`](../../crates/euler-provider/src/chatgpt.rs), lines 93–109.
 
 Startup seeding parses an explicit auth file as core `AuthStorage`, while the legacy ChatGPT adapter intentionally reads a different `{tokens}` schema. A valid synthetic legacy file loaded in the adapter, failed core storage parsing, and produced zero secret-sink notifications. Built-in adapters use the no-op sink. Request-time resolution of stored environment references, OAuth refresh, and external credential rotation can therefore introduce values absent from the startup redaction snapshot.
 
@@ -139,7 +139,7 @@ Startup seeding parses an explicit auth file as core `AuthStorage`, while the le
 
 ### F06 — Checkpoints store bytes already known to contain a secret
 
-**P1 · Reproduced storage/admission gap; session call chain traced.** [`session/tool_dispatch.rs`](crates/euler-core/src/session/tool_dispatch.rs), lines 193–233 and 519–524; [`session/companion.rs`](crates/euler-core/src/session/companion.rs), line 567; [`checkpoints.rs`](crates/euler-core/src/checkpoints.rs), lines 42–55; [`file_diff.rs`](crates/euler-core/src/file_diff.rs), lines 344–390.
+**P1 · Reproduced storage/admission gap; session call chain traced.** [`session/tool_dispatch.rs`](../../crates/euler-core/src/session/tool_dispatch.rs), lines 193–233 and 519–524; [`session/companion.rs`](../../crates/euler-core/src/session/companion.rs), line 567; [`checkpoints.rs`](../../crates/euler-core/src/checkpoints.rs), lines 42–55; [`file_diff.rs`](../../crates/euler-core/src/file_diff.rs), lines 344–390.
 
 The patch event is redacted, but checkpoint storage receives the original `patch.before`. Its heuristic does not consult the session's known-value redactor. A registered synthetic secret in an ordinary `host = ...` file passed checkpoint admission and remained in the stored bytes. The ledger can look sanitized while `.euler/checkpoints` retains the raw value.
 
@@ -151,7 +151,7 @@ The patch event is redacted, but checkpoint storage receives the original `patch
 
 ### F07 — Overlapping known secrets are only partly redacted
 
-**P2 · Reproduced.** [`redaction.rs`](crates/euler-core/src/redaction.rs), lines 263–293; compare longest-first preparation in [`scrub.rs`](crates/euler-core/src/scrub.rs), lines 38–49.
+**P2 · Reproduced.** [`redaction.rs`](../../crates/euler-core/src/redaction.rs), lines 263–293; compare longest-first preparation in [`scrub.rs`](../../crates/euler-core/src/scrub.rs), lines 38–49.
 
 Registering `prefix12` before `prefix12-canary-sensitive-tail` causes the longer value to become `[redacted-secret]-canary-sensitive-tail`. Replacing the short prefix prevents the subsequent full-secret match.
 
@@ -161,7 +161,7 @@ Registering `prefix12` before `prefix12-canary-sensitive-tail` causes the longer
 
 ### F08 — Scrubbing one session breaks another session's rollback
 
-**P3 (lowered from P2 in second pass) · Reproduced.** [`provenance/scrub.rs`](crates/euler-core/src/provenance/scrub.rs), lines 139–153, 220–225, 360–363, and 424–445; [`checkpoints.rs`](crates/euler-core/src/checkpoints.rs), lines 58–75 and 119–120.
+**P3 (lowered from P2 in second pass) · Reproduced.** [`provenance/scrub.rs`](../../crates/euler-core/src/provenance/scrub.rs), lines 139–153, 220–225, 360–363, and 424–445; [`checkpoints.rs`](../../crates/euler-core/src/checkpoints.rs), lines 58–75 and 119–120.
 
 Checkpoint blobs are workspace-global and content-addressed. Sessions A and B can reference the same hash. Scrubbing A rewrites its references and removes/sanitizes the old blob without updating B. The probe left B's hash unchanged and made B's restore fail with `NotFound`.
 
@@ -173,7 +173,7 @@ Checkpoint blobs are workspace-global and content-addressed. Sessions A and B ca
 
 ### F09 — An empty token-limited completion makes the session unresumable
 
-**P1 · Reproduced.** [`session.rs`](crates/euler-core/src/session.rs), lines 600–656; [`resume.rs`](crates/euler-core/src/resume.rs), line 762 onward.
+**P1 · Reproduced.** [`session.rs`](../../crates/euler-core/src/session.rs), lines 600–656; [`resume.rs`](../../crates/euler-core/src/resume.rs), line 762 onward.
 
 An empty `MaxTokens` response records `model.result`, then a provider error parented to that result. Resume interprets the error as another model terminal and fails with `DuplicateModelTerminal`. The turn fails honestly in memory but creates a log its own recovery logic rejects.
 
@@ -185,7 +185,7 @@ An empty `MaxTokens` response records `model.result`, then a provider error pare
 
 ### F10 — Failed streams lose their captured partial output from durable provenance
 
-**P2 · Reproduced.** [`session.rs`](crates/euler-core/src/session.rs), lines 2462, 3158, and 3189; [`provenance.rs`](crates/euler-core/src/provenance.rs), line 1427.
+**P2 · Reproduced.** [`session.rs`](../../crates/euler-core/src/session.rs), lines 2462, 3158, and 3189; [`provenance.rs`](../../crates/euler-core/src/provenance.rs), line 1427.
 
 A fake provider emitted `PARTIAL_RESEARCH_EVIDENCE_CANARY`, then a transport error. The marker existed in in-memory events but disappeared from `read_provenance`. Deltas are intentionally runtime-only, and failure discards the accumulated round data while persisting only the error message/category. The vision explicitly calls for keeping partial streams and failed paths as evidence.
 
@@ -197,7 +197,7 @@ A fake provider emitted `PARTIAL_RESEARCH_EVIDENCE_CANARY`, then a transport err
 
 ### F11 — Partial token-limited output has the same return shape as completion
 
-**P2 · Reproduced behavior; outcome/API design gap.** [`session.rs`](crates/euler-core/src/session.rs), lines 630–656.
+**P2 · Reproduced behavior; outcome/API design gap.** [`session.rs`](../../crates/euler-core/src/session.rs), lines 630–656.
 
 Text followed by `MaxTokens` returns normal `Ok` and emits `assistant.message`. The stop reason **is preserved in provenance**, so this is not missing finish metadata. The gap is that callers and users cannot reliably distinguish completed work from a capped partial answer through the ordinary turn result.
 
@@ -209,7 +209,7 @@ Text followed by `MaxTokens` returns normal `Ok` and emits `assistant.message`. 
 
 ### F12 — Reused provider tool-call IDs remove later results from the canvas
 
-**P1 (raised from P2 in second pass) · Reproduced.** [`canvas.rs`](crates/euler-core/src/canvas.rs), lines 901–948.
+**P1 (raised from P2 in second pass) · Reproduced.** [`canvas.rs`](../../crates/euler-core/src/canvas.rs), lines 901–948.
 
 Pairing globally keys `calls_by_id` and `paired_call_ids` by the provider payload ID. Two valid sequential model rounds that reuse that ID leave two tool results in provenance but only the first in the working canvas. Provider-local identifiers should not be session-global identity.
 
@@ -221,7 +221,7 @@ Pairing globally keys `calls_by_id` and `paired_call_ids` by the provider payloa
 
 ### F13 — A torn UTF-8 tail prevents inspection of the valid log prefix
 
-**P3 (lowered from P2 in second pass; P2 for read-only replay) · Reproduced.** [`provenance.rs`](crates/euler-core/src/provenance.rs), lines 515 and 551; [`resume.rs`](crates/euler-core/src/resume.rs), line 462.
+**P3 (lowered from P2 in second pass; P2 for read-only replay) · Reproduced.** [`provenance.rs`](../../crates/euler-core/src/provenance.rs), lines 515 and 551; [`resume.rs`](../../crates/euler-core/src/resume.rs), line 462.
 
 Whole-file `read_to_string` fails before prefix handling when the final incomplete fragment contains a partial multibyte character. Both replay and resume-prefix reading reject the file, while `query_provenance` returns the complete prefix correctly.
 
@@ -233,7 +233,7 @@ Whole-file `read_to_string` fails before prefix handling when the final incomple
 
 ### F14 — Compaction carries excluded project guidance into children
 
-**P1 · Reproduced.** [`session.rs`](crates/euler-core/src/session.rs), lines 2714–2724, 3691–3703, and 3912–3916; [`canvas.rs`](crates/euler-core/src/canvas.rs), lines 399–405.
+**P1 · Reproduced.** [`session.rs`](../../crates/euler-core/src/session.rs), lines 2714–2724, 3691–3703, and 3912–3916; [`canvas.rs`](../../crates/euler-core/src/canvas.rs), lines 399–405.
 
 The summarizer receives pinned project context, but its output becomes an ordinary unclassified `Projection`. A child using `project_context:none` removes typed project items while retaining that summary. A marker appearing only in synthetic `EULER.md` reached the child's prompt even though the child had **zero typed project-context items**. This undermines the intended independence of review/worker contexts.
 
@@ -245,7 +245,7 @@ The summarizer receives pinned project context, but its output becomes an ordina
 
 ### F15 — An isolated companion forgets its own tool results
 
-**P1 · Reproduced.** [`session/companion.rs`](crates/euler-core/src/session/companion.rs), lines 814–825 and 929–960.
+**P1 · Reproduced.** [`session/companion.rs`](../../crates/euler-core/src/session/companion.rs), lines 814–825 and 929–960.
 
 With `with_parent_canvas(false)`, canvas assembly returns empty on every round. A two-round child that read a file made its second request with only the task and **zero own tool outputs**. Excluding the parent's history inadvertently excludes the child's developing history too.
 
@@ -257,7 +257,7 @@ With `with_parent_canvas(false)`, canvas assembly returns empty on every round. 
 
 ### F16 — Child request admission differs by execution path and target
 
-**P2 · Sequential bypass reproduced; heterogeneous-target issue source-backed.** [`session/companion.rs`](crates/euler-core/src/session/companion.rs), lines 887–972; [`session/parallel_spawn.rs`](crates/euler-core/src/session/parallel_spawn.rs), lines 307–322.
+**P2 · Sequential bypass reproduced; heterogeneous-target issue source-backed.** [`session/companion.rs`](../../crates/euler-core/src/session/companion.rs), lines 887–972; [`session/parallel_spawn.rs`](../../crates/euler-core/src/session/parallel_spawn.rs), lines 307–322.
 
 An 8 KiB explicit context with a 10-token context limit dispatched successfully through `spawn_companion`. The identical parallel reviewer request was rejected before dispatch as requiring 2,339 tokens. Sequential assembly checks inherited canvas retention, not the final request token requirement. Parallel admission also uses the parent's configured context window rather than the resolved reviewer's target window.
 
@@ -267,7 +267,7 @@ An 8 KiB explicit context with a 10-token context limit dispatched successfully 
 
 ### F17 — ChatGPT stream corruption is silently accepted
 
-**P2 · Reproduced.** [`sse.rs`](crates/euler-provider/src/sse.rs), lines 95–132 and 248–269; shared WebSocket use in [`chatgpt_websocket.rs`](crates/euler-provider/src/chatgpt_websocket.rs), lines 124–132.
+**P2 · Reproduced.** [`sse.rs`](../../crates/euler-provider/src/sse.rs), lines 95–132 and 248–269; shared WebSocket use in [`chatgpt_websocket.rs`](../../crates/euler-provider/src/chatgpt_websocket.rs), lines 124–132.
 
 Malformed JSON is discarded with `.ok()?`; a following completed frame makes the stream appear successful. Malformed tool arguments become `Null`, while missing identifiers/arguments receive synthesized defaults. Probes observed malformed-frame → `Finished(Completed)`, malformed arguments → `ToolCall { input: Null }`, and duplicate completed frames → two parser terminal events. The root normally stops at the first terminal, limiting the last symptom's direct impact.
 
@@ -279,7 +279,7 @@ Malformed JSON is discarded with `.ok()?`; a following completed frame makes the
 
 ### F18 — UI availability checks can block on OAuth refresh
 
-**P2 · Source-backed.** [`provider/lib.rs`](crates/euler-provider/src/lib.rs), lines 657–675; [`chatgpt.rs`](crates/euler-provider/src/chatgpt.rs), lines 93–94; [`auth_validation.rs`](crates/euler-cli/src/auth_validation.rs), lines 149–157; [`ui/app.rs`](crates/euler-cli/src/ui/app.rs), lines 875, 1008, and 1053–1056; [`chatgpt_device.rs`](crates/euler-provider/src/chatgpt_device.rs), lines 229–233; [`auth_storage.rs`](crates/euler-core/src/auth_storage.rs), lines 318–338.
+**P2 · Source-backed.** [`provider/lib.rs`](../../crates/euler-provider/src/lib.rs), lines 657–675; [`chatgpt.rs`](../../crates/euler-provider/src/chatgpt.rs), lines 93–94; [`auth_validation.rs`](../../crates/euler-cli/src/auth_validation.rs), lines 149–157; [`ui/app.rs`](../../crates/euler-cli/src/ui/app.rs), lines 875, 1008, and 1053–1056; [`chatgpt_device.rs`](../../crates/euler-provider/src/chatgpt_device.rs), lines 229–233; [`auth_storage.rs`](../../crates/euler-core/src/auth_storage.rs), lines 318–338.
 
 `authenticated_provider_ids` calls provider validation; ChatGPT validation loads credentials and may refresh them. Startup/picker rebuilding performs this synchronously on the UI path, even when another provider is selected. Refresh holds the auth store's cross-process exclusive lock. The underlying ureq defaults have a 30-second connect timeout but no read/write/overall timeout, so a connected stalled endpoint can block indefinitely.
 
@@ -291,7 +291,7 @@ Malformed JSON is discarded with `.ok()?`; a following completed frame makes the
 
 ### F19 — Accepted custom compatibility requirements do not affect requests
 
-**P2 · Reproduced using localhost capture.** [`provider_config.rs`](crates/euler-provider/src/provider_config.rs), lines 443–452 and 668–675; [`chat_completions.rs`](crates/euler-provider/src/chat_completions.rs), lines 35–103, 257–268, and 355–373.
+**P2 · Reproduced using localhost capture.** [`provider_config.rs`](../../crates/euler-provider/src/provider_config.rs), lines 443–452 and 668–675; [`chat_completions.rs`](../../crates/euler-provider/src/chat_completions.rs), lines 35–103, 257–268, and 355–373.
 
 The config accepts `requires_tool_result_name` and `requires_assistant_after_tool_result`, but runtime shaping does not consume them. With both enabled, a captured request omitted the tool result's `name` and ended with the tool message rather than the required assistant continuation. No config warning was emitted.
 
@@ -303,7 +303,7 @@ The config accepts `requires_tool_result_name` and `requires_assistant_after_too
 
 ### F20 — Built-in OpenAI drops the selected reasoning effort
 
-**P2 · Source-backed.** [`openai.rs`](crates/euler-provider/src/openai.rs), lines 12–19; [`chat_completions.rs`](crates/euler-provider/src/chat_completions.rs), lines 25–60.
+**P2 · Source-backed.** [`openai.rs`](../../crates/euler-provider/src/openai.rs), lines 12–19; [`chat_completions.rs`](../../crates/euler-provider/src/chat_completions.rs), lines 25–60.
 
 OpenAI uses `first_party_five_minute_cache()`, which leaves `reasoning_request: None`. Request shaping consumes the selected effort only when this option is present. The catalog/CLI expose reasoning choices, but changing the selection does not change the built-in OpenAI request's reasoning field.
 
@@ -313,7 +313,7 @@ OpenAI uses `first_party_five_minute_cache()`, which leaves `reasoning_request: 
 
 ### F21 — Refreshed catalog capabilities disagree with adapter validation
 
-**P2 · Reproduced with a synthetic updated catalog.** [`provider/lib.rs`](crates/euler-provider/src/lib.rs), lines 619–625 and 689–699; [`chatgpt.rs`](crates/euler-provider/src/chatgpt.rs), lines 98–107; [`catalog.rs`](crates/euler-provider/src/catalog.rs), lines 1137–1154; [`anthropic.rs`](crates/euler-provider/src/anthropic.rs), lines 144–159.
+**P2 · Reproduced with a synthetic updated catalog.** [`provider/lib.rs`](../../crates/euler-provider/src/lib.rs), lines 619–625 and 689–699; [`chatgpt.rs`](../../crates/euler-provider/src/chatgpt.rs), lines 98–107; [`catalog.rs`](../../crates/euler-provider/src/catalog.rs), lines 1137–1154; [`anthropic.rs`](../../crates/euler-provider/src/anthropic.rs), lines 144–159.
 
 The host and UI use the active merged catalog, while ChatGPT validation and some Anthropic capability decisions read embedded metadata. A valid synthetic updated catalog admitted `max` for `gpt-5.5`, but the adapter rejected it before authentication/network access. This demonstrates drift under a supported catalog update; it is not a claim that today's embedded catalog disagrees with itself.
 
@@ -323,7 +323,7 @@ The host and UI use the active merged catalog, while ChatGPT validation and some
 
 ### F22 — Custom-provider secret syntax differs from the documented resolver
 
-**P3 · Reproduced.** [`secrets.md`](docs/contracts/secrets.md), line 11; [`custom_provider.rs`](crates/euler-provider/src/custom_provider.rs), lines 212–243; [`auth_storage.rs`](crates/euler-core/src/auth_storage.rs), lines 480–531.
+**P3 · Reproduced.** [`secrets.md`](../contracts/secrets.md), line 11; [`custom_provider.rs`](../../crates/euler-provider/src/custom_provider.rs), lines 212–243; [`auth_storage.rs`](../../crates/euler-core/src/auth_storage.rs), lines 480–531.
 
 `${KEY_PREFIX}_API_KEY` is documented and supported for stored auth. The custom resolver only unwraps an entire `${NAME}` and rejects the constructed form's braces. A valid synthetic configuration parsed without warnings but failed authentication with `env reference is invalid`.
 
@@ -333,7 +333,7 @@ The host and UI use the active merged catalog, while ChatGPT validation and some
 
 ### F23 — Provider-controlled indexes and frames can cause excessive allocation
 
-**P2 · Source-backed resilience risk; no OOM probe.** [`chat_completions.rs`](crates/euler-provider/src/chat_completions.rs), lines 493–506 and 643–647; [`anthropic.rs`](crates/euler-provider/src/anthropic.rs), lines 491–504, 599–606, and 835–838; [`sse.rs`](crates/euler-provider/src/sse.rs), lines 18–30.
+**P2 · Source-backed resilience risk; no OOM probe.** [`chat_completions.rs`](../../crates/euler-provider/src/chat_completions.rs), lines 493–506 and 643–647; [`anthropic.rs`](../../crates/euler-provider/src/anthropic.rs), lines 491–504, 599–606, and 835–838; [`sse.rs`](../../crates/euler-provider/src/sse.rs), lines 18–30.
 
 External block/tool indexes drive `Vec::resize_with(index + 1)`. A sparse large index allocates in proportion to the index rather than useful work; allocation failure may terminate the process. SSE line/data buffers also grow without a cap when a peer withholds a newline. An ordinary panic boundary does not reliably contain allocator aborts.
 
@@ -343,7 +343,7 @@ External block/tool indexes drive `Vec::resize_with(index + 1)`. A sparse large 
 
 ### F24 — Auth status and invocation use different credential precedence
 
-**P3 · Source-backed.** [`auth_storage.rs`](crates/euler-core/src/auth_storage.rs), lines 247–269 and 681–695; [`auth_validation.rs`](crates/euler-cli/src/auth_validation.rs), lines 94–100.
+**P3 · Source-backed.** [`auth_storage.rs`](../../crates/euler-core/src/auth_storage.rs), lines 247–269 and 681–695; [`auth_validation.rs`](../../crates/euler-cli/src/auth_validation.rs), lines 94–100.
 
 Status can mark an empty/unresolved API-key entry valid. A malformed stored entry can fall back to an environment status, while actual invocation intentionally treats any stored entry as authoritative and disables that fallback. The user can see `valid/env` but still be unable to invoke.
 
@@ -353,7 +353,7 @@ Status can mark an empty/unresolved API-key entry valid. A malformed stored entr
 
 ### F25 — Nonzero managed shutdown leaves owned descendants alive
 
-**P2 · Reproduced.** [`runtime.rs`](crates/euler-managed-process/src/runtime.rs), lines 681, 703, and 761–767; [`extension-sdk.md`](docs/contracts/extension-sdk.md), lines 516–519.
+**P2 · Reproduced.** [`runtime.rs`](../../crates/euler-managed-process/src/runtime.rs), lines 681, 703, and 761–767; [`extension-sdk.md`](../contracts/extension-sdk.md), lines 516–519.
 
 Shutdown calls `try_wait`, marks the leader reaped even on nonzero exit, then returns an error. `abort` skips group cleanup when `child_reaped` is true. A synthetic peer exited 1 after completing the shutdown/exit exchange; the host returned failure in ~75 ms, but its ordinary child wrote a marker a second later. The child then self-exited. The failure cleanup contract promises group termination before reaping.
 
@@ -365,7 +365,7 @@ Shutdown calls `try_wait`, marks the leader reaped even on nonzero exit, then re
 
 ### F26 — TUI Add composes an impossible link/install transition
 
-**P2 · Source-backed UI flow plus reproduced SDK transition.** [`ui/app/extension_runs.rs`](crates/euler-cli/src/ui/app/extension_runs.rs), lines 372–403; [`extension_package.rs`](crates/euler-sdk/src/extension_package.rs), line 500; [`extension_registry.rs`](crates/euler-core/src/extension_registry.rs), line 305.
+**P2 · Source-backed UI flow plus reproduced SDK transition.** [`ui/app/extension_runs.rs`](../../crates/euler-cli/src/ui/app/extension_runs.rs), lines 372–403; [`extension_package.rs`](../../crates/euler-sdk/src/extension_package.rs), line 500; [`extension_registry.rs`](../../crates/euler-core/src/extension_registry.rs), line 305.
 
 Add links the package, then installs the same ID. SDK installation rejects a Linked record with `ModeConflict`. The first mutation remains, while the success/enable path cannot complete. Re-adding an enabled linked package can revoke its consent before failing. Removing the install call alone is insufficient because generic `enable` differs from linked launch consent.
 
@@ -377,7 +377,7 @@ Add links the package, then installs the same ID. SDK installation rejects a Lin
 
 ### F27 — The empty extension manager cannot open Add
 
-**P2 · Direct control-flow finding; no live terminal reproduction.** [`ui/bottom_surface.rs`](crates/euler-cli/src/ui/bottom_surface.rs), lines 299–311; [`ui/bottom_surface/picker.rs`](crates/euler-cli/src/ui/bottom_surface/picker.rs), lines 207 and 531.
+**P2 · Direct control-flow finding; no live terminal reproduction.** [`ui/bottom_surface.rs`](../../crates/euler-cli/src/ui/bottom_surface.rs), lines 299–311; [`ui/bottom_surface/picker.rs`](../../crates/euler-cli/src/ui/bottom_surface/picker.rs), lines 207 and 531.
 
 The key handler obtains a selected row with `?` before matching `'a'`. An empty registry has no selected row, so it returns before handling Add, even though the picker advertises `a add`.
 
@@ -387,7 +387,7 @@ The key handler obtains a selected row with `?` before matching `'a'`. An empty 
 
 ### F28 — Failed native registration leaves executable partial state
 
-**P3 (lowered from P2 in second pass) · Reproduced through the public native API.** [`extensions.rs`](crates/euler-core/src/extensions.rs), lines 229–243 and 1584.
+**P3 (lowered from P2 in second pass) · Reproduced through the public native API.** [`extensions.rs`](../../crates/euler-core/src/extensions.rs), lines 229–243 and 1584.
 
 Full registration inserts the extension, then validates/inserts commands sequentially. A valid command followed by an invalid capability descriptor returns a registration error but leaves the earlier command executable; retrying the extension ID fails as a duplicate. Shipping managed package execution uses command-scoped validation, so this is not a demonstrated managed-package capability bypass.
 
@@ -399,7 +399,7 @@ Full registration inserts the extension, then validates/inserts commands sequent
 
 ### F29 — Native callbacks escape the intended panic boundary
 
-**P3 (lowered from P2 in second pass) · Descriptor panic reproduced; related callbacks source-backed.** [`extensions.rs`](crates/euler-core/src/extensions.rs), lines 1715 and 1725; [`session/extension_bridge.rs`](crates/euler-core/src/session/extension_bridge.rs), lines 421 and 497.
+**P3 (lowered from P2 in second pass) · Descriptor panic reproduced; related callbacks source-backed.** [`extensions.rs`](../../crates/euler-core/src/extensions.rs), lines 1715 and 1725; [`session/extension_bridge.rs`](../../crates/euler-core/src/session/extension_bridge.rs), lines 421 and 497.
 
 `runner.descriptor()` runs outside the existing unwind guard. Other invocation/manifest paths also call extension-supplied methods before reaching guarded registration. The synthetic descriptor panic escaped the host and invoked the ordinary panic hook. Current managed descriptors clone local data; the demonstrated failure concerns native extension implementations.
 
@@ -411,7 +411,7 @@ Full registration inserts the extension, then validates/inserts commands sequent
 
 ### F30 — Pending explicit extension runs can use stale launch consent
 
-**P2 · Source-backed; approval race not dynamically reproduced.** [`ui/app/extension_runs.rs`](crates/euler-cli/src/ui/app/extension_runs.rs), lines 193–226; [`cli/extension_run.rs`](crates/euler-cli/src/cli/extension_run.rs), lines 126–154; [`session/extension_bridge.rs`](crates/euler-core/src/session/extension_bridge.rs), lines 439–448; existing solution in [`extension_cli/runtime.rs`](crates/euler-cli/src/extension_cli/runtime.rs), line 148.
+**P2 · Source-backed; approval race not dynamically reproduced.** [`ui/app/extension_runs.rs`](../../crates/euler-cli/src/ui/app/extension_runs.rs), lines 193–226; [`cli/extension_run.rs`](../../crates/euler-cli/src/cli/extension_run.rs), lines 126–154; [`session/extension_bridge.rs`](../../crates/euler-core/src/session/extension_bridge.rs), lines 439–448; existing solution in [`extension_cli/runtime.rs`](../../crates/euler-cli/src/extension_cli/runtime.rs), line 148.
 
 Explicit CLI/TUI runs resolve a raw adapter and validate consent before capability approval. If the package is disabled/reloaded or its manifest changes while approval is pending, execution uses the captured adapter without rechecking. Model/idle paths already use `RevalidatedLinkedCommand` immediately before execution.
 
@@ -423,7 +423,7 @@ Explicit CLI/TUI runs resolve a raw adapter and validate consent before capabili
 
 ### F31 — Supported macOS testing has fixture portability failures
 
-**P2 · Reproduced test defects.** [`project_context/tests.rs`](crates/euler-core/src/project_context/tests.rs), including line 2014; [`project_context/discovery.rs`](crates/euler-core/src/project_context/discovery.rs), lines 951–955; [CI workflow](.github/workflows/ci.yml), line 16.
+**P2 · Reproduced test defects.** [`project_context/tests.rs`](../../crates/euler-core/src/project_context/tests.rs), including line 2014; [`project_context/discovery.rs`](../../crates/euler-core/src/project_context/discovery.rs), lines 951–955; [CI workflow](../../.github/workflows/ci.yml), line 16.
 
 The initial core run had nine failures. Eight came from macOS `/var` versus `/private/var` temporary-path aliases: discovery intentionally requires a canonical supplied user-skill root, while fixtures passed an alias. A canonical `TMPDIR` resolved them. The ninth creates a filename with byte `0xff`; APFS rejects that name. These are not nine product bugs: normal CLI home resolution already canonicalizes the root.
 
@@ -433,7 +433,7 @@ The initial core run had nine failures. Eight came from macOS `/var` versus `/pr
 
 ### F32 — Toolchain guidance understates the dependency requirement
 
-**P3 · Confirmed metadata mismatch.** [README](README.md), line 72; [workspace manifest](Cargo.toml); [lockfile](Cargo.lock).
+**P3 · Confirmed metadata mismatch.** [README](../../README.md), line 72; [workspace manifest](../../Cargo.toml); [lockfile](../../Cargo.lock).
 
 README recommends Rust 1.80+, while locked `ratatui`/`ratatui-core` metadata requires Rust 1.88.0. The workspace declares no `rust-version`, and CI does not establish a tested minimum. The exact whole-workspace minimum was not measured on older compilers; **1.88 is a demonstrated lower bound, not a verified MSRV**.
 
@@ -443,7 +443,7 @@ README recommends Rust 1.80+, while locked `ratatui`/`ratatui-core` metadata req
 
 ### F33 — Contract and roadmap references have drifted
 
-**P3 · Confirmed documentation issues.** [Provenance contract](docs/contracts/provenance.md), line 11; [event contract](docs/contracts/events.md), lines 53 and 90; [ADR index](docs/adr/README.md); [roadmap](docs/roadmap.md), line 24.
+**P3 · Confirmed documentation issues.** [Provenance contract](../contracts/provenance.md), line 11; [event contract](../contracts/events.md), lines 53 and 90; [ADR index](../adr/README.md); [roadmap](../roadmap.md), line 24.
 
 Contracts repeatedly refer to nonexistent `docs/contracts/persistence.md`. The ADR index says the next number is 0018 although ADR 0018 exists. The roadmap lists headless resume as future work despite implemented `exec --resume` support.
 
@@ -455,7 +455,7 @@ Contracts repeatedly refer to nonexistent `docs/contracts/persistence.md`. The A
 
 ### F34 — Auto-approved write plus auto-approved `git` chains to arbitrary execution
 
-**P1 · Source-backed; each half reproduced separately (F01 probe, `is_safe_git` tests).** [`command_safety.rs`](crates/euler-core/src/command_safety.rs), lines 227–240 (`sensitive_basename`) and 470–484 (`is_safe_git`); [`tools.rs`](crates/euler-core/src/tools.rs), lines 704 and 718.
+**P1 · Source-backed; each half reproduced separately (F01 probe, `is_safe_git` tests).** [`command_safety.rs`](../../crates/euler-core/src/command_safety.rs), lines 227–240 (`sensitive_basename`) and 470–484 (`is_safe_git`); [`tools.rs`](../../crates/euler-core/src/tools.rs), lines 704 and 718.
 
 `sensitive_basename` denies `.env*`, `id_rsa`, `id_ed25519`, `*.pem`, `*.key`, and names containing `secret`/`credential`. It does not deny `.git/config`. So `uniq payload .git/config` is static-safe under F01, and the subsequent `git status` is also static-safe. Git honors `core.hooksPath` and `core.fsmonitor` from that file, so two consecutive auto-approved commands execute attacker-chosen code with zero decider calls. The shell tool's before/after workspace snapshot records the write; it does not prevent it.
 
@@ -467,7 +467,7 @@ This upgrades F01 from "clobbers a workspace file" to "reaches code execution". 
 
 ### F35 — Explicit permission mode changes are not durable either
 
-**P1 · Source-backed; same mechanism as the reproduced F03.** [`session.rs`](crates/euler-core/src/session.rs), lines 1568–1570; [`resume.rs`](crates/euler-core/src/resume.rs), lines 614–616; [`session/permissions_gate.rs`](crates/euler-core/src/session/permissions_gate.rs), lines 336–352.
+**P1 · Source-backed; same mechanism as the reproduced F03.** [`session.rs`](../../crates/euler-core/src/session.rs), lines 1568–1570; [`resume.rs`](../../crates/euler-core/src/resume.rs), lines 614–616; [`session/permissions_gate.rs`](../../crates/euler-core/src/session/permissions_gate.rs), lines 336–352.
 
 `Session::set_permission_mode` writes the in-memory gate and emits nothing. A user who flips `ShellExec` to `AlwaysDeny` through the permissions UI has that decision silently discarded on resume, and the fold at `resume.rs:614–616` then replays any historical session allow as `SessionAllow` on top of it. The blast radius is wider than F03 because it does not require a prior grant.
 
@@ -479,7 +479,7 @@ A second inconsistency in the same code: `scope: "session"` is stamped only on *
 
 ### F36 — Checkpoint is captured from the prepare-time preimage and stored after the write
 
-**P2 · Source-backed; ordering is unambiguous in the dispatch code.** [`session/tool_dispatch.rs`](crates/euler-core/src/session/tool_dispatch.rs), lines 202, 206, 229, and 233; [`session/companion.rs`](crates/euler-core/src/session/companion.rs), lines 565–567; [`tools.rs`](crates/euler-core/src/tools.rs), lines 620–631 and 854–893.
+**P2 · Source-backed; ordering is unambiguous in the dispatch code.** [`session/tool_dispatch.rs`](../../crates/euler-core/src/session/tool_dispatch.rs), lines 202, 206, 229, and 233; [`session/companion.rs`](../../crates/euler-core/src/session/companion.rs), lines 565–567; [`tools.rs`](../../crates/euler-core/src/tools.rs), lines 620–631 and 854–893.
 
 Order of operations is `PATCH_PROPOSED` → `fs::write` → `PATCH_APPLIED` → `store_pre_image(patch.before)`. Two consequences. First, `patch.before` was read at **prepare** time, so under the F04 race rollback restores the prepare-time bytes rather than what was actually overwritten. Second, a crash between the write and the checkpoint leaves no preimage at all. F04's acceptance text says to inject write/checkpoint failures, but the report did not state this ordering as a finding.
 
@@ -491,7 +491,7 @@ Related: `write_path` is canonicalized at prepare (`resolve_path_inner`, `tools.
 
 ### F37 — Canvas assembly has no per-actor filter for ordinary tool rounds
 
-**P2 · Source-backed; complements the reproduced F15.** [`canvas.rs`](crates/euler-core/src/canvas.rs), lines 758, 869, and 887; [`session/companion.rs`](crates/euler-core/src/session/companion.rs), lines 446–452.
+**P2 · Source-backed; complements the reproduced F15.** [`canvas.rs`](../../crates/euler-core/src/canvas.rs), lines 758, 869, and 887; [`session/companion.rs`](../../crates/euler-core/src/session/companion.rs), lines 446–452.
 
 Canvas assembly filters by `event.agent` only for extension contributions and driver snapshots. Ordinary messages and tool rounds are not agent-scoped. Consequences: a child spawned with parent canvas **on** sees prior siblings' tool rounds, and after a child returns, the parent's next canvas contains the child's raw `TOOL_CALL`/`TOOL_RESULT` events rather than only its `agent.result`. Neither behavior is documented in `docs/contracts/multi-agent.md`.
 
@@ -503,7 +503,7 @@ Separately, the child's tool executor passes the **full** parent bus to `execute
 
 ### F38 — No production HTTP or WebSocket transport has a read timeout
 
-**P2 · Source-backed; generalizes F18 and O5.** [`anthropic.rs`](crates/euler-provider/src/anthropic.rs), line 59; [`chatgpt.rs`](crates/euler-provider/src/chatgpt.rs), line 121; [`chat_completions_provider.rs`](crates/euler-provider/src/chat_completions_provider.rs), line 205; [`chatgpt_device.rs`](crates/euler-provider/src/chatgpt_device.rs), line 232; [`chatgpt_websocket.rs`](crates/euler-provider/src/chatgpt_websocket.rs), line 152; [`provider/lib.rs`](crates/euler-provider/src/lib.rs), lines 724–727.
+**P2 · Source-backed; generalizes F18 and O5.** [`anthropic.rs`](../../crates/euler-provider/src/anthropic.rs), line 59; [`chatgpt.rs`](../../crates/euler-provider/src/chatgpt.rs), line 121; [`chat_completions_provider.rs`](../../crates/euler-provider/src/chat_completions_provider.rs), line 205; [`chatgpt_device.rs`](../../crates/euler-provider/src/chatgpt_device.rs), line 232; [`chatgpt_websocket.rs`](../../crates/euler-provider/src/chatgpt_websocket.rs), line 152; [`provider/lib.rs`](../../crates/euler-provider/src/lib.rs), lines 724–727.
 
 All four `ureq::builder().redirects(0).build()` sites take ureq's defaults: 30-second connect timeout, no read timeout, no overall timeout. The WebSocket `socket.read()` loop has none either. The cancellation wrapper at `lib.rs:724–727` documents that it cannot preempt blocked I/O. F18 describes the UI-thread symptom for auth; this finding records that every model stream has the same property, so a connected-but-stalled endpoint holds a worker thread indefinitely in every adapter.
 
@@ -513,7 +513,7 @@ All four `ureq::builder().redirects(0).build()` sites take ureq's defaults: 30-s
 
 ## Optimization opportunities
 
-These recommendations distinguish measured costs from source-level opportunities. The timings below came from an **optimized release build on the local Mac with Rust 1.98.0**, using synthetic data and the baseline dependency graph. Pagination/canvas values are medians of three runs; snapshot and file-read values are single captures. They are not production SLOs, cold-cache benchmarks, or promises of a particular speedup. [Source](audit/2026-09-05/src/bin/scaling.rs) and [recorded release output](audit/2026-09-05/outputs/scaling-release-baseline.log) are preserved.
+These recommendations distinguish measured costs from source-level opportunities. The timings below came from an **optimized release build on the local Mac with Rust 1.98.0**, using synthetic data and the baseline dependency graph. Pagination/canvas values are medians of three runs; snapshot and file-read values are single captures. They are not production SLOs, cold-cache benchmarks, or promises of a particular speedup. [Source](2026-09-05-repository-audit-probes/src/bin/scaling.rs) and [recorded release output](2026-09-05-repository-audit-probes/outputs/scaling-release-baseline.log) are preserved.
 
 | Workload | Observed time | Interpretation |
 | --- | ---: | --- |
@@ -530,7 +530,7 @@ These recommendations distinguish measured costs from source-level opportunities
 
 ### O1 — Index provenance pagination and targeted retrieval
 
-**P2 · Measured scaling issue.** [`provenance.rs`](crates/euler-core/src/provenance.rs), lines 610–694.
+**P2 · Measured scaling issue.** [`provenance.rs`](../../crates/euler-core/src/provenance.rs), lines 610–694.
 
 Each event-ID page reopens the file and parses from the beginning to find its cursor. `scan_limit` applies only after cursor discovery. Traversing all pages therefore repeats earlier work and approaches quadratic total scanning for fixed-size pages. Full-log helpers used by context/plan/extension features can compound the cost.
 
@@ -540,7 +540,7 @@ Each event-ID page reopens the file and parses from the beginning to find its cu
 
 ### O2 — Maintain incremental actor-specific canvas projections
 
-**P2 after context correctness · Measured/source-backed.** [`canvas.rs`](crates/euler-core/src/canvas.rs), lines 230–275, 521–582, and 901–948; [`session.rs`](crates/euler-core/src/session.rs), line 2306.
+**P2 after context correctness · Measured/source-backed.** [`canvas.rs`](../../crates/euler-core/src/canvas.rs), lines 230–275, 521–582, and 901–948; [`session.rs`](../../crates/euler-core/src/session.rs), line 2306.
 
 Canvas assembly reconstructs call/result indexes and repeatedly validates historical swaps, including linear event-ID searches. Reassembling broad session history for each child's next request adds avoidable filtering and cloning. Current measured absolute costs are modest, so correctness and long-history profiles should set the schedule.
 
@@ -550,7 +550,7 @@ Canvas assembly reconstructs call/result indexes and repeatedly validates histor
 
 ### O3 — Make workspace observation coverage explicit, then reduce scan cost
 
-**P2 design/observability improvement · Measured; existing behavior is documented.** [`tools.rs`](crates/euler-core/src/tools.rs), around lines 704–721; [`file_diff.rs`](crates/euler-core/src/file_diff.rs), lines 10–14 and 143–188.
+**P2 design/observability improvement · Measured; existing behavior is documented.** [`tools.rs`](../../crates/euler-core/src/tools.rs), around lines 704–721; [`file_diff.rs`](../../crates/euler-core/src/file_diff.rs), lines 10–14 and 143–188.
 
 Every shell invocation captures before/after snapshots. The measured 47 ms was one capture of ~16 MiB of source; it is not a measurement of the whole shell operation. Snapshots deliberately stop at bounds such as 4,096 files/64 MiB, and `changes_to` returns empty when either capture is incomplete. The 4,097-file probe therefore reported no changes after an edit. This follows the implementation's documented safety policy but makes "none observed" difficult to distinguish from "fully observed, no changes."
 
@@ -560,7 +560,7 @@ Every shell invocation captures before/after snapshots. The measured 47 ms was o
 
 ### O4 — Bound acquisition, not only the returned preview
 
-**P2 resilience/performance · Source-backed, file-read example measured.** [`tools.rs`](crates/euler-core/src/tools.rs), lines 472–477 and 1091–1116; [`file_diff.rs`](crates/euler-core/src/file_diff.rs), lines 60–65; provider bounds in F23.
+**P2 resilience/performance · Source-backed, file-read example measured.** [`tools.rs`](../../crates/euler-core/src/tools.rs), lines 472–477 and 1091–1116; [`file_diff.rs`](../../crates/euler-core/src/file_diff.rs), lines 60–65; provider bounds in F23.
 
 `read_file` reads the entire file before slicing. Shell stdout/stderr accumulate in unbounded vectors before preview truncation/redaction/blob handling. Diff generation computes a full diff before bounding it. A small `max_bytes` response is therefore not a small memory/work budget.
 
@@ -570,7 +570,7 @@ Every shell invocation captures before/after snapshots. The measured 47 ms was o
 
 ### O5 — Reuse transports and bound their lifetime
 
-**P2 reliability/optimization · Source-backed; no remote latency benchmark.** [`provider/lib.rs`](crates/euler-provider/src/lib.rs), lines 714–784; [`chat_completions_provider.rs`](crates/euler-provider/src/chat_completions_provider.rs), line 205; [`chatgpt.rs`](crates/euler-provider/src/chatgpt.rs), line 121; [`anthropic.rs`](crates/euler-provider/src/anthropic.rs), line 59.
+**P2 reliability/optimization · Source-backed; no remote latency benchmark.** [`provider/lib.rs`](../../crates/euler-provider/src/lib.rs), lines 714–784; [`chat_completions_provider.rs`](../../crates/euler-provider/src/chat_completions_provider.rs), line 205; [`chatgpt.rs`](../../crates/euler-provider/src/chatgpt.rs), line 121; [`anthropic.rs`](../../crates/euler-provider/src/anthropic.rs), line 59.
 
 Adapters build fresh ureq agents for requests, losing opportunities for connection reuse. The cancellation wrapper releases the caller promptly but may leave a blocked synchronous transport worker alive. This logical-versus-physical cancellation distinction is documented. Repeated stalled requests can still consume resources after the user has moved on; this is separate from the UI metadata refresh bug in F18.
 
@@ -580,7 +580,7 @@ Adapters build fresh ureq agents for requests, losing opportunities for connecti
 
 ### O6 — Measure TUI event pressure before further rendering changes
 
-**P3 benchmark target · Source-backed, no demonstrated starvation.** [`ui/app/turn_events.rs`](crates/euler-cli/src/ui/app/turn_events.rs), lines 42–48; [`ui/app.rs`](crates/euler-cli/src/ui/app.rs), lines 1286–1294.
+**P3 benchmark target · Source-backed, no demonstrated starvation.** [`ui/app/turn_events.rs`](../../crates/euler-cli/src/ui/app/turn_events.rs), lines 42–48; [`ui/app.rs`](../../crates/euler-cli/src/ui/app.rs), lines 1286–1294.
 
 Worker events use an unbounded channel and are drained until empty, while terminal input has an explicit drain budget. Sustained producer pressure could increase memory and input latency. This audit did not measure visible starvation or a production queue backlog.
 
@@ -590,13 +590,13 @@ Existing finalized-row caching in `visual_canvas.rs`, streaming memoization in `
 
 ### O7 — Reduce redaction passes after fixing matching semantics
 
-**P3 measurement-dependent opportunity.** [`redaction.rs`](crates/euler-core/src/redaction.rs), lines 263–293.
+**P3 measurement-dependent opportunity.** [`redaction.rs`](../../crates/euler-core/src/redaction.rs), lines 263–293.
 
 Each known secret triggers another string replacement/allocation while the read lock remains held. Fix F07 first. Then profile realistic secret counts and output sizes; if this is material, snapshot an immutable matcher outside the lock and perform one original-input pass. Keep refresh updates visible and avoid retaining unnecessary historical copies of secret-bearing input. For short lists, a simple original-input span matcher may be preferable to a new dependency.
 
 ### O8 — Keep workflow meaning outside reusable core mechanisms
 
-**Architectural direction; not a claimed runtime bug.** [`session/swarm_tool.rs`](crates/euler-core/src/session/swarm_tool.rs); [`compaction.rs`](crates/euler-core/src/compaction.rs), lines 36–38 and 188; [boundary contract](docs/contracts/boundaries.md).
+**Architectural direction; not a claimed runtime bug.** [`session/swarm_tool.rs`](../../crates/euler-core/src/session/swarm_tool.rs); [`compaction.rs`](../../crates/euler-core/src/compaction.rs), lines 36–38 and 188; [boundary contract](../contracts/boundaries.md).
 
 The vision is a research platform, but core contains workflow-specific CodeSwarm routing and coding-shaped compaction fields such as `compiler_state` and `modified_files`. Some of these may be deliberate transitional exceptions. Their cost is that adding another research workflow risks another core-specific path with its own admission and lifecycle rules.
 
@@ -705,9 +705,9 @@ env -u EULER_HOME TMPDIR=/private/tmp \
   --skip project_context::tests::user_skill_path_diagnostics_do_not_change_project_acknowledgment_digest
 ```
 
-`cargo nextest` was unavailable, so this used Cargo's workspace test runner instead of the exact documented nextest gate. The initial run's nine failures and their fixture diagnosis are retained; the one APFS-incompatible fixture was explicitly skipped, not silently counted as a pass. [Final workspace log](audit/2026-09-05/outputs/workspace-tests.log), [initial failing run](audit/2026-09-05/outputs/workspace-tests-initial.log), and [Clippy log](audit/2026-09-05/outputs/workspace-clippy.log) are included.
+`cargo nextest` was unavailable, so this used Cargo's workspace test runner instead of the exact documented nextest gate. The initial run's nine failures and their fixture diagnosis are retained; the one APFS-incompatible fixture was explicitly skipped, not silently counted as a pass. [Final workspace log](2026-09-05-repository-audit-probes/outputs/workspace-tests.log), [initial failing run](2026-09-05-repository-audit-probes/outputs/workspace-tests-initial.log), and [Clippy log](2026-09-05-repository-audit-probes/outputs/workspace-clippy.log) are included.
 
-The [portable evidence package](audit/2026-09-05/README.md) is separate from the production Cargo workspace and includes the ten probes, seven binaries, synthetic process fixture, locked dependencies, and recorded outputs. Its tests deliberately pass when the **current defects occur**. Convert individual probes into desired-behavior regression tests when implementing fixes; do not add the whole audit package to CI as a correctness gate. Source line references in this report refer to `9dfb881` and will move after edits.
+The [portable evidence package](2026-09-05-repository-audit-probes/README.md) is separate from the production Cargo workspace and includes the ten probes, seven binaries, synthetic process fixture, locked dependencies, and recorded outputs. Its tests deliberately pass when the **current defects occur**. Convert individual probes into desired-behavior regression tests when implementing fixes; do not add the whole audit package to CI as a correctness gate. Source line references in this report refer to `9dfb881` and will move after edits.
 
 ### Second-pass verification
 

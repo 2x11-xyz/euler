@@ -48,5 +48,6 @@ rather than being backfilled or reused.
 | [0018](0018-extension-model-tools-and-idle-contributions.md) | Extension model tools and idle contributions | Accepted 2026-07-27 |
 | [0019](0019-extension-request-tick.md) | Extension request tick | Accepted 2026-08-01 |
 | [0020](0020-durable-run-and-queue-lifecycle.md) | Durable run and queue lifecycle | Accepted 2026-09-05 |
+| [0021](0021-subprocess-authority-and-sandboxing.md) | Subprocess authority, sandbox backends, and approval shape | Accepted 2026-09-06 |
 
-Next number: **0021**.
+Next number: **0022**.

@@ -1,6 +1,6 @@
 # How Codex answers the #217 product questions
 
-Date: 2026-09-06. Source: OpenAI Codex CLI checkout at `~/code/codex`, head `1fb5158b34` (2026-09-07). Five parallel read-only reviews (Opus), one per Euler decision A–E, each citing `file:line`. Companion to [pr-217-decision-summary.md](pr-217-decision-summary.md) and [pr-217-split-plan.md](pr-217-split-plan.md).
+Date: 2026-09-06. Source: OpenAI Codex CLI checkout at `~/code/codex`, head `1fb5158b34` (2026-09-07). Five parallel read-only reviews (Opus), one per Euler decision A–E, each citing `file:line`. Companion to [ADR 0021](../adr/0021-subprocess-authority-and-sandboxing.md) and [the split plan](2026-09-05-pr-217-split-plan.md).
 
 Codex is the closest shipping analogue to Euler: a Rust CLI agent, Linux and macOS, sandboxed shell execution, an approval model, and a git-aware workspace. Where Codex made a different call than the plan, the reason is recorded here, with a verdict on whether Euler should follow.
 

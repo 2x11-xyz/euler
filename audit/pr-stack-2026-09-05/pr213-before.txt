@@ -1,4 +1,0 @@
-Source: /private/tmp/euler-wt/pr-213 at aa7c4783581226f5957502f7e66f213d57f671b1 (unmodified)
-Command: env -u EULER_HOME CARGO_HOME=/private/tmp/euler-audit-cargo CARGO_TARGET_DIR=/private/tmp/euler-audit-target cargo run --offline --manifest-path /private/tmp/euler-shadow-retry-probe/Cargo.toml
-stage=first_byte dispatched=3 retry_events=2 terminal_stage="first_byte" terminal_has_attempt_id=true
-stage=semantic_idle dispatched=3 retry_events=2 terminal_stage="semantic_idle" terminal_has_attempt_id=true
