@@ -303,6 +303,7 @@ impl<D> Session<D> {
             extension_id,
             command,
             required,
+            None,
             &CancellationToken::new(),
         )
     }
@@ -311,6 +312,7 @@ impl<D> Session<D> {
         &self,
         operation: String,
         required: &[Capability],
+        shell_command: Option<&str>,
     ) -> Result<Option<PermissionRequestBatch>, ExtensionExecutionError>
     where
         D: crate::permissions::PermissionDecider,
@@ -327,7 +329,12 @@ impl<D> Session<D> {
                     return Err(ExtensionExecutionError::CapabilityDenied { capability });
                 }
                 ApprovalMode::Ask => {
-                    let request = PermissionRequest::new(capability, operation.clone());
+                    let mut request = PermissionRequest::new(capability, operation.clone());
+                    if capability == Capability::ShellExec {
+                        if let Some(command) = shell_command {
+                            request = request.with_command(command);
+                        }
+                    }
                     if self.permissions.granted_source(&request).is_none()
                         && !pending
                             .iter()
@@ -346,6 +353,10 @@ impl<D> Session<D> {
         extension_id: &str,
         command: &str,
         required: &[Capability],
+        // Shell command line the invocation carries, when it carries one:
+        // a `shell-exec` request that names a command must go through the
+        // danger walk like `run_shell` does (review round 2, finding 7).
+        shell_command: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<(), ExtensionExecutionError>
     where
@@ -355,7 +366,8 @@ impl<D> Session<D> {
             return Err(ExtensionExecutionError::Cancelled);
         }
         let operation = format!("extension {extension_id}.{command}");
-        let Some(batch) = self.extension_permission_batch(operation, required)? else {
+        let Some(batch) = self.extension_permission_batch(operation, required, shell_command)?
+        else {
             return if cancellation.is_cancelled() {
                 Err(ExtensionExecutionError::Cancelled)
             } else {
@@ -486,6 +498,7 @@ impl<D> Session<D> {
             &extension_id,
             command,
             required,
+            input.get("command").and_then(Value::as_str),
             cancellation,
         )?;
         if cancellation.is_cancelled() {

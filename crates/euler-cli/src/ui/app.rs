@@ -2848,10 +2848,16 @@ impl AppCore {
                 self.reply_to_modal(PermissionReply::AllowOnce)
             }
             KeyCode::Char('a') | KeyCode::Char('A') if draft_empty => {
+                if !self.modal_offers_grants() {
+                    return self.reply_to_modal(PermissionReply::AllowOnce);
+                }
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
             }
             KeyCode::Char('p') | KeyCode::Char('P') if draft_empty && !self.modal_is_batch() => {
+                if !self.modal_offers_grants() {
+                    return self.reply_to_modal(PermissionReply::AllowOnce);
+                }
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
             }
@@ -2963,6 +2969,14 @@ impl AppCore {
             }
             ApprovalOption::Deny => self.reply_deny_from_modal(),
         }
+    }
+
+    /// Whether the live ask may offer a grant at all. A danger-flagged
+    /// command is covered by no grant in any mode, so installing one would
+    /// be a promise the gate breaks on the next identical command.
+    fn modal_offers_grants(&self) -> bool {
+        self.modal_permission_request()
+            .is_none_or(|request| !request.dangerous_command)
     }
 
     fn modal_scope_prefix(&self) -> Option<String> {
@@ -4588,6 +4602,7 @@ impl AppCore {
                     selected_option: self.approval_selection,
                     scope_prefix,
                     user_rule_prefix: self.modal_user_rule_prefix(),
+                    grants_offerable: !request.dangerous_command,
                     companion_name: self.in_flight_companion_name.clone(),
                 })
             }

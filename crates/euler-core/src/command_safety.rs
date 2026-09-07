@@ -84,6 +84,13 @@ const MAX_WRAPPER_DEPTH: usize = 8;
 /// fails closed the same way the depth cap does.
 const MAX_NODE_VISITS: usize = 50_000;
 
+/// How many operands after a `-c`-style flag are treated as candidate
+/// scripts. The script is not always the next word (`sh -c -- script`,
+/// `sh -c -e script`); a spurious candidate parses as an ordinary command
+/// and classifies itself, so a small window is enough and keeps the walk
+/// bounded.
+const SCRIPT_CANDIDATES: usize = 4;
+
 /// Node kinds a provably-safe command line may contain (Codex's list).
 const ALLOWED_KINDS: &[&str] = &[
     "program",
@@ -176,6 +183,16 @@ impl CommandSegment {
 /// This is the conservative parser: everything it accepts is a sequence of
 /// literal-word commands joined by `&&`, `||`, `;`, `|`.
 pub fn parse_plain_segments(command: &str) -> Option<Vec<CommandSegment>> {
+    // A backslash anywhere means escape processing this analysis does not
+    // model, and `tree-sitter-bash` does not model it the way `sh` does:
+    // a backslash-newline is whitespace to the grammar but a line
+    // continuation to the shell, so `cat .en\<newline>v` parses as the
+    // words [cat, .en, v] — each confined and harmless — while `sh -c`
+    // runs `cat .env`. Reproduced in review round 2; the whole line is
+    // simply not provable.
+    if command.contains('\\') {
+        return None;
+    }
     let tree = parse_script(command)?;
     let root = tree.root_node();
     if root.has_error() || root.is_missing() {
@@ -525,7 +542,6 @@ const READ_ONLY_BINARIES: &[(&str, BinaryRule)] = &[
                 "--fixed-strings",
                 "--extended-regexp",
                 "--invert-match",
-                "--recursive",
                 "--files-with-matches",
                 "--files-without-match",
                 "--no-messages",
@@ -537,7 +553,7 @@ const READ_ONLY_BINARIES: &[(&str, BinaryRule)] = &[
             ],
             &["--include", "--exclude", "--max-count"],
             &["--color", "--colour"],
-            "nilLcwxFEvrhHobsqam",
+            "nilLcwxFEvhHobsqam",
             "",
             None,
         ),
@@ -556,8 +572,6 @@ const READ_ONLY_BINARIES: &[(&str, BinaryRule)] = &[
                 "--line-regexp",
                 "--fixed-strings",
                 "--invert-match",
-                "--no-ignore",
-                "--hidden",
                 "--no-heading",
                 "--with-filename",
                 "--no-filename",
@@ -576,7 +590,7 @@ const READ_ONLY_BINARIES: &[(&str, BinaryRule)] = &[
                 "--context",
             ],
             &["--color"],
-            "nilcwxFvHhoqSsu",
+            "nilcwxFvHhoqSs",
             "",
             None,
         ),
@@ -888,17 +902,20 @@ fn is_statically_safe_at_depth(command: &str, workspace_root: &Path, depth: usiz
 /// This is the permissive half of the two-parser design (Codex
 /// `parse_shell_lc_literal_commands` + `dangerous_command_match`). Unlike
 /// [`is_statically_safe_command`] it accepts arbitrary shell syntax and
-/// visits every command node in the tree: inside control flow, command
-/// substitutions, process substitutions, expansions, and the scripts
-/// carried by `sh -c`, `eval`, `env -S`, and `trap`. It deliberately
-/// over-flags — a false positive costs one prompt — and fails closed on a
-/// parse error, on a dynamic command name, on a dynamic argument of a
-/// dangerous or wrapper command, and past [`MAX_WRAPPER_DEPTH`].
+/// visits every command node in the tree: inside control flow, command and
+/// process substitutions, expansions, redirection arguments, and the
+/// scripts carried by `sh -c`, `eval`, `env -S`, `flock -c`, and `trap`.
+///
+/// It fails closed — the answer is "dangerous" — on a parse error, a
+/// dynamic command name, a dynamic argument of a dangerous or wrapper
+/// command, an unrecognized option on any wrapper, a shell invocation with
+/// no readable script (`… | sh`, `bash -s`, `sh <<EOF`), and past
+/// [`MAX_WRAPPER_DEPTH`]. Over-flagging costs one prompt.
 ///
 /// The dangerous set is an intentionally extensible table: commands that
-/// destroy data with no undo. `run_shell` runs with stdin closed, so `rm
-/// -r` never gets its interactive confirmation and is as destructive as
-/// `rm -rf`; both are in.
+/// destroy data with no undo, and writes to a path an interpreter later
+/// honors. `run_shell` runs with stdin closed, so `rm -r` never gets its
+/// interactive confirmation and is as destructive as `rm -rf`.
 pub fn contains_dangerous_command(command: &str) -> bool {
     script_is_dangerous(command, 0)
 }
@@ -935,8 +952,59 @@ fn script_is_dangerous(script: &str, depth: usize) -> bool {
 }
 
 fn command_node_is_dangerous(node: Node<'_>, src: &str, depth: usize) -> bool {
+    if redirect_targets(node, src)
+        .iter()
+        .any(|target| target.as_deref().is_none_or(writes_interpreter_config))
+    {
+        // `printf x > .git/hooks/pre-commit` is the shell twin of
+        // `write_file .git/hooks/pre-commit`, which asks (audit F34). An
+        // unreadable target is unreadable.
+        return true;
+    }
     let words = literal_or_dynamic_words(node, src);
     words_are_dangerous(&words, depth)
+}
+
+/// Whether writing `path` hands an interpreter new instructions: the
+/// sensitive list, which is exactly the set of files whose contents another
+/// program later executes.
+fn writes_interpreter_config(path: &str) -> bool {
+    sensitive_basename(Path::new(path))
+}
+
+/// Destination words of every redirection attached to this command, `None`
+/// where the destination is dynamic. `tree-sitter-bash` hangs redirects off
+/// a `redirected_statement` parent, and every word after the operator ends
+/// up there too, so this over-collects; for the danger table that is the
+/// safe direction.
+fn redirect_targets(node: Node<'_>, src: &str) -> Vec<Option<String>> {
+    let mut targets = Vec::new();
+    let Some(parent) = node.parent() else {
+        return targets;
+    };
+    if parent.kind() != "redirected_statement" {
+        return targets;
+    }
+    let mut cursor = parent.walk();
+    for redirect in parent.named_children(&mut cursor) {
+        if !redirect.kind().ends_with("redirect") {
+            continue;
+        }
+        let mut inner = redirect.walk();
+        for child in redirect.named_children(&mut inner) {
+            match child.kind() {
+                "word" | "number" | "string" | "raw_string" | "concatenation" => {
+                    targets.push(literal_word(child, src));
+                }
+                "simple_expansion"
+                | "expansion"
+                | "command_substitution"
+                | "process_substitution" => targets.push(None),
+                _ => {}
+            }
+        }
+    }
+    targets
 }
 
 /// Every word of a command node, `None` where the word is dynamic. Unlike
@@ -958,112 +1026,8 @@ fn literal_or_dynamic_words(node: Node<'_>, src: &str) -> Vec<Option<String>> {
             }
         }
     }
-    words.extend(redirected_arguments(node, src));
+    words.extend(redirect_targets(node, src));
     words
-}
-
-/// `tree-sitter-bash` hangs the words that FOLLOW a redirection off the
-/// redirect node rather than the command (`rm 2>&1 -rf dir` parses as a
-/// `redirected_statement` whose `file_redirect` carries `1`, `-rf`, and
-/// `dir`). Reading only the command node would therefore see a bare `rm`.
-/// Over-collecting here is harmless: a redirect target is just one more
-/// operand as far as the danger table is concerned.
-fn redirected_arguments(node: Node<'_>, src: &str) -> Vec<Option<String>> {
-    let Some(parent) = node.parent() else {
-        return Vec::new();
-    };
-    if parent.kind() != "redirected_statement" {
-        return Vec::new();
-    }
-    let mut extra = Vec::new();
-    let mut cursor = parent.walk();
-    for redirect in parent.named_children(&mut cursor) {
-        if !redirect.kind().ends_with("redirect") {
-            continue;
-        }
-        let mut inner = redirect.walk();
-        for child in redirect.named_children(&mut inner) {
-            match child.kind() {
-                "word" | "number" | "string" | "raw_string" | "concatenation" => {
-                    extra.push(literal_word(child, src));
-                }
-                "simple_expansion"
-                | "expansion"
-                | "command_substitution"
-                | "process_substitution" => extra.push(None),
-                _ => {}
-            }
-        }
-    }
-    extra
-}
-
-/// Commands that destroy data with no undo. Extend this table rather than
-/// reasoning about which flags are "really" harmful.
-fn destructive_rule(name: &str, args: &[&str]) -> bool {
-    match name {
-        // `run_shell` closes stdin, so `-r` never prompts interactively.
-        "rm" => args
-            .iter()
-            .take_while(|arg| **arg != "--")
-            .any(|arg| is_short_cluster_with(arg, "rRf") || is_long_abbreviation(arg, RM_LONGS)),
-        "shred" | "wipefs" | "truncate" => true,
-        "dd" => args.iter().any(|arg| arg.starts_with("of=")),
-        "find" => args.iter().any(|arg| {
-            matches!(
-                *arg,
-                "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fprintf"
-            )
-        }),
-        "git" => {
-            args.first() == Some(&"clean")
-                && args.iter().any(|arg| {
-                    is_short_cluster_with(arg, "f") || is_long_abbreviation(arg, &["--force"])
-                })
-        }
-        _ => name.starts_with("mkfs"),
-    }
-}
-
-const RM_LONGS: &[&str] = &["--force", "--recursive", "--dir"];
-
-fn is_short_cluster_with(arg: &str, letters: &str) -> bool {
-    arg.strip_prefix('-')
-        .is_some_and(|rest| !rest.starts_with('-') && rest.chars().any(|c| letters.contains(c)))
-}
-
-/// GNU long options may be abbreviated to any unambiguous prefix, so
-/// `rm --forc` forces just as well as `rm --force`.
-fn is_long_abbreviation(arg: &str, longs: &[&str]) -> bool {
-    let candidate = match arg.split_once('=') {
-        Some((name, _)) => name,
-        None => arg,
-    };
-    candidate.len() > 2 && longs.iter().any(|long| long.starts_with(candidate))
-}
-
-/// Wrappers whose operands are another command, or shell source.
-enum Wrapper {
-    /// Some operand starts another command; try each, since which one
-    /// depends on option grammars this walk does not model.
-    Command,
-    /// Every operand is shell source (`eval`, `trap`).
-    Script,
-    /// Shell: the operand after a `-c`-bearing flag is shell source.
-    Shell,
-    /// `env`: assignments and options, then a command.
-    Env,
-}
-
-fn wrapper_kind(name: &str) -> Option<Wrapper> {
-    Some(match name {
-        "sudo" | "doas" | "nohup" | "time" | "timeout" | "nice" | "ionice" | "chrt" | "stdbuf"
-        | "setsid" | "flock" | "xargs" | "command" | "builtin" | "exec" => Wrapper::Command,
-        "eval" | "trap" => Wrapper::Script,
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "su" => Wrapper::Shell,
-        "env" => Wrapper::Env,
-        _ => return None,
-    })
 }
 
 fn words_are_dangerous(words: &[Option<String>], depth: usize) -> bool {
@@ -1084,110 +1048,773 @@ fn words_are_dangerous(words: &[Option<String>], depth: usize) -> bool {
     };
     let dynamic_args = words[1..].iter().any(Option::is_none);
     let literal: Vec<&str> = words[1..].iter().filter_map(Option::as_deref).collect();
-    if is_tabled(name) {
+    if let Some(destructive) = destructive_verdict(name, &literal) {
         // `rm $FLAGS file` may be `rm -rf file`.
-        return dynamic_args || destructive_rule(name, &literal);
+        return dynamic_args || destructive;
     }
-    let Some(kind) = wrapper_kind(name) else {
+    let Some(spec) = wrapper_spec(name) else {
         return false;
     };
-    if dynamic_args {
-        return true;
-    }
-    match kind {
-        Wrapper::Command => (0..literal.len()).any(|start| {
-            let suffix: Vec<Option<String>> = literal[start..]
-                .iter()
-                .map(|word| Some((*word).to_owned()))
-                .collect();
-            words_are_dangerous(&suffix, depth + 1)
+    dynamic_args || wrapper_is_dangerous(spec, &literal, depth)
+}
+
+/// Commands that destroy data with no undo, or hand an interpreter new
+/// instructions. `None` means the name has no entry — the single source of
+/// truth for "is this name tabled".
+///
+/// Extend this table rather than reasoning about which flags are "really"
+/// harmful.
+fn destructive_verdict(name: &str, args: &[&str]) -> Option<bool> {
+    Some(match name {
+        // `run_shell` closes stdin, so `-r` never prompts interactively.
+        "rm" => args
+            .iter()
+            .take_while(|arg| **arg != "--")
+            .any(|arg| is_short_cluster_with(arg, "rRf") || is_long_abbreviation(arg, RM_LONGS)),
+        "shred" | "wipefs" | "truncate" => true,
+        "dd" => args
+            .iter()
+            .any(|arg| arg.strip_prefix("of=").is_some_and(|_| true)),
+        "find" => args.iter().any(|arg| {
+            matches!(
+                *arg,
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
         }),
-        Wrapper::Script => literal
-            .iter()
-            .any(|script| script_is_dangerous(script, depth + 1)),
-        Wrapper::Shell => shell_scripts(&literal)
-            .iter()
-            .any(|script| script_is_dangerous(script, depth + 1)),
-        Wrapper::Env => env_is_dangerous(&literal, depth),
-    }
+        // Global options come before the subcommand: `git -C . clean -fdx`.
+        "git" => {
+            let rest = skip_git_global_options(args);
+            rest.first() == Some(&"clean")
+                && rest.iter().any(|arg| {
+                    is_short_cluster_with(arg, "f") || is_long_abbreviation(arg, &["--force"])
+                })
+        }
+        // Write-position operands: a copy, move, link, or tee onto a file an
+        // interpreter later honors is the shell twin of `write_file` on it.
+        "cp" | "mv" | "tee" | "install" | "ln" | "rsync" | "mktemp" => {
+            args.iter().any(|arg| writes_interpreter_config(arg))
+        }
+        _ => {
+            if name.starts_with("mkfs") {
+                true
+            } else {
+                return None;
+            }
+        }
+    })
 }
 
-/// Whether `name` has an entry in the destructive table (including the
-/// `mkfs*` family).
-fn is_tabled(name: &str) -> bool {
-    matches!(
-        name,
-        "rm" | "shred" | "wipefs" | "truncate" | "dd" | "find" | "git"
-    ) || name.starts_with("mkfs")
-}
+const RM_LONGS: &[&str] = &["--force", "--recursive", "--dir"];
 
-/// Operands a shell treats as command source: everything after the flag
-/// carrying `c` (`-c`, `-lc`, `-cx`, and `su`'s `-c`), since which operand
-/// is the script depends on the remaining option order.
-fn shell_scripts<'a>(args: &[&'a str]) -> Vec<&'a str> {
-    let Some(flag) = args
-        .iter()
-        .position(|arg| is_short_cluster_with(arg, "c") || *arg == "--command")
-    else {
-        return Vec::new();
-    };
-    args[flag + 1..]
-        .iter()
-        .filter(|arg| **arg != "--")
-        .copied()
-        .collect()
-}
-
-/// `env` skips assignments and its own options before the wrapped command.
-/// An unrecognized option fails closed, and `-S`/`--split-string` carries
-/// shell source.
-fn env_is_dangerous(args: &[&str], depth: usize) -> bool {
+/// `git` global options precede the subcommand, and `-C`/`-c`/`--git-dir`
+/// and friends may carry a detached value.
+fn skip_git_global_options<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    const VALUE_GLOBALS: &[&str] = &[
+        "-C",
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--exec-path",
+        "--config-env",
+    ];
     let mut index = 0usize;
     while index < args.len() {
         let arg = args[index];
-        index += 1;
-        if arg == "--" {
-            break;
-        }
-        if is_assignment(arg) {
-            continue;
-        }
         if !arg.starts_with('-') {
-            index -= 1;
             break;
         }
-        let (name, attached) = match arg.split_once('=') {
-            Some((name, value)) => (name, Some(value)),
-            None => (arg, None),
+        index += 1;
+        let name = match arg.split_once('=') {
+            Some((name, _)) => name,
+            None => arg,
         };
-        match name {
-            "-i" | "--ignore-environment" | "-0" | "--null" | "-v" | "--debug" => {}
-            "-u" | "--unset" | "-C" | "--chdir" => {
+        if VALUE_GLOBALS.contains(&name) && !arg.contains('=') {
+            index += 1;
+        }
+    }
+    args[index.min(args.len())..].to_vec()
+}
+
+fn is_short_cluster_with(arg: &str, letters: &str) -> bool {
+    arg.strip_prefix('-')
+        .is_some_and(|rest| !rest.starts_with('-') && rest.chars().any(|c| letters.contains(c)))
+}
+
+/// GNU long options may be abbreviated to any unambiguous prefix, so
+/// `rm --forc` forces just as well as `rm --force`.
+fn is_long_abbreviation(arg: &str, longs: &[&str]) -> bool {
+    let candidate = match arg.split_once('=') {
+        Some((name, _)) => name,
+        None => arg,
+    };
+    candidate.len() > 2 && longs.iter().any(|long| long.starts_with(candidate))
+}
+
+/// What a wrapper's remaining operands are, once its own options are gone.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WrapperTail {
+    /// The operands are another command (`sudo ls`).
+    Command,
+    /// The operands are shell source, joined with spaces as the shell does
+    /// (`eval rm -rf x`).
+    Script,
+    /// A shell: only a `-c`-style script is readable. Anything else (a
+    /// piped script, `-s`, a here-document) is unreadable, so dangerous.
+    Shell,
+    /// `env`: leading `NAME=value` assignments, then a command.
+    Env,
+}
+
+/// One wrapper's option grammar. Every option is enumerated: an
+/// unrecognized one means the operand layout is unknown, which fails
+/// closed (uniform with `env`).
+struct WrapperSpec {
+    /// Short letters taking a value, attached or as the next word.
+    short_value: &'static str,
+    /// Short letters taking no value; these may bundle.
+    short_bool: &'static str,
+    /// Short letters introducing a script operand.
+    short_script: &'static str,
+    long_value: &'static [&'static str],
+    long_bool: &'static [&'static str],
+    long_script: &'static [&'static str],
+    /// Operands consumed before the wrapped command: `timeout`'s duration,
+    /// `flock`'s lock file, `chrt`'s priority.
+    skip_operands: usize,
+    tail: WrapperTail,
+}
+
+/// Wrappers whose operands are another command or shell source. A launcher
+/// missing from this table is not "harmless": it simply carries no
+/// wrapped command this walk can read, and the command it names is
+/// classified on its own.
+/// Wrappers whose operands are another command or shell source. Every
+/// option is enumerated: an unrecognized one means the operand layout is
+/// unknown, which fails closed (uniform with `env`).
+///
+/// A launcher missing from this table is not "harmless": it carries no
+/// wrapped command this walk can read, and the command it names is
+/// classified on its own.
+const WRAPPERS: &[(&str, WrapperSpec)] = &[
+    (
+        "su",
+        WrapperSpec {
+            short_value: "ugCpUhDRT",
+            short_bool: "EHnPkKAb",
+            short_script: "c",
+            long_value: &["--user", "--group", "--prompt", "--chdir", "--login"],
+            long_bool: &["--preserve-env", "--set-home", "--non-interactive"],
+            long_script: &["--command"],
+            skip_operands: 1,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "chroot",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 1,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "sudo",
+        WrapperSpec {
+            short_value: "ugCpUhDRT",
+            short_bool: "EHnPkKAb",
+            short_script: "c",
+            long_value: &["--user", "--group", "--prompt", "--chdir", "--login"],
+            long_bool: &["--preserve-env", "--set-home", "--non-interactive"],
+            long_script: &["--command"],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "doas",
+        WrapperSpec {
+            short_value: "ugCpUhDRT",
+            short_bool: "EHnPkKAb",
+            short_script: "c",
+            long_value: &["--user", "--group", "--prompt", "--chdir", "--login"],
+            long_bool: &["--preserve-env", "--set-home", "--non-interactive"],
+            long_script: &["--command"],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "nohup",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "setsid",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "exec",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "command",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "builtin",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "unshare",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "busybox",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "nsenter",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "eatmydata",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "time",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "p",
+            short_script: "",
+            long_value: &[],
+            long_bool: &["--portability"],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "timeout",
+        WrapperSpec {
+            short_value: "sk",
+            short_bool: "",
+            short_script: "",
+            long_value: &["--signal", "--kill-after"],
+            long_bool: &["--preserve-status", "--foreground"],
+            long_script: &[],
+            skip_operands: 1,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "nice",
+        WrapperSpec {
+            short_value: "n",
+            short_bool: "",
+            short_script: "",
+            long_value: &["--adjustment"],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "ionice",
+        WrapperSpec {
+            short_value: "cnp",
+            short_bool: "t",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "chrt",
+        WrapperSpec {
+            short_value: "p",
+            short_bool: "fbroia",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 1,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "stdbuf",
+        WrapperSpec {
+            short_value: "ioe",
+            short_bool: "",
+            short_script: "",
+            long_value: &["--input", "--output", "--error"],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "flock",
+        WrapperSpec {
+            short_value: "wE",
+            short_bool: "sxnuoF",
+            short_script: "c",
+            long_value: &["--wait", "--timeout", "--conflict-exit-code"],
+            long_bool: &[
+                "--shared",
+                "--exclusive",
+                "--nonblock",
+                "--unlock",
+                "--no-fork",
+            ],
+            long_script: &["--command"],
+            skip_operands: 1,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "script",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "qafe",
+            short_script: "c",
+            long_value: &[],
+            long_bool: &["--quiet", "--append", "--flush", "--return"],
+            long_script: &["--command"],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "watch",
+        WrapperSpec {
+            short_value: "nd",
+            short_bool: "xtbegp",
+            short_script: "",
+            long_value: &["--interval"],
+            long_bool: &["--exec", "--beep", "--errexit"],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "xargs",
+        WrapperSpec {
+            short_value: "nLIPsadEeJ",
+            short_bool: "0rtpx",
+            short_script: "",
+            long_value: &[
+                "--max-args",
+                "--max-lines",
+                "--replace",
+                "--max-procs",
+                "--max-chars",
+                "--arg-file",
+                "--delimiter",
+                "--eof",
+            ],
+            long_bool: &["--null", "--no-run-if-empty", "--verbose", "--interactive"],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Command,
+        },
+    ),
+    (
+        "eval",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Script,
+        },
+    ),
+    (
+        "trap",
+        WrapperSpec {
+            short_value: "",
+            short_bool: "",
+            short_script: "",
+            long_value: &[],
+            long_bool: &[],
+            long_script: &[],
+            skip_operands: 0,
+            tail: WrapperTail::Script,
+        },
+    ),
+    (
+        "sh",
+        WrapperSpec {
+            short_value: "o",
+            short_bool: "lisxeuvamnfb",
+            short_script: "c",
+            long_value: &["--rcfile", "--init-file"],
+            long_bool: &[
+                "--login",
+                "--norc",
+                "--noprofile",
+                "--posix",
+                "--interactive",
+            ],
+            long_script: &["--command"],
+            skip_operands: 0,
+            tail: WrapperTail::Shell,
+        },
+    ),
+    (
+        "bash",
+        WrapperSpec {
+            short_value: "o",
+            short_bool: "lisxeuvamnfb",
+            short_script: "c",
+            long_value: &["--rcfile", "--init-file"],
+            long_bool: &[
+                "--login",
+                "--norc",
+                "--noprofile",
+                "--posix",
+                "--interactive",
+            ],
+            long_script: &["--command"],
+            skip_operands: 0,
+            tail: WrapperTail::Shell,
+        },
+    ),
+    (
+        "zsh",
+        WrapperSpec {
+            short_value: "o",
+            short_bool: "lisxeuvamnfb",
+            short_script: "c",
+            long_value: &["--rcfile", "--init-file"],
+            long_bool: &[
+                "--login",
+                "--norc",
+                "--noprofile",
+                "--posix",
+                "--interactive",
+            ],
+            long_script: &["--command"],
+            skip_operands: 0,
+            tail: WrapperTail::Shell,
+        },
+    ),
+    (
+        "dash",
+        WrapperSpec {
+            short_value: "o",
+            short_bool: "lisxeuvamnfb",
+            short_script: "c",
+            long_value: &["--rcfile", "--init-file"],
+            long_bool: &[
+                "--login",
+                "--norc",
+                "--noprofile",
+                "--posix",
+                "--interactive",
+            ],
+            long_script: &["--command"],
+            skip_operands: 0,
+            tail: WrapperTail::Shell,
+        },
+    ),
+    (
+        "ksh",
+        WrapperSpec {
+            short_value: "o",
+            short_bool: "lisxeuvamnfb",
+            short_script: "c",
+            long_value: &["--rcfile", "--init-file"],
+            long_bool: &[
+                "--login",
+                "--norc",
+                "--noprofile",
+                "--posix",
+                "--interactive",
+            ],
+            long_script: &["--command"],
+            skip_operands: 0,
+            tail: WrapperTail::Shell,
+        },
+    ),
+    (
+        "env",
+        WrapperSpec {
+            short_value: "uC",
+            short_bool: "i0v",
+            short_script: "S",
+            long_value: &["--unset", "--chdir"],
+            long_bool: &["--ignore-environment", "--null", "--debug"],
+            long_script: &["--split-string"],
+            skip_operands: 0,
+            tail: WrapperTail::Env,
+        },
+    ),
+];
+
+fn wrapper_spec(name: &str) -> Option<&'static WrapperSpec> {
+    WRAPPERS
+        .iter()
+        .find(|(wrapper, _)| *wrapper == name)
+        .map(|(_, spec)| spec)
+}
+
+/// Unwrap one wrapper in a single pass: consume its own options (an
+/// unrecognized one fails closed), collect any script operands, then walk
+/// the remaining words once. No suffix enumeration — a 400-argument
+/// `sudo … sudo cmd` used to cost one Vec and one recursion per operand.
+/// Where a wrapper's own options end, and the scripts they carried.
+struct WrapperScan<'a> {
+    scripts: Vec<&'a str>,
+    rest: usize,
+}
+
+/// Unwrap one wrapper in a single pass: consume its own options and collect
+/// any script operands. `None` means an option was not enumerated, so the
+/// operand layout is unknown — the caller fails closed. No suffix
+/// enumeration: a 400-argument `sudo … sudo cmd` used to cost one Vec and
+/// one recursion per operand (574 ms debug, 3.06 s release).
+fn scan_wrapper_options<'a>(spec: &WrapperSpec, args: &[&'a str]) -> Option<WrapperScan<'a>> {
+    let mut scripts: Vec<&str> = Vec::new();
+    let mut skipped = 0usize;
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = args[index];
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            if spec.tail == WrapperTail::Env && is_assignment(arg) {
+                index += 1;
+                continue;
+            }
+            if skipped < spec.skip_operands {
+                skipped += 1;
+                index += 1;
+                continue;
+            }
+            break;
+        }
+        index += 1;
+        if let Some(long) = arg.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            let full = format!("--{name}");
+            let full = full.as_str();
+            if spec.long_script.contains(&full) {
+                let script = attached.or_else(|| args.get(index).copied())?;
                 if attached.is_none() {
                     index += 1;
                 }
+                scripts.push(script);
+            } else if spec.long_value.contains(&full) {
+                if attached.is_none() {
+                    index += 1;
+                }
+            } else if !spec.long_bool.contains(&full) {
+                // Unknown option: the operand layout is unknown too.
+                return None;
             }
-            "-S" | "--split-string" => {
-                let script = match attached {
-                    Some(value) => Some(value),
-                    None => {
-                        let next = args.get(index).copied();
-                        index += 1;
-                        next
-                    }
-                };
-                if script.is_none_or(|script| script_is_dangerous(script, depth + 1)) {
-                    return true;
+            continue;
+        }
+        index = scan_short_cluster(spec, args, &arg[1..], index, &mut scripts)?;
+    }
+    Some(WrapperScan {
+        scripts,
+        rest: index.min(args.len()),
+    })
+}
+
+/// One short cluster (`-la`, `-n 1`, `-cx script`). Every letter must be
+/// enumerated; a value letter takes the rest of the cluster or the next
+/// word. Returns the new operand index, or `None` to fail closed.
+fn scan_short_cluster<'a>(
+    spec: &WrapperSpec,
+    args: &[&'a str],
+    cluster: &'a str,
+    start: usize,
+    scripts: &mut Vec<&'a str>,
+) -> Option<usize> {
+    let mut index = start;
+    for (offset, letter) in cluster.char_indices() {
+        let rest = &cluster[offset + letter.len_utf8()..];
+        if spec.short_script.contains(letter) {
+            // Which operand is the script depends on the shell: `-c` takes
+            // the NEXT word while `env -Sscript` attaches it, and a cluster
+            // may carry more flags after the letter (`sh -cx script`). The
+            // script is not always the immediately next word either
+            // (`sh -c -- s`, `sh -c -e s`), so take a small window of
+            // candidates: a spurious one parses as an ordinary command and
+            // classifies itself.
+            if !rest.is_empty() {
+                scripts.push(rest);
+                if !rest.chars().all(|c| {
+                    spec.short_bool.contains(c)
+                        || spec.short_value.contains(c)
+                        || spec.short_script.contains(c)
+                }) {
+                    return None;
                 }
             }
-            _ => return true,
+            let candidates: Vec<&str> = args[index.min(args.len())..]
+                .iter()
+                .take(SCRIPT_CANDIDATES)
+                .copied()
+                .collect();
+            if candidates.is_empty() && rest.is_empty() {
+                return None;
+            }
+            scripts.extend(candidates);
+            if rest.is_empty() {
+                index += 1;
+            }
+            return Some(index);
+        }
+        if spec.short_value.contains(letter) {
+            if rest.is_empty() {
+                index += 1;
+            }
+            return Some(index);
+        }
+        if !spec.short_bool.contains(letter) && !letter.is_ascii_digit() {
+            return None;
         }
     }
-    let suffix: Vec<Option<String>> = args[index.min(args.len())..]
+    Some(index)
+}
+
+fn wrapper_is_dangerous(spec: &WrapperSpec, args: &[&str], depth: usize) -> bool {
+    let Some(scan) = scan_wrapper_options(spec, args) else {
+        return true;
+    };
+    if scan
+        .scripts
         .iter()
-        .map(|word| Some((*word).to_owned()))
-        .collect();
-    words_are_dangerous(&suffix, depth + 1)
+        .any(|script| script_is_dangerous(script, depth + 1))
+    {
+        return true;
+    }
+    let rest = &args[scan.rest..];
+    match spec.tail {
+        // A shell with no readable script runs whatever arrives on stdin
+        // or in a here-document: `echo 'rm -rf .' | sh`, `bash -s`.
+        WrapperTail::Shell => scan.scripts.is_empty(),
+        WrapperTail::Script => {
+            // The shell joins `eval`'s operands with spaces before parsing.
+            !rest.is_empty() && script_is_dangerous(&rest.join(" "), depth + 1)
+        }
+        WrapperTail::Command | WrapperTail::Env => {
+            let words: Vec<Option<String>> =
+                rest.iter().map(|word| Some((*word).to_owned())).collect();
+            words_are_dangerous(&words, depth + 1)
+        }
+    }
 }
 
 /// `NAME=value` prefixes a command with an environment assignment.
@@ -1267,10 +1894,9 @@ mod tests {
         // backslash is not proof of the runtime argv (Codex's rule).
         assert!(parse_plain_segments(r"echo a\;b").is_none());
         assert!(parse_plain_segments(r"cat $'-rf'").is_none());
-        // A line continuation is whitespace, not a word.
-        let parsed = segments("ls \\\n-la");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].words[1], "-la");
+        // A line continuation is whitespace to the grammar and an escape
+        // to the shell, so the whole line stops being provable.
+        assert!(parse_plain_segments("ls \\\n-la").is_none());
     }
 
     #[test]
@@ -1348,10 +1974,7 @@ mod tests {
             "ls",
             "ls -la --color=always",
             "cat Cargo.toml",
-            // Audit F02: `-r` only dereferences command-line operands
-            // (which confinement already checked); `-R` follows symlinks
-            // out of the workspace and is rejected below.
-            "grep -r Cargo.toml -n",
+            "grep -n Cargo Cargo.toml",
             "head -n 50 src/lib.rs",
             "tail -n 20 src/lib.rs",
             "uniq input.txt",
@@ -1398,7 +2021,7 @@ mod tests {
         // exempt; `.` and workspace-relative paths are inside).
         for command in [
             "ls",
-            "grep -r pattern .",
+            "grep -n pattern README.md",
             "cat README.md",
             "tail -n 20 logs/output.txt",
         ] {
@@ -1478,7 +2101,7 @@ mod tests {
         for command in [
             "ls | wc -l",
             "find . -name file.txt | head",
-            "grep -r Cargo.toml -n || true",
+            "grep -n Cargo Cargo.toml || true",
             "ls && pwd",
             "echo hi ; ls",
             "ls src\nwc -l src/lib.rs",
@@ -1521,7 +2144,7 @@ mod tests {
     #[test]
     fn rg_flag_rules() {
         assert!(safe("rg Cargo.toml -n"));
-        assert!(safe("rg --no-ignore pattern src"));
+        assert!(safe("rg -n pattern src"));
         for command in [
             "rg --pre pwned files",
             "rg --pre=pwned files",
@@ -1719,7 +2342,11 @@ mod tests {
             assert!(!safe(command), "expected unsafe: {command}");
         }
         // The non-dereferencing forms stay safe.
-        for command in ["grep -r pattern .", "rg pattern .", "find . -name x"] {
+        for command in [
+            "grep -n pattern README.md",
+            "rg pattern .",
+            "find . -name x",
+        ] {
             assert!(safe(command), "expected safe: {command}");
         }
     }
@@ -1931,7 +2558,7 @@ mod tests {
         ] {
             assert!(!safe(command), "expected unsafe: {command}");
         }
-        assert!(safe("grep -r pattern ."));
+        assert!(safe("grep -n pattern README.md"));
     }
 
     #[test]
@@ -1960,7 +2587,7 @@ mod tests {
         for command in [
             "ls -la",
             "ls --color=always",
-            "grep -rn pattern src",
+            "grep -n pattern src",
             "head -n 50 Cargo.toml",
             "cut -d , -f 1 Cargo.toml",
             "uniq -c input.txt",
@@ -2114,5 +2741,181 @@ mod tests {
         assert!(!is_statically_safe_command(&bomb, temp.path()));
         let nested = format!("{}ls{}", "$(".repeat(64), ")".repeat(64));
         assert!(!is_statically_safe_command(&nested, temp.path()));
+    }
+
+    #[test]
+    fn backslash_continuation_cannot_smuggle_a_word() {
+        // Review round 2, finding 1: `tree-sitter-bash` reads a
+        // backslash-newline as whitespace, so this parses as
+        // [cat, .en, v] — three confined, harmless words — while `sh -c`
+        // runs `cat .env`. Reproduced against the previous commit; it
+        // printed the secret.
+        let temp = tempfile::tempdir().expect("temp workspace");
+        std::fs::write(temp.path().join(".env"), "TOKEN=1\n").expect("seed env");
+        for command in [
+            "cat .en\\\nv",
+            "cat .\\\n./.\\\n./etc/hosts",
+            "sh -c 'cat .en\\\nv'",
+            "grep -n x fi\\\nle",
+        ] {
+            assert!(
+                !is_statically_safe_command(command, temp.path()),
+                "expected unsafe: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_operands_are_joined_before_walking() {
+        // Review round 2, finding 2: the shell joins eval's operands with
+        // spaces, so walking each one alone saw a harmless `rm`.
+        assert!(contains_dangerous_command("eval rm -rf x"));
+        assert!(contains_dangerous_command("eval rm -f x"));
+        assert!(!contains_dangerous_command("eval ls -la"));
+    }
+
+    #[test]
+    fn git_global_options_precede_the_subcommand() {
+        // Review round 2, finding 3.
+        for command in [
+            "git -C . clean -fdx",
+            "git --git-dir=.git clean -f",
+            "git -c a=b clean -f",
+            "git --no-pager clean -f",
+            "git -C . -c a=b clean --force",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        assert!(!contains_dangerous_command("git -C . status"));
+    }
+
+    #[test]
+    fn unreadable_launchers_fail_closed() {
+        // Review round 2, finding 4: a shell with no readable `-c` script
+        // runs whatever arrives on stdin or in a here-document, and an
+        // unrecognized wrapper option means the operand layout is unknown.
+        for command in [
+            "echo 'rm -rf .' | sh",
+            "printf 'rm -rf x' | bash -s",
+            "sh <<EOF\nrm -rf .\nEOF",
+            "flock lock -c 'rm -rf .'",
+            "busybox sh -c 'rm -rf x'",
+            "chroot / rm -rf x",
+            "unshare rm -rf x",
+            "script -qc 'rm -rf x' /dev/null",
+            "watch -x rm -rf x",
+            "timeout 5 sh",
+            "sudo --bogus ls",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        // Readable wrappers around harmless commands stay unflagged.
+        for command in [
+            "sh -c 'ls -la'",
+            "timeout 5 ls -la",
+            "xargs -n 1 ls",
+            "nice -n 10 cargo build",
+        ] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn writes_to_interpreter_config_are_dangerous() {
+        // Review round 2, finding 5: audit F34's write side. `write_file
+        // .git/hooks/pre-commit` asks; the shell twin must too.
+        for command in [
+            "printf x > .git/hooks/pre-commit",
+            "echo x > .bashrc",
+            "cp evil .git/hooks/pre-commit",
+            "tee .bashrc < payload",
+            "sh -c 'echo x > .git/config'",
+            "cat payload >> .zshrc",
+            "mv evil .npmrc",
+            "ln -s evil .git/hooks/pre-push",
+            "dd if=evil of=.bashrc",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        for command in ["echo x > out.txt", "cp a b", "tee log.txt"] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_readers_are_not_provable() {
+        // Review round 2, finding 6: a tree walk reads files the
+        // per-operand sensitive check never saw — `grep -r PASSWORD .`
+        // printed `.env`.
+        for command in [
+            "grep -r PASSWORD .",
+            "grep -rn PASSWORD .",
+            "grep --recursive PASSWORD .",
+            "rg -uu PASSWORD .",
+            "rg --hidden PASSWORD .",
+            "rg --no-ignore PASSWORD .",
+        ] {
+            assert!(!safe(command), "expected unsafe: {command}");
+        }
+        // Non-recursive reads of a named operand still prove.
+        assert!(safe("grep -n PASSWORD Cargo.toml"));
+        assert!(safe("rg -n PASSWORD Cargo.toml"));
+    }
+
+    #[test]
+    fn find_write_actions_are_all_dangerous() {
+        // Review round 2, finding 8.
+        for command in [
+            "find . -delete",
+            "find . -exec rm {} +",
+            "find . -execdir rm {} +",
+            "find . -ok rm {} ;",
+            "find . -okdir rm {} ;",
+            "find . -fprint out",
+            "find . -fprint0 out",
+            "find . -fprintf out %p",
+            "find . -fls out",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+        assert!(!contains_dangerous_command("find . -name x -print"));
+    }
+
+    #[test]
+    fn danger_walk_is_bounded_on_pathological_input() {
+        // Review round 2, finding 11: suffix enumeration made a deep
+        // wrapper chain with hundreds of operands cost 574 ms in debug.
+        // One pass per wrapper keeps a 4 KiB input in the low
+        // milliseconds.
+        let args = "x ".repeat(2100);
+        let command = format!("{}rm -rf {args}", "sudo ".repeat(8));
+        assert!(command.len() > 4096);
+        let started = std::time::Instant::now();
+        assert!(contains_dangerous_command(&command));
+        let elapsed = started.elapsed();
+        println!("danger walk: {elapsed:?} for {} bytes", command.len());
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "danger walk took {elapsed:?} for a {} byte input",
+            command.len()
+        );
     }
 }

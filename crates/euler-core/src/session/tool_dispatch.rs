@@ -107,9 +107,9 @@ impl<D: PermissionDecider> Session<D> {
             // containing a forced `rm` anywhere — inside control flow, a
             // substitution, or a `sudo`/`env`/`trap`/`xargs` wrapper —
             // takes an explicit permission decision no matter what else
-            // would have covered it. Under `ask` that is a prompt; under a
-            // never-prompt decider the same path denies. `always-allow`
-            // and `always-deny` semantics are untouched.
+            // would have covered it, and `mode_for_request` escalates every
+            // mode short of `always-deny` to an ask for it (ADR 0021
+            // decision D). Under a never-prompt decider that path denies.
             // Walked once, when the request was built.
             let dangerous_command = request.dangerous_command;
             // Statically-safe read-only shell commands run under `ask`

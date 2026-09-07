@@ -184,7 +184,9 @@ reinstalling on a store wipe).
 Capability modes are the coarse gate. **Scoped grants** sit above `ask`: when a
 request matches an active session, project, or user grant, the gate allows it
 without re-prompting. `always-deny` still denies even if a grant exists.
-`session-allow` remains capability-wide and does not require a grant match.
+`session-allow` remains capability-wide and does not require a grant match —
+except for a request the danger walk flags or a sensitive path, which
+`mode_for_request` escalates to `ask` (see "Static command safety").
 
 Grant lifetime and pattern:
 
@@ -319,7 +321,11 @@ distinct nodes.
   forbidden.
 - **Literal words.** Every word must be exactly what the binary will
   receive: no `* ? [ ] { } ~ $ ` \ ^ #`, and no word beginning with `=`.
-  A word the shell may rewrite is never proof, for any binary.
+  A word the shell may rewrite is never proof, for any binary. A backslash
+  ANYWHERE in the line makes it unprovable: `tree-sitter-bash` treats a
+  backslash-newline as whitespace while `sh` treats it as a line
+  continuation, so `cat .en\<newline>v` parses as three harmless words and
+  executes as `cat .env`.
 - **Options are an allowlist.** Each binary in the read-only set declares
   the exact option spellings it accepts. An unknown option, a GNU long
   abbreviation (`--recu`, `--dereference-rec`, `--fol`), an attached short
@@ -331,7 +337,11 @@ distinct nodes.
   cat head tail wc ls nl paste rev cut tr stat uniq grep rg base64`, plus
   `find` (only the enumerated read-only predicates, so `-exec`, `-delete`,
   `-L`, `-follow` are rejected by omission) and `sed` (only the print-range
-  form `sed -n Np [file]`). `uniq` accepts at most one operand, because the
+  form `sed -n Np [file]`). Recursive readers are excluded — no `grep -r`,
+  no `rg --hidden`/`--no-ignore`/`-u` — because a tree walk reads files the
+  per-operand sensitive check never saw (`grep -r PASSWORD .` printed
+  `.env`). Under ADR 0021 row P the sandbox auto-allows these later; until
+  then they prompt. `uniq` accepts at most one operand, because the
   second operand is an output file it truncates. Binaries outside the set
   are never provable — `sort` (`-o` writes a file), `tee`, and every
   interpreter included.
@@ -390,11 +400,17 @@ that destroy data with no undo: `rm` with `-r`/`-R`/`-f`/`--recursive`/
 `rm -r` never gets its interactive confirmation and is as destructive as
 `rm -rf`), `find` with `-delete`/`-exec`/`-execdir`/`-ok`/`-okdir`, `git
 clean -f`, `shred`, `truncate`, `wipefs`, `dd of=`, and the `mkfs*` family.
-A command **truncated** at the retention bound counts as dangerous: nobody
-can read what will actually run.
+It also flags **writes an interpreter later honors**: a redirect target or a
+`cp`/`mv`/`tee`/`install`/`ln`/`rsync` destination on the sensitive list, so
+`printf x > .git/hooks/pre-commit` and `echo x > .bashrc` ask exactly as
+`write_file` on those paths does (audit F34, write side).
+
+A **truncated** command still blocks scoped grant matching, but the walk
+itself reads the full command text, so an ordinary multi-kilobyte command is
+not flagged merely for being long.
 
 A flagged command is **never auto-approved, in any mode** (ADR 0021 decision
-D). No grant covers it — scoped or unscoped, session, project, or user —
+D), and is never routed to the guardian reviewer: it must reach a human. No grant covers it — scoped or unscoped, session, project, or user —
 and every capability mode short of `always-deny` is escalated to `ask` for
 that one request, so a forced `rm` prompts even under a blanket
 `session-allow`. `always-deny` still denies without prompting, and a

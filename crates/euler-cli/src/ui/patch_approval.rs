@@ -214,9 +214,11 @@ pub(crate) fn panel_lines(
         approval_option_lines(
             modal.request.capability.as_str(),
             derive_scope_prefix(&modal.request).as_deref(),
-            // Patch approval is fs-write only; durable user rules are
-            // shell-command prefix rules and never apply here.
+            // Patch approval is fs-write only, never danger-flagged.
+            // Durable user rules are shell-command prefix rules and never
+            // apply here.
             None,
+            !modal.request.dangerous_command,
             selected_option,
         )
         .into_iter()
@@ -246,6 +248,12 @@ pub(crate) fn consequences_row(preview: &PatchPreview, prior_count: usize) -> Op
 /// workspace-relative directory. Returns `None` when derivation is not possible
 /// (caller falls back to unscoped and labels honestly).
 pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String> {
+    if request.dangerous_command {
+        // A danger-flagged command is covered by no grant, so no prefix is
+        // offerable: `granted_source` would refuse the scope the moment it
+        // was installed.
+        return None;
+    }
     if request.command_truncated {
         // A truncated command can never satisfy scoped matching (the full
         // string may differ past the bound) — offer only unscoped options.
@@ -279,12 +287,6 @@ pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String>
 /// cwd from the request; without one no segment counts as safe and the
 /// offer follows the same fail-closed rule as coverage.
 pub(crate) fn derive_shell_prefix(command: &str, workspace_root: Option<&Path>) -> Option<String> {
-    // A danger-flagged command is covered by no grant, so offering
-    // "Allow rm * for this session" would offer a scope the gate can never
-    // honor — the next `rm -rf` would prompt again anyway.
-    if euler_core::command_safety::contains_dangerous_command(command) {
-        return None;
-    }
     let segments = parse_plain_segments(command)?;
     let mut unsafe_tokens = segments
         .iter()
@@ -312,9 +314,13 @@ pub(crate) fn derive_shell_prefix(command: &str, workspace_root: Option<&Path>) 
 /// keeps the panel honest. Callers additionally gate on the session having
 /// a loaded user store.
 pub(crate) fn derive_user_rule_prefix(request: &PermissionRequest) -> Option<String> {
-    if request.capability != Capability::ShellExec || request.command_truncated {
-        // A truncated command may hide metacharacters past the bound; never
-        // offer a durable rule the gate would refuse to honor.
+    if request.capability != Capability::ShellExec
+        || request.command_truncated
+        || request.dangerous_command
+    {
+        // A truncated command may hide metacharacters past the bound, and a
+        // danger-flagged one is covered by no grant at all: never offer a
+        // durable rule the gate would refuse to honor.
         return None;
     }
     let command = request.command.as_deref()?;
@@ -351,21 +357,33 @@ pub(crate) fn approval_option_lines(
     capability: &str,
     scope_prefix: Option<&str>,
     user_rule_prefix: Option<&str>,
+    offers_grants: bool,
     selected: ApprovalOption,
 ) -> Vec<ApprovalOptionLine> {
-    let (session_label, project_label) = match scope_prefix.filter(|p| !p.is_empty()) {
-        Some(prefix) => (
-            format!("a  Allow {prefix} * for this session"),
-            format!("p  Allow {prefix} * in this project"),
-        ),
-        None if capability == "shell-exec" => (
-            "a  Allow all shell commands for this session".to_owned(),
-            "p  Allow all shell commands in this project".to_owned(),
-        ),
-        None => (
-            format!("a  Allow {capability} for this session"),
-            format!("p  Allow {capability} in this project"),
-        ),
+    // A danger-flagged command is covered by no grant in any mode, so the
+    // panel must not offer one — not even the broad "all shell commands"
+    // fallback. The rows stay in place (selection navigation is positional)
+    // and say what they now do: allow this once.
+    let (session_label, project_label) = if !offers_grants {
+        (
+            "a  Allow once (this command always asks)".to_owned(),
+            "p  Allow once (this command always asks)".to_owned(),
+        )
+    } else {
+        match scope_prefix.filter(|p| !p.is_empty()) {
+            Some(prefix) => (
+                format!("a  Allow {prefix} * for this session"),
+                format!("p  Allow {prefix} * in this project"),
+            ),
+            None if capability == "shell-exec" => (
+                "a  Allow all shell commands for this session".to_owned(),
+                "p  Allow all shell commands in this project".to_owned(),
+            ),
+            None => (
+                format!("a  Allow {capability} for this session"),
+                format!("p  Allow {capability} in this project"),
+            ),
+        }
     };
     let mut lines = vec![
         // v2.1 (§7b): the selection bar (the `›` marker plus gold-on-select

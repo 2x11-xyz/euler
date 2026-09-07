@@ -46,9 +46,9 @@ pub struct PermissionRequest {
     /// (deep review P1-b).
     pub sensitive_path: bool,
     /// True when the permissive danger walk
-    /// ([`crate::command_safety::contains_dangerous_command`]) flagged
-    /// `command`, or when the command was truncated so no walk can read
-    /// it. Computed ONCE, in [`PermissionRequest::with_command`].
+    /// ([`crate::command_safety::contains_dangerous_command`]) flagged the
+    /// command. Walked ONCE over the full command text, in
+    /// [`PermissionRequest::with_command`].
     ///
     /// Such a request is auto-approved by nothing: no grant covers it
     /// ([`PermissionGate::granted_source`]) and no capability mode short of
@@ -84,15 +84,16 @@ impl PermissionRequest {
             .as_deref()
             .is_some_and(|bounded| bounded.len() < full.trim().len());
         // Walked once here, then carried on the request: the dispatcher,
-        // grant matching, and the gate all read this field instead of
-        // re-parsing the command. A truncated command is dangerous by
-        // definition — the walk would read a prefix while `sh -c` runs the
-        // whole string, and a `;` past the bound hides anything.
-        self.dangerous_command = self.command_truncated
-            || self
-                .command
-                .as_deref()
-                .is_some_and(crate::command_safety::contains_dangerous_command);
+        // grant matching, the gate, and the approval panel all read this
+        // field instead of re-parsing the command.
+        //
+        // The walk reads the FULL string, not the bounded copy: bounding
+        // first would both miss danger past the bound and make every
+        // benign multi-kilobyte command (an ordinary `apply_patch`
+        // heredoc) count as unreadable and prompt. Truncation still blocks
+        // SCOPED grant matching, which needs text nobody can show the user
+        // (`command_for_matching`).
+        self.dangerous_command = crate::command_safety::contains_dangerous_command(&full);
         self
     }
 
@@ -1305,23 +1306,26 @@ mod tests {
         );
         assert_eq!(gate.granted_source(&request), None);
 
-        // Review round 2, finding 10: an UNSCOPED grant used to cover a
-        // truncated command, because `command_for_matching()` returns None
-        // and an unscoped pattern matches capability-wide. That let
-        // `rm -rf .; echo <4 KiB of padding>` run with no prompt. A command
-        // nobody can read is now covered by no grant at all.
+        // Unscoped grants are capability-wide and unaffected by truncation
+        // (review round 2, finding 10: walking the FULL string keeps this
+        // true for benign multi-kilobyte commands while still flagging a
+        // `rm -rf` hidden past the bound — asserted below).
         gate.install_grant(
             Capability::ShellExec,
             GrantScope::Session(ScopePattern::unscoped()),
         )
         .expect("install unscoped");
-        assert!(!gate.is_granted(&request));
-        assert!(request.dangerous_command);
-        assert_eq!(
-            gate.mode_for_request(&request),
-            ApprovalMode::Ask,
-            "a truncated command must reach the prompt"
-        );
+        assert!(gate.is_granted(&request));
+        assert!(!request.dangerous_command);
+
+        // Danger past the retention bound is still seen, because the walk
+        // reads the full text before the stored copy is bounded.
+        let hidden = format!("{}; rm -rf .", "echo padding ".repeat(400));
+        let hidden =
+            PermissionRequest::new(Capability::ShellExec, "tool run_shell").with_command(&hidden);
+        assert!(hidden.command_truncated);
+        assert!(hidden.dangerous_command);
+        assert!(!gate.is_granted(&hidden));
 
         // Non-truncated commands keep working.
         let short = PermissionRequest::new(Capability::ShellExec, "tool run_shell")

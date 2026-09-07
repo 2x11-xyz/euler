@@ -18,14 +18,18 @@ pull requests that landed them; deeper design rationale lives in
   `sh -c`, `eval`, `env -S`, and `trap`, and unwraps `sudo`, `su`, `env`,
   `timeout`, `nice`, `xargs`, `exec`, `command`, and the rest.
 - A command that walk flags is **never auto-approved, in any mode**: no
-  grant covers it, and every capability mode short of `always-deny` is
-  escalated to a prompt for that request, so a forced `rm` asks even under
-  a blanket session allow. The danger table is extensible and covers more
+  grant covers it, the guardian reviewer never adjudicates it, the approval
+  panel offers no grant for it, and every capability mode short of
+  `always-deny` is escalated to a prompt for that request, so a forced `rm`
+  asks even under a blanket session allow. The danger table is extensible and covers more
   than forced `rm`: `run_shell` closes stdin, so `rm -r` never gets its
   confirmation, and `find -delete`, `git clean -f`, `shred`, `truncate`,
   `dd of=`, `wipefs`, and `mkfs*` are in it too. A command truncated at the
-  retention bound counts as unreadable, so it can no longer ride an
-  unscoped grant.
+  retention bound is walked in full before it is bounded, so danger hidden
+  past the bound is still seen while an ordinary multi-kilobyte command is
+  not flagged for being long. The walk also covers the write side of audit
+  F34: a redirect target or `cp`/`mv`/`tee`/`install`/`ln` destination on
+  the sensitive list asks exactly as `write_file` on that path does.
 - Auto-approvals that could act outside the workspace are gone (audit F01,
   F02, F34). `uniq in out` writes `out`, so `uniq` allows at most one
   operand. Shell-rewritable words (globs, `~`, `${...}`, `$'...'`) are
@@ -34,7 +38,11 @@ pull requests that landed them; deeper design rationale lives in
   `git` subcommands still run repository-controlled `diff.external`,
   `core.fsmonitor`, and filter programs. Traversal flags that dereference
   symlinks, attached option values, and GNU long abbreviations are all
-  rejected by the allowlist rather than chased with a denylist.
+  rejected by the allowlist rather than chased with a denylist, as are
+  recursive readers (`grep -r`, `rg --hidden`) whose tree walk reads files
+  the per-operand sensitive check never saw. A backslash anywhere in the
+  line makes it unprovable, because a backslash-newline is whitespace to
+  the grammar and a line continuation to `sh`.
 - The sensitive-path denylist (which blocks both static shell approval and
   blanket fs-tool grants) now covers anything under a `.git` component,
   `.gitmodules`, `.gitattributes`, `.gitconfig`, `.cargo/config.toml`,
