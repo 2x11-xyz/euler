@@ -75,13 +75,15 @@ jobs:
             ~/.cargo/git
             target
           key: ci-macos-seatbelt-${{ hashFiles('Cargo.lock') }}
-      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2
-        with:
-          tool: nextest@0.9.140
       - name: Seatbelt is actually enforced here
         run: cargo run --locked -p euler-cli -- --check-sandbox
-      - name: Test on macOS
-        run: cargo nextest run --workspace
+      # The Linux `checks` job owns the repository-wide gate. Keep this job
+      # focused on behavior that only a non-nested macOS host can exercise.
+      - name: Exercise the Seatbelt boundary
+        run: |
+          cargo test --locked -p euler-core --lib sandbox::sandbox_test::
+          cargo test --locked -p euler-cli --test headless \
+            agent_shell_applies_backend_environment_and_home_isolation -- --exact --nocapture
 
   sandbox-unavailable:
     # A host that cannot create a user namespace must produce Euler's
