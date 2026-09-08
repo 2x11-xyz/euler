@@ -61,6 +61,30 @@ jobs:
       - name: Doc tests
         run: cargo test --workspace --doc
 
+  macos-seatbelt:
+    # A release build does not prove that the default macOS boundary can be
+    # applied. This job runs the probe and the runtime confinement tests on a
+    # real GitHub macOS host, where Seatbelt is not nested beneath Codex.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ci-macos-seatbelt-${{ hashFiles('Cargo.lock') }}
+      - name: Seatbelt is actually enforced here
+        run: cargo run --locked -p euler-cli -- --check-sandbox
+      # The Linux `checks` job owns the repository-wide gate. Keep this job
+      # focused on behavior that only a non-nested macOS host can exercise.
+      - name: Exercise the Seatbelt boundary
+        run: |
+          cargo test --locked -p euler-core --lib sandbox::sandbox_test::
+          cargo test --locked -p euler-cli --test headless \
+            agent_shell_applies_backend_environment_and_home_isolation -- --exact --nocapture
+
   sandbox-unavailable:
     # A host that cannot create a user namespace must produce Euler's
     # actionable diagnostic, not a raw Bubblewrap failure (ADR 0021 row A').

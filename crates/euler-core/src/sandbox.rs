@@ -1,9 +1,9 @@
-//! Linux workspace subprocess sandboxing with Bubblewrap.
+//! Workspace subprocess sandboxing with Linux Bubblewrap and macOS Seatbelt.
 //!
-//! The profile is deliberately narrow: an agent-controlled child sees its
-//! workspace, a private runtime, the toolchain roots its host environment
-//! implies, and no host home or network. It is an execution boundary, not a
-//! synonym for permission approval.
+//! Linux gets a private runtime and no host home or network. The first
+//! Seatbelt unit on macOS preserves broad reads for tool compatibility while
+//! restricting writes and network; Unit 3 owns read-surface parity. A sandbox
+//! is an execution boundary, not a synonym for permission approval.
 //!
 //! Residual: a Cargo `config.toml` in a reachable toolchain home may itself
 //! declare a registry token. That file is not masked — it carries the registry
@@ -11,11 +11,9 @@
 //! token the user can move is strictness the user would feel. The profile
 //! detects it and says so once at session start instead.
 //!
-//! Bubblewrap is the default and enforced backend on Linux (ADR 0021 row A′).
-//! Off Linux there is no backend yet, so agent subprocesses run on the host
-//! under the ordinary permission decider until the Seatbelt backend lands;
-//! [`SandboxBackend`] names both so a third backend slots in without touching
-//! call sites.
+//! Bubblewrap is the default and enforced backend on Linux (ADR 0021 row A′),
+//! and Seatbelt is the default and enforced backend on macOS (ADR 0021 row A).
+//! Other platforms run on the host under the ordinary permission decider.
 
 use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
@@ -48,6 +46,8 @@ impl SandboxProfile {
 pub enum SandboxBackend {
     /// Linux Bubblewrap, the default and enforced backend.
     Bwrap,
+    /// macOS Seatbelt, the default and enforced backend.
+    Seatbelt,
     /// Direct host execution, gated only by the permission decider.
     Host,
 }
@@ -56,6 +56,7 @@ impl SandboxBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bwrap => "bwrap",
+            Self::Seatbelt => "seatbelt",
             Self::Host => "host",
         }
     }
@@ -64,9 +65,8 @@ impl SandboxBackend {
 /// Whether agent-controlled subprocesses use a sandbox profile.
 ///
 /// This is a core execution choice, intentionally separate from the
-/// capability gate and its approval modes. Linux defaults to the enforced
-/// no-network profile; every other platform runs on the host until its own
-/// backend exists.
+/// capability gate and its approval modes. Linux and macOS default to the
+/// enforced no-network profile; unsupported platforms run on the host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SubprocessSandbox {
     /// Agent subprocesses run directly on the host. This is not "no
@@ -78,7 +78,7 @@ pub enum SubprocessSandbox {
 
 impl Default for SubprocessSandbox {
     fn default() -> Self {
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             Self::Enforce(SandboxProfile::WorkspaceNoNetwork)
         } else {
             Self::Host
@@ -89,11 +89,15 @@ impl Default for SubprocessSandbox {
 /// A concise, non-secret reason why a requested sandbox profile cannot run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SandboxUnavailableReason {
-    /// Euler is not running on a Linux host.
+    /// Euler is not running on a host with an implemented backend.
     UnsupportedPlatform,
     /// The `bwrap` executable was not found.
     BubblewrapMissing,
-    /// Bubblewrap could not create the profile that Euler requires.
+    /// The macOS Seatbelt launcher was not found at its trusted system path.
+    SeatbeltMissing,
+    /// A symlinked `.git` path cannot be protected by the first Seatbelt unit.
+    GitMetadataSymlink,
+    /// The platform launcher could not create the profile Euler requires.
     CannotEnforce,
     /// The selected workspace cannot be resolved to a directory.
     InvalidWorkspace,
@@ -102,9 +106,17 @@ pub enum SandboxUnavailableReason {
 impl SandboxUnavailableReason {
     pub const fn message(self) -> &'static str {
         match self {
-            Self::UnsupportedPlatform => "workspace sandbox is currently supported on Linux only",
+            Self::UnsupportedPlatform => {
+                "workspace sandbox is currently supported on Linux and macOS only"
+            }
             Self::BubblewrapMissing => {
                 "workspace sandbox requires Bubblewrap (`bwrap`) to be installed"
+            }
+            Self::SeatbeltMissing => {
+                "workspace sandbox requires macOS Seatbelt at /usr/bin/sandbox-exec"
+            }
+            Self::GitMetadataSymlink => {
+                "workspace sandbox cannot safely protect a symbolic-link `.git` path"
             }
             Self::CannotEnforce => {
                 "this host cannot enforce Euler's required workspace sandbox profile"
@@ -119,6 +131,8 @@ impl SandboxUnavailableReason {
         match self {
             Self::UnsupportedPlatform => "unsupported_platform",
             Self::BubblewrapMissing => "bubblewrap_missing",
+            Self::SeatbeltMissing => "seatbelt_missing",
+            Self::GitMetadataSymlink => "git_metadata_symlink",
             Self::CannotEnforce => "cannot_enforce",
             Self::InvalidWorkspace => "invalid_workspace",
         }
@@ -138,6 +152,10 @@ impl fmt::Display for SandboxUnavailableReason {
 pub enum SandboxFailureCause {
     /// `bwrap` was not found at a trusted absolute path.
     BubblewrapMissing,
+    /// `/usr/bin/sandbox-exec` is absent or is not an executable file.
+    SeatbeltMissing,
+    /// The workspace `.git` entry is a symbolic link.
+    GitMetadataSymlink,
     /// A sysctl disables unprivileged user namespaces outright.
     UserNamespacesDisabled,
     /// Ubuntu 23.10+ AppArmor restricts unprivileged user namespaces.
@@ -150,6 +168,8 @@ pub enum SandboxFailureCause {
     BubblewrapTooOld,
     /// Namespaces work, but this host would not give the profile its mounts.
     ProfileMountsRejected,
+    /// Seatbelt exists, but macOS refused to apply Euler's required profile.
+    SeatbeltProfileRejected,
     /// The probe did not finish in time, so nothing about it was learned.
     ProbeTimedOut,
     /// The workspace root is not a directory Euler can resolve.
@@ -165,6 +185,10 @@ impl SandboxFailureCause {
     pub const fn description(self) -> &'static str {
         match self {
             Self::BubblewrapMissing => "`bwrap` is not installed at /usr/bin/bwrap or /bin/bwrap",
+            Self::SeatbeltMissing => "macOS Seatbelt is not available at /usr/bin/sandbox-exec",
+            Self::GitMetadataSymlink => {
+                "the workspace `.git` entry is a symbolic link whose protected ancestors cannot be fixed in the static Seatbelt profile"
+            }
             Self::UserNamespacesDisabled => {
                 "unprivileged user namespaces are disabled by a kernel sysctl"
             }
@@ -181,6 +205,9 @@ impl SandboxFailureCause {
             Self::ProfileMountsRejected => {
                 "Bubblewrap can create namespaces on this host, but could not set up the \
 profile's mounts for this workspace"
+            }
+            Self::SeatbeltProfileRejected => {
+                "macOS refused to apply Euler's required Seatbelt profile"
             }
             Self::ProbeTimedOut => "the sandbox probe did not finish in time",
             Self::InvalidWorkspace => "the workspace root is not an accessible directory",
@@ -199,12 +226,16 @@ profile's mounts for this workspace"
     pub fn for_reason(reason: SandboxUnavailableReason) -> Self {
         match reason {
             SandboxUnavailableReason::BubblewrapMissing => Self::BubblewrapMissing,
+            SandboxUnavailableReason::SeatbeltMissing => Self::SeatbeltMissing,
+            SandboxUnavailableReason::GitMetadataSymlink => Self::GitMetadataSymlink,
             SandboxUnavailableReason::InvalidWorkspace => Self::InvalidWorkspace,
             SandboxUnavailableReason::UnsupportedPlatform => Self::UnsupportedPlatform,
             SandboxUnavailableReason::CannotEnforce => match probe_sandbox_backend() {
                 // Namespaces demonstrably work, so the profile's own mounts
                 // are what this host rejected.
-                SandboxStatus::Enforced => Self::ProfileMountsRejected,
+                SandboxStatus::Enforced(SandboxBackend::Bwrap) => Self::ProfileMountsRejected,
+                SandboxStatus::Enforced(SandboxBackend::Seatbelt) => Self::SeatbeltProfileRejected,
+                SandboxStatus::Enforced(SandboxBackend::Host) => Self::UnsupportedPlatform,
                 // The backend probe already attributed this host's failure.
                 // Re-deriving would discard a better answer: an out-of-date
                 // Bubblewrap would become a lecture about namespace sysctls.
@@ -218,6 +249,12 @@ profile's mounts for this workspace"
     pub const fn remedy(self) -> &'static str {
         match self {
             Self::BubblewrapMissing => "install it (Debian/Ubuntu: `sudo apt install bubblewrap`)",
+            Self::SeatbeltMissing => {
+                "use a supported macOS installation that provides /usr/bin/sandbox-exec"
+            }
+            Self::GitMetadataSymlink => {
+                "replace the `.git` symlink with a Git directory or standard `gitdir:` worktree pointer file"
+            }
             Self::UserNamespacesDisabled => {
                 "enable them: `sudo sysctl -w kernel.unprivileged_userns_clone=1` \
 and `sudo sysctl -w user.max_user_namespaces=15000`"
@@ -238,15 +275,18 @@ https://github.com/2x11-xyz/euler/issues/230"
                 "check that /usr, /etc and the workspace are readable and that the workspace \
 is not on a filesystem Bubblewrap cannot bind, such as an unusual FUSE mount"
             }
+            Self::SeatbeltProfileRejected => {
+                "run Euler outside another macOS application sandbox; if the host is managed, ask the administrator to permit nested Seatbelt profiles"
+            }
             Self::ProbeTimedOut => {
-                "try again on a less loaded machine; if it persists, run \
-`bwrap --unshare-user --unshare-net --ro-bind / / /bin/true` by hand to see where it stops"
+                "try again on a less loaded machine; if it persists, run the platform launcher \
+directly (`bwrap` on Linux or `/usr/bin/sandbox-exec` on macOS) to see where it stops"
             }
             Self::InvalidWorkspace => {
                 "start Euler in a directory that exists and that you can read"
             }
             Self::UnsupportedPlatform => {
-                "nothing on this host: the macOS Seatbelt backend is the next unit of ADR 0021"
+                "use Linux or macOS, or explicitly select host execution when that profile ships"
             }
             Self::Unattributed => {
                 "check `sysctl kernel.unprivileged_userns_clone user.max_user_namespaces` and \
@@ -267,12 +307,12 @@ impl fmt::Display for SandboxFailureCause {
 /// commands closed rather than falling back to the host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SandboxStatus {
-    /// Bubblewrap ran a trivial sandboxed command successfully.
-    Enforced,
+    /// The named backend ran a trivial sandboxed command successfully.
+    Enforced(SandboxBackend),
     /// No backend exists for this platform yet; commands run on the host under
     /// the permission decider.
     Host,
-    /// Linux with no usable Bubblewrap. Sandbox-requiring commands fail.
+    /// A supported host whose required backend is unusable. Commands fail.
     Unavailable {
         reason: SandboxUnavailableReason,
         cause: SandboxFailureCause,
@@ -283,7 +323,7 @@ impl SandboxStatus {
     /// The value recorded as `sandbox_backend` on `session.start`.
     pub const fn backend_label(self) -> &'static str {
         match self {
-            Self::Enforced => SandboxBackend::Bwrap.as_str(),
+            Self::Enforced(backend) => backend.as_str(),
             Self::Host => SandboxBackend::Host.as_str(),
             Self::Unavailable { .. } => "unavailable",
         }
@@ -291,7 +331,7 @@ impl SandboxStatus {
 
     pub const fn reason(self) -> Option<SandboxUnavailableReason> {
         match self {
-            Self::Enforced | Self::Host => None,
+            Self::Enforced(_) | Self::Host => None,
             Self::Unavailable { reason, .. } => Some(reason),
         }
     }
@@ -302,7 +342,7 @@ impl SandboxStatus {
             return None;
         };
         Some(format!(
-            "Euler could not start its Linux sandbox: {}.\nTo fix it: {}.\n\
+            "Euler could not start its subprocess sandbox: {}.\nTo fix it: {}.\n\
 Until then `run_shell` and the `git_*` tools fail closed; there is no automatic \
 fallback to host execution. The probe result is cached for this process, so \
 fixing the host takes effect in a new run, not this one.",
@@ -325,14 +365,36 @@ impl SandboxAvailability {
     }
 }
 
+#[derive(Debug)]
+enum SandboxLauncher {
+    Bubblewrap(PathBuf),
+    Seatbelt {
+        executable: PathBuf,
+        _scratch: tempfile::TempDir,
+        scratch_path: PathBuf,
+        git_metadata: PathBuf,
+        git_metadata_resolved: PathBuf,
+    },
+}
+
+impl SandboxLauncher {
+    const fn backend(&self) -> SandboxBackend {
+        match self {
+            Self::Bubblewrap(_) => SandboxBackend::Bwrap,
+            Self::Seatbelt { .. } => SandboxBackend::Seatbelt,
+        }
+    }
+}
+
 /// A workspace-specific profile that has already been probed. It retains the
 /// stable availability result so callers can fail closed without copying raw
-/// Bubblewrap diagnostics into tool output or provenance.
-#[derive(Clone, Debug)]
+/// launcher diagnostics into tool output or provenance.
+#[derive(Debug)]
 pub(crate) struct WorkspaceSandbox {
     workspace: Option<PathBuf>,
     runtime: RuntimeRoots,
-    bwrap: Option<PathBuf>,
+    backend: SandboxBackend,
+    launcher: Option<SandboxLauncher>,
     availability: SandboxAvailability,
     /// How the profile probe ended, when one ran. `None` means the profile
     /// was ruled out before any process started.
@@ -352,47 +414,117 @@ impl WorkspaceSandbox {
         profile: SandboxProfile,
         runtime: RuntimeRoots,
     ) -> Self {
-        if !cfg!(target_os = "linux") {
-            return Self {
-                workspace: None,
+        let backend = if cfg!(target_os = "linux") {
+            SandboxBackend::Bwrap
+        } else if cfg!(target_os = "macos") {
+            SandboxBackend::Seatbelt
+        } else {
+            SandboxBackend::Host
+        };
+        if backend == SandboxBackend::Host {
+            return Self::unavailable(
+                None,
                 runtime,
-                bwrap: None,
-                availability: SandboxAvailability::Unavailable(
-                    SandboxUnavailableReason::UnsupportedPlatform,
-                ),
-                probe: None,
-            };
+                backend,
+                SandboxUnavailableReason::UnsupportedPlatform,
+            );
         }
         let Ok(workspace) = canonical_workspace(workspace.as_ref()) else {
-            return Self {
-                workspace: None,
+            return Self::unavailable(
+                None,
                 runtime,
-                bwrap: None,
-                availability: SandboxAvailability::Unavailable(
-                    SandboxUnavailableReason::InvalidWorkspace,
-                ),
-                probe: None,
-            };
+                backend,
+                SandboxUnavailableReason::InvalidWorkspace,
+            );
         };
         let runtime = runtime.excluding(&workspace);
+        match backend {
+            SandboxBackend::Bwrap => Self::with_bwrap(workspace, runtime, profile),
+            SandboxBackend::Seatbelt => Self::with_seatbelt(workspace, runtime, profile),
+            SandboxBackend::Host => unreachable!("host returned above"),
+        }
+    }
+
+    fn with_bwrap(workspace: PathBuf, runtime: RuntimeRoots, profile: SandboxProfile) -> Self {
+        let backend = SandboxBackend::Bwrap;
         let Some(bwrap) = bwrap_path() else {
-            return Self {
-                workspace: Some(workspace),
+            return Self::unavailable(
+                Some(workspace),
                 runtime,
-                bwrap: None,
-                availability: SandboxAvailability::Unavailable(
-                    SandboxUnavailableReason::BubblewrapMissing,
-                ),
-                probe: None,
-            };
+                backend,
+                SandboxUnavailableReason::BubblewrapMissing,
+            );
         };
-        let (availability, outcome) = probe_profile(&bwrap, &workspace, &runtime, profile);
+        let (availability, outcome) = probe_bwrap_profile(&bwrap, &workspace, &runtime, profile);
         Self {
             workspace: Some(workspace),
             runtime,
-            bwrap: Some(bwrap),
+            backend,
+            launcher: Some(SandboxLauncher::Bubblewrap(bwrap)),
             availability,
             probe: Some(outcome),
+        }
+    }
+
+    fn with_seatbelt(workspace: PathBuf, runtime: RuntimeRoots, profile: SandboxProfile) -> Self {
+        let backend = SandboxBackend::Seatbelt;
+        let Some(executable) = seatbelt_path() else {
+            return Self::unavailable(
+                Some(workspace),
+                runtime,
+                backend,
+                SandboxUnavailableReason::SeatbeltMissing,
+            );
+        };
+        let Some((scratch, scratch_path)) = seatbelt_scratch() else {
+            return Self::unavailable(
+                Some(workspace),
+                runtime,
+                backend,
+                SandboxUnavailableReason::CannotEnforce,
+            );
+        };
+        let git_metadata = workspace.join(".git");
+        let git_metadata_resolved = match seatbelt_git_metadata_path(&git_metadata) {
+            Ok(path) => path,
+            Err(reason) => return Self::unavailable(Some(workspace), runtime, backend, reason),
+        };
+        let launcher = SandboxLauncher::Seatbelt {
+            executable,
+            _scratch: scratch,
+            scratch_path,
+            git_metadata,
+            git_metadata_resolved,
+        };
+        let outcome = probe_seatbelt_profile(&launcher, &workspace, &runtime, profile);
+        let availability = if outcome.succeeded() {
+            SandboxAvailability::Enforced(profile)
+        } else {
+            SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
+        };
+        Self {
+            workspace: Some(workspace),
+            runtime,
+            backend,
+            launcher: Some(launcher),
+            availability,
+            probe: Some(outcome),
+        }
+    }
+
+    fn unavailable(
+        workspace: Option<PathBuf>,
+        runtime: RuntimeRoots,
+        backend: SandboxBackend,
+        reason: SandboxUnavailableReason,
+    ) -> Self {
+        Self {
+            workspace,
+            runtime,
+            backend,
+            launcher: None,
+            availability: SandboxAvailability::Unavailable(reason),
+            probe: None,
         }
     }
 
@@ -400,18 +532,43 @@ impl WorkspaceSandbox {
         self.availability
     }
 
+    pub(crate) const fn backend(&self) -> SandboxBackend {
+        self.backend
+    }
+
     /// The availability with its cause attached, using what this sandbox's own
     /// probe observed rather than re-deriving it from the reason alone.
     pub(crate) fn status(&self) -> SandboxStatus {
         let SandboxAvailability::Unavailable(reason) = self.availability else {
-            return SandboxStatus::Enforced;
+            return SandboxStatus::Enforced(self.backend);
         };
         SandboxStatus::Unavailable {
             reason,
             // A probe that never finished taught us nothing, so naming the
             // mounts or the namespace would be a guess.
-            cause: match self.probe {
-                Some(ProbeOutcome::TimedOut) => SandboxFailureCause::ProbeTimedOut,
+            cause: match (self.backend, self.probe) {
+                (_, Some(ProbeOutcome::TimedOut)) => SandboxFailureCause::ProbeTimedOut,
+                (SandboxBackend::Seatbelt, _) => match reason {
+                    SandboxUnavailableReason::SeatbeltMissing => {
+                        SandboxFailureCause::SeatbeltMissing
+                    }
+                    SandboxUnavailableReason::GitMetadataSymlink => {
+                        SandboxFailureCause::GitMetadataSymlink
+                    }
+                    SandboxUnavailableReason::InvalidWorkspace => {
+                        SandboxFailureCause::InvalidWorkspace
+                    }
+                    SandboxUnavailableReason::UnsupportedPlatform => {
+                        SandboxFailureCause::UnsupportedPlatform
+                    }
+                    SandboxUnavailableReason::BubblewrapMissing => {
+                        SandboxFailureCause::BubblewrapMissing
+                    }
+                    SandboxUnavailableReason::CannotEnforce => match probe_sandbox_backend() {
+                        SandboxStatus::Unavailable { cause, .. } => cause,
+                        _ => SandboxFailureCause::SeatbeltProfileRejected,
+                    },
+                },
                 _ => SandboxFailureCause::for_reason(reason),
             },
         }
@@ -463,22 +620,92 @@ registry and build settings a build needs. Move the token to `credentials.toml` 
             .workspace
             .as_deref()
             .ok_or(SandboxUnavailableReason::InvalidWorkspace)?;
-        let bwrap = self
-            .bwrap
-            .as_deref()
+        let launcher = self
+            .launcher
+            .as_ref()
             .ok_or(SandboxUnavailableReason::CannotEnforce)?;
-        Ok(bwrap_command(
-            bwrap,
-            SandboxLaunch {
-                profile,
-                workspace,
-                runtime: &self.runtime,
-                env,
-            },
-            program.as_ref(),
-            args,
-        ))
+        debug_assert_eq!(launcher.backend(), self.backend);
+        let launch = SandboxLaunch {
+            profile,
+            workspace,
+            runtime: &self.runtime,
+            env,
+        };
+        Ok(match launcher {
+            SandboxLauncher::Bubblewrap(bwrap) => {
+                bwrap_command(bwrap, launch, program.as_ref(), args)
+            }
+            SandboxLauncher::Seatbelt {
+                executable,
+                _scratch: _,
+                scratch_path,
+                git_metadata,
+                git_metadata_resolved,
+            } => seatbelt_command(
+                SeatbeltCommand {
+                    executable,
+                    scratch: scratch_path,
+                    git_metadata,
+                    git_metadata_resolved,
+                },
+                launch,
+                program.as_ref(),
+                args,
+            ),
+        })
     }
+}
+
+/// Resolve both ordinary `.git` directories and Git's regular-file
+/// `gitdir:` indirection. Seatbelt matches paths, so protecting only the
+/// pointer file would leave an in-workspace metadata target writable.
+fn seatbelt_git_metadata_path(git_metadata: &Path) -> Result<PathBuf, SandboxUnavailableReason> {
+    let Ok(metadata) = git_metadata.symlink_metadata() else {
+        return Ok(git_metadata.to_path_buf());
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(SandboxUnavailableReason::GitMetadataSymlink);
+    }
+    if metadata.is_dir() {
+        return Ok(git_metadata
+            .canonicalize()
+            .unwrap_or_else(|_| git_metadata.to_path_buf()));
+    }
+    if !metadata.is_file() || metadata.len() > 16 * 1024 {
+        return Err(SandboxUnavailableReason::CannotEnforce);
+    }
+
+    let pointer = std::fs::read_to_string(git_metadata)
+        .map_err(|_| SandboxUnavailableReason::CannotEnforce)?;
+    let pointer = pointer.trim_end_matches(['\r', '\n']);
+    if pointer.contains(['\r', '\n']) {
+        return Err(SandboxUnavailableReason::CannotEnforce);
+    }
+    let target = pointer
+        .strip_prefix("gitdir: ")
+        .filter(|path| !path.is_empty())
+        .ok_or(SandboxUnavailableReason::CannotEnforce)?;
+    let target = Path::new(target);
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        git_metadata
+            .parent()
+            .ok_or(SandboxUnavailableReason::CannotEnforce)?
+            .join(target)
+    };
+    let target = target
+        .canonicalize()
+        .map_err(|_| SandboxUnavailableReason::CannotEnforce)?;
+    let workspace = git_metadata
+        .parent()
+        .ok_or(SandboxUnavailableReason::CannotEnforce)?
+        .canonicalize()
+        .map_err(|_| SandboxUnavailableReason::CannotEnforce)?;
+    if target.starts_with(workspace) {
+        return Err(SandboxUnavailableReason::CannotEnforce);
+    }
+    Ok(target)
 }
 
 /// The isolation flags both probes and every launch share. A host that
@@ -495,6 +722,8 @@ const PROFILE_ISOLATION_FLAGS: &[&str] = &[
 ];
 
 const BWRAP_PATHS: &[&str] = &["/usr/bin/bwrap", "/bin/bwrap"];
+const SEATBELT_PATH: &str = "/usr/bin/sandbox-exec";
+const SEATBELT_PROFILE: &str = include_str!("seatbelt_profile.sbpl");
 const SANDBOX_WORKSPACE: &str = "/workspace";
 const SANDBOX_HOME: &str = "/tmp/home";
 const SANDBOX_CACHE: &str = "/tmp/cache";
@@ -850,6 +1079,18 @@ impl RuntimeRoots {
             .collect::<Vec<_>>()
             .join(OsStr::new(":"))
     }
+
+    /// The same detected toolchain path in the host filesystem view used by
+    /// Seatbelt, which filters access without constructing a new root.
+    fn seatbelt_path(&self) -> OsString {
+        let mut entries = self.path_entries.clone();
+        entries.extend(std::env::split_paths(OsStr::new(SYSTEM_SANDBOX_PATH)));
+        entries
+            .iter()
+            .map(|entry| entry.as_os_str().to_os_string())
+            .collect::<Vec<_>>()
+            .join(OsStr::new(":"))
+    }
 }
 
 /// Accept a toolchain root only when it is an existing directory that is not
@@ -946,6 +1187,33 @@ pub fn probe_sandbox_backend() -> SandboxStatus {
 }
 
 fn probe_sandbox_backend_uncached() -> SandboxStatus {
+    if cfg!(target_os = "macos") {
+        let Some(seatbelt) = seatbelt_path() else {
+            return SandboxStatus::Unavailable {
+                reason: SandboxUnavailableReason::SeatbeltMissing,
+                cause: SandboxFailureCause::SeatbeltMissing,
+            };
+        };
+        let mut command = Command::new(seatbelt);
+        command
+            .env_clear()
+            .args([
+                "-p",
+                "(version 1) (deny default) (allow process-exec) (allow file-read*)",
+                "--",
+            ])
+            .arg("/usr/bin/true");
+        mark_inherited_fds_close_on_exec(&mut command);
+        let cause = match run_probe_to_completion(command) {
+            ProbeOutcome::Succeeded => return SandboxStatus::Enforced(SandboxBackend::Seatbelt),
+            ProbeOutcome::TimedOut => SandboxFailureCause::ProbeTimedOut,
+            ProbeOutcome::Refused => SandboxFailureCause::SeatbeltProfileRejected,
+        };
+        return SandboxStatus::Unavailable {
+            reason: SandboxUnavailableReason::CannotEnforce,
+            cause,
+        };
+    }
     if !cfg!(target_os = "linux") {
         return SandboxStatus::Host;
     }
@@ -965,7 +1233,7 @@ fn probe_sandbox_backend_uncached() -> SandboxStatus {
     command.args(PROFILE_ISOLATION_FLAGS);
     command.args(["--unshare-net", "--ro-bind", "/", "/", "/bin/true"]);
     let cause = match run_probe_to_completion(command) {
-        ProbeOutcome::Succeeded => return SandboxStatus::Enforced,
+        ProbeOutcome::Succeeded => return SandboxStatus::Enforced(SandboxBackend::Bwrap),
         ProbeOutcome::TimedOut => SandboxFailureCause::ProbeTimedOut,
         ProbeOutcome::Refused => attribute_isolation_failure(&bwrap),
     };
@@ -1048,7 +1316,7 @@ pub(crate) fn strip_sandbox_ready_marker(stdout: &str) -> Result<&str, SandboxUn
         .ok_or(SandboxUnavailableReason::CannotEnforce)
 }
 
-fn probe_profile(
+fn probe_bwrap_profile(
     bwrap: &Path,
     workspace: &Path,
     runtime: &RuntimeRoots,
@@ -1094,6 +1362,44 @@ fn probe_profile(
         SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
     };
     (availability, outcome)
+}
+
+fn probe_seatbelt_profile(
+    launcher: &SandboxLauncher,
+    workspace: &Path,
+    runtime: &RuntimeRoots,
+    profile: SandboxProfile,
+) -> ProbeOutcome {
+    let SandboxLauncher::Seatbelt {
+        executable,
+        _scratch: _,
+        scratch_path,
+        git_metadata,
+        git_metadata_resolved,
+    } = launcher
+    else {
+        unreachable!("Seatbelt profile probe requires a Seatbelt launcher");
+    };
+    let command = seatbelt_command(
+        SeatbeltCommand {
+            executable,
+            scratch: scratch_path,
+            git_metadata,
+            git_metadata_resolved,
+        },
+        SandboxLaunch {
+            profile,
+            workspace,
+            runtime,
+            env: &[],
+        },
+        OsStr::new("/bin/sh"),
+        [
+            "-c",
+            "probe=\"$TMPDIR/euler-seatbelt-probe-$$\"; printf ready >\"$probe\" && rm -f \"$probe\"",
+        ],
+    );
+    run_probe_to_completion(command)
 }
 
 fn shell_quote(path: &Path) -> String {
@@ -1156,6 +1462,25 @@ fn bwrap_path() -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
+/// Seatbelt is part of macOS, and the trusted system path prevents a
+/// workspace-controlled `PATH` from substituting the policy launcher.
+fn seatbelt_path() -> Option<PathBuf> {
+    let path = Path::new(SEATBELT_PATH);
+    path.is_file().then(|| path.to_path_buf())
+}
+
+fn seatbelt_scratch() -> Option<(tempfile::TempDir, PathBuf)> {
+    let scratch = tempfile::Builder::new()
+        .prefix("euler-seatbelt-")
+        .tempdir()
+        .ok()?;
+    let scratch_path = scratch.path().canonicalize().ok()?;
+    for directory in ["home", "cache", "tmp"] {
+        std::fs::create_dir(scratch_path.join(directory)).ok()?;
+    }
+    Some((scratch, scratch_path))
+}
+
 fn canonical_workspace(workspace: &Path) -> Result<PathBuf, std::io::Error> {
     let workspace = workspace.canonicalize()?;
     if workspace.is_dir() {
@@ -1174,6 +1499,14 @@ struct SandboxLaunch<'a> {
     workspace: &'a Path,
     runtime: &'a RuntimeRoots,
     env: &'a [(OsString, OsString)],
+}
+
+#[derive(Clone, Copy)]
+struct SeatbeltCommand<'a> {
+    executable: &'a Path,
+    scratch: &'a Path,
+    git_metadata: &'a Path,
+    git_metadata_resolved: &'a Path,
 }
 
 fn bwrap_command<I, S>(bwrap: &Path, launch: SandboxLaunch<'_>, program: &OsStr, args: I) -> Command
@@ -1236,6 +1569,66 @@ where
         .arg(program)
         .args(args);
     command
+}
+
+fn seatbelt_command<I, S>(
+    seatbelt: SeatbeltCommand<'_>,
+    launch: SandboxLaunch<'_>,
+    program: &OsStr,
+    args: I,
+) -> Command
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let SeatbeltCommand {
+        executable,
+        scratch,
+        git_metadata,
+        git_metadata_resolved,
+    } = seatbelt;
+    let SandboxLaunch {
+        profile,
+        workspace,
+        runtime,
+        env,
+    } = launch;
+    match profile {
+        SandboxProfile::WorkspaceNoNetwork => {}
+    }
+    let mut command = Command::new(executable);
+    command
+        .env_clear()
+        .current_dir(workspace)
+        .arg("-p")
+        .arg(SEATBELT_PROFILE)
+        .arg(seatbelt_definition("WORKSPACE", workspace))
+        .arg(seatbelt_definition("GIT_METADATA", git_metadata))
+        .arg(seatbelt_definition(
+            "GIT_METADATA_RESOLVED",
+            git_metadata_resolved,
+        ))
+        .arg(seatbelt_definition("SCRATCH", scratch))
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(SANDBOX_READY_WRAPPER)
+        .arg("euler-sandbox")
+        .arg(program)
+        .args(args);
+    for (name, value) in seatbelt_environment(runtime, scratch, env) {
+        command.env(name, value);
+    }
+    mark_inherited_fds_close_on_exec(&mut command);
+    command
+}
+
+fn seatbelt_definition(name: &str, path: &Path) -> OsString {
+    let mut definition = OsString::from("-D");
+    definition.push(name);
+    definition.push("=");
+    definition.push(path);
+    definition
 }
 
 /// Mount the toolchain roots read-only at their real paths.
@@ -1351,6 +1744,31 @@ fn sandbox_environment(
             runtime.sandbox_view(Path::new(value)).into_os_string(),
         )
     }));
+    environment.extend(extra.iter().cloned());
+    environment
+}
+
+fn seatbelt_environment(
+    runtime: &RuntimeRoots,
+    scratch: &Path,
+    extra: &[(OsString, OsString)],
+) -> Vec<(OsString, OsString)> {
+    let mut environment = vec![
+        (
+            OsString::from("HOME"),
+            scratch.join("home").into_os_string(),
+        ),
+        (
+            OsString::from("XDG_CACHE_HOME"),
+            scratch.join("cache").into_os_string(),
+        ),
+        (
+            OsString::from("TMPDIR"),
+            scratch.join("tmp").into_os_string(),
+        ),
+        (OsString::from("PATH"), runtime.seatbelt_path()),
+    ];
+    environment.extend(runtime.variables.iter().cloned());
     environment.extend(extra.iter().cloned());
     environment
 }
@@ -1554,6 +1972,94 @@ mod tests {
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn seatbelt_uses_the_static_profile_and_path_parameters() {
+        let workspace_temp = tempfile::tempdir().expect("temp workspace");
+        let scratch_temp = tempfile::tempdir().expect("temp scratch");
+        let workspace = workspace_temp
+            .path()
+            .canonicalize()
+            .expect("canonical workspace");
+        let scratch = scratch_temp
+            .path()
+            .canonicalize()
+            .expect("canonical scratch");
+        for directory in ["home", "cache", "tmp"] {
+            std::fs::create_dir(scratch.join(directory)).expect("scratch directory");
+        }
+        let git_metadata = workspace.join(".git");
+        let command = seatbelt_command(
+            SeatbeltCommand {
+                executable: Path::new(SEATBELT_PATH),
+                scratch: &scratch,
+                git_metadata: &git_metadata,
+                git_metadata_resolved: &git_metadata,
+            },
+            SandboxLaunch {
+                profile: SandboxProfile::WorkspaceNoNetwork,
+                workspace: &workspace,
+                runtime: &RuntimeRoots::default(),
+                env: &[],
+            },
+            OsStr::new("/usr/bin/true"),
+            std::iter::empty::<&str>(),
+        );
+        let arguments = command_arguments(&command);
+
+        assert_eq!(command.get_program(), OsStr::new(SEATBELT_PATH));
+        assert_eq!(command.get_current_dir(), Some(workspace.as_path()));
+        let profile = arguments
+            .windows(2)
+            .find_map(|pair| (pair[0] == "-p").then_some(pair[1].as_str()))
+            .expect("-p profile");
+        assert_eq!(profile, SEATBELT_PROFILE);
+        for definition in [
+            format!("-DWORKSPACE={}", workspace.display()),
+            format!("-DGIT_METADATA={}", git_metadata.display()),
+            format!("-DGIT_METADATA_RESOLVED={}", git_metadata.display()),
+            format!("-DSCRATCH={}", scratch.display()),
+        ] {
+            assert!(arguments.contains(&definition), "{arguments:?}");
+        }
+        assert!(profile.contains("(deny default)"));
+        assert!(profile.contains("(literal (param \"GIT_METADATA\"))"));
+        assert!(profile.contains("(subpath (param \"GIT_METADATA\"))"));
+        assert!(profile.contains("(deny file-write-unlink"));
+        assert!(!profile.contains("(allow network"));
+        assert!(!profile.contains("(allow system-socket"));
+    }
+
+    #[test]
+    fn seatbelt_resolves_a_gitdir_pointer_file() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let metadata = tempfile::tempdir().expect("external metadata");
+        let git_entry = workspace.path().join(".git");
+        std::fs::write(
+            &git_entry,
+            format!("gitdir: {}\n", metadata.path().display()),
+        )
+        .expect("gitdir pointer");
+
+        assert_eq!(
+            seatbelt_git_metadata_path(&git_entry).expect("valid gitdir pointer"),
+            metadata.path().canonicalize().expect("canonical metadata")
+        );
+    }
+
+    #[test]
+    fn seatbelt_rejects_an_in_workspace_gitdir_target() {
+        let workspace = tempfile::tempdir().expect("temp workspace");
+        let metadata = workspace.path().join("metadata");
+        std::fs::create_dir(&metadata).expect("metadata directory");
+        let git_entry = workspace.path().join(".git");
+        std::fs::write(&git_entry, "gitdir: metadata\n").expect("gitdir pointer");
+
+        assert_eq!(
+            seatbelt_git_metadata_path(&git_entry),
+            Err(SandboxUnavailableReason::CannotEnforce)
+        );
     }
 
     #[test]
@@ -2353,17 +2859,27 @@ token = \"secret\"\n",
         );
         assert!(SandboxStatus::Host.diagnostic().is_none());
         assert_eq!(SandboxStatus::Host.backend_label(), "host");
-        assert_eq!(SandboxStatus::Enforced.backend_label(), "bwrap");
+        assert_eq!(
+            SandboxStatus::Enforced(SandboxBackend::Bwrap).backend_label(),
+            "bwrap"
+        );
+        assert_eq!(
+            SandboxStatus::Enforced(SandboxBackend::Seatbelt).backend_label(),
+            "seatbelt"
+        );
     }
 
     #[test]
     fn every_failure_cause_names_a_distinct_remedy() {
         for cause in [
             SandboxFailureCause::BubblewrapMissing,
+            SandboxFailureCause::SeatbeltMissing,
+            SandboxFailureCause::GitMetadataSymlink,
             SandboxFailureCause::UserNamespacesDisabled,
             SandboxFailureCause::AppArmorUserNamespaceRestriction,
             SandboxFailureCause::Container,
             SandboxFailureCause::Wsl1,
+            SandboxFailureCause::SeatbeltProfileRejected,
             SandboxFailureCause::Unattributed,
         ] {
             assert!(!cause.description().is_empty());
@@ -2372,8 +2888,8 @@ token = \"secret\"\n",
     }
 
     #[test]
-    fn the_platform_default_is_the_enforced_linux_profile() {
-        if cfg!(target_os = "linux") {
+    fn the_platform_default_is_enforced_on_linux_and_macos() {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             assert_eq!(
                 SubprocessSandbox::default(),
                 SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork)

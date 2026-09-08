@@ -6,8 +6,8 @@ use crate::structured_file;
 use crate::{
     apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
     ApplyPatchDocument, ApplyPatchError, IncompleteObservation, ObservedFileChange,
-    SandboxAvailability, SandboxFailureCause, SandboxStatus, SandboxUnavailableReason,
-    SubprocessSandbox, WorkspaceSnapshot, MAX_WORKSPACE_SNAPSHOT_FILES,
+    SandboxAvailability, SandboxBackend, SandboxFailureCause, SandboxStatus,
+    SandboxUnavailableReason, SubprocessSandbox, WorkspaceSnapshot, MAX_WORKSPACE_SNAPSHOT_FILES,
 };
 use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use euler_provider::ToolDefinition;
@@ -118,6 +118,9 @@ pub struct ToolExecution {
     /// bytes. The session persists it on `tool.result`; canvas filtering and
     /// rehydration must preserve it so child policy cannot be bypassed.
     pub project_context_snapshot_digest: Option<String>,
+    /// Execution boundary for process-backed shell and Git tools. Structured
+    /// tools omit it because no subprocess boundary ran.
+    pub sandbox_backend: Option<SandboxBackend>,
     pub exit_code: Option<i32>,
     pub patch: Option<PatchEvents>,
     pub file_changes: Vec<ObservedFileChange>,
@@ -616,6 +619,7 @@ impl ToolRegistry {
             ),
             output_preview_budget: None,
             project_context_snapshot_digest: Some(skill.snapshot_digest.clone()),
+            sandbox_backend: None,
             exit_code: None,
             patch: None,
             file_changes: Vec::new(),
@@ -635,6 +639,7 @@ impl ToolRegistry {
             output,
             output_preview_budget: None,
             project_context_snapshot_digest: None,
+            sandbox_backend: None,
             exit_code: None,
             patch: None,
             file_changes: Vec::new(),
@@ -664,6 +669,7 @@ impl ToolRegistry {
             output: format!("edited {relative}"),
             output_preview_budget: None,
             project_context_snapshot_digest: None,
+            sandbox_backend: None,
             exit_code: None,
             patch: Some(PatchEvents {
                 path: relative.to_owned(),
@@ -710,6 +716,7 @@ impl ToolRegistry {
             output: format!("created {relative}"),
             output_preview_budget: None,
             project_context_snapshot_digest: None,
+            sandbox_backend: None,
             exit_code: None,
             patch: Some(PatchEvents {
                 path: relative.to_owned(),
@@ -755,6 +762,7 @@ impl ToolRegistry {
                     output: format!("{label} prepared add {path}"),
                     output_preview_budget: None,
                     project_context_snapshot_digest: None,
+                    sandbox_backend: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
                         path,
@@ -783,6 +791,7 @@ impl ToolRegistry {
                     output: format!("{label} prepared update {path}"),
                     output_preview_budget: None,
                     project_context_snapshot_digest: None,
+                    sandbox_backend: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
                         path,
@@ -894,6 +903,7 @@ impl ToolRegistry {
         let before = self.observe_workspace();
         let child = self.agent_subprocess("sh", &["-c", command], &[])?;
         let sandboxed = child.sandboxed;
+        let sandbox_backend = child.backend;
         let outcome = run_process(child.command, Some(timeout_ms), cancellation)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         let text = collected_agent_output(
@@ -930,6 +940,7 @@ impl ToolRegistry {
                 max_lines: DEFAULT_MAX_LINES,
             }),
             project_context_snapshot_digest: None,
+            sandbox_backend: Some(sandbox_backend),
             exit_code: Some(status),
             patch: None,
             file_changes,
@@ -958,6 +969,7 @@ impl ToolRegistry {
         let args = neutralization.args(command);
         let child = self.agent_subprocess("git", &args, neutralization.env())?;
         let sandboxed = child.sandboxed;
+        let sandbox_backend = child.backend;
         let mut command = child.command;
         neutralization.strip_inherited_redirects(&mut command);
         let outcome = run_process(command, None, cancellation)
@@ -984,6 +996,7 @@ impl ToolRegistry {
                 max_lines: DEFAULT_MAX_LINES,
             }),
             project_context_snapshot_digest: None,
+            sandbox_backend: Some(sandbox_backend),
             exit_code: Some(status),
             patch: None,
             file_changes: Vec::new(),
@@ -1085,9 +1098,9 @@ see them.\n"
             .map_err(sandbox_unavailable)
     }
 
-    /// Construct the child process for an agent-controlled command. The
-    /// sandbox branch deliberately receives no host `current_dir`: Bubblewrap
-    /// establishes `/workspace` inside its private mount namespace.
+    /// Construct the child process for an agent-controlled command.
+    /// Bubblewrap establishes `/workspace` inside its private mount namespace;
+    /// Seatbelt keeps the canonical host workspace as its current directory.
     fn agent_subprocess(
         &self,
         program: &str,
@@ -1108,7 +1121,7 @@ see them.\n"
                 command
             }
         };
-        // Defense in depth: Bubblewrap clears this environment too, while
+        // Defense in depth: both launchers clear this environment too, while
         // ordinary host execution needs an explicit child-process boundary.
         scrub_agent_subprocess_env(&mut child);
         if !sandboxed {
@@ -1117,6 +1130,10 @@ see them.\n"
         Ok(AgentSubprocess {
             command: child,
             sandboxed,
+            backend: self
+                .workspace_sandbox
+                .as_ref()
+                .map_or(SandboxBackend::Host, WorkspaceSandbox::backend),
         })
     }
 
@@ -1314,11 +1331,12 @@ fn read_to_string(mut file: fs::File) -> Result<String, ToolError> {
 struct AgentSubprocess {
     command: Command,
     sandboxed: bool,
+    backend: SandboxBackend,
 }
 
-/// Preserve program output, but do not expose Bubblewrap diagnostics when the
+/// Preserve program output, but do not expose launcher diagnostics when the
 /// launcher did not reach the inner command. The readiness marker is emitted
-/// by the private sandbox wrapper only after its mount namespace exists.
+/// only after the platform profile has been applied.
 fn collected_agent_output(
     stdout: String,
     stderr: String,
@@ -2179,6 +2197,7 @@ fn tool_result_get(
         output,
         output_preview_budget: None,
         project_context_snapshot_digest: project_context_snapshot_digest.map(str::to_owned),
+        sandbox_backend: None,
         exit_code: None,
         patch: None,
         file_changes: Vec::new(),

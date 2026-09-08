@@ -490,6 +490,9 @@ pub(crate) fn tool_result_payload(
             digest.clone().into(),
         );
     }
+    if let Some(backend) = execution.sandbox_backend {
+        payload.insert("sandbox_backend".to_owned(), backend.as_str().into());
+    }
     if let Some(exit_code) = execution.exit_code {
         payload.insert("exit_code".to_owned(), exit_code.into());
     }
@@ -718,4 +721,44 @@ pub(crate) fn file_diff_payload(
                 .map_or(Value::Null, std::convert::Into::into),
         ),
     ])
+}
+
+#[cfg(test)]
+mod sandbox_backend_tests {
+    use super::*;
+    use crate::SandboxBackend;
+
+    fn execution(backend: Option<SandboxBackend>) -> ToolExecution {
+        ToolExecution {
+            name: "run_shell".to_owned(),
+            output: "done".to_owned(),
+            output_preview_budget: None,
+            project_context_snapshot_digest: None,
+            sandbox_backend: backend,
+            exit_code: Some(0),
+            patch: None,
+            file_changes: Vec::new(),
+            observation: None,
+        }
+    }
+
+    #[test]
+    fn process_results_record_the_backend_that_ran() {
+        let payload = tool_result_payload(
+            "call".to_owned(),
+            &execution(Some(SandboxBackend::Seatbelt)),
+            &SecretRedactor::new(),
+        );
+        assert_eq!(
+            payload.get("sandbox_backend").and_then(Value::as_str),
+            Some("seatbelt")
+        );
+    }
+
+    #[test]
+    fn structured_results_do_not_claim_a_subprocess_backend() {
+        let payload =
+            tool_result_payload("call".to_owned(), &execution(None), &SecretRedactor::new());
+        assert!(!payload.contains_key("sandbox_backend"));
+    }
 }

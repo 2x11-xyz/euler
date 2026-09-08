@@ -46,16 +46,17 @@ Minimum v0 scopes:
 ## Execution boundary and capability decisions
 
 A capability decision and an execution boundary are separate facts. On Linux
-the enforced Bubblewrap backend is the boundary for `run_shell` and the
-`git_*` tools; the permission decision still happens, and the sandbox never
-turns a denial into an allow. Off Linux there is no backend yet and the
+and macOS the enforced Bubblewrap and Seatbelt backends are the boundary for
+`run_shell` and the `git_*` tools; the permission decision still happens, and
+the sandbox never turns a denial into an allow. On unsupported platforms the
 permission decision is the whole confinement story for those tools, which is
 why the prove-safe grammar stays conservative there.
 
 The backend is probed at session start, not assumed, and recorded on
-`session.start` as `sandbox_backend` (`bwrap` | `host` | `unavailable`). When
-the probe fails on Linux, sandbox-requiring tools fail closed: no backend is
-never silently downgraded to host execution. `euler --check-sandbox` reports
+`session.start` as `sandbox_backend` (`bwrap` | `seatbelt` | `host` |
+`unavailable`). When a required probe fails, sandbox-requiring tools fail
+closed: no backend is ever silently downgraded to host execution.
+`euler --check-sandbox` reports
 the same result with an actionable diagnostic. Deliberate unsandboxed
 execution is the explicit "Full access (unsandboxed)" preset of ADR 0021
 row D, which a later release adds; it is never a side effect of an approval

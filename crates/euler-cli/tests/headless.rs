@@ -13,6 +13,25 @@ use std::time::{Duration, Instant};
 use euler_event::{object, EventEnvelope, EventKind};
 use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
 
+fn nested_seatbelt_blocks_agent_subprocesses() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", "(version 1) (allow default)", "--", "/usr/bin/true"])
+            .output()
+            .expect("run direct Seatbelt canary");
+        let nested = !output.status.success()
+            && String::from_utf8_lossy(&output.stderr)
+                .contains("sandbox-exec: sandbox_apply: Operation not permitted");
+        if nested {
+            eprintln!("SKIP: enclosing macOS Seatbelt profile blocks nested agent subprocesses");
+        }
+        nested
+    }
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
 #[test]
 fn fixture_loop_writes_jsonl_in_rendered_order() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -74,7 +93,10 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
 }
 
 #[test]
-fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
+fn agent_shell_applies_backend_environment_and_home_isolation() {
+    if nested_seatbelt_blocks_agent_subprocesses() {
+        return;
+    }
     let exe = env!("CARGO_BIN_EXE_euler");
     let user_home = isolated_home();
     let outer_euler_home = tempfile::tempdir().expect("outer Euler home");
@@ -193,6 +215,15 @@ fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
         assert!(
             tool_output.starts_with("exit 127\n") || tool_output.starts_with("exit 126\n"),
             "nested Euler should be unreachable inside the sandbox: {tool_output}"
+        );
+        return;
+    }
+    if backend == "seatbelt" {
+        assert!(tool_output.contains("rust-log=\n"), "{tool_output}");
+        assert!(tool_output.contains("child-home=\n"), "{tool_output}");
+        assert!(
+            !tool_output.starts_with("exit 127\n") && !tool_output.starts_with("exit 126\n"),
+            "nested Euler should remain readable inside Seatbelt: {tool_output}"
         );
         return;
     }
@@ -5639,6 +5670,9 @@ fn diag_reconstruct_final_state_from_capture() {
 
 #[test]
 fn tui_pty_session_grant_keeps_tool_blocks_well_formed() {
+    if nested_seatbelt_blocks_agent_subprocesses() {
+        return;
+    }
     // Review v2 §2/§8: after "allow for session", subsequent shell blocks
     // must still render through the block renderer (header + fold), carry
     // the dim `· session grant` tag instead of fresh decision records, and
@@ -6063,6 +6097,9 @@ fn tui_pty_grow_settles_top_anchored_with_nothing_below_footer() {
 
 #[test]
 fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
+    if nested_seatbelt_blocks_agent_subprocesses() {
+        return;
+    }
     // Resize/repaint dogfood repros 2/4/5: a ctrl+o fold toggle triggers a
     // purge+replay. Toggling right after a resize (before the debounced
     // settled replay has run) must not consume stale geometry, and the

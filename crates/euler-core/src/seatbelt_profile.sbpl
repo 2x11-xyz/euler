@@ -1,0 +1,53 @@
+(version 1)
+
+; Euler's first macOS execution boundary. Keep this policy static: paths enter
+; only through sandbox-exec's -D parameters, so workspace content can never
+; become policy source text.
+(deny default)
+
+; Children inherit the policy. These process and platform queries are needed
+; by ordinary shells, compilers, and language runtimes.
+(allow process-exec)
+(allow process-fork)
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+(allow sysctl-read)
+(allow mach-lookup)
+(allow iokit-open)
+(allow ipc-posix-sem)
+(allow ipc-posix-shm-read-data ipc-posix-shm-write-create ipc-posix-shm-write-unlink)
+(allow pseudo-tty)
+
+; Unit 2B preserves normal toolchain reads. Unit 3 owns a narrower macOS read
+; surface and conformance parity with Linux.
+(allow file-read*)
+(allow file-write-data
+  (require-all
+    (literal "/dev/null")
+    (vnode-type CHARACTER-DEVICE)))
+
+; The workspace is writable except for its Git authority boundary. Both
+; literal and subpath exclusions matter: subpath alone permits first-time
+; creation of .git, while literal alone permits writes beneath it.
+(allow file-write*
+  (require-all
+    (subpath (param "WORKSPACE"))
+    (require-not (literal (param "GIT_METADATA")))
+    (require-not (subpath (param "GIT_METADATA")))
+    (require-not (literal (param "GIT_METADATA_RESOLVED")))
+    (require-not (subpath (param "GIT_METADATA_RESOLVED")))))
+
+; HOME, caches, and TMPDIR all live in this private tree.
+(allow file-write* (subpath (param "SCRATCH")))
+
+; Explicit denies stay last so no broader allowance can reopen Git metadata.
+(deny file-write* (literal (param "GIT_METADATA")))
+(deny file-write* (subpath (param "GIT_METADATA")))
+(deny file-write* (literal (param "GIT_METADATA_RESOLVED")))
+(deny file-write* (subpath (param "GIT_METADATA_RESOLVED")))
+(deny file-write-unlink
+  (require-all
+    (literal (param "WORKSPACE"))
+    (vnode-type DIRECTORY)))
+; There is intentionally no network, system-socket, network-bind, or
+; network-outbound allowance in this profile.
