@@ -6116,18 +6116,19 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
     // settled replay run too.
     tui.resize(24, 72);
     tui.write("\x0f");
-    // Unlike the stable-window toggles above, this wait spans the whole
-    // debounced repaint pipeline: the size change has to be observed, the
-    // toggle's purge+replay has to re-emit a transcript taller than the
-    // screen at the narrowed width, and RESIZE_REPLAY_DEBOUNCE (450ms) then
-    // lands a second purge+replay that resets the quiet interval. The
-    // standard idle-screen ceiling leaves no headroom for that on a loaded
-    // shared runner, which is where this assertion has been observed to
-    // expire (#228). Give it a ceiling sized to the pipeline instead; the
-    // wait still returns as soon as the screen is quiet, so a fast run
-    // never pays it.
+    // Unlike the stable-window toggles above, this wait spans a debounced
+    // repaint pipeline: the size change has to be observed, the toggle's
+    // purge+replay has to re-emit a transcript taller than the screen at the
+    // narrowed width, and the settled replay lands one debounce later,
+    // resetting the quiet interval when it does. RESIZE_REPLAY_SETTLE is that
+    // floor. Measured cost is 240-869ms unloaded and 1040ms worst of 28 runs
+    // at 40x oversubscription (~1.9x the floor), while the shared runner this
+    // expired on (#228) needed more than the 5s idle-screen ceiling, i.e.
+    // upwards of 9x. 16x the floor clears that with margin for a slower
+    // runner and still surfaces a stuck debounce in seconds. The wait returns
+    // as soon as the screen is quiet, so a fast run never pays it.
     assert!(
-        tui.wait_for_stable_screen(Duration::from_secs(20), |screen| {
+        tui.wait_for_stable_screen(RESIZE_REPLAY_SETTLE.saturating_mul(16), |screen| {
             screen.contains("tool-line-15")
         }),
         "post-resize expand did not reveal folded output:\n{}",
@@ -7083,6 +7084,13 @@ struct PtyHarness {
 
 const PTY_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const PTY_QUIET_INTERVAL: Duration = Duration::from_millis(100);
+/// Mirrors `ui::app::RESIZE_REPLAY_DEBOUNCE`.
+const RESIZE_REPLAY_DEBOUNCE: Duration = Duration::from_millis(450);
+/// Floor for a wait that spans a resize's debounced repaint: the settled
+/// replay lands one debounce after the size change, and the screen must then
+/// stay quiet for one interval. Derived from both constants so the ceiling
+/// below cannot drift if either changes.
+const RESIZE_REPLAY_SETTLE: Duration = RESIZE_REPLAY_DEBOUNCE.saturating_add(PTY_QUIET_INTERVAL);
 
 impl PtyHarness {
     fn spawn_with_args(home: &Path, args: &[&str]) -> Self {

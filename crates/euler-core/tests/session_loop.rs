@@ -1202,20 +1202,33 @@ fn lifecycle_barrier_settles_ready_shadow_usage_instead_of_discarding_it() {
     config.auto_compaction.tier = CompactionTier::Off;
     config.compaction_keep_recent = 0;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
-    // The compactor's result is settled work once its physical attempt has
-    // ended, which is the boundary the lifecycle close consumes. A provider
-    // stream that has merely produced its terminal event is two thread hops
-    // short of that, so synchronize on the attempt terminal the runtime
-    // publishes rather than on the fixture's own emission.
+    // Synchronize on the compaction attempt's terminal, not on the fixture's
+    // own emission. `compaction_worker::spawn` wraps the runtime observer and
+    // stores `attempt_terminal_observed` on `Ended` BEFORE forwarding to the
+    // host observer installed here, so by the time this callback runs the
+    // settlement boundary is already published: `cancel_and_recv` then loads
+    // it, takes the blocking receive, and settles the ready result instead of
+    // racing `COMPACTION_CANCEL_GRACE`. Observing `Ended` is therefore
+    // sufficient. A stream that has merely produced its terminal event is two
+    // thread hops short of that boundary, which is what made this test flake.
     let attempt_ended = Arc::clone(&gate);
+    let last_outcome = Arc::new(Mutex::new(None));
+    let observed_outcome = Arc::clone(&last_outcome);
     session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
-        if matches!(
-            &event,
-            ProviderRuntimeEvent::Attempt {
-                target,
-                event: ProviderAttemptEvent::Ended(_),
-            } if target.scope == ProviderRuntimeScope::Compaction
-        ) {
+        let ProviderRuntimeEvent::Attempt {
+            target,
+            event: ProviderAttemptEvent::Ended(summary),
+        } = &event
+        else {
+            return;
+        };
+        if target.scope != ProviderRuntimeScope::Compaction {
+            return;
+        }
+        *observed_outcome.lock().expect("attempt outcome") = Some(summary.outcome);
+        // Release only on a completed attempt: a retried attempt's earlier
+        // terminal must not open the gate on a result that is not there.
+        if summary.outcome == ProviderAttemptOutcome::Completed {
             attempt_ended.mark_completed();
         }
     }));
@@ -1231,7 +1244,8 @@ fn lifecycle_barrier_settles_ready_shadow_usage_instead_of_discarding_it() {
     gate.release();
     assert!(
         gate.wait_until_completed(),
-        "compactor attempt never reached its terminal"
+        "compaction attempt ended as {:?}, expected Completed",
+        *last_outcome.lock().expect("attempt outcome"),
     );
 
     assert_eq!(
