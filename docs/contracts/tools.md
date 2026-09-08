@@ -223,13 +223,13 @@ UI special cases.
 
 ## Execution boundary
 
-On Linux, Bubblewrap is the default and enforced backend for `run_shell` and
-the `git_*` tools (ADR 0021 row A′). The child gets a private root tmpfs, its
+Bubblewrap on Linux and Seatbelt on macOS are the default enforced backends for
+`run_shell` and the `git_*` tools (ADR 0021 rows A and A′). The Linux child gets
+a private root tmpfs, its
 workspace bound read-write at `/workspace`, a private `/tmp`, `/proc` and
 `/dev`, a tmpfs `HOME`, no host network namespace, and a cleared environment.
-Every other platform has no backend yet, so those tools run directly on the
-host under the ordinary permission decision; the Seatbelt backend replaces
-that.
+Unsupported platforms run those tools directly on the host under the ordinary
+permission decision.
 
 Because `HOME` inside the sandbox is a private tmpfs, toolchains installed
 under the real home would otherwise be unreachable. Euler detects the
@@ -254,15 +254,27 @@ masked nor reported — the workspace is readable by design — but its variable
 and `PATH` are re-pointed at the bound workspace path so the toolchain still
 works.
 
+On macOS, Euler hard-pins `/usr/bin/sandbox-exec` and supplies a compiled-in
+deny-default Seatbelt profile through `-p`. The canonical workspace and a
+private scratch tree enter through `-D` parameters. Workspace writes exclude
+the literal `.git` path and everything beneath it; explicit write and unlink
+denies also prevent first-time creation and renaming it out of the carve-out.
+The profile contains no network allowance. It preserves broad filesystem reads
+for tool compatibility; Unit 3 owns a narrower read surface and conformance
+parity with Linux.
+
 Availability is probed at session start by running a trivial sandboxed
-command, because an installed `bwrap` is not evidence that it works. The
-outcome is recorded on `session.start` as `sandbox_backend`
-(`bwrap` | `host` | `unavailable`) with `sandbox_unavailable_reason`. When the
-probe fails, sandbox-requiring tools fail closed with a concise reason; there
-is no automatic fallback to host execution. `euler --check-sandbox` runs the
-same probes and prints the diagnostic, which names the likely cause
-(user namespaces disabled by sysctl or AppArmor, a container, WSL1, `bwrap`
-missing) and the host change that fixes it.
+command, because an installed launcher is not evidence that its profile can be
+applied. The outcome is recorded on `session.start` as `sandbox_backend`
+(`bwrap` | `seatbelt` | `host` | `unavailable`) with
+`sandbox_unavailable_reason`. Every completed `run_shell`, `git_status`, and
+`git_diff` result carries the same `sandbox_backend` for the boundary that ran
+that command; structured tools omit the field. When a required probe fails,
+sandbox-requiring tools fail closed with a concise reason; there is no
+automatic fallback to host execution. `euler --check-sandbox` runs the same
+probes and prints the diagnostic, which names the likely cause (user namespaces
+disabled by sysctl or AppArmor, a container, WSL1, `bwrap` missing, or Seatbelt
+refusing the profile) and the host change that fixes it.
 
 Euler's own Git invocations are neutralized before they run (ADR 0021 row G).
 `git_status` and `git_diff` set `core.hooksPath=/dev/null`,

@@ -2548,9 +2548,8 @@ fn session_start_records_the_probed_sandbox_backend() {
         start.payload.get("sandbox_backend").and_then(Value::as_str),
         Some(expected.backend_label())
     );
-    // macOS has no backend yet, so the honest record is `host`, never a
-    // silent omission that a reader would have to interpret.
-    if !cfg!(target_os = "linux") {
+    // Unsupported platforms record direct host execution explicitly.
+    if !cfg!(any(target_os = "linux", target_os = "macos")) {
         assert_eq!(
             start.payload.get("sandbox_backend").and_then(Value::as_str),
             Some("host")

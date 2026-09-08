@@ -8,13 +8,14 @@ pull requests that landed them; deeper design rationale lives in
 
 ### Subprocess sandboxing
 
-- **Linux: Bubblewrap is now the default and enforced execution boundary for
-  `run_shell` and the `git_*` tools.** The child gets a private root, its
+- **Linux and macOS now have default enforced execution boundaries for
+  `run_shell` and the `git_*` tools: Bubblewrap and Seatbelt, respectively.**
+  On Linux the child gets a private root, its
   workspace bound read-write, private `/tmp` `/proc` `/dev`, a tmpfs `HOME`,
-  no host network namespace, and a cleared environment. macOS is unchanged:
-  no backend exists there yet, so those tools still run on the host under the
-  ordinary permission decision. `SandboxBackend` names both so the Seatbelt
-  backend slots in without touching call sites.
+  no host network namespace, and a cleared environment. On macOS Euler invokes
+  the pinned `/usr/bin/sandbox-exec` with a static deny-default profile. The
+  workspace and a private scratch tree are writable, `.git` is carved out by
+  exact and subpath rules with rename defenses, and network access is denied.
 - Toolchains installed under the real home stay reachable. The toolchain homes
   the host environment implies (`CARGO_HOME`, `RUSTUP_HOME`, `NVM_DIR`,
   `PYENV_ROOT`, `ASDF_DATA_DIR`, `GOPATH`, `PNPM_HOME`, plus `/nix/store`) are
@@ -25,7 +26,9 @@ pull requests that landed them; deeper design rationale lives in
 - Availability is probed at session start by running a trivial sandboxed
   command, because an installed `bwrap` is not evidence that it works. The
   outcome is recorded on `session.start` as `sandbox_backend`
-  (`bwrap` | `host` | `unavailable`) with `sandbox_unavailable_reason`. A
+  (`bwrap` | `seatbelt` | `host` | `unavailable`) with
+  `sandbox_unavailable_reason`. Every completed shell and Git result also
+  records the backend that executed it. A
   failed probe fails sandbox-requiring tools closed — never a silent fallback
   to host execution — and emits a diagnostic naming the likely cause
   (userns disabled by sysctl or AppArmor, a container, WSL1, `bwrap` missing)

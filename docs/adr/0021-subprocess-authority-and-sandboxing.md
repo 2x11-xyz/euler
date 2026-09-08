@@ -4,8 +4,10 @@
 
 Accepted (2026-09-06). Supersedes the fail-closed posture declared by the
 ADR 0014 amendment proposed in PR #217; ADR 0014 remains the record of the
-original Linux sandbox. Implementation is staged in the units listed under
-Consequences; none had landed when this was accepted.
+original Linux sandbox. The prerequisite, Unit 1, and the Linux and macOS
+backend portions of Unit 2 have shipped. Network and environment policy, host
+mode, approval shape, and the final shipped-state record remain staged in the
+units listed under Consequences.
 
 ## Context
 

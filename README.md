@@ -71,13 +71,15 @@ cargo build --release
 
 Rust 1.80+ recommended. Linux and macOS.
 
-**On Linux, shell and Git tools run inside a Bubblewrap sandbox by default.**
-Install `bwrap` (`sudo apt install bubblewrap`) and make sure unprivileged user
-namespaces are permitted; if they are not, those tools fail closed rather than
-running unconfined. Run `euler --check-sandbox` to see the backend Euler would
-use here and, when there is none, exactly what to change. macOS has no sandbox
-backend yet: there, shell and Git tools run on the host under the ordinary
-permission prompts.
+**Shell and Git tools run inside an enforced sandbox by default:** Bubblewrap
+on Linux and Seatbelt on macOS. Install `bwrap` on Linux
+(`sudo apt install bubblewrap`) and make sure unprivileged user namespaces are
+permitted. macOS uses the system `/usr/bin/sandbox-exec`. If the required
+backend cannot be applied, those tools fail closed rather than running
+unconfined. Run `euler --check-sandbox` to see the backend Euler would use and,
+when it is unavailable, exactly what to change. The first macOS profile blocks
+writes outside the workspace and all network access, but preserves broad host
+filesystem reads for tool compatibility; Unit 3 will narrow that read surface.
 
 ## Authenticate
 

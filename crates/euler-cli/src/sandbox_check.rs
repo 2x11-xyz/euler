@@ -26,7 +26,7 @@ this platform has no sandbox backend yet."
     // about: the result can differ between workspaces.
     let root = std::env::current_dir()?;
     let status = match backend {
-        SandboxStatus::Enforced => probe_workspace_sandbox(&root),
+        SandboxStatus::Enforced(_) => probe_workspace_sandbox(&root),
         other => other,
     };
     writeln!(
@@ -54,7 +54,7 @@ mod tests {
         let stdout = String::from_utf8(stdout).expect("utf-8 report");
 
         assert!(stdout.starts_with("sandbox backend: "), "{stdout}");
-        if cfg!(target_os = "linux") {
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
             // Enforced on a userns-capable host, an actionable diagnostic
             // otherwise; never a silent success with no backend.
             if result.is_err() {

@@ -14,17 +14,19 @@ cargo build --release
 Use `./target/release/euler` in the examples below, or put it on your `PATH` as
 `euler`.
 
-On Linux, install Bubblewrap (`sudo apt install bubblewrap`) — `run_shell` and
-the `git_*` tools run inside it by default and fail closed without it — and
-check the boundary before your first session:
+On Linux, install Bubblewrap (`sudo apt install bubblewrap`). On macOS, Euler
+uses the system Seatbelt launcher. `run_shell` and the `git_*` tools run inside
+the platform backend by default and fail closed when it cannot be applied.
+Check the boundary before your first session:
 
 ```sh
 euler --check-sandbox
 ```
 
-If it reports `unavailable`, the diagnostic names the cause (usually
-unprivileged user namespaces disabled by a sysctl or by AppArmor) and the
-command that fixes it. macOS has no sandbox backend yet and reports `host`.
+If it reports `unavailable`, the diagnostic names the cause and the host
+change that fixes it. Common Linux causes are unprivileged user namespaces
+disabled by a sysctl or AppArmor; on macOS another application sandbox can
+prevent Seatbelt from nesting.
 
 ## Authenticate
 

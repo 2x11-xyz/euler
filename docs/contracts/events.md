@@ -414,6 +414,11 @@ extension error does not consume the later result.
   fits, so a later secret-scrub rewrite cannot bypass the projection bound.
   Large `output` strings are content-addressed in the durable log and
   rehydrated at the session boundary.
+  Optional `sandbox_backend` is `bwrap`, `seatbelt`, or `host` on completed
+  `run_shell`, `git_status`, and `git_diff` results and records the execution
+  boundary that ran that command. Structured tools omit it because they did
+  not launch a subprocess. It is per-command provenance; readers must not
+  substitute the session-start backend when an older result omits it.
   Optional `project_context_snapshot_digest` is the candidate digest of the
   immutable project-context snapshot from which this result derived bytes.
   It classifies `skill_read` and every `tool_result_get` rehydration of a
@@ -772,13 +777,15 @@ extension error does not consume the later result.
   how the session was launched for discovery/resume UI grouping only. Omitted
   means unknown/legacy and must not affect resume authority or canvas content.
   `sandbox_backend` records the execution boundary agent subprocesses actually
-  got, probed at session start rather than assumed (ADR 0021 row A′): `bwrap`
-  (Linux Bubblewrap enforced), `host` (no backend on this platform;
-  subprocesses run under the permission decision), or `unavailable` (a backend
-  was required but could not be enforced, so sandbox-requiring tools fail
-  closed). The companion `sandbox_unavailable_reason` is `null` unless the
-  backend is `unavailable`, and is then one of `unsupported_platform`,
-  `bubblewrap_missing`, `cannot_enforce`, `invalid_workspace`. Current writers
+  got, probed at session start rather than assumed (ADR 0021 rows A and A′):
+  `bwrap` (Linux Bubblewrap enforced), `seatbelt` (macOS Seatbelt enforced),
+  `host` (no backend on this platform; subprocesses run under the permission
+  decision), or `unavailable` (a backend was required but could not be
+  enforced, so sandbox-requiring tools fail closed). The companion
+  `sandbox_unavailable_reason` is `null` unless the backend is `unavailable`,
+  and is then one of `unsupported_platform`, `bubblewrap_missing`,
+  `seatbelt_missing`, `git_metadata_symlink`, `cannot_enforce`,
+  `invalid_workspace`. Current writers
   always emit both; they are omitted only in streams written before this
   release, where omission means unknown, never `host`. They are provenance for
   the session that produced the stream, and `session.resumed` carries the same
