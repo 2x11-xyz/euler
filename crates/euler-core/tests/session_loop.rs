@@ -1244,7 +1244,7 @@ fn lifecycle_barrier_settles_ready_shadow_usage_instead_of_discarding_it() {
     gate.release();
     assert!(
         gate.wait_until_completed(),
-        "compaction attempt ended as {:?}, expected Completed",
+        "compaction attempt did not complete; last terminal outcome: {:?}",
         *last_outcome.lock().expect("attempt outcome"),
     );
 
