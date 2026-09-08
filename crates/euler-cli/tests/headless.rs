@@ -93,7 +93,7 @@ fn fixture_loop_writes_jsonl_in_rendered_order() {
 }
 
 #[test]
-fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
+fn agent_shell_applies_backend_environment_and_home_isolation() {
     if nested_seatbelt_blocks_agent_subprocesses() {
         return;
     }
@@ -215,6 +215,15 @@ fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
         assert!(
             tool_output.starts_with("exit 127\n") || tool_output.starts_with("exit 126\n"),
             "nested Euler should be unreachable inside the sandbox: {tool_output}"
+        );
+        return;
+    }
+    if backend == "seatbelt" {
+        assert!(tool_output.contains("rust-log=\n"), "{tool_output}");
+        assert!(tool_output.contains("child-home=\n"), "{tool_output}");
+        assert!(
+            !tool_output.starts_with("exit 127\n") && !tool_output.starts_with("exit 126\n"),
+            "nested Euler should remain readable inside Seatbelt: {tool_output}"
         );
         return;
     }
