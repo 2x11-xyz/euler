@@ -1202,6 +1202,36 @@ fn lifecycle_barrier_settles_ready_shadow_usage_instead_of_discarding_it() {
     config.auto_compaction.tier = CompactionTier::Off;
     config.compaction_keep_recent = 0;
     let mut session = Session::new(config, provider, ScriptedDecider::new(vec![]));
+    // Synchronize on the compaction attempt's terminal, not on the fixture's
+    // own emission. `compaction_worker::spawn` wraps the runtime observer and
+    // stores `attempt_terminal_observed` on `Ended` BEFORE forwarding to the
+    // host observer installed here, so by the time this callback runs the
+    // settlement boundary is already published: `cancel_and_recv` then loads
+    // it, takes the blocking receive, and settles the ready result instead of
+    // racing `COMPACTION_CANCEL_GRACE`. Observing `Ended` is therefore
+    // sufficient. A stream that has merely produced its terminal event is two
+    // thread hops short of that boundary, which is what made this test flake.
+    let attempt_ended = Arc::clone(&gate);
+    let last_outcome = Arc::new(Mutex::new(None));
+    let observed_outcome = Arc::clone(&last_outcome);
+    session.set_provider_runtime_observer(ProviderRuntimeObserver::new(move |event| {
+        let ProviderRuntimeEvent::Attempt {
+            target,
+            event: ProviderAttemptEvent::Ended(summary),
+        } = &event
+        else {
+            return;
+        };
+        if target.scope != ProviderRuntimeScope::Compaction {
+            return;
+        }
+        *observed_outcome.lock().expect("attempt outcome") = Some(summary.outcome);
+        // Release only on a completed attempt: a retried attempt's earlier
+        // terminal must not open the gate on a result that is not there.
+        if summary.outcome == ProviderAttemptOutcome::Completed {
+            attempt_ended.mark_completed();
+        }
+    }));
 
     session
         .run_turn(&format!("read, then finish {}", "x".repeat(20_000)))
@@ -1212,7 +1242,11 @@ fn lifecycle_barrier_settles_ready_shadow_usage_instead_of_discarding_it() {
     );
     assert!(gate.wait_until_started(), "compactor never reached gate");
     gate.release();
-    assert!(gate.wait_until_completed(), "compactor never completed");
+    assert!(
+        gate.wait_until_completed(),
+        "compaction attempt did not complete; last terminal outcome: {:?}",
+        *last_outcome.lock().expect("attempt outcome"),
+    );
 
     assert_eq!(
         session
@@ -7173,8 +7207,8 @@ impl ModelProvider for ShadowBlockingProvider {
         if request.tools.is_empty() {
             self.gate.mark_started();
             self.gate.wait_for_release();
-            return Ok(Box::new(ShadowCompletionStream {
-                events: vec![
+            return Ok(Box::new(
+                vec![
                     Ok(ModelStreamEvent::TextDelta(test_projection().to_json())),
                     Ok(ModelStreamEvent::Finished {
                         stop_reason: StopReason::Completed,
@@ -7182,8 +7216,7 @@ impl ModelProvider for ShadowBlockingProvider {
                     }),
                 ]
                 .into_iter(),
-                gate: Arc::clone(&self.gate),
-            }));
+            ));
         }
         let call = self.root_calls.fetch_add(1, Ordering::SeqCst);
         let events = if call == 0 {
@@ -7208,23 +7241,6 @@ impl ModelProvider for ShadowBlockingProvider {
             ]
         };
         Ok(Box::new(events.into_iter()))
-    }
-}
-
-struct ShadowCompletionStream {
-    events: std::vec::IntoIter<Result<ModelStreamEvent, ProviderError>>,
-    gate: Arc<ShadowGate>,
-}
-
-impl Iterator for ShadowCompletionStream {
-    type Item = Result<ModelStreamEvent, ProviderError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let event = self.events.next()?;
-        if matches!(&event, Ok(ModelStreamEvent::Finished { .. })) {
-            self.gate.mark_completed();
-        }
-        Some(event)
     }
 }
 
