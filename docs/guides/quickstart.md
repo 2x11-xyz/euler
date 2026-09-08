@@ -14,6 +14,18 @@ cargo build --release
 Use `./target/release/euler` in the examples below, or put it on your `PATH` as
 `euler`.
 
+On Linux, install Bubblewrap (`sudo apt install bubblewrap`) — `run_shell` and
+the `git_*` tools run inside it by default and fail closed without it — and
+check the boundary before your first session:
+
+```sh
+euler --check-sandbox
+```
+
+If it reports `unavailable`, the diagnostic names the cause (usually
+unprivileged user namespaces disabled by a sysctl or by AppArmor) and the
+command that fixes it. macOS has no sandbox backend yet and reports `host`.
+
 ## Authenticate
 
 Euler has one browser/OAuth login path today: ChatGPT.

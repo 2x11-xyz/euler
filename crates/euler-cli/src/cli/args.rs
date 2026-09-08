@@ -201,6 +201,7 @@ pub(crate) struct RawArgs {
     pub(crate) login: bool,
     pub(crate) logout: bool,
     pub(crate) auth_status: bool,
+    pub(crate) check_sandbox: bool,
     pub(crate) models: bool,
     pub(crate) models_command: ModelsCommand,
     pub(crate) extension: Option<ExtensionArgs>,
@@ -233,6 +234,7 @@ impl RawArgs {
             && !self.login
             && !self.logout
             && !self.auth_status
+            && !self.check_sandbox
             && !self.models
             && self.extension.is_none()
             && self.replay_path.is_none()

@@ -493,6 +493,7 @@ pub(crate) fn tool_result_payload(
     if let Some(exit_code) = execution.exit_code {
         payload.insert("exit_code".to_owned(), exit_code.into());
     }
+    insert_observation(&mut payload, execution);
     // Reaching this builder means the executor returned a completed
     // ToolExecution. That is distinct from the process outcome: a nonzero
     // exit makes the canonical tool operation fail while its output and exit
@@ -508,6 +509,24 @@ pub(crate) fn tool_result_payload(
         );
     }
     payload
+}
+
+/// Record an incomplete workspace observation as a status of its own
+/// (ADR 0021 row E). It is deliberately not folded into `ok`: the command's
+/// own success is a separate fact, and an unobserved workspace must not be
+/// reported as an unchanged one either way.
+fn insert_observation(payload: &mut JsonObject, execution: &ToolExecution) {
+    let Some(observation) = execution.observation else {
+        return;
+    };
+    payload.insert(
+        "observation".to_owned(),
+        serde_json::json!({
+            "status": "incomplete",
+            "reason": observation.reason.as_str(),
+            "bound": observation.bound,
+        }),
+    );
 }
 
 pub(crate) fn tool_cancelled_payload(
@@ -528,6 +547,7 @@ pub(crate) fn tool_cancelled_payload(
             "output".to_owned(),
             redactor.redact(&execution.output).into(),
         );
+        insert_observation(&mut payload, execution);
         if let Some(exit_code) = execution.exit_code {
             payload.insert("exit_code".to_owned(), exit_code.into());
         }

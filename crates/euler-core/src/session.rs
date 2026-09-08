@@ -22,7 +22,7 @@ use crate::provider_runtime::{
 };
 use crate::redaction::SecretRedactor;
 use crate::runtime_identity::RuntimeIdentity;
-use crate::sandbox::SubprocessSandbox;
+use crate::sandbox::{SandboxStatus, SubprocessSandbox};
 use crate::session_kind::SessionKind;
 use crate::session_name::{session_renamed_event, validate_session_name_for_write};
 use crate::session_root::session_root_for_event;
@@ -270,7 +270,7 @@ impl SessionConfig {
             model: "fixture".to_owned(),
             reasoning_effort: ReasoningEffort::Medium,
             root: root.into(),
-            subprocess_sandbox: SubprocessSandbox::Disabled,
+            subprocess_sandbox: SubprocessSandbox::default(),
             max_tool_rounds: None,
             provider_transport_retries: 2,
             provider_transport_retry_backoff_ms: vec![1000, 3000],
@@ -1314,7 +1314,11 @@ impl<D> Session<D> {
         }
         let active_target = ModelTarget::new(config.provider.clone(), config.model.clone());
         let mut bus = EventBus::new();
-        push_session_bootstrap(&mut bus, &config, session_start_payload(&config));
+        push_session_bootstrap(
+            &mut bus,
+            &config,
+            session_start_payload(&config, tools.sandbox_status()),
+        );
         // The session inherits the startup redactor that was constructed and
         // seeded before project-context discovery ran; without a bootstrap
         // the environment-seeded redactor is built here as before.
@@ -5854,9 +5858,25 @@ fn record_unseen_instructions(
     }
 }
 
+impl<D: PermissionDecider> Session<D> {
+    /// The execution boundary this session's agent subprocesses get, as
+    /// recorded on `session.start`. Front ends surface its diagnostic once at
+    /// startup, so an unavailable sandbox is not first discovered as a terse
+    /// failure on the agent's first command.
+    pub fn sandbox_status(&self) -> SandboxStatus {
+        self.tools.sandbox_status()
+    }
+
+    /// Things the sandbox profile can see but cannot fix, surfaced once at
+    /// startup beside its diagnostic.
+    pub fn sandbox_advisories(&self) -> Vec<String> {
+        self.tools.sandbox_advisories()
+    }
+}
+
 /// The `session.start` payload for a fresh session, including the compact
 /// project-context summary when a bootstrap is configured.
-fn session_start_payload(config: &SessionConfig) -> JsonObject {
+fn session_start_payload(config: &SessionConfig, sandbox: SandboxStatus) -> JsonObject {
     let mut payload = object([
         ("provider", config.provider.clone().into()),
         ("model", config.model.clone().into()),
@@ -5912,6 +5932,7 @@ fn session_start_payload(config: &SessionConfig) -> JsonObject {
         ),
         ("root", session_root_for_event(&config.root).into()),
     ]);
+    payload.extend(sandbox_start_fields(sandbox));
     if let Some(bootstrap) = &config.project_context {
         payload.insert(
             "project_context".to_owned(),
@@ -5935,6 +5956,21 @@ fn session_start_payload(config: &SessionConfig) -> JsonObject {
         serde_json::to_value(runtime).expect("runtime identity serializes"),
     );
     payload
+}
+
+/// The execution boundary agent subprocesses actually got, probed rather than
+/// assumed (ADR 0021 row A′). `unavailable` means sandbox-requiring tools fail
+/// closed for this session; it is never a silent downgrade to host execution.
+fn sandbox_start_fields(sandbox: SandboxStatus) -> JsonObject {
+    object([
+        ("sandbox_backend", sandbox.backend_label().into()),
+        (
+            "sandbox_unavailable_reason",
+            sandbox
+                .reason()
+                .map_or(Value::Null, |reason| reason.as_str().into()),
+        ),
+    ])
 }
 
 /// Push the fresh-session bootstrap into the bus: `session.start`, then —

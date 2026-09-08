@@ -79,7 +79,7 @@ fn requested_but_invalid_profile_fails_closed_before_shell_execution() {
         .expect_err("unavailable sandbox must not fall back to host shell");
 
     assert!(
-        matches!(error, ToolError::SandboxUnavailable(reason) if reason == expected),
+        matches!(error, ToolError::SandboxUnavailable { reason, .. } if reason == expected),
         "run_shell must refuse with the sandbox's own reason, got: {error:?}"
     );
 }
@@ -133,11 +133,11 @@ fn selected_workspace_profile_routes_shell_and_git_or_fails_closed() {
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 shell,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
             assert!(matches!(
                 git,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }
@@ -174,7 +174,7 @@ fn sandboxed_shell_uses_only_the_profile_environment() {
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 result,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }
@@ -224,7 +224,7 @@ fn sandboxed_shell_cannot_read_an_inherited_host_descriptor() {
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 result,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }
@@ -232,7 +232,7 @@ fn sandboxed_shell_cannot_read_an_inherited_host_descriptor() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn sandboxed_git_cannot_read_an_inherited_host_descriptor() {
+fn sandboxed_agent_git_cannot_read_an_inherited_host_descriptor() {
     let temp = tempfile::tempdir().expect("temp dir");
     let workspace = temp.path().join("workspace");
     let outside = temp.path().join("outside");
@@ -281,29 +281,89 @@ fn sandboxed_git_cannot_read_an_inherited_host_descriptor() {
     let availability = registry
         .sandbox_availability()
         .expect("sandbox was requested");
-    let result = registry.execute("git_status", &json!({}));
+    // Git the agent runs itself, not Euler's `git_status`: ADR 0021 row G
+    // neutralizes repository-selected helpers for Euler's own invocations, so
+    // the sandbox is what has to hold for an agent-run one. That makes this
+    // the case where a repository-controlled program really does execute
+    // inside git, which is what an inherited descriptor would leak through.
+    let result = registry.execute("run_shell", &json!({"command": "git status --short"}));
 
     match availability {
         SandboxAvailability::Enforced(_) => {
-            let execution = result.expect("sandboxed direct git");
+            let execution = result.expect("sandboxed agent git");
             assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
             assert_eq!(
                 fs::read_to_string(workspace.join("fsmonitor-invoked"))
-                    .expect("direct git invoked fsmonitor"),
+                    .expect("agent-run git invoked fsmonitor"),
                 "invoked"
             );
             assert!(
                 !workspace.join("git-fd-leak").exists(),
-                "direct git read an inherited host descriptor"
+                "agent-run git read an inherited host descriptor"
             );
         }
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 result,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }
+}
+
+/// The companion to the test above: Euler's own `git_status` must not run the
+/// same repository-selected helper at all (ADR 0021 row G).
+#[cfg(target_os = "linux")]
+#[test]
+fn sandboxed_direct_git_does_not_run_a_repository_selected_fsmonitor() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&workspace)
+        .status()
+        .expect("git available for git_status tool");
+    assert!(initialized.success(), "initialize workspace repository");
+    let fsmonitor = workspace.join("fsmonitor");
+    fs::write(
+        &fsmonitor,
+        "#!/bin/sh\nprintf invoked > /workspace/fsmonitor-invoked\n\
+         printf 'version 2\\n'\nprintf 'token\\n'\n",
+    )
+    .expect("write fsmonitor hook");
+    let mut permissions = fs::metadata(&fsmonitor)
+        .expect("fsmonitor metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fsmonitor, permissions).expect("make fsmonitor executable");
+    let configured = std::process::Command::new("git")
+        .args(["config", "core.fsmonitor", "/workspace/fsmonitor"])
+        .current_dir(&workspace)
+        .status()
+        .expect("configure fsmonitor hook");
+    assert!(configured.success(), "configure fsmonitor hook");
+
+    let registry = ToolRegistry::with_subprocess_sandbox(
+        &workspace,
+        SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork),
+    );
+    if !registry
+        .sandbox_availability()
+        .expect("sandbox was requested")
+        .is_enforced()
+    {
+        return;
+    }
+    let execution = registry
+        .execute("git_status", &json!({}))
+        .expect("sandboxed direct git");
+
+    assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
+    assert!(
+        !workspace.join("fsmonitor-invoked").exists(),
+        "direct git ran a repository-selected fsmonitor helper"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -323,7 +383,7 @@ fn sandboxed_shell_cannot_use_an_inherited_host_socket() {
         let result = registry.execute("run_shell", &json!({"command": "printf should-not-run"}));
         assert!(matches!(
             result,
-            Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+            Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
         ));
         return;
     }
@@ -403,7 +463,7 @@ fn sandboxed_shell_timeout_kills_the_bubblewrap_process_group() {
         SandboxAvailability::Unavailable(reason) => {
             assert!(matches!(
                 result,
-                Err(ToolError::SandboxUnavailable(actual)) if actual == reason
+                Err(ToolError::SandboxUnavailable { reason: actual, .. }) if actual == reason
             ));
         }
     }

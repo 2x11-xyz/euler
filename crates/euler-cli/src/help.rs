@@ -97,6 +97,7 @@ Options:
 --replay <path>            Render an existing provenance log and exit
   --resume <path>            Resume a session from a provenance log
   --no-tty                   Never launch the TUI; stay line-oriented
+  --check-sandbox            Report the subprocess sandbox backend and exit
 {HELP_LINE}"
     )
 }

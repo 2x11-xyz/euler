@@ -4,14 +4,14 @@ Baseline: `9dfb881`. All fixtures are synthetic. The observations below must be 
 
 ## Root probes
 
-- `uniq input output` is statically approved under ShellExec=Ask, performs a write even with FsWrite=AlwaysDeny, and bypasses a denying decider. Static command safety needs command-specific argument semantics.
-- Globs, changed cwd, and `rg --follow` pass the static path check yet read a synthetic outside file through symlinks. The direct literal symlink path correctly fails. Do not generalize the measured `rg` behavior to macOS `grep -R`, which did not reproduce it.
-- Prepared creates and edits overwrite intervening user changes; apply-time preimage/no-clobber validation is missing.
+- Retired (F01, #226): `uniq input output` was statically approved under ShellExec=Ask, performed a write even with FsWrite=AlwaysDeny, and bypassed a denying decider. The two-parser approval grammar now routes it to the decider.
+- Retired (F02, #226): globs, changed cwd, and `rg --follow` passed the static path check yet read a synthetic outside file through symlinks; these commands are no longer statically approved. Do not generalize the measured `rg` behavior to macOS `grep -R`, which did not reproduce it.
+- Retired (F04 / F36, #227): prepared creates and edits overwrote intervening user changes. Apply now fails with `FileAlreadyExists` / `StalePreparedWrite`.
 - Reusing a provider tool call ID in a later round leaves both durable results but hides the second result from canvas. Pair by canonical call identity/model round.
 - Session grant revocation is in-memory only and the historical allow revives on resume.
-- An empty MaxTokens stop fails the turn and then causes DuplicateModelTerminal on resume; a partial MaxTokens stop returns normal completion. The latter is an outcome/API design gap unless a binding contract establishes stricter behavior.
+- An empty MaxTokens stop fails the turn and then causes DuplicateModelTerminal on resume; a partial MaxTokens stop returns normal completion (since #218, a `run.terminal` with status `completed`). The latter is an outcome/API design gap unless a binding contract establishes stricter behavior.
 - A torn UTF-8 tail blocks full replay/resume even though query pagination returns the valid complete prefix.
-- Partial streamed text survives in memory but is absent from durable provenance after transport failure.
+- Retired (F10, #216): partial streamed text survived in memory but was absent from durable provenance after transport failure; the partial response is now durably recorded.
 
 ## Context and agents
 

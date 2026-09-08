@@ -162,14 +162,41 @@ fn agent_shell_isolates_nested_euler_home_and_preserves_rust_log() {
     );
 
     let events = read_jsonl(&log);
+    let backend = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_START)
+        .and_then(|event| event.payload.get("sandbox_backend"))
+        .and_then(serde_json::Value::as_str)
+        .expect("session.start records the execution boundary")
+        .to_owned();
     let tool_output = events
         .iter()
         .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
         .and_then(|event| event.payload.get("output"))
         .and_then(serde_json::Value::as_str)
         .expect("nested Euler tool output");
-    assert!(tool_output.contains("rust-log=project_under_test=trace"));
+    // A nested Euler must never fall through to the user's `$HOME/.euler`.
+    // The two backends establish that differently, so assert the one that
+    // actually ran rather than the one the platform suggests.
     assert!(!tool_output.contains("default-only-extension"));
+    if backend == "bwrap" {
+        // The enforced profile clears the environment outright, so there is
+        // no inherited `RUST_LOG` and no `EULER_HOME` to fall through from.
+        // The `printf` is a shell builtin, so these two lines are positive
+        // evidence that the sandboxed command really ran — without them the
+        // branch would pass on a command that never executed at all.
+        assert!(tool_output.contains("rust-log=\n"), "{tool_output}");
+        assert!(tool_output.contains("child-home=\n"), "{tool_output}");
+        // The nested Euler is outside every mount the profile makes, so it is
+        // not merely unconfigured but unreachable. That is the isolation this
+        // backend provides, and a nonzero exit is what proves it was tried.
+        assert!(
+            tool_output.starts_with("exit 127\n") || tool_output.starts_with("exit 126\n"),
+            "nested Euler should be unreachable inside the sandbox: {tool_output}"
+        );
+        return;
+    }
+    assert!(tool_output.contains("rust-log=project_under_test=trace"));
     let child_home = tool_output
         .lines()
         .find_map(|line| line.strip_prefix("child-home="))

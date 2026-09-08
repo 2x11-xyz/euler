@@ -1,7 +1,7 @@
 //! Workspace file listing for `@` mentions (gitignore-respected).
 
+use euler_core::host_git_command;
 use std::path::Path;
-use std::process::Command;
 
 const MAX_WORKSPACE_FILES: usize = 2_000;
 
@@ -16,19 +16,22 @@ pub fn list_workspace_files(root: &Path) -> Vec<String> {
     walk_workspace_files(root)
 }
 
+/// The picker runs on a user keypress in a repository the agent can write, so
+/// it is as reachable as the tools are: it goes through the same neutralization
+/// (ADR 0021 row G), not a bare `git`.
 fn git_ls_files(root: &Path) -> Option<Vec<String>> {
-    let output = Command::new("git")
-        .args(["-C"])
-        .arg(root)
-        .args([
+    let output = host_git_command(
+        root,
+        &[
             "ls-files",
             "-z",
             "--cached",
             "--others",
             "--exclude-standard",
-        ])
-        .output()
-        .ok()?;
+        ],
+    )
+    .output()
+    .ok()?;
     if !output.status.success() {
         return None;
     }
@@ -147,6 +150,64 @@ mod tests {
         ];
         let hits = filter_workspace_files(&files, "app.rs");
         assert_eq!(hits[0], "crates/euler-cli/src/ui/app.rs");
+    }
+
+    /// ADR 0021 row G: the picker runs `git ls-files` on a user keypress in a
+    /// repository the agent can write. A repository-selected `core.fsmonitor`
+    /// helper must not execute — `core.hooksPath=/dev/null` does not stop that
+    /// one, only the fsmonitor override does.
+    #[test]
+    fn the_picker_does_not_run_a_repository_selected_fsmonitor_helper() {
+        let Some(temp) = git_repository_fixture() else {
+            return;
+        };
+        let root = temp.path();
+        let helper = root.join("fsmonitor-helper");
+        fs::write(&helper, "#!/bin/sh\ntouch fsmonitor-ran\nexit 1\n").expect("helper");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).expect("helper mode");
+        }
+        run_git(root, &["config", "core.fsmonitor", "./fsmonitor-helper"]);
+
+        let files = list_workspace_files(root);
+
+        assert!(
+            !root.join("fsmonitor-ran").exists(),
+            "picker ran a repository-selected fsmonitor helper: {files:?}"
+        );
+        assert!(files.contains(&"tracked.txt".to_owned()), "{files:?}");
+    }
+
+    fn git_repository_fixture() -> Option<tempfile::TempDir> {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return None;
+        }
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        run_git(root, &["init", "--quiet"]);
+        run_git(root, &["config", "user.email", "euler@example.invalid"]);
+        run_git(root, &["config", "user.name", "Euler"]);
+        fs::write(root.join("tracked.txt"), "original\n").expect("tracked file");
+        run_git(root, &["add", "tracked.txt"]);
+        run_git(root, &["commit", "--quiet", "-m", "seed"]);
+        Some(temp)
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git fixture command");
+        assert!(status.success(), "git {args:?}");
     }
 
     #[test]

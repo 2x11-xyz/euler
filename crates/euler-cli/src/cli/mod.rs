@@ -83,6 +83,7 @@ pub(crate) fn run() -> Result<()> {
         Command::Login(login) => login_chatgpt(login),
         Command::Logout(logout) => logout_chatgpt(logout),
         Command::AuthStatus => print_auth_status(),
+        Command::CheckSandbox => crate::sandbox_check::check_sandbox(io::stdout(), io::stderr()),
         Command::Models(ModelsCommand::List) => model_catalog::print_model_catalog(
             model_catalog::default_model_catalog_path().as_deref(),
             provider_config_runtime::default_provider_config_path().as_deref(),

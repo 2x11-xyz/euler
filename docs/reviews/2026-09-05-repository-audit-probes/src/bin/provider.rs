@@ -33,7 +33,8 @@ fn main() {
     let cp_content = format!("host = {tainted}\n");
     let cp_hash =
         euler_core::checkpoints::store_pre_image(cp_workspace.path(), "conf.toml", &cp_content)
-            .unwrap();
+            .unwrap()
+            .expect("fixture pre-image is checkpoint-safe and non-empty");
     println!("checkpoint known-taint: redactor_detects={}, heuristic_accepts={}, stored_bytes_retain_known_value={}", !known.detect(&cp_content).is_empty(), euler_core::file_diff::content_is_checkpoint_safe("conf.toml", &cp_content), euler_core::checkpoints::load_pre_image(cp_workspace.path(), &cp_hash).unwrap().contains(tainted));
 
     let workspace = tempfile::tempdir().unwrap();
@@ -45,7 +46,8 @@ fn main() {
         "conf.toml",
         &format!("host = {value}\n"),
     )
-    .unwrap();
+    .unwrap()
+    .expect("fixture pre-image is checkpoint-safe and non-empty");
     for (dir, session) in [
         (session_a.path(), "session-a"),
         (session_b.path(), "session-b"),

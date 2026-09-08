@@ -68,6 +68,9 @@ pub(crate) enum Command {
     Login(LoginArgs),
     Logout(LogoutArgs),
     AuthStatus,
+    /// Report the execution boundary agent subprocesses would get here, with
+    /// the actionable diagnostic when there is none (ADR 0021 row A′).
+    CheckSandbox,
     Models(ModelsCommand),
     Extension(ExtensionArgs),
     Scrub(ScrubArgs),
@@ -246,6 +249,8 @@ fn build_command_from_parsed(
     } else if parsed.auth_status {
         build_auth_status_args(parsed)?;
         Command::AuthStatus
+    } else if parsed.check_sandbox {
+        Command::CheckSandbox
     } else if parsed.models {
         build_models_args(parsed)?;
         Command::Models(parsed.models_command)
