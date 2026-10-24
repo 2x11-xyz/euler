@@ -67,6 +67,7 @@ fn subcommand_help(name: &str) -> Option<String> {
         "auth" => Some(AUTH_HELP.to_owned()),
         "models" => Some(MODELS_HELP.to_owned()),
         "extension" => Some(EXTENSION_HELP.to_owned()),
+        "scrub" => Some(SCRUB_HELP.to_owned()),
         _ => None,
     }
 }
@@ -90,6 +91,7 @@ Subcommands:
   auth status     Show stored credential status
   models          List the offline catalog; `models refresh` checks GitHub
   extension       Manage and run extensions
+  scrub           Remove credential values from a closed session
   help            Show help for a subcommand
 
 Options:
@@ -192,6 +194,19 @@ List the offline provider catalog, or verify and cache the latest GitHub release
 
 Usage: euler models
        euler models refresh
+
+Options:
+  -h, --help                 Show this help
+";
+
+const SCRUB_HELP: &str = "\
+Remove credential values from a closed session's persistent data.
+
+Usage: printf '%s\\n' \"$SECRET\" | euler scrub <session>
+
+<session> is a session id or name. Values are read from stdin, one per line;
+they are never accepted as arguments because command lines can be recorded.
+Blank lines are ignored; each value must be at least 4 bytes long.
 
 Options:
   -h, --help                 Show this help

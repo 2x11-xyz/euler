@@ -12,6 +12,7 @@ const SUBCOMMANDS: &[&str] = &[
     "auth",
     "models",
     "extension",
+    "scrub",
 ];
 
 fn euler(args: &[&str]) -> Output {
