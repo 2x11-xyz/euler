@@ -352,7 +352,7 @@ fn bounded_text(text: &str, max_bytes: usize) -> String {
 /// thresholds stated here are duplicated — and enforced — in
 /// [`apply_guardian_policy`].
 const GUARDIAN_SYSTEM_PROMPT: &str = "\
-You are Euler's permission guardian. The coding agent has asked to perform \
+You are Euler's permission guardian. The agent has asked to perform \
 one action that requires approval, and you review that ask in place of the \
 human operator. You cannot run tools and you hold no capabilities; your only \
 output is a verdict.

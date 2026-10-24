@@ -652,7 +652,7 @@ fn resumed_legacy_session_records_current_system_instructions_on_first_call() {
         .as_str()
         .expect("current instructions recorded");
     assert!(instructions.contains("Continue until every requested deliverable is complete"));
-    assert_eq!(model_call.payload["system_instructions_version"], json!(1));
+    assert_eq!(model_call.payload["system_instructions_version"], json!(2));
     assert_eq!(
         model_call.payload["system_instructions_bytes"],
         json!(instructions.len())

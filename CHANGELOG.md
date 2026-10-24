@@ -210,6 +210,14 @@ pull requests that landed them; deeper design rationale lives in
   driver with a concurrent shadow terminalizes and fences both calls, so
   neither provider's late return can append events or swap the canvas.
 
+### Research-neutral core prompts
+
+- The fixed root instructions now introduce Euler as a research and coding
+  agent rather than a coding agent, matching `docs/vision.md`.
+  `system_instructions_version` is now `2`, so provenance distinguishes calls
+  made under the new text. The shadow compactor and permission guardian
+  prompts no longer assume a coding task.
+
 ### Extension workflow scaffolding
 
 - Extension commands can declare bounded model tools and one terminal-idle

@@ -60,7 +60,7 @@ fn session_new_records_session_start_first() {
     let instructions = payload_str(start, "system_instructions").expect("system instructions");
     assert!(instructions.contains("do not stop after analysis, a plan, or partial implementation"));
     assert!(instructions.contains("Never claim a check passed when it failed or was not run"));
-    assert_eq!(start.payload["system_instructions_version"], json!(1));
+    assert_eq!(start.payload["system_instructions_version"], json!(2));
     assert_eq!(
         start.payload["system_instructions_bytes"],
         json!(instructions.len())
@@ -213,7 +213,7 @@ fn model_request_prefers_apply_patch_for_file_edits() {
         .contains("verify the result with the most relevant available checks"));
     let expected_digest = format!("{:x}", Sha256::digest(request.instructions.as_bytes()));
     let model_call = find_kind(session.events(), EventKind::MODEL_CALL);
-    assert_eq!(model_call.payload["system_instructions_version"], json!(1));
+    assert_eq!(model_call.payload["system_instructions_version"], json!(2));
     assert!(model_call.payload.get("system_instructions").is_none());
     assert_eq!(
         model_call.payload["system_instructions_bytes"],

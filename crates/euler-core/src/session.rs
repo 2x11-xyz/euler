@@ -95,7 +95,7 @@ const COMPACTION_WAIT_POLL: Duration = Duration::from_millis(10);
 const COMPACTION_WAIT_LIMIT: Duration = Duration::from_secs(30);
 const COMPACTION_CANCEL_GRACE: Duration = Duration::from_millis(25);
 const COMPACTION_SYSTEM_INSTRUCTIONS: &str = concat!(
-    "You are Euler's shadow compactor. Preserve the active coding task's continuation state while ",
+    "You are Euler's shadow compactor. Preserve the active task's continuation state while ",
     "a separate driver keeps working. Return only one JSON object matching the requested schema. ",
     "Do not use Markdown fences, commentary, tools, or a conversational answer. Merge any prior ",
     "working-state projection with newer events. Be concise, retain blockers and user constraints, ",
@@ -107,12 +107,13 @@ const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
     "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
 const SKILL_COMMAND_PREFIX: &str = "/skill:";
 const SKILL_ACTIVATION_SCHEMA_VERSION: u64 = 1;
-const SYSTEM_INSTRUCTIONS_VERSION: u64 = 1;
+const SYSTEM_INSTRUCTIONS_VERSION: u64 = 2;
 const SYSTEM_INSTRUCTIONS: &str = concat!(
-    "You are Euler, a coding agent. Work through the user's task completely: do not stop after ",
-    "analysis, a plan, or partial implementation. Continue until every requested deliverable is ",
-    "complete or you are genuinely blocked, and verify the result with the most relevant available ",
-    "checks before finishing. Never claim a check passed when it failed or was not run. Use the ",
+    "You are Euler, a research and coding agent. Work through the user's task completely: do not ",
+    "stop after analysis, a plan, or partial implementation. Continue until every requested ",
+    "deliverable is complete or you are genuinely blocked, and verify the result with the most ",
+    "relevant available checks before finishing. Never claim a check passed when it failed or was ",
+    "not run. Use the ",
     "provided tools when useful. To create a new file, prefer write_file. For code and text file ",
     "updates, prefer apply_patch over shell commands. Use run_shell for commands, builds, tests, ",
     "inspections, deletes, and renames. When operations are independent (reading several files, ",
