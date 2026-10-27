@@ -2,7 +2,7 @@ use super::permission::CliDecider;
 use anyhow::{anyhow, Result};
 use euler_core::{PermissionDecider, Session};
 
-use crate::extension_cli;
+use crate::extension_cli::{self, UserCommandInput};
 
 pub(super) fn execute_live_extension_run(
     session: &mut Session<CliDecider>,
@@ -17,23 +17,28 @@ pub(super) fn execute_live_extension_run(
     }
 }
 
-fn parse_live_extension_request(request: &str) -> Result<(String, String, serde_json::Value)> {
+/// `<id>.<command> {json}` or `<id>.<command> --flag value...`; declared
+/// flags are parsed against the live descriptor before the command runs.
+fn parse_live_extension_request(request: &str) -> Result<(String, String, UserCommandInput)> {
     let mut parts = request.splitn(2, char::is_whitespace);
     let reference = parts
         .next()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| anyhow!("extension_run requires an extension command reference"))?;
-    let input = parts
-        .next()
-        .ok_or_else(|| anyhow!("extension_run {reference} requires JSON input"))?
-        .trim_start();
+    let input = parts.next().unwrap_or_default().trim();
     if input.is_empty() {
-        return Err(anyhow!("extension_run {reference} requires JSON input"));
+        return Err(anyhow!(
+            "extension_run {reference} requires JSON input or declared --flag arguments"
+        ));
     }
     let (id, command) = parse_live_extension_reference(reference)?;
+    if input.starts_with("--") {
+        let flags = input.split_whitespace().map(str::to_owned).collect();
+        return Ok((id, command, UserCommandInput::Flags(flags)));
+    }
     let input = serde_json::from_str(input)
         .map_err(|error| anyhow!("extension_run {reference} input must be JSON: {error}"))?;
-    Ok((id, command, input))
+    Ok((id, command, UserCommandInput::Json(input)))
 }
 
 fn parse_live_extension_reference(reference: &str) -> Result<(String, String)> {
@@ -106,7 +111,7 @@ fn run_live_extension_command(
     session: &mut Session<CliDecider>,
     id: &str,
     command: &str,
-    input: serde_json::Value,
+    input: UserCommandInput,
     gated: bool,
 ) -> serde_json::Value {
     match run_live_linked_extension_command(session, id, command, input, gated) {
@@ -119,7 +124,7 @@ fn run_live_linked_extension_command(
     session: &mut Session<CliDecider>,
     id: &str,
     command: &str,
-    input: serde_json::Value,
+    input: UserCommandInput,
     gated: bool,
 ) -> Option<serde_json::Value> {
     let (extension, descriptor) =
@@ -133,6 +138,14 @@ fn run_live_linked_extension_command(
             id, command,
         )));
     }
+    let input = match extension_cli::resolve_user_command_input(
+        &format!("{id}.{command}"),
+        &descriptor,
+        input,
+    ) {
+        Ok(input) => input,
+        Err(error) => return Some(headless_extension_error(error.to_string())),
+    };
     if !gated && !descriptor.required_capabilities.is_empty() {
         let granted = descriptor
             .required_capabilities

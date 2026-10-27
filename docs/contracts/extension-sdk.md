@@ -750,6 +750,45 @@ Rules:
 - Remediation text anywhere in the system must name only invocations that
   work; an agent-only command must not be advertised as a user command.
 
+## Command Arguments v0
+
+A `user` command may declare `--flag` arguments. In a manifest they are the
+command's optional `args` array; each entry is `{"flag", "kind", ...kind
+fields, "required"}`. The flag is an extension identifier, is also the input
+key, and must not be `input-file`. `required` defaults to `false`. A command
+with `args` must have `invocation: "user"`. Absent `args` means none, in the
+manifest and in the persisted link inventory. The managed-process runtime maps
+each entry to `ArgSpec` with `ArgValueKind`.
+
+One kind exists today: `model-targets` (`ArgValueKind::ModelTargets { max }`,
+ADR 0022), with `max` in 1..=16 (`MAX_MODEL_TARGETS`), at most one per
+command. The command receives `{"<flag>": ["provider::model", ...]}`, an
+array of 1 to `max` distinct target strings. Provider and authentication
+knowledge stays in the host: no API lists authenticated providers to
+extensions.
+
+Input routes:
+
+- `euler extension run <id>.<command> <session> --<flag> a::b,c::d` and the
+  headless control line `extension_run <id>.<command> --<flag> a::b,c::d` take
+  a comma-separated list. Whitespace around an entry is ignored inside one
+  argv value; the control line and the TUI split on whitespace, so there the
+  list must be one token (`a::b,c::d`).
+- In the TUI, a bare slash command whose model-targets argument is required
+  opens the authenticated-model checklist picker, bounded at `max`. Enter runs
+  the command with the checked targets; esc runs nothing. With an optional
+  argument, a bare command runs as before. `--<flag> a::b,c::d` works in the
+  TUI too.
+- JSON input (`--input-file`, the control line's `{...}`, the TUI's `{...}`)
+  stays available and is mutually exclusive with flags.
+
+The host resolves input against the live command descriptor before the
+extension starts, on every route: unknown or repeated flags, a missing
+required argument, a count outside 1..=`max`, an entry without non-empty
+`provider` and `model` halves around `::`, whitespace or control characters,
+an entry over 256 bytes, and duplicates are errors. JSON input that carries
+the input key is held to the same rules.
+
 ## Local Event Wake v0
 
 Core provides a process-local wake primitive on `ProvenanceWriter` /

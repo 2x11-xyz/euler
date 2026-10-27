@@ -8,21 +8,36 @@ use crate::ui::theme::ThemeChoice;
 use euler_core::{ApprovalMode, ReasoningEffort, SkillCatalogEntry};
 use insta::assert_snapshot;
 
-fn code_swarm_picker_surface(selected: Vec<String>) -> BottomSurface {
-    let mut surface = BottomSurface::new(CommandContext::default());
-    let choices = vec![
-        ModelChoice::new("openrouter", "z-ai/glm-5.2"),
-        ModelChoice::new("anthropic", "claude-opus-5"),
-        ModelChoice::new("openai", "gpt-5.5"),
-        ModelChoice::new("mistral", "large-3"),
-        ModelChoice::new("google", "gemini-3-pro"),
-        ModelChoice::new("fixture", "echo"),
-    ];
-    surface.open_picker(PickerSpec::CodeSwarmModels {
-        choices,
-        selected,
-        user_tier: false,
-    });
+/// Opens the `/code-swarm` checklist the way the palette does, so the
+/// command's default selection applies when `saved` is empty.
+fn code_swarm_picker_surface(saved: Vec<String>) -> BottomSurface {
+    let context = CommandContext {
+        model_target_choices: vec![
+            ModelChoice::new("openrouter", "z-ai/glm-5.2"),
+            ModelChoice::new("anthropic", "claude-opus-5"),
+            ModelChoice::new("openai", "gpt-5.5"),
+            ModelChoice::new("mistral", "large-3"),
+            ModelChoice::new("google", "gemini-3-pro"),
+            ModelChoice::new("fixture", "echo"),
+        ],
+        extension_items: vec![ExtensionManagerItem {
+            id: "code-swarm".to_owned(),
+            display_name: "CodeSwarm Review".to_owned(),
+            enabled: true,
+            materialization: Some("linked".to_owned()),
+            version: "0.1.0".to_owned(),
+            commands: vec![],
+            capabilities: vec![],
+            audit_status: None,
+        }],
+        code_swarm_models: saved,
+        ..CommandContext::default()
+    };
+    let CommandEffect::OpenPicker(spec) = dispatch_command("/code-swarm", &context) else {
+        panic!("/code-swarm should open its picker");
+    };
+    let mut surface = BottomSurface::new(context);
+    surface.open_picker(spec);
     surface
 }
 
@@ -127,7 +142,7 @@ fn palette_confirm_on_code_swarm_opens_config_not_extension_run() {
     let event = surface.confirm();
     assert_eq!(event, SurfaceEvent::None, "should open a picker, not act");
     assert!(
-        surface.is_code_swarm_picker(),
+        surface.is_model_targets_picker(),
         "code-swarm config picker should own the surface"
     );
 
@@ -272,6 +287,7 @@ fn code_swarm_picker_defaults_to_first_three_checked() {
         "lines: {lines}"
     );
     assert!(lines.contains("[ ] mistral::large-3"), "lines: {lines}");
+    assert!(lines.contains("⏎ save · ⌫ back"), "lines: {lines}");
     assert!(lines.contains("min 1 · max 5"), "lines: {lines}");
 }
 
@@ -291,14 +307,14 @@ fn code_swarm_toggle_enforces_cap_and_confirm_enforces_min() {
     surface.move_selection_down();
     surface.move_selection_down();
     surface.move_selection_down();
-    assert_eq!(surface.code_swarm_toggle(), Some(SurfaceEvent::None));
+    assert_eq!(surface.model_targets_toggle(), Some(SurfaceEvent::None));
     surface.move_selection_down();
-    assert_eq!(surface.code_swarm_toggle(), Some(SurfaceEvent::None));
+    assert_eq!(surface.model_targets_toggle(), Some(SurfaceEvent::None));
     assert_eq!(code_swarm_checked(&surface), 5);
     // Sixth check is refused.
     surface.move_selection_down();
     assert!(matches!(
-        surface.code_swarm_toggle(),
+        surface.model_targets_toggle(),
         Some(SurfaceEvent::Message(message)) if message.contains("5/5")
     ));
     assert_eq!(code_swarm_checked(&surface), 5);
@@ -320,7 +336,7 @@ fn code_swarm_toggle_enforces_cap_and_confirm_enforces_min() {
     for _ in 0..5 {
         empty.move_selection_down();
     }
-    assert_eq!(empty.code_swarm_toggle(), Some(SurfaceEvent::None));
+    assert_eq!(empty.model_targets_toggle(), Some(SurfaceEvent::None));
     assert_eq!(code_swarm_checked(&empty), 0);
     assert!(matches!(
         empty.confirm(),
@@ -1291,10 +1307,12 @@ fn code_swarm_backspace_steps_back_to_palette_when_filter_is_empty() {
     surface.edit_composer(|draft| draft.insert_text("draft before slash"));
     surface.open_palette();
     let saved = surface.composer().clone();
-    surface.open_picker(PickerSpec::CodeSwarmModels {
+    surface.open_picker(PickerSpec::ModelTargets {
+        title: "/code-swarm · reviewer models · project tier".to_owned(),
         choices: vec![ModelChoice::new("fixture", "echo")],
         selected: Vec::new(),
-        user_tier: false,
+        max: 5,
+        confirm: crate::ui::commands::ModelTargetsConfirm::CodeSwarmSave { user_tier: false },
     });
 
     assert!(surface.picker_backspace_steps_back());
@@ -1402,4 +1420,94 @@ fn only_palette_reports_bottom_surface_cursor() {
     assert!(surface.surface_cursor(80).is_some());
     assert_eq!(surface.confirm(), SurfaceEvent::None);
     assert_eq!(surface.surface_cursor(80), None);
+}
+
+/// A `user` command with a required model-targets argument: the bare slash
+/// command opens the shared model-targets picker, checks stop at the declared
+/// `max`, Enter runs the command with only the target strings, and esc runs
+/// nothing.
+fn model_targets_command_surface() -> BottomSurface {
+    let mut configure = ExtensionCommandItem::user("configure");
+    configure.required_model_targets = Some(crate::ui::commands::RequiredModelTargets {
+        flag: "models".to_owned(),
+        max: 2,
+    });
+    let extension_items = vec![ExtensionManagerItem {
+        id: "targets-example".to_owned(),
+        display_name: "Targets example".to_owned(),
+        enabled: true,
+        materialization: Some("linked".to_owned()),
+        version: "0.1.0".to_owned(),
+        commands: vec![configure],
+        capabilities: vec![],
+        audit_status: None,
+    }];
+    let context = CommandContext {
+        model_target_choices: vec![
+            ModelChoice::new("openai", "gpt-5.5"),
+            ModelChoice::new("anthropic", "claude-opus-5"),
+            ModelChoice::new("fixture", "echo"),
+        ],
+        extension_slash_commands: crate::ui::commands::build_extension_slash_commands(
+            &extension_items,
+        ),
+        extension_items,
+        ..CommandContext::default()
+    };
+    let mut surface = BottomSurface::new(context);
+    surface.open_palette();
+    surface.palette_insert("configure");
+    assert_eq!(surface.confirm(), SurfaceEvent::None, "opens a picker");
+    assert!(surface.is_model_targets_picker());
+    surface
+}
+
+#[test]
+fn model_targets_picker_bounds_selection_and_runs_with_target_strings() {
+    let mut surface = model_targets_command_surface();
+    assert_eq!(code_swarm_checked(&surface), 0, "no preselection");
+    let lines = {
+        let BottomOwner::Picker(picker) = surface.owner() else {
+            panic!("picker should own surface");
+        };
+        picker.render_lines(120).join("\n")
+    };
+    assert!(lines.contains("0 selected · 1–2"), "lines: {lines}");
+    assert!(lines.contains("⏎ run · ⌫ back"), "lines: {lines}");
+    assert!(lines.contains("min 1 · max 2"), "lines: {lines}");
+
+    // Enter with nothing checked is refused and keeps the picker open.
+    assert!(matches!(
+        surface.confirm(),
+        SurfaceEvent::Message(message) if message == "select at least 1 model (min 1 · max 2)"
+    ));
+    assert!(surface.is_model_targets_picker());
+
+    assert_eq!(surface.model_targets_toggle(), Some(SurfaceEvent::None));
+    surface.move_selection_down();
+    assert_eq!(surface.model_targets_toggle(), Some(SurfaceEvent::None));
+    surface.move_selection_down();
+    assert!(matches!(
+        surface.model_targets_toggle(),
+        Some(SurfaceEvent::Message(message)) if message.contains("2/2")
+    ));
+    assert_eq!(code_swarm_checked(&surface), 2);
+
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Action(CommandAction::ExtensionRun {
+            id: "targets-example".to_owned(),
+            command: "configure".to_owned(),
+            input: serde_json::json!({"models": ["openai::gpt-5.5", "anthropic::claude-opus-5"]}),
+            raw_args: None,
+        })
+    );
+}
+
+#[test]
+fn model_targets_picker_esc_cancels_without_running() {
+    let mut surface = model_targets_command_surface();
+    assert_eq!(surface.model_targets_toggle(), Some(SurfaceEvent::None));
+    assert_eq!(surface.cancel(), SurfaceEvent::None);
+    assert!(matches!(surface.owner(), BottomOwner::Composer));
 }

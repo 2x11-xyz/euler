@@ -13,10 +13,10 @@ pub struct CommandSpec {
 pub struct CommandContext {
     pub model_choices: Vec<ModelChoice>,
     /// Same shape as `model_choices`, filtered to providers whose auth
-    /// `ProviderSet::is_authenticated` accepts today. Feeds the
-    /// `/code-swarm` reviewer-model picker so it cannot offer a target that
-    /// only fails once a spawn slot is already spent (#58).
-    pub code_swarm_model_choices: Vec<ModelChoice>,
+    /// `ProviderSet::is_authenticated` accepts today. Feeds the model-targets
+    /// picker so it cannot offer a target that only fails once a spawn slot
+    /// is already spent (#58).
+    pub model_target_choices: Vec<ModelChoice>,
     pub effort_choices: Vec<EffortChoice>,
     pub theme_choices: Vec<ThemeChoiceItem>,
     pub checkpoint_items: Vec<CheckpointItem>,
@@ -65,6 +65,27 @@ pub struct ExtensionManagerItem {
 pub struct ExtensionCommandItem {
     pub name: String,
     pub invocation: euler_sdk::Invocation,
+    pub required_model_targets: Option<RequiredModelTargets>,
+}
+
+/// A command's required model-targets argument. A bare slash invocation
+/// opens the model-targets picker for it instead of running the command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequiredModelTargets {
+    pub flag: String,
+    pub max: usize,
+}
+
+impl RequiredModelTargets {
+    pub fn from_args(args: &[euler_sdk::ArgSpec]) -> Option<Self> {
+        args.iter().find_map(|spec| match spec.value_kind {
+            euler_sdk::ArgValueKind::ModelTargets { max } if spec.required => Some(Self {
+                flag: spec.flag.clone(),
+                max,
+            }),
+            _ => None,
+        })
+    }
 }
 
 impl ExtensionCommandItem {
@@ -74,6 +95,7 @@ impl ExtensionCommandItem {
         Self {
             name: name.into(),
             invocation: euler_sdk::Invocation::User,
+            required_model_targets: None,
         }
     }
 }
@@ -128,6 +150,7 @@ pub struct ExtensionSlashCommand {
     pub extension_id: String,
     pub command: String,
     pub enabled: bool,
+    pub required_model_targets: Option<RequiredModelTargets>,
 }
 
 /// Palette row: core static command or extension-sourced entry.
@@ -610,16 +633,56 @@ pub enum PickerSpec {
     Resume(Vec<ResumeItem>),
     Rollback(Vec<CheckpointItem>),
     Extensions(Vec<ExtensionManagerItem>),
-    /// `/code-swarm` reviewer-model checklist: selection IS the agent count.
-    /// `user_tier` routes the save to the user-global store.
-    CodeSwarmModels {
+    /// Checklist of 1 to `max` authenticated `provider::model` targets.
+    /// Enter hands the checked set to `confirm`; esc runs nothing.
+    ModelTargets {
+        title: String,
         choices: Vec<ModelChoice>,
         selected: Vec<String>,
-        user_tier: bool,
+        max: usize,
+        confirm: ModelTargetsConfirm,
     },
     Compaction(CompactionSettings),
     /// §5.1 Advanced, one level down from the posture picker.
     PermissionsAdvanced(Vec<PermissionChoice>),
+}
+
+/// What the model-targets picker does with the checked set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModelTargetsConfirm {
+    /// `/code-swarm`: persist the reviewer set to one tier.
+    CodeSwarmSave { user_tier: bool },
+    /// Run a `user` extension command with the targets under `flag`.
+    ExtensionRun {
+        id: String,
+        command: String,
+        flag: String,
+    },
+}
+
+impl ModelTargetsConfirm {
+    /// The Enter verb shown in the picker footer.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::CodeSwarmSave { .. } => "save",
+            Self::ExtensionRun { .. } => "run",
+        }
+    }
+
+    pub fn action(&self, targets: Vec<String>) -> CommandAction {
+        match self {
+            Self::CodeSwarmSave { user_tier } => CommandAction::CodeSwarmSaveModels {
+                models: targets,
+                user_tier: *user_tier,
+            },
+            Self::ExtensionRun { id, command, flag } => CommandAction::ExtensionRun {
+                id: id.clone(),
+                command: command.clone(),
+                input: serde_json::json!({ flag.as_str(): targets }),
+                raw_args: None,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -856,6 +919,7 @@ pub fn build_extension_slash_commands(
                 extension_id: item.id.clone(),
                 command: "review".to_owned(),
                 enabled: item.enabled,
+                required_model_targets: None,
             });
         }
         for command in &item.commands {
@@ -881,6 +945,7 @@ pub fn build_extension_slash_commands(
                 extension_id: item.id.clone(),
                 command: name.clone(),
                 enabled: item.enabled,
+                required_model_targets: command.required_model_targets.clone(),
             });
         }
     }
@@ -1092,18 +1157,8 @@ fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffe
     }
     let arg = arg.map(str::trim).filter(|arg| !arg.is_empty());
     match arg {
-        None => CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
-            // #58: authenticated providers only — never offer a target that
-            // burns a spawn slot to discover it has no credentials.
-            choices: context.code_swarm_model_choices.clone(),
-            selected: context.code_swarm_models.clone(),
-            user_tier: false,
-        }),
-        Some("--user") => CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
-            choices: context.code_swarm_model_choices.clone(),
-            selected: context.code_swarm_models.clone(),
-            user_tier: true,
-        }),
+        None => code_swarm_picker(context, false),
+        Some("--user") => code_swarm_picker(context, true),
         Some("clear") => CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: false }),
         Some("clear --user") => {
             CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: true })
@@ -1127,6 +1182,35 @@ pub(crate) const CODE_SWARM_AGENT_ONLY_TEACH: &str =
      its code_swarm_review tool with explicit context. \
      Use /code-swarm to choose which reviewer models it uses.";
 
+/// The `/code-swarm` reviewer checklist on the shared model-targets picker.
+/// With no saved set, the first three authenticated choices are pre-checked
+/// (the design's default of 3).
+fn code_swarm_picker(context: &CommandContext, user_tier: bool) -> CommandEffect {
+    let selected = if context.code_swarm_models.is_empty() {
+        context
+            .model_target_choices
+            .iter()
+            .take(3)
+            .map(|choice| format!("{}::{}", choice.provider, choice.model))
+            .collect()
+    } else {
+        context.code_swarm_models.clone()
+    };
+    let tier = if user_tier { "user" } else { "project" };
+    CommandEffect::OpenPicker(PickerSpec::ModelTargets {
+        title: format!("/code-swarm · reviewer models · {tier} tier"),
+        // #58: authenticated providers only. Never offer a target that burns
+        // a spawn slot to discover it has no credentials.
+        choices: context.model_target_choices.clone(),
+        selected,
+        max: CODE_SWARM_MAX_MODELS,
+        confirm: ModelTargetsConfirm::CodeSwarmSave { user_tier },
+    })
+}
+
+/// Swarm cap (mirrors the extension's MAX_SWARM_AGENTS).
+const CODE_SWARM_MAX_MODELS: usize = 5;
+
 fn extension_slash_or_unknown(
     token: &str,
     arg: Option<&str>,
@@ -1139,6 +1223,20 @@ fn extension_slash_or_unknown(
     {
         if !cmd.enabled {
             return CommandEffect::Notice(disabled_extension_teach(&cmd.token, &cmd.extension_id));
+        }
+        let bare = arg.map(str::trim).is_none_or(str::is_empty);
+        if let (true, Some(targets)) = (bare, &cmd.required_model_targets) {
+            return CommandEffect::OpenPicker(PickerSpec::ModelTargets {
+                title: format!("{} · {}", cmd.token, targets.flag),
+                choices: context.model_target_choices.clone(),
+                selected: Vec::new(),
+                max: targets.max,
+                confirm: ModelTargetsConfirm::ExtensionRun {
+                    id: cmd.extension_id.clone(),
+                    command: cmd.command.clone(),
+                    flag: targets.flag.clone(),
+                },
+            });
         }
         // Arguments are never dropped: JSON parses here, `--flag` text is
         // parsed against the ArgSpec at resolve time, anything else is a
@@ -1789,7 +1887,7 @@ mod tests {
             // All four are "authenticated" in this fixture; the filtering
             // behavior itself is covered by the dedicated picker-filter test
             // below.
-            code_swarm_model_choices: model_choices.clone(),
+            model_target_choices: model_choices.clone(),
             model_choices,
             extension_items: vec![ExtensionManagerItem {
                 id: "code-swarm".to_owned(),
@@ -1803,6 +1901,7 @@ mod tests {
                 commands: vec![ExtensionCommandItem {
                     name: "review".to_owned(),
                     invocation: euler_sdk::Invocation::AgentOnly,
+                    required_model_targets: None,
                 }],
                 capabilities: vec![],
                 audit_status: None,
@@ -1815,13 +1914,23 @@ mod tests {
     fn code_swarm_no_arg_opens_model_checklist_picker() {
         let context = code_swarm_context(true);
         match dispatch_command("/code-swarm", &context) {
-            CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
+            CommandEffect::OpenPicker(PickerSpec::ModelTargets {
                 choices,
                 selected,
-                user_tier: false,
+                max: 5,
+                confirm: ModelTargetsConfirm::CodeSwarmSave { user_tier: false },
+                ..
             }) => {
                 assert_eq!(choices.len(), 4);
-                assert!(selected.is_empty());
+                // No saved set: the first three choices are pre-checked.
+                assert_eq!(
+                    selected,
+                    vec![
+                        "openrouter::z-ai/glm-5.2".to_owned(),
+                        "anthropic::claude-opus-5".to_owned(),
+                        "openai::gpt-5.5".to_owned(),
+                    ]
+                );
             }
             other => panic!("expected picker, got {other:?}"),
         }
@@ -1831,8 +1940,9 @@ mod tests {
     fn code_swarm_user_flag_routes_picker_to_user_tier() {
         let context = code_swarm_context(true);
         match dispatch_command("/code-swarm --user", &context) {
-            CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels {
-                user_tier: true, ..
+            CommandEffect::OpenPicker(PickerSpec::ModelTargets {
+                confirm: ModelTargetsConfirm::CodeSwarmSave { user_tier: true },
+                ..
             }) => {}
             other => panic!("expected user-tier picker, got {other:?}"),
         }
@@ -1841,13 +1951,13 @@ mod tests {
     #[test]
     fn code_swarm_picker_uses_authenticated_choices_not_all_model_choices() {
         // #58: the picker must not offer a provider that will burn a spawn
-        // slot to discover it isn't authenticated. code_swarm_model_choices
+        // slot to discover it isn't authenticated. model_target_choices
         // is the pre-filtered list; the picker must read that field, not the
         // unfiltered model_choices.
         let mut context = code_swarm_context(true);
-        context.code_swarm_model_choices = vec![ModelChoice::new("openai", "gpt-5.5")];
+        context.model_target_choices = vec![ModelChoice::new("openai", "gpt-5.5")];
         match dispatch_command("/code-swarm", &context) {
-            CommandEffect::OpenPicker(PickerSpec::CodeSwarmModels { choices, .. }) => {
+            CommandEffect::OpenPicker(PickerSpec::ModelTargets { choices, .. }) => {
                 assert_eq!(choices, vec![ModelChoice::new("openai", "gpt-5.5")]);
             }
             other => panic!("expected picker, got {other:?}"),
@@ -1968,6 +2078,7 @@ mod tests {
                 extension_id: "note-taker".to_owned(),
                 command: "summarize".to_owned(),
                 enabled: true,
+                required_model_targets: None,
             }],
             ..CommandContext::default()
         };
@@ -2015,6 +2126,75 @@ mod tests {
     }
 
     #[test]
+    fn required_model_targets_bare_opens_picker_and_flags_still_dispatch() {
+        let spec = |required| euler_sdk::ArgSpec {
+            flag: "models".to_owned(),
+            input_key: "models".to_owned(),
+            value_kind: euler_sdk::ArgValueKind::ModelTargets { max: 3 },
+            required,
+            repeatable: false,
+        };
+        assert_eq!(RequiredModelTargets::from_args(&[spec(false)]), None);
+        let required = RequiredModelTargets::from_args(&[spec(true)]);
+        assert_eq!(
+            required,
+            Some(RequiredModelTargets {
+                flag: "models".to_owned(),
+                max: 3,
+            })
+        );
+
+        let command = |required_model_targets| ExtensionSlashCommand {
+            token: "/configure".to_owned(),
+            summary: "targets-example · configure".to_owned(),
+            extension_id: "targets-example".to_owned(),
+            command: "configure".to_owned(),
+            enabled: true,
+            required_model_targets,
+        };
+        let mut context = CommandContext {
+            model_target_choices: vec![ModelChoice::new("openai", "gpt-5.5")],
+            extension_slash_commands: vec![command(required)],
+            ..CommandContext::default()
+        };
+        assert_eq!(
+            dispatch_command("/configure", &context),
+            CommandEffect::OpenPicker(PickerSpec::ModelTargets {
+                title: "/configure · models".to_owned(),
+                choices: vec![ModelChoice::new("openai", "gpt-5.5")],
+                selected: Vec::new(),
+                max: 3,
+                confirm: ModelTargetsConfirm::ExtensionRun {
+                    id: "targets-example".to_owned(),
+                    command: "configure".to_owned(),
+                    flag: "models".to_owned(),
+                },
+            })
+        );
+        // Explicit flags skip the picker and are validated at resolve time.
+        assert_eq!(
+            dispatch_command("/configure --models openai::gpt-5.5", &context),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "targets-example".to_owned(),
+                command: "configure".to_owned(),
+                input: serde_json::json!({}),
+                raw_args: Some("--models openai::gpt-5.5".to_owned()),
+            })
+        );
+        // An optional model-targets argument leaves bare invocation as a run.
+        context.extension_slash_commands = vec![command(None)];
+        assert_eq!(
+            dispatch_command("/configure", &context),
+            CommandEffect::Action(CommandAction::ExtensionRun {
+                id: "targets-example".to_owned(),
+                command: "configure".to_owned(),
+                input: serde_json::json!({}),
+                raw_args: None,
+            })
+        );
+    }
+
+    #[test]
     fn disabled_extension_slash_teaches_instead_of_unknown() {
         let context = CommandContext {
             extension_slash_commands: vec![ExtensionSlashCommand {
@@ -2023,6 +2203,7 @@ mod tests {
                 extension_id: "note-taker".to_owned(),
                 command: "summarize".to_owned(),
                 enabled: false,
+                required_model_targets: None,
             }],
             ..CommandContext::default()
         };

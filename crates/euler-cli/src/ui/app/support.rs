@@ -411,7 +411,7 @@ pub(super) fn command_context(
         provider_config_runtime::default_provider_config_path().as_deref(),
     );
     let model_choices = model_choices(model_catalog, &provider_config.registry, provider, model);
-    // The reviewer-model picker must not offer a target that will burn a
+    // The model-targets picker must not offer a target that will burn a
     // spawn slot to discover it isn't authenticated (#58): filter to
     // providers `validate_auth` accepted when the session was last Idle.
     // The general `/model` picker keeps the full list — switching to an
@@ -419,14 +419,14 @@ pub(super) fn command_context(
     // /login. The caller passes a cached snapshot so rebuilds while the
     // session is checked out onto the worker thread (mid-turn, after
     // submission) never shrink the picker to empty.
-    let code_swarm_model_choices = model_choices
+    let model_target_choices = model_choices
         .iter()
         .filter(|choice| authenticated_providers.contains(&choice.provider))
         .cloned()
         .collect();
     CommandContext {
         model_choices,
-        code_swarm_model_choices,
+        model_target_choices,
         effort_choices: effort_choices(model_catalog, parts.current_effort, provider, model),
         theme_choices: theme_choices(parts.current_theme),
         checkpoint_items: parts.checkpoint_items,

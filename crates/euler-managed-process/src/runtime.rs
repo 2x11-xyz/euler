@@ -165,7 +165,7 @@ impl ManagedProcessExtension {
                     // through host APIs; there is no hidden path/session-id
                     // injection into their arbitrary JSON input.
                     accepts_session_id: false,
-                    args: Vec::new(),
+                    args: command.args.clone(),
                     invocation: command.invocation,
                     model_tool: command.model_tool.clone(),
                 })

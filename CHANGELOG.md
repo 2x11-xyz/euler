@@ -260,6 +260,13 @@ pull requests that landed them; deeper design rationale lives in
   host cap of 320 KiB, as the budget for its whole serialized input. Without
   it the budget stays 64 KiB. Any other value fails manifest parsing and
   registration (ADR 0022).
+- A `user` command may declare a model-targets argument in its manifest
+  `args`: 1 to `max` (at most 16) `provider::model` targets. The TUI opens the
+  authenticated-model picker for a required one (the same picker `/code-swarm`
+  uses), and `euler extension run` and the headless `extension_run` line take
+  `--<flag> a::b,c::d`. The host checks count, shape, and duplicates on every
+  route, JSON input included, and the extension receives a JSON array of target
+  strings (ADR 0022).
 - Extensions can publish bounded typed plan presentation through
   `plan-presentation`; core emits canonical structured `plan.update` events
   and renders one checklist cell without taking ownership of workflow policy.

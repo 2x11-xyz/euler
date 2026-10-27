@@ -1,24 +1,22 @@
 use super::*;
 
 impl BottomSurface {
-    /// Space in the `/code-swarm` checklist toggles the selected row.
-    /// Checking beyond the cap is refused (the row stays visible and dim in
-    /// the design); unchecking below 1 is allowed — the minimum is enforced
-    /// at save.
-    pub fn code_swarm_toggle(&mut self) -> Option<SurfaceEvent> {
+    /// Space in the model-targets checklist toggles the selected row.
+    /// Checking beyond `max` is refused (the row stays visible and dim in
+    /// the design); unchecking below 1 is allowed, since the minimum is
+    /// enforced at confirm.
+    pub fn model_targets_toggle(&mut self) -> Option<SurfaceEvent> {
         let BottomOwner::Picker(picker) = &mut self.owner else {
             return None;
         };
-        if picker.kind != PickerKind::CodeSwarmModels {
-            return None;
-        }
+        let max = picker.model_targets.as_ref()?.max;
         let checked = picker.items.iter().filter(|item| item.current).count();
         let index = picker.selected_item_index()?;
         let item = &mut picker.items[index];
-        if !item.current && checked >= CODE_SWARM_MAX_MODELS {
-            return Some(SurfaceEvent::Message(
-                "at 5/5 further checks are refused — uncheck one to free a slot".to_owned(),
-            ));
+        if !item.current && checked >= max {
+            return Some(SurfaceEvent::Message(format!(
+                "at {max}/{max} further checks are refused: uncheck one to free a slot"
+            )));
         }
         item.current = !item.current;
         Some(SurfaceEvent::None)
@@ -56,8 +54,15 @@ pub struct ReplacementPicker {
     pub(super) saved_draft: ComposerDraft,
     /// Read-only ledger-tail lines for the selected resume row (`ctrl+o`).
     resume_preview: Option<Vec<String>>,
-    /// `/code-swarm --user`: route the checklist save to the user tier.
-    pub(super) code_swarm_user_tier: bool,
+    /// Set exactly when `kind` is `ModelTargets`.
+    pub(super) model_targets: Option<ModelTargetsSelection>,
+}
+
+/// The model-targets checklist's bound and what Enter does with the set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ModelTargetsSelection {
+    pub(super) max: usize,
+    pub(super) confirm: ModelTargetsConfirm,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,7 +71,7 @@ pub(super) enum PickerKind {
     Model,
     Resume,
     Extensions,
-    CodeSwarmModels,
+    ModelTargets,
     Compaction,
     /// §5.1 Advanced, one level down from the posture picker.
     PermissionsAdvanced,
@@ -74,7 +79,7 @@ pub(super) enum PickerKind {
 
 impl PickerKind {
     fn searchable(self) -> bool {
-        matches!(self, Self::Model | Self::Resume | Self::CodeSwarmModels)
+        matches!(self, Self::Model | Self::Resume | Self::ModelTargets)
     }
 }
 
@@ -120,7 +125,7 @@ impl ReplacementPicker {
             return None;
         }
         match self.kind {
-            PickerKind::CodeSwarmModels => Some(checkbox),
+            PickerKind::ModelTargets => Some(checkbox),
             PickerKind::Compaction => Some(checkbox),
             PickerKind::Extensions => Some(dot),
             // The model picker has no state column. An unfilled `○` on every
@@ -176,13 +181,22 @@ impl ReplacementPicker {
     fn chrome(&self) -> PickerChrome {
         let selected_count = self.items.iter().filter(|item| item.current).count();
         match self.kind {
-            PickerKind::CodeSwarmModels => PickerChrome {
-                title: self.title.clone(),
-                params: vec![format!("{selected_count} selected"), "1–5".to_owned()],
-                footer: "↑↓ move · space toggle · ⏎ save · ⌫ back · esc cancel · min 1 · max 5"
-                    .to_owned(),
-                empty: "no matches",
-            },
+            PickerKind::ModelTargets => {
+                let (max, verb) = self
+                    .model_targets
+                    .as_ref()
+                    .map_or((1, "save"), |selection| {
+                        (selection.max, selection.confirm.verb())
+                    });
+                PickerChrome {
+                    title: self.title.clone(),
+                    params: vec![format!("{selected_count} selected"), format!("1–{max}")],
+                    footer: format!(
+                        "↑↓ move · space toggle · ⏎ {verb} · ⌫ back · esc cancel · min 1 · max {max}"
+                    ),
+                    empty: "no matches",
+                }
+            }
             PickerKind::Compaction => {
                 let state = |index: usize| {
                     if self.items.get(index).is_some_and(|item| item.current) {
@@ -437,13 +451,13 @@ pub struct PickerItem {
 
 impl ReplacementPicker {
     pub fn from_spec(spec: PickerSpec, saved_draft: ComposerDraft, visible_rows: usize) -> Self {
-        let code_swarm_user_tier = matches!(
-            &spec,
-            PickerSpec::CodeSwarmModels {
-                user_tier: true,
-                ..
-            }
-        );
+        let model_targets = match &spec {
+            PickerSpec::ModelTargets { max, confirm, .. } => Some(ModelTargetsSelection {
+                max: *max,
+                confirm: confirm.clone(),
+            }),
+            _ => None,
+        };
         let (kind, title, items) = picker_parts(spec);
         let mut picker = Self {
             kind,
@@ -455,7 +469,7 @@ impl ReplacementPicker {
             visible_rows: visible_rows.max(1),
             saved_draft,
             resume_preview: None,
-            code_swarm_user_tier,
+            model_targets,
         };
         picker.ensure_selected_visible();
         picker
@@ -738,18 +752,16 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             "Extensions".to_owned(),
             extension_manager_items(items),
         ),
-        PickerSpec::CodeSwarmModels {
+        PickerSpec::ModelTargets {
+            title,
             choices,
             selected,
-            user_tier,
+            confirm,
+            ..
         } => (
-            PickerKind::CodeSwarmModels,
-            if user_tier {
-                "/code-swarm · reviewer models · user tier".to_owned()
-            } else {
-                "/code-swarm · reviewer models · project tier".to_owned()
-            },
-            code_swarm_model_items(choices, &selected),
+            PickerKind::ModelTargets,
+            title,
+            model_target_items(choices, &selected, &confirm),
         ),
         PickerSpec::Compaction(settings) => (
             PickerKind::Compaction,
@@ -797,40 +809,31 @@ fn compaction_items(settings: CompactionSettings) -> Vec<PickerItem> {
     ]
 }
 
-/// Checklist rows for the `/code-swarm` picker. `current` is the checked
-/// state; with no saved selection the first three catalog entries are
-/// pre-checked (the design's default of 3).
-fn code_swarm_model_items(choices: Vec<ModelChoice>, selected: &[String]) -> Vec<PickerItem> {
+/// Checklist rows for the model-targets picker. `current` is the checked
+/// state, seeded from `selected`.
+fn model_target_items(
+    choices: Vec<ModelChoice>,
+    selected: &[String],
+    confirm: &ModelTargetsConfirm,
+) -> Vec<PickerItem> {
     choices
         .into_iter()
-        .enumerate()
-        .map(|(index, choice)| {
+        .map(|choice| {
             let target = format!("{}::{}", choice.provider, choice.model);
-            let checked = if selected.is_empty() {
-                index < CODE_SWARM_MAX_MODELS.min(3)
-            } else {
-                selected.iter().any(|entry| entry == &target)
-            };
             PickerItem {
                 label: choice.label,
                 detail: None,
                 status: None,
                 group: None,
+                current: selected.contains(&target),
                 provider_tag: Some(target),
-                current: checked,
                 // Placeholder: confirm_picker collects the checked set and
-                // dispatches one CodeSwarmSaveModels for the whole picker.
-                action: CommandAction::CodeSwarmSaveModels {
-                    models: vec![],
-                    user_tier: false,
-                },
+                // dispatches one confirm action for the whole picker.
+                action: confirm.action(Vec::new()),
             }
         })
         .collect()
 }
-
-/// Swarm cap (mirrors the extension's MAX_SWARM_AGENTS).
-const CODE_SWARM_MAX_MODELS: usize = 5;
 
 /// §4.2: the row is caret + state marker + label + description column, and it
 /// never repeats its own value. `ExtensionManagerItem::label()` predates the

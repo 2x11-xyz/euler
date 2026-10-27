@@ -315,10 +315,11 @@ euler extension enable my-extension
 euler extension run my-extension.inspect ./session.jsonl --input-file ./input.json
 ```
 
-The managed-process CLI accepts only an optional `--input-file` containing one
-JSON object (at most 64 KiB) in this first slice. `reload` returns the linked
-package to `needs-review`, revoking its prior execution grant. Linked native
-packages and all installed packages remain inert.
+The managed-process CLI accepts either an optional `--input-file` containing
+one JSON object (at most 64 KiB) or the command's declared `--flag` arguments
+(see Command Arguments in `docs/contracts/extension-sdk.md`). `reload`
+returns the linked package to `needs-review`, revoking its prior execution
+grant. Linked native packages and all installed packages remain inert.
 
 A linked managed-process `euler extension run` is a headless surface: naming
 the command explicitly grants that command's declared capabilities for that one

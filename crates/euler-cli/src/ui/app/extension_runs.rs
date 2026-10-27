@@ -157,11 +157,11 @@ impl AppCore {
                     crate::cli::extension_run::agent_only_control_line_error(&id, &command)
                 ));
             }
-            if raw_args.is_some() {
-                return Err(anyhow!(
-                    "linked managed-process commands accept JSON input in-session"
-                ));
-            }
+            let input = crate::extension_cli::resolve_user_command_input(
+                &format!("{id}.{command}"),
+                &descriptor,
+                crate::extension_cli::UserCommandInput::from_slash_args(input, raw_args),
+            )?;
             return Ok(ExtensionRunRequest {
                 id,
                 command,
@@ -313,6 +313,9 @@ fn append_linked_manager_items(
                 .map(|c| crate::ui::commands::ExtensionCommandItem {
                     name: c.name.clone(),
                     invocation: c.invocation,
+                    required_model_targets: crate::ui::commands::RequiredModelTargets::from_args(
+                        &c.args,
+                    ),
                 })
                 .collect(),
             capabilities: link.descriptor.capabilities.clone(),
