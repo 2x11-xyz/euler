@@ -33,6 +33,15 @@ fn git_dir(root: &Path) {
     fs::create_dir_all(root.join(".git")).expect("git dir");
 }
 
+/// The user-global skills root under a test's temp dir, canonical like the
+/// `EulerHome::skills_dir()` production passes. Discovery rejects a
+/// non-canonical root, and macOS temp dirs sit under the `/var` symlink.
+fn user_skills_root(temp: &tempfile::TempDir) -> PathBuf {
+    fs::canonicalize(temp.path())
+        .expect("canonical temp dir")
+        .join("home/skills")
+}
+
 fn source_paths(bootstrap: &ProjectContextBootstrap) -> Vec<String> {
     bootstrap.source_identities.clone()
 }
@@ -2069,7 +2078,7 @@ fn missing_skill_name_uses_the_valid_parent_directory_name() {
     let temp = tempfile::tempdir().expect("temp");
     let root = temp.path().join("repo");
     git_dir(&root);
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write(
         &user_skills.join("commit-writing/SKILL.md"),
         "---\ndescription: Write focused commits.\n---\nKeep commits focused.\n",
@@ -2091,7 +2100,7 @@ fn yaml_null_skill_name_uses_the_valid_parent_directory_name() {
     let temp = tempfile::tempdir().expect("temp");
     let root = temp.path().join("repo");
     git_dir(&root);
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write(
         &user_skills.join("commit-writing/SKILL.md"),
         "---\nname: null\ndescription: Write focused commits.\n---\nKeep commits focused.\n",
@@ -2194,7 +2203,7 @@ fn invalid_explicit_or_derived_skill_names_remain_rejected() {
     let temp = tempfile::tempdir().expect("temp");
     let root = temp.path().join("repo");
     git_dir(&root);
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write(
         &user_skills.join("valid-folder/SKILL.md"),
         "---\nname: Invalid Name\ndescription: Invalid explicit name.\n---\nbody\n",
@@ -2226,7 +2235,7 @@ fn derived_and_mismatched_explicit_names_share_the_existing_collision_policy() {
     let temp = tempfile::tempdir().expect("temp");
     let root = temp.path().join("repo");
     git_dir(&root);
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write(
         &user_skills.join("commit-writing/SKILL.md"),
         "---\ndescription: Derived name.\n---\nderived body\n",
@@ -2259,7 +2268,7 @@ fn catalog_rejection_suppresses_a_name_mismatch_warning() {
     let temp = tempfile::tempdir().expect("temp");
     let root = temp.path().join("repo");
     git_dir(&root);
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     for index in 0..30 {
         let name = format!("skill-{index:02}");
         write_skill(&user_skills, &name, &"description ".repeat(75), "body\n");
@@ -2296,7 +2305,7 @@ fn user_skill_mismatch_does_not_enter_project_acknowledgment_counts() {
     let root = temp.path().join("repo");
     git_dir(&root);
     write(&root.join("EULER.md"), "project rules\n");
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write(
         &user_skills.join("shared-folder/SKILL.md"),
         "---\nname: commit-writing\ndescription: Write focused commits.\n---\nbody\n",
@@ -2336,7 +2345,7 @@ fn skill_description_limit_counts_unicode_scalar_values_after_yaml_decoding() {
     let temp = tempfile::tempdir().expect("temp");
     let root = temp.path().join("repo");
     git_dir(&root);
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     let accepted = "é".repeat(MAX_SKILL_DESCRIPTION_CHARS);
     let rejected = "é".repeat(MAX_SKILL_DESCRIPTION_CHARS + 1);
     write_skill(&user_skills, "accepted", &accepted, "accepted body\n");
@@ -2366,7 +2375,7 @@ fn user_skills_are_admitted_when_project_context_is_off() {
     let root = temp.path().join("repo");
     git_dir(&root);
     write(&root.join("EULER.md"), "project rules");
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write_skill(
         &user_skills,
         "commit-writing",
@@ -2407,7 +2416,7 @@ fn duplicate_skill_names_across_scopes_exclude_both() {
         "Project GitHub workflow.",
         "project body\n",
     );
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write_skill(
         &user_skills,
         "github-workflow",
@@ -2436,7 +2445,7 @@ fn user_skill_changes_do_not_change_project_acknowledgment_digest() {
     let root = temp.path().join("repo");
     git_dir(&root);
     write(&root.join("EULER.md"), "project rules\n");
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write_skill(
         &user_skills,
         "commit-writing",
@@ -2468,7 +2477,7 @@ fn user_skill_path_diagnostics_do_not_change_project_acknowledgment_digest() {
     let root = temp.path().join("repo");
     git_dir(&root);
     write(&root.join("EULER.md"), "project rules\n");
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     fs::create_dir_all(&user_skills).expect("user skill root");
     let first = Preflight::run_with_user_skills(&root, Some(&user_skills), &redactor())
         .expect("first preflight");
@@ -2493,7 +2502,7 @@ fn rendered_catalog_admits_every_listed_skill_or_reports_its_omission() {
     let temp = tempfile::tempdir().expect("temp");
     let root = temp.path().join("repo");
     git_dir(&root);
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     for index in 0..30 {
         let name = format!("skill-{index:02}");
         write_skill(&user_skills, &name, &"description ".repeat(75), "body\n");
@@ -2575,7 +2584,7 @@ fn user_skills_survive_indeterminate_repository_boundary_discovery() {
     for index in 0..=MAX_DIR_ENTRIES {
         write(&root.join(format!("entry-{index:04}")), "");
     }
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write_skill(
         &user_skills,
         "commit-writing",
@@ -2683,7 +2692,7 @@ fn user_only_skills_obey_the_admission_budget_when_project_context_is_off() {
     let temp = tempfile::tempdir().expect("temp");
     let root = temp.path().join("repo");
     git_dir(&root);
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write_skill(
         &user_skills,
         "commit-writing",
@@ -2727,7 +2736,7 @@ fn decline_excludes_project_skills_from_frozen_set_and_fold() {
         "Project skill.",
         "project body\n",
     );
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write_skill(&user_skills, "user-skill", "User skill.", "user body\n");
     let canonical = fs::canonicalize(&root).expect("canonical");
     let consent = temp.path().join("consent");
@@ -2786,7 +2795,7 @@ fn fold_rejects_forged_project_scope_skill_in_declined_snapshot() {
         "Project skill.",
         "project body\n",
     );
-    let user_skills = temp.path().join("home/skills");
+    let user_skills = user_skills_root(&temp);
     write_skill(&user_skills, "user-skill", "User skill.", "user body\n");
     let canonical = fs::canonicalize(&root).expect("canonical");
     let consent = temp.path().join("consent");

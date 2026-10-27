@@ -164,6 +164,11 @@ pull requests that landed them; deeper design rationale lives in
   core framing, user-only manifests receive the same context-budget checks,
   and child `none | inherit` policy is enforced for prior skill-result canvas
   rounds and `tool_result_get` rehydration.
+- Tests that assert project-context output no longer depend on the host temp
+  directory. Their fixture workspaces are their own repository boundaries and
+  user-skill fixtures pass a canonical root, so a crowded or symlinked
+  `$TMPDIR` (the macOS default) no longer fails them. Production discovery is
+  unchanged.
 
 ### Steering reliability
 
