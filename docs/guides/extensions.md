@@ -257,8 +257,8 @@ Host calls gate on those capabilities:
   attributed structured `plan.update` presentation while workflow state and
   transition policy remain extension-owned.
 
-Root sessions default `extension-state`, `context-slot`, and
-`plan-presentation` to `session-allow`. Terminal-idle extension commands never
+Root sessions default `extension-state`, `context-slot`, `plan-presentation`,
+and `artifact-write` to `session-allow`. Terminal-idle extension commands never
 prompt: they run only when all required capabilities already have standing
 authority. Explicit model tools use the ordinary permission flow.
 

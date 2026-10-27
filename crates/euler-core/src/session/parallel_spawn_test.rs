@@ -1499,9 +1499,10 @@ fn batch_rejects_unknown_provider_before_any_event() {
         .spawn_reviewers_parallel(tasks, &CancellationToken::new())
         .expect_err("unknown provider");
 
-    assert!(error
-        .to_string()
-        .contains("is not configured for this session"));
+    let message = error.to_string();
+    assert!(message.contains("provider `nope` is not configured for this session"));
+    assert!(message.contains("run /login"));
+    assert!(!message.contains("reviewer-model picker"));
     assert!(batch_events(session.events()).is_empty());
 }
 

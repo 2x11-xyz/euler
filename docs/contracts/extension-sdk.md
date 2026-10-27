@@ -413,10 +413,12 @@ rejecting other ordinary controls, Unicode 17 `Cf`, and `Zl`/`Zp`. That
 once-redacted value is persisted and modeled verbatim; emission does not run a
 second, potentially non-idempotent redaction pass.
 
-Root sessions default `extension-state` and the bounded, extension-namespaced
-`context-slot` and `plan-presentation` capabilities to `session-allow`. This
-permits absent-state/resume probing and bounded presentation without a prompt;
-it does not create a plan, goal, or workflow in core.
+Root sessions default `extension-state`, the bounded, extension-namespaced
+`context-slot` and `plan-presentation` capabilities, and host-mediated
+`artifact-write` to `session-allow` (ADR 0022). This permits absent-state/resume
+probing, bounded presentation, and host-written session-private artifacts
+without a prompt; it grants no filesystem authority and does not create a plan,
+goal, or workflow in core. Child and companion gates keep their deny-all start.
 
 Pending user input wins both before and after command execution. Cancellation
 is checked at both boundaries. An accepted continuation is recorded as

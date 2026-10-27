@@ -4091,6 +4091,8 @@ fn gated_extension_run_asks_for_declared_capabilities() {
         ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
     )
     .with_provenance(writer);
+    // `artifact-write` is session-allow by default; this test exercises the ask path.
+    session.set_permission_mode(Capability::ArtifactWrite, ApprovalMode::Ask);
     let extension = test_extension(
         "artifact-ext",
         vec![Capability::ArtifactWrite],
@@ -4132,6 +4134,59 @@ fn gated_extension_run_asks_for_declared_capabilities() {
 }
 
 #[test]
+fn root_session_extension_artifact_write_runs_without_a_prompt_by_default() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp
+        .path()
+        .join("sessions")
+        .join("session-artifact-default");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let writer = ProvenanceWriter::new(session_dir.join("events.jsonl")).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    config.session_id = "session-artifact-default".to_owned();
+    enable_test_extensions(&mut config, &["artifact-ext"]);
+    // An empty script denies any prompt, so reaching the decider fails the run.
+    let mut session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    )
+    .with_provenance(writer);
+    let extension = test_extension(
+        "artifact-ext",
+        vec![Capability::ArtifactWrite],
+        TestCommandBehavior::Write {
+            chunks: vec![b"default artifact".to_vec()],
+            after: AfterWrite::Ok,
+        },
+    );
+
+    session
+        .execute_extension_command_gated(
+            &extension,
+            "write",
+            json!(null),
+            &[Capability::ArtifactWrite],
+        )
+        .expect("artifact-write is session-allow in a root session");
+
+    assert_eq!(extension_artifacts(session.events()).len(), 1);
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::PERMISSION_PROMPT));
+    // Only the host's static-grant record of the executed capability remains.
+    let decisions = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].payload["capability"], json!("artifact-write"));
+    assert_eq!(decisions[0].payload["mode"], json!("static-grant"));
+}
+
+#[test]
 fn idle_extension_permissions_after_a_completed_run_are_live_and_resumable() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("idle-extension-permission.jsonl");
@@ -4145,6 +4200,8 @@ fn idle_extension_permissions_after_a_completed_run_are_live_and_resumable() {
         ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
     )
     .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    // `artifact-write` is session-allow by default; this test exercises the ask path.
+    session.set_permission_mode(Capability::ArtifactWrite, ApprovalMode::Ask);
     session
         .admit_user_message("completed run", None, true)
         .expect("admit run");
@@ -4208,6 +4265,8 @@ fn gated_extension_run_denial_blocks_execution() {
         ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Deny]),
     )
     .with_provenance(writer);
+    // `artifact-write` is session-allow by default; this test exercises the ask path.
+    session.set_permission_mode(Capability::ArtifactWrite, ApprovalMode::Ask);
     let extension = test_extension(
         "artifact-ext",
         vec![Capability::ArtifactWrite],
@@ -4259,6 +4318,8 @@ fn gated_extension_run_session_grant_covers_later_runs() {
         ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::AllowSession]),
     )
     .with_provenance(writer);
+    // `artifact-write` is session-allow by default; this test exercises the ask path.
+    session.set_permission_mode(Capability::ArtifactWrite, ApprovalMode::Ask);
     let extension = test_extension(
         "artifact-ext",
         vec![Capability::ArtifactWrite],
@@ -4308,6 +4369,8 @@ fn gated_extension_run_batches_capabilities_but_keeps_individual_decisions() {
         ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::AllowSession]),
     )
     .with_provenance(writer);
+    // `artifact-write` is session-allow by default; this test exercises the ask path.
+    session.set_permission_mode(Capability::ArtifactWrite, ApprovalMode::Ask);
     let required = [Capability::ArtifactWrite, Capability::Network];
     let extension = test_extension(
         "batch-ext",
@@ -4383,6 +4446,8 @@ fn gated_extension_batch_denial_records_every_capability_and_executes_nothing() 
         ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Deny]),
     )
     .with_provenance(writer);
+    // `artifact-write` is session-allow by default; this test exercises the ask path.
+    session.set_permission_mode(Capability::ArtifactWrite, ApprovalMode::Ask);
     let required = [Capability::ArtifactWrite, Capability::Network];
     let extension = test_extension(
         "batch-ext",
@@ -5562,6 +5627,8 @@ fn cancellation_while_extension_batch_permission_waits_never_executes_or_commits
         },
     )
     .with_provenance(writer);
+    // `artifact-write` is session-allow by default; this test exercises the ask path.
+    session.set_permission_mode(Capability::ArtifactWrite, ApprovalMode::Ask);
     let extension = test_extension(
         "cancel-ext",
         vec![Capability::ArtifactWrite, Capability::Network],

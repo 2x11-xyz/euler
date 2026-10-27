@@ -221,10 +221,10 @@ impl<D: PermissionDecider> Session<D> {
         if !self.providers.contains(&target.provider) {
             // Named up front (not just "a target failed") and actionable:
             // this aborts the whole spawn batch (extension callers stop on
-            // the first spawn Err), so a code-swarm run with a bad target
-            // must not burn the remaining reviewer slots to find out (#58).
+            // the first spawn Err), so a batch with a bad target must not
+            // burn the remaining spawn slots to find out (#58).
             return Err(SessionError::InvalidCompanionTask(format!(
-                "provider `{}` is not configured for this session; run /login to authenticate it or pick a different target from the reviewer-model picker",
+                "provider `{}` is not configured for this session; run /login to authenticate it or choose a different target",
                 target.provider
             )));
         }
