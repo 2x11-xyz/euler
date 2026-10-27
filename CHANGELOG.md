@@ -219,7 +219,7 @@ pull requests that landed them; deeper design rationale lives in
   own provenance stays faithful, and `agent.spawn` marks these children with
   `egress_redacted: true`.
 
-### Session lock release
+### Session lock release (#243)
 
 - Dropping a provenance writer now releases its session lock even while a
   child process spawned on another thread still shares the lock descriptor
