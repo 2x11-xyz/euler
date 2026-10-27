@@ -31,6 +31,7 @@ struct TestExtension {
 struct TestExtensionState {
     idle_outputs: VecDeque<Value>,
     model_tool_calls: usize,
+    last_model_tool_input: Option<Value>,
     idle_calls: usize,
     cancel_after_idle: Option<Arc<AtomicBool>>,
     steer_after_idle: Option<Arc<super::super::steering::SteeringQueue>>,
@@ -43,6 +44,7 @@ impl TestExtension {
             state: Arc::new(Mutex::new(TestExtensionState {
                 idle_outputs: idle_outputs.into_iter().collect(),
                 model_tool_calls: 0,
+                last_model_tool_input: None,
                 idle_calls: 0,
                 cancel_after_idle: None,
                 steer_after_idle: None,
@@ -254,6 +256,7 @@ impl FailingTickWorkflowExtension {
                     .into_iter()
                     .collect(),
                 model_tool_calls: 0,
+                last_model_tool_input: None,
                 idle_calls: 0,
                 cancel_after_idle: None,
                 steer_after_idle: None,
@@ -536,6 +539,7 @@ impl ExtensionCommand for TestCommand {
         match self.kind {
             TestCommandKind::ModelTool => {
                 state.model_tool_calls += 1;
+                state.last_model_tool_input = Some(context.input.clone());
                 Ok(json!({"stored": context.input["items"]}))
             }
             TestCommandKind::Idle => {
@@ -1837,6 +1841,7 @@ fn model_tool_failure_projection_is_bounded_and_format_safe() {
         state: Arc::new(Mutex::new(TestExtensionState {
             idle_outputs: VecDeque::new(),
             model_tool_calls: 0,
+            last_model_tool_input: None,
             idle_calls: 0,
             cancel_after_idle: None,
             steer_after_idle: None,
@@ -2043,6 +2048,48 @@ fn model_tool_is_advertised_and_uses_canonical_attributed_braid() {
             .unwrap_or_else(PoisonError::into_inner)
             .model_tool_calls,
         1
+    );
+}
+
+#[test]
+fn model_tool_input_reaches_the_extension_redacted_while_tool_call_stays_faithful() {
+    const SECRET: &str = "synthetic-model-tool-secret-0123456789";
+    let temp = tempfile::tempdir().expect("temp");
+    let extension = TestExtension::model_tool_only();
+    let state = Arc::clone(&extension.state);
+    let (mut session, _requests) = session_with_extension(
+        &temp,
+        extension,
+        vec![
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-update".to_owned(),
+                name: "update_workflow".to_owned(),
+                input: json!({"items": [format!("token {SECRET}")]}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ],
+        Vec::new(),
+    );
+    session.add_redacted_secret(SECRET);
+
+    session.run_turn("do the work").expect("turn");
+
+    let delivered = state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .last_model_tool_input
+        .clone()
+        .expect("extension received input");
+    assert_eq!(delivered, json!({"items": ["token [redacted-secret]"]}));
+    let call = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .expect("tool call");
+    assert_eq!(
+        call.payload["input"],
+        json!({"items": [format!("token {SECRET}")]}),
+        "the tool.call event keeps the model's faithful arguments"
     );
 }
 

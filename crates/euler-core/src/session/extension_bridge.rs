@@ -96,8 +96,8 @@ impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
                 "agent spawn quota exhausted: one command may run at most {MAX_SPAWNS_PER_COMMAND} agents"
             )));
         }
-        let agent_task = convert_spawn_task(task)?;
         let mut session = self.session.borrow_mut();
+        let agent_task = convert_spawn_task(task, &session.redactor)?;
         // Companion events append through the session bus. Sync already-queued
         // extension events into the bus first, so the durable parent chain the
         // post-command publish asserts stays intact.
@@ -124,12 +124,12 @@ impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
                 "agent spawn quota exhausted: one command may run at most {MAX_SPAWNS_PER_COMMAND} agents"
             )));
         }
+        let mut session = self.session.borrow_mut();
         let agent_tasks = tasks
             .into_iter()
-            .map(convert_spawn_task)
+            .map(|task| convert_spawn_task(task, &session.redactor))
             .collect::<Result<Vec<_>, _>>()?;
         let batch_len = agent_tasks.len();
-        let mut session = self.session.borrow_mut();
         session
             .publish_queued_extension_events(&self.queue)
             .map_err(spawn_failed)?;
@@ -171,24 +171,36 @@ fn invalid_spawn_task(error: AgentError) -> ExtensionError {
     ExtensionError::Message(format!("invalid agent task: {error}"))
 }
 
-fn convert_spawn_task(task: SpawnAgentTask) -> Result<AgentTask, ExtensionError> {
+/// Build the child task an extension asked for. Every text the extension
+/// supplies is redacted here, before the task exists, so `agent.spawn`
+/// records exactly what leaves the host and the task bounds apply to the
+/// redacted bytes (ADR 0022). The inherited parent canvas is redacted at
+/// request assembly.
+fn convert_spawn_task(
+    task: SpawnAgentTask,
+    redactor: &crate::redaction::SecretRedactor,
+) -> Result<AgentTask, ExtensionError> {
+    let text = redactor.redact(&task.task);
+    let persona = redactor.redact(&task.persona);
     let mut agent_task = if task.provider.is_empty() && task.model.is_empty() {
-        AgentTask::new_inheriting_target(&task.task, &task.persona)
+        AgentTask::new_inheriting_target(&text, &persona)
     } else {
-        AgentTask::new(&task.task, &task.persona, &task.provider, &task.model)
+        AgentTask::new(&text, &persona, &task.provider, &task.model)
     }
     .map_err(invalid_spawn_task)?;
     if !task.system_prompt.is_empty() {
         agent_task = agent_task
-            .with_system_prompt(&task.system_prompt)
+            .with_system_prompt(redactor.redact(&task.system_prompt))
             .map_err(invalid_spawn_task)?;
     }
     if let Some(context) = &task.explicit_context {
         agent_task = agent_task
-            .with_explicit_context(context)
+            .with_explicit_context(redactor.redact(context))
             .map_err(invalid_spawn_task)?;
     }
-    agent_task = agent_task.with_parent_canvas(task.include_parent_canvas);
+    agent_task = agent_task
+        .with_parent_canvas(task.include_parent_canvas)
+        .with_egress_redaction();
     let budget = AgentBudget::new(
         budget_u32("max_turns", task.max_turns)?,
         budget_u32("max_tool_calls", task.max_tool_calls)?,
@@ -782,3 +794,7 @@ mod tests {
             .expect("non-shell capabilities still approve");
     }
 }
+
+#[cfg(test)]
+#[path = "extension_egress_test.rs"]
+mod extension_egress_test;

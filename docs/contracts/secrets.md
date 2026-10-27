@@ -74,6 +74,11 @@ of euler provenance; redacting it would corrupt the record (owner decision,
   incident: a granted `cat` of a foreign secrets file),
 - provider error messages (external HTTP bodies),
 - context-slot content (extension-supplied data that enters model context),
+- what crosses an extension boundary (ADR 0022): model-tool input delivered
+  to an extension, and the provider request of a child spawned on an
+  extension's behalf (task text, system prompt, explicit context, and the
+  inherited parent canvas). These are egress copies; the session's own
+  provenance of the same text stays faithful,
 - resolved provider/auth secrets (registered with the redactor at
   resolution time so their values are caught wherever they surface).
 

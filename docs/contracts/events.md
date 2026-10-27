@@ -1005,6 +1005,10 @@ extension error does not consume the later result.
   request assembly receives the parent's frozen project-context snapshot.
   Missing (events written before the field existed) decodes as `none`; an
   unknown value is invalid and never falls through to inheritance.
+  Optional `egress_redacted: true` marks a child spawned on an extension's
+  behalf (ADR 0022): its `task`, `persona`, `system_prompt`, and explicit
+  context were redacted before the task was built, and its inherited parent canvas is
+  redacted at request assembly. Absent means a core-authored spawn.
 - `agent.message`: `from_agent_id`, `to_agent_id`, `spawn_event_id`,
   `queued_ts`, `payload`. This is a parent-drained child-to-parent report from
   a live current-process background child, not transcript content and not a

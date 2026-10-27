@@ -619,10 +619,14 @@ impl<D: PermissionDecider> Session<D> {
                 started,
             );
         }
+        // The extension receives a redacted copy (ADR 0022); the `tool.call`
+        // event keeps the model's faithful arguments.
+        let mut delivered_input = call.input.clone();
+        self.redactor.redact_value(&mut delivered_input);
         let result = self.execute_extension_command_cancellable(
             binding.extension.as_ref(),
             &binding.command,
-            call.input.clone(),
+            delivered_input,
             binding.required_capabilities.iter().copied(),
             cancellation,
         );

@@ -6026,6 +6026,44 @@ fn child_canvas_boundary(mut canvas: Vec<CanvasItem>) -> Vec<CanvasItem> {
     canvas
 }
 
+/// Egress copy of a canvas for a child spawned on an extension's behalf
+/// (ADR 0022): redact every text its provider would receive. Provenance keeps
+/// the faithful originals. Items whose exact bytes are bound elsewhere cannot
+/// be edited, so one the redactor would change is dropped instead: signed
+/// provider reasoning, and project-context or skill bodies whose snapshot
+/// digest `model.call` may record. Those bodies were redacted at admission, so
+/// only a secret registered later drops them.
+fn redact_child_canvas_for_egress(
+    canvas: &mut Vec<CanvasItem>,
+    redactor: &crate::redaction::SecretRedactor,
+) {
+    canvas.retain_mut(|item| match item {
+        CanvasItem::Message { content, .. }
+        | CanvasItem::Projection { content, .. }
+        | CanvasItem::Slot { content, .. }
+        | CanvasItem::ExtensionContribution { content, .. } => {
+            *content = redactor.redact(content);
+            true
+        }
+        CanvasItem::ToolCall { input, .. } => {
+            redactor.redact_value(input);
+            true
+        }
+        CanvasItem::ToolOutput { output, error, .. } => {
+            *output = redactor.redact(output);
+            if let Some(error) = error {
+                *error = redactor.redact(error);
+            }
+            true
+        }
+        CanvasItem::Reasoning { content, .. }
+        | CanvasItem::SkillActivation { content, .. }
+        | CanvasItem::ProjectContext {
+            rendered: content, ..
+        } => redactor.redact(content) == *content,
+    });
+}
+
 /// Apply a child's explicit `project_context` policy to its request canvas
 /// (ADR 0017). `None` filters every project-context-classified item even
 /// when `include_parent_canvas` is true; `Inherit` supplies the parent's
