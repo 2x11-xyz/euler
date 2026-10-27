@@ -342,6 +342,11 @@ capabilities.
 - Schema bytes, nesting, property counts, and model-supplied input bytes are
   host-bounded. Input is validated before capability approval or extension
   execution.
+- The whole serialized model input is bounded by the descriptor's optional
+  `max_input_bytes`, or 64 KiB (`MAX_MODEL_TOOL_INPUT_BYTES`) when it is
+  absent. A declared budget must be 1 to 320 KiB
+  (`MAX_DECLARED_MODEL_TOOL_INPUT_BYTES`); any other value fails registration
+  and manifest parsing (ADR 0022).
 - Numeric `minimum`/`maximum` ordering and input checks compare the exact
   canonical JSON decimals represented by `serde_json::Number`, without
   converting integers through `f64`; adjacent integers above `2^53` therefore

@@ -256,6 +256,10 @@ pull requests that landed them; deeper design rationale lives in
   unchanged.
 - The spawn preflight error for an unconfigured provider no longer names a
   reviewer-model picker; it still points at `/login`.
+- A model-tool descriptor may declare `max_input_bytes`, from 1 byte up to a
+  host cap of 320 KiB, as the budget for its whole serialized input. Without
+  it the budget stays 64 KiB. Any other value fails manifest parsing and
+  registration (ADR 0022).
 - Extensions can publish bounded typed plan presentation through
   `plan-presentation`; core emits canonical structured `plan.update` events
   and renders one checklist cell without taking ownership of workflow policy.

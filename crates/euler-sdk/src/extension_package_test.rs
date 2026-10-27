@@ -601,7 +601,8 @@ fn manifest_parses_model_tool_idle_and_request_tick_contributions() {
                     },
                     "required": ["items"],
                     "additionalProperties": false
-                }
+                },
+                "max_input_bytes": 128 * 1024
             }
         }, {
             "name": "idle",
@@ -625,6 +626,14 @@ fn manifest_parses_model_tool_idle_and_request_tick_contributions() {
             .expect("model tool")
             .name,
         "update_workflow"
+    );
+    assert_eq!(
+        descriptor.commands[0]
+            .model_tool
+            .as_ref()
+            .expect("model tool")
+            .max_input_bytes,
+        Some(128 * 1024)
     );
     assert_eq!(
         descriptor.idle_contribution,
@@ -697,6 +706,40 @@ fn manifest_rejects_user_model_tools_and_invalid_idle_commands() {
     assert!(error
         .to_string()
         .contains("idle_contribution command `update` must be agent-only"));
+}
+
+#[test]
+fn manifest_rejects_model_tool_input_budget_above_the_host_cap() {
+    let manifest = json!({
+        "version": 1,
+        "id": "workflow-example",
+        "display_name": "Workflow example",
+        "extension_version": "0.1.0",
+        "runtime_kind": "native-rust",
+        "capabilities": [],
+        "commands": [{
+            "name": "update",
+            "display_name": "Update",
+            "summary": "Update extension-owned state.",
+            "required_capabilities": [],
+            "invocation": "agent-only",
+            "model_tool": {
+                "name": "update_workflow",
+                "description": "Update extension-owned workflow state.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                },
+                "max_input_bytes": crate::MAX_DECLARED_MODEL_TOOL_INPUT_BYTES + 1
+            }
+        }]
+    });
+    let error = parse_extension_manifest_bytes(&serde_json::to_vec(&manifest).expect("manifest"))
+        .expect_err("budget above the cap");
+    assert!(error.to_string().contains("model_tool is invalid"));
+    assert!(error.to_string().contains("max_input_bytes"));
 }
 
 #[test]

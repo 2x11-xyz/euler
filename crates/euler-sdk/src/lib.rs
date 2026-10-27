@@ -33,8 +33,9 @@ pub use extension_package::{
 pub use model_text::extension_model_text_is_format_safe;
 pub use model_tool::{
     validate_model_tool_descriptor, validate_model_tool_input, ModelToolValidationError,
-    MAX_MODEL_TOOL_DESCRIPTION_BYTES, MAX_MODEL_TOOL_INPUT_BYTES, MAX_MODEL_TOOL_NAME_BYTES,
-    MAX_MODEL_TOOL_OUTPUT_BYTES, MAX_MODEL_TOOL_SCHEMA_BYTES,
+    MAX_DECLARED_MODEL_TOOL_INPUT_BYTES, MAX_MODEL_TOOL_DESCRIPTION_BYTES,
+    MAX_MODEL_TOOL_INPUT_BYTES, MAX_MODEL_TOOL_NAME_BYTES, MAX_MODEL_TOOL_OUTPUT_BYTES,
+    MAX_MODEL_TOOL_SCHEMA_BYTES,
 };
 pub use plan_presentation::{
     validate_plan_presentation, PlanItemStatus, PlanPresentation, PlanPresentationItem,
@@ -263,6 +264,11 @@ pub struct ModelToolDescriptor {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// Byte budget for the whole serialized model input. `None` means
+    /// `MAX_MODEL_TOOL_INPUT_BYTES`; a declared value must be
+    /// 1..=`MAX_DECLARED_MODEL_TOOL_INPUT_BYTES`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_input_bytes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]

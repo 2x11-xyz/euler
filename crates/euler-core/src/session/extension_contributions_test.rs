@@ -577,6 +577,7 @@ fn standard_model_tool_descriptor() -> ModelToolDescriptor {
             "required": ["items"],
             "additionalProperties": false
         }),
+        max_input_bytes: None,
     }
 }
 
@@ -602,6 +603,7 @@ fn large_model_tool_descriptor(name: &str) -> ModelToolDescriptor {
             "required": [],
             "additionalProperties": false
         }),
+        max_input_bytes: None,
     }
 }
 
@@ -2581,6 +2583,82 @@ fn invalid_model_tool_input_fails_before_permission_or_execution() {
 }
 
 #[test]
+fn model_tool_input_budget_above_the_host_cap_fails_registration() {
+    let wire = |max_input_bytes| {
+        let temp = tempfile::tempdir().expect("temp");
+        let (provider, _) = CapturingProvider::new(Vec::new());
+        let mut config = super::super::SessionConfig::new(temp.path());
+        config.extensions_enabled.insert("workflow-ext".to_owned());
+        let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
+        let mut descriptor = standard_model_tool_descriptor();
+        descriptor.max_input_bytes = Some(max_input_bytes);
+        session.wire_extension(Arc::new(
+            TestExtension::model_tool_only().with_model_tool_descriptor(descriptor),
+        ))
+    };
+
+    wire(euler_sdk::MAX_DECLARED_MODEL_TOOL_INPUT_BYTES).expect("budget at the cap");
+    let error =
+        wire(euler_sdk::MAX_DECLARED_MODEL_TOOL_INPUT_BYTES + 1).expect_err("budget above the cap");
+    assert!(matches!(error, ExtensionExecutionError::RegistrationFailed));
+}
+
+#[test]
+fn declared_model_tool_input_budget_governs_the_session_tool_path() {
+    const BUDGET: usize = 100 * 1024;
+    let temp = tempfile::tempdir().expect("temp");
+    let mut descriptor = standard_model_tool_descriptor();
+    descriptor.max_input_bytes = Some(BUDGET);
+    let extension = TestExtension::model_tool_only().with_model_tool_descriptor(descriptor);
+    let state = Arc::clone(&extension.state);
+    // Schema-valid input over the 64 KiB default but within the declared budget.
+    let above_default = json!({"items": vec!["x".repeat(1024); 64]});
+    let above_default_bytes = serde_json::to_vec(&above_default).expect("input").len();
+    assert!(above_default_bytes > euler_sdk::MAX_MODEL_TOOL_INPUT_BYTES);
+    assert!(above_default_bytes <= BUDGET);
+    let above_budget = json!({"items": vec!["x".repeat(1024); 101]});
+    assert!(serde_json::to_vec(&above_budget).expect("input").len() > BUDGET);
+    let (mut session, _) = session_with_extension(
+        &temp,
+        extension,
+        vec![
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-within-budget".to_owned(),
+                name: "update_workflow".to_owned(),
+                input: above_default,
+            }]),
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-above-budget".to_owned(),
+                name: "update_workflow".to_owned(),
+                input: above_budget,
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ],
+        Vec::new(),
+    );
+
+    session.run_turn("do the work").expect("turn");
+
+    assert_eq!(
+        state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .model_tool_calls,
+        1
+    );
+    let results = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].payload["ok"], json!(true));
+    assert_eq!(results[1].payload["ok"], json!(false));
+    let error = results[1].payload["error"].as_str().expect("error");
+    assert!(error.contains(&format!("exceeds {BUDGET}")));
+}
+
+#[test]
 fn exact_integer_bound_rejects_adjacent_input_before_permission_or_execution() {
     const MAXIMUM: u64 = 9_007_199_254_740_992;
     let temp = tempfile::tempdir().expect("temp");
@@ -2595,6 +2673,7 @@ fn exact_integer_bound_rejects_adjacent_input_before_permission_or_execution() {
             "required": ["value"],
             "additionalProperties": false
         }),
+        max_input_bytes: None,
     };
     let extension = TestExtension::model_tool_only()
         .with_capabilities(vec![Capability::FsWrite])

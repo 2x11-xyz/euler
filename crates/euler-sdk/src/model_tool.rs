@@ -9,6 +9,8 @@ pub const MAX_MODEL_TOOL_NAME_BYTES: usize = 64;
 pub const MAX_MODEL_TOOL_DESCRIPTION_BYTES: usize = 1024;
 pub const MAX_MODEL_TOOL_SCHEMA_BYTES: usize = 16 * 1024;
 pub const MAX_MODEL_TOOL_INPUT_BYTES: usize = 64 * 1024;
+/// Host cap on a descriptor's declared `max_input_bytes` (ADR 0022).
+pub const MAX_DECLARED_MODEL_TOOL_INPUT_BYTES: usize = 320 * 1024;
 pub const MAX_MODEL_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 
 const MAX_SCHEMA_DEPTH: usize = 8;
@@ -49,6 +51,14 @@ pub fn validate_model_tool_descriptor(
 ) -> Result<(), ModelToolValidationError> {
     validate_tool_name(&descriptor.name)?;
     validate_description(&descriptor.description)?;
+    if descriptor
+        .max_input_bytes
+        .is_some_and(|budget| budget == 0 || budget > MAX_DECLARED_MODEL_TOOL_INPUT_BYTES)
+    {
+        return Err(ModelToolValidationError::new(format!(
+            "model tool max_input_bytes must be 1..={MAX_DECLARED_MODEL_TOOL_INPUT_BYTES}"
+        )));
+    }
     let schema_bytes = serde_json::to_vec(&descriptor.input_schema)
         .map_err(|_| ModelToolValidationError::new("model tool schema is not valid JSON"))?
         .len();
@@ -79,9 +89,12 @@ pub fn validate_model_tool_input(
     let input_bytes = serde_json::to_vec(input)
         .map_err(|_| ModelToolValidationError::new("model tool input is not valid JSON"))?
         .len();
-    if input_bytes > MAX_MODEL_TOOL_INPUT_BYTES {
+    let budget = descriptor
+        .max_input_bytes
+        .unwrap_or(MAX_MODEL_TOOL_INPUT_BYTES);
+    if input_bytes > budget {
         return Err(ModelToolValidationError::new(format!(
-            "model tool input is too large: {input_bytes} bytes exceeds {MAX_MODEL_TOOL_INPUT_BYTES}"
+            "model tool input is too large: {input_bytes} bytes exceeds {budget}"
         )));
     }
     validate_value(&descriptor.input_schema, input, "$")
@@ -748,6 +761,7 @@ mod tests {
                 "required": ["items"],
                 "additionalProperties": false
             }),
+            max_input_bytes: None,
         }
     }
 
@@ -818,7 +832,16 @@ mod tests {
             json!("s".repeat(MAX_MODEL_TOOL_SCHEMA_BYTES));
         assert!(validate_model_tool_descriptor(&oversized_schema).is_err());
 
-        let unbounded_string = crate::ModelToolDescriptor {
+        let unbounded_string = unbounded_string_descriptor(None);
+        assert!(validate_model_tool_input(
+            &unbounded_string,
+            &json!({"value": "v".repeat(MAX_MODEL_TOOL_INPUT_BYTES)})
+        )
+        .is_err());
+    }
+
+    fn unbounded_string_descriptor(max_input_bytes: Option<usize>) -> crate::ModelToolDescriptor {
+        crate::ModelToolDescriptor {
             name: "store_value".to_owned(),
             description: "Store one value.".to_owned(),
             input_schema: json!({
@@ -827,12 +850,69 @@ mod tests {
                 "required": ["value"],
                 "additionalProperties": false
             }),
-        };
-        assert!(validate_model_tool_input(
-            &unbounded_string,
-            &json!({"value": "v".repeat(MAX_MODEL_TOOL_INPUT_BYTES)})
+            max_input_bytes,
+        }
+    }
+
+    /// An input whose whole serialization is exactly `bytes` long.
+    fn input_of_serialized_bytes(bytes: usize) -> Value {
+        let envelope = serde_json::to_vec(&json!({"value": ""}))
+            .expect("envelope")
+            .len();
+        let input = json!({"value": "v".repeat(bytes - envelope)});
+        assert_eq!(serde_json::to_vec(&input).expect("input").len(), bytes);
+        input
+    }
+
+    #[test]
+    fn default_input_budget_rejects_one_byte_over_the_default() {
+        let descriptor = unbounded_string_descriptor(None);
+        validate_model_tool_input(
+            &descriptor,
+            &input_of_serialized_bytes(MAX_MODEL_TOOL_INPUT_BYTES),
         )
-        .is_err());
+        .expect("default budget accepts exactly its size");
+        let error = validate_model_tool_input(
+            &descriptor,
+            &input_of_serialized_bytes(MAX_MODEL_TOOL_INPUT_BYTES + 1),
+        )
+        .expect_err("default budget rejects one byte over");
+        assert!(error.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn declared_input_budget_accepts_up_to_its_value_and_rejects_above() {
+        // One budget above the default and one below it.
+        for budget in [100 * 1024, 1024] {
+            let descriptor = unbounded_string_descriptor(Some(budget));
+            validate_model_tool_descriptor(&descriptor).expect("declared budget under the cap");
+            validate_model_tool_input(&descriptor, &input_of_serialized_bytes(budget))
+                .expect("declared budget accepts exactly its size");
+            let error =
+                validate_model_tool_input(&descriptor, &input_of_serialized_bytes(budget + 1))
+                    .expect_err("declared budget rejects one byte over");
+            assert!(error.to_string().contains(&format!("exceeds {budget}")));
+        }
+    }
+
+    #[test]
+    fn declared_input_budget_is_capped_by_the_host() {
+        let at_cap = unbounded_string_descriptor(Some(MAX_DECLARED_MODEL_TOOL_INPUT_BYTES));
+        validate_model_tool_descriptor(&at_cap).expect("budget at the cap");
+        validate_model_tool_input(
+            &at_cap,
+            &input_of_serialized_bytes(MAX_DECLARED_MODEL_TOOL_INPUT_BYTES),
+        )
+        .expect("cap-sized input");
+
+        for budget in [0, MAX_DECLARED_MODEL_TOOL_INPUT_BYTES + 1] {
+            let descriptor = unbounded_string_descriptor(Some(budget));
+            assert!(validate_model_tool_descriptor(&descriptor)
+                .expect_err("budget outside 1..=cap")
+                .to_string()
+                .contains("max_input_bytes"));
+            assert!(validate_model_tool_input(&descriptor, &json!({"value": ""})).is_err());
+        }
     }
 
     #[test]
@@ -852,6 +932,7 @@ mod tests {
                 "required": ["value"],
                 "additionalProperties": false
             }),
+            max_input_bytes: None,
         };
         validate_model_tool_descriptor(&bounded_integer).expect("valid exact bound");
         validate_model_tool_input(&bounded_integer, &json!({"value": F64_EXACT_INTEGER_EDGE}))
