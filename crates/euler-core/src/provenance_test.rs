@@ -1870,6 +1870,30 @@ fn lock_released_on_drop_allows_new_writer() {
 }
 
 #[test]
+fn lock_released_on_drop_while_a_spawned_child_shares_the_descriptor() {
+    // Between fork and exec a child spawned by any thread holds a duplicate
+    // of the lock descriptor, sharing its open file description, exactly as
+    // `try_clone` does here. Dropping the writer must still release the lock.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let writer = ProvenanceWriter::new(log.clone()).expect("first writer");
+    let child_duplicate = writer
+        ._lock
+        .file
+        .try_clone()
+        .expect("duplicate lock descriptor");
+
+    drop(writer);
+
+    let _writer = ProvenanceWriter::new(log.clone()).expect("writer after drop");
+    assert!(matches!(
+        ProvenanceWriter::new(log),
+        Err(ProvenanceWriterError::SessionLocked { .. })
+    ));
+    drop(child_duplicate);
+}
+
+#[test]
 fn legacy_pid_lock_file_is_refused_with_recovery_guidance() {
     // A bare-PID lock belongs to a pre-advisory-lock Euler that owns the
     // session by pathname existence and holds no OS lock — it may be live

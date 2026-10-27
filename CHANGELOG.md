@@ -219,6 +219,14 @@ pull requests that landed them; deeper design rationale lives in
   own provenance stays faithful, and `agent.spawn` marks these children with
   `egress_redacted: true`.
 
+### Session lock release
+
+- Dropping a provenance writer now releases its session lock even while a
+  child process spawned on another thread still shares the lock descriptor
+  between fork and exec. Reopening a session right after closing it, for
+  example to scrub it, no longer fails intermittently with a session-lock
+  error while a tool or sandbox probe is starting.
+
 ### Research-neutral core prompts
 
 - The fixed root instructions now introduce Euler as a research and coding
