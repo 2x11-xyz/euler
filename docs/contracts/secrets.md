@@ -2,7 +2,7 @@
 
 Euler uses simple local-agent secret resolution.
 
-Euler is a coding agent for a user's laptop, dev box, or VM. It should not pretend to be a hardened secrets platform. Real isolation comes from the OS, SSH/Tailscale access, containers, or the user's password manager.
+Euler is a local research and coding agent for a user's laptop, dev box, or VM. It should not pretend to be a hardened secrets platform. Real isolation comes from the OS, SSH/Tailscale access, containers, or the user's password manager.
 
 ## Secret Value Syntax
 
@@ -40,7 +40,7 @@ Some providers, especially the first ChatGPT subscription provider, obtain OAuth
 
 These tokens are stored in a dedicated local auth file, such as `~/.euler/auth.json`, with restrictive file permissions. They are secret-tainted and follow all redaction rules in this contract. Provider refresh is handled inside the provider layer.
 
-This is not a custom secret vault; it is a pragmatic local token file for a local coding agent.
+This is not a custom secret vault; it is a pragmatic local token file for a local agent.
 
 ## Config-Edit Guardrail
 
