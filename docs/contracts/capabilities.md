@@ -57,7 +57,16 @@ The backend is probed at session start, not assumed, and recorded on
 `unavailable`). When a required probe fails, sandbox-requiring tools fail
 closed: no backend is ever silently downgraded to host execution.
 `euler --check-sandbox` reports
-the same result with an actionable diagnostic. Deliberate unsandboxed
+the same result with an actionable diagnostic.
+
+A probe that does not finish within its deadline is a timeout, not a refusal:
+it is reported with its own reason (`probe_timed_out`), its own message (the
+check timed out, most likely under host load; start a new session to check
+again) in the tool error, on `session.start`, and in `euler --check-sandbox`,
+and the session still fails closed. The host-level backend probe caches a
+definite result (enforced, or a real unavailability such as `bwrap` missing,
+user namespaces blocked, or Seatbelt refusing the profile) for the process
+lifetime, but never caches a timeout, so the next session probes again. Deliberate unsandboxed
 execution is the explicit "Full access (unsandboxed)" preset of ADR 0021
 row D, which a later release adds; it is never a side effect of an approval
 mode.

@@ -35,6 +35,13 @@ pull requests that landed them; deeper design rationale lives in
   and the fix. New `euler --check-sandbox` runs the same probes and exits
   nonzero with that diagnostic. Bubblewrap must be installed on the host;
   bundling a digest-verified `bwrap` is tracked as a follow-up.
+- A sandbox probe that times out under host load no longer reads as a host
+  that refused the profile, and no longer sticks for the rest of the process.
+  It has its own reason, `probe_timed_out`, on `session.start` and
+  `session.resumed`, and the tool error and `euler --check-sandbox` say the
+  check timed out and to start a new session. That session still fails
+  closed; the backend probe caches only definite results, so the next session
+  probes again.
 - Euler's own Git invocations are neutralized: `core.hooksPath=/dev/null`,
   `safe.bareRepository=explicit`, `attr.tree=`, `core.attributesFile=`,
   `GIT_LFS_SKIP_SMUDGE=1 GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0`, every

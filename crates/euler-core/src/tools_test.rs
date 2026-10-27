@@ -2104,6 +2104,16 @@ fn selected_sandbox_normalizes_subprocess_io_failures() {
 }
 
 #[test]
+fn a_timed_out_sandbox_probe_reads_as_a_timeout_in_the_tool_error() {
+    let message = sandbox_unavailable(SandboxUnavailableReason::ProbeTimedOut).to_string();
+
+    assert!(message.contains("timed out"), "{message}");
+    assert!(message.contains("heavy load"), "{message}");
+    assert!(message.contains("start a new session"), "{message}");
+    assert!(!message.contains("refused"), "{message}");
+}
+
+#[test]
 fn sandbox_timeout_before_readiness_hides_launcher_output() {
     let output = collected_agent_output(
         "bwrap: host mount detail".to_owned(),

@@ -789,7 +789,10 @@ extension error does not consume the later result.
   `sandbox_unavailable_reason` is `null` unless the backend is `unavailable`,
   and is then one of `unsupported_platform`, `bubblewrap_missing`,
   `seatbelt_missing`, `git_metadata_symlink`, `cannot_enforce`,
-  `invalid_workspace`. Current writers
+  `probe_timed_out`, `invalid_workspace`. `probe_timed_out` means the probe
+  did not finish before its deadline (most likely host load), so nothing was
+  learned about the host; it is never cached, and a later session probes
+  again. Current writers
   always emit both; they are omitted only in streams written before this
   release, where omission means unknown, never `host`. They are provenance for
   the session that produced the stream, and `session.resumed` carries the same
