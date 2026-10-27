@@ -2956,12 +2956,13 @@ token = \"secret\"\n",
         let missing = temp.path().join("missing");
         let sandbox = WorkspaceSandbox::new(&missing, SandboxProfile::WorkspaceNoNetwork);
 
-        // Fails closed on every platform — that is the guarantee under test.
-        // The reason is platform-specific: off Linux the platform check
-        // short-circuits before the workspace is validated (ADR 0014).
-        #[cfg(target_os = "linux")]
+        // Fails closed on every platform; that is the guarantee under test.
+        // The reason is platform-specific: a platform with a backend
+        // (Bubblewrap on Linux, Seatbelt on macOS) validates the workspace,
+        // and any other platform short-circuits first (ADR 0021).
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let expected = SandboxUnavailableReason::InvalidWorkspace;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let expected = SandboxUnavailableReason::UnsupportedPlatform;
 
         assert_eq!(
