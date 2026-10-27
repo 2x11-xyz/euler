@@ -56,9 +56,15 @@ it must not open another writer as a bypass.
 Writer ownership is the non-blocking exclusive OS advisory lock held on the
 persistent `events.jsonl.lock` file descriptor for the writer lifetime. The
 lock pathname's existence and its best-effort diagnostic metadata are never
-authority. A legacy PID-only lock file, malformed metadata, or metadata left by
-a crashed process is overwritten after the OS grants the lock; users must not
-delete the pathname to force access while another writer may be active.
+authority. Malformed metadata or metadata left by a crashed process is
+overwritten after the OS grants the lock (a legacy PID-only lock file is
+refused instead; see Mixed versions below); users must not delete the pathname
+to force access while another writer may be active.
+Dropping a writer explicitly unlocks before closing the descriptor. On Unix, a
+child process spawned by any thread holds a duplicate of every descriptor until
+it execs, and that duplicate shares the lock's open file description, so a close
+alone could leave the lock held and fail a writer reopened in the same instant
+with a spurious session-lock error.
 The session directory is part of the trust boundary: while a writer is live,
 other actors must not unlink, rename, or replace its lock pathname. Advisory
 locks attach to open files rather than names, so replacing that pathname can

@@ -1349,7 +1349,23 @@ fn write_blob_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
 struct SessionLock {
     // Lock ownership belongs to this open file description, not its pathname.
     // Keeping it alive makes the OS lock lifetime match the writer lifetime.
-    _file: File,
+    // Never hand a duplicate of it to another owner: unlocking through any
+    // duplicate releases the lock for all of them.
+    file: File,
+}
+
+impl Drop for SessionLock {
+    // A child spawned by any thread of this process holds a duplicate of
+    // every descriptor until it execs (close-on-exec takes effect only at
+    // exec), and that duplicate shares this open file description. Closing
+    // our descriptor alone would leave the lock held through the child, so
+    // a writer reopened right after this drop could see a spurious
+    // `SessionLocked`. Unlocking the description releases it for every
+    // duplicate. If unlocking fails, the close that follows still releases
+    // the lock once no duplicate remains.
+    fn drop(&mut self) {
+        let _ = <File as fs4::FileExt>::unlock(&self.file);
+    }
 }
 
 impl SessionLock {
@@ -1368,6 +1384,7 @@ impl SessionLock {
             }
             Err(TryLockError::Error(source)) => return Err(ProvenanceWriterError::Io(source)),
         }
+        let mut lock = Self { file };
 
         // A bare-PID payload is a lock from a pre-advisory-lock Euler. Those
         // versions own a session by pathname existence and hold no OS lock,
@@ -1376,8 +1393,8 @@ impl SessionLock {
         // put two writers on one log. Refuse and ask for one manual check —
         // exactly the recovery the old versions themselves required — rather
         // than auto-migrating through the only window where corruption is
-        // possible. Dropping `file` releases the flock.
-        if let Some(legacy_pid) = read_legacy_lock_pid(&mut file) {
+        // possible. Dropping `lock` releases the flock.
+        if let Some(legacy_pid) = read_legacy_lock_pid(&mut lock.file) {
             return Err(ProvenanceWriterError::LegacySessionLock {
                 session: session_name_for(log_path),
                 path: path.clone(),
@@ -1388,8 +1405,8 @@ impl SessionLock {
         // Metadata is diagnostic only. Failure or stale/malformed contents do
         // not affect ownership once the OS has granted the advisory lock.
         let metadata = LockOwnerMetadata::current();
-        let _ = write_lock_owner(&mut file, &metadata);
-        Ok(Self { _file: file })
+        let _ = write_lock_owner(&mut lock.file, &metadata);
+        Ok(lock)
     }
 }
 
