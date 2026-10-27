@@ -4288,7 +4288,7 @@ fn replaying_provenance_reproduces_the_transcript() {
 
 #[test]
 fn resume_then_next_turn_matches_uninterrupted_transcript_projection() {
-    let temp = tempfile::tempdir().expect("temp dir");
+    let temp = repository_tempdir();
     let resumed_log = temp.path().join("resumed.jsonl");
     let uninterrupted_log = temp.path().join("uninterrupted.jsonl");
     let exe = env!("CARGO_BIN_EXE_euler");
@@ -7708,8 +7708,19 @@ fn replay_transcript(exe: &str, log: &Path) -> String {
     String::from_utf8(output.stdout).expect("utf8 transcript")
 }
 
+/// An isolated `HOME`, which `command_with_home` also makes the workspace.
 fn isolated_home() -> tempfile::TempDir {
-    tempfile::tempdir().expect("isolated HOME")
+    repository_tempdir()
+}
+
+/// A temp dir that is its own repository boundary, so project-context
+/// discovery from a workspace inside it never enumerates the host temp
+/// directory. A crowded `$TMPDIR` would otherwise fail discovery closed and
+/// add diagnostic events these tests do not expect.
+fn repository_tempdir() -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("temp dir");
+    fs::create_dir(temp.path().join(".git")).expect("repository marker");
+    temp
 }
 
 fn record_recent_catalog_refresh_for_test(home: &Path) {

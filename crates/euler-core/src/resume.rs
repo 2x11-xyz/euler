@@ -1777,12 +1777,21 @@ mod relocation_epoch_tests {
         )
     }
 
-    fn old_new_prefix() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<EventEnvelope>) {
-        let temp = tempfile::tempdir().expect("temp");
+    /// Two workspace roots, each its own repository boundary, so
+    /// project-context discovery never enumerates the host temp directory. A
+    /// crowded `$TMPDIR` would otherwise fail discovery closed with
+    /// diagnostics these fixtures do not record.
+    fn old_and_new_roots(temp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
         let old = temp.path().join("old");
         let new = temp.path().join("new");
-        std::fs::create_dir_all(&old).expect("old");
-        std::fs::create_dir_all(&new).expect("new");
+        std::fs::create_dir_all(old.join(".git")).expect("old");
+        std::fs::create_dir_all(new.join(".git")).expect("new");
+        (old, new)
+    }
+
+    fn old_new_prefix() -> (tempfile::TempDir, PathBuf, PathBuf, Vec<EventEnvelope>) {
+        let temp = tempfile::tempdir().expect("temp");
+        let (old, new) = old_and_new_roots(&temp);
         let redactor = SecretRedactor::new();
         let old_boot = ProjectContextBootstrap::dormant(&old, &redactor).expect("old boot");
         let old_snap = old_boot.snapshot_payload();
@@ -1872,10 +1881,7 @@ mod relocation_epoch_tests {
     #[test]
     fn session_grants_before_a_relocation_are_invalidated() {
         let temp = tempfile::tempdir().expect("temp");
-        let old = temp.path().join("old");
-        let new = temp.path().join("new");
-        std::fs::create_dir_all(&old).expect("old");
-        std::fs::create_dir_all(&new).expect("new");
+        let (old, new) = old_and_new_roots(&temp);
         let redactor = SecretRedactor::new();
         let old_boot = ProjectContextBootstrap::dormant(&old, &redactor).expect("old boot");
         let new_boot = ProjectContextBootstrap::dormant(&new, &redactor).expect("new boot");
