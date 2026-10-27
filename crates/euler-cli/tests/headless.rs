@@ -6188,9 +6188,10 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
     // floor. Measured cost is 240-869ms unloaded and 1040ms worst of 28 runs
     // at 40x oversubscription (~1.9x the floor). The generous ceiling only
     // bounds a failure: the wait returns as soon as the screen is quiet.
-    // Expiries here on loaded Linux runners (#177, #228) were the toggle key
-    // stranded behind the resize, not a slow pipeline; see
+    // On macOS, expiries here were the toggle key stranded behind the resize,
+    // not a slow pipeline; see
     // `tui_pty_input_that_arrives_with_a_resize_is_read_without_further_input`.
+    // The Linux expiries in #177 did not reproduce with that fix disabled.
     assert!(
         tui.wait_for_stable_screen(RESIZE_REPLAY_SETTLE.saturating_mul(32), |screen| {
             screen.contains("tool-line-15")

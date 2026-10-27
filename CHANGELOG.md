@@ -206,8 +206,9 @@ pull requests that landed them; deeper design rationale lives in
   the next keystroke. crossterm 0.29 dropped input that arrived in the same
   wakeup as a resize (crossterm-rs/crossterm#1126); euler now detects input
   left in the tty queue and requests a cursor report so the reader picks it
-  up. This was the cause of the intermittent fold-toggle-after-resize test
-  failure on loaded Linux runners (#177).
+  up. This reproduced on macOS as the intermittent fold-toggle-after-resize
+  test failure; the same test's failures on loaded Linux runners (#177) did
+  not reproduce with the fix disabled and remain open.
 
 ### Compaction resilience
 
