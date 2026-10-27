@@ -326,10 +326,10 @@ user names targets explicitly.
 
 A session-level tool advertised **only** to the root session when the
 `code-swarm` extension is wired and enabled — companions never see it
-(depth one). An enabled extension model tool with the same name replaces it
-(ADR 0022 transitional rule, extension SDK contract). It is a stage-agnostic
-review gate: plans, diffs, analyses, drafts — the calling agent selects the subject with ordinary tools before it
-calls the gate.
+(depth one). It is a stage-agnostic review gate: plans, diffs, analyses,
+drafts — the calling agent selects the subject with ordinary tools before it
+calls the gate. An enabled extension model tool with the same name replaces
+it (ADR 0022 transitional rule, extension SDK contract).
 
 - **Required focus and context.** `focus` is the concise review question
   (at most 7 KiB); `context` is the exact review material (at most 256 KiB).
