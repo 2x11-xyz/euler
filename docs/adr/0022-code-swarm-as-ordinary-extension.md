@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-10-24).
+Accepted (2026-10-24).
 
 ## Context
 
@@ -71,10 +71,20 @@ Each is useful to any extension and names no product.
    `<euler home>/extensions/<id>/config.json`. The host derives `<id>` from the
    command's registration; it is never a parameter. Config is data, not
    authority. `HostApi::write_extension_config(tier, value)` requires the
-   existing, unused `config-write` capability. A **project-tier write always
-   asks**, and no session allow or grant covers it, because the file is shared
-   with everyone who opens the workspace. A user-tier write follows the normal
-   modes. Documents are JSON objects of at most 16 KiB, written with a
+   existing, unused `config-write` capability. A user-tier write follows the
+   normal modes. A project-tier write is governed by who started it, because
+   the file is shared with everyone who opens the workspace and the threat is
+   a manipulated agent, not extension code (which the capability contract
+   already treats as trusted):
+
+   | Write started by | Rule |
+   |---|---|
+   | A `user` command the human invoked (TUI or `euler extension run`) | Normal modes |
+   | An agent-invoked model tool | Always asks a human. No session allow or grant covers it, and the guardian never adjudicates it. Unattended runs therefore deny it |
+   | A lifecycle hook (idle contributor, request tick, observer) | Refused, since hooks never prompt |
+
+   An unattended run can propose a shared config change as an artifact but
+   cannot commit it. Documents are JSON objects of at most 16 KiB, written with a
    same-directory temp file and rename. Last writer wins. A write whose value
    matches a known secret is refused. A malformed document is an error, never
    a silent fall-through.
@@ -150,8 +160,9 @@ One change per PR, ordered so the review tool is never missing:
 
 Each step ships with regression tests: no prompt under session allow for the
 review, cancelled-result shape for the extension tool, legacy pending-call
-resume, egress redaction of every spawn field, the project-tier write prompt,
-and oversize-input rejection at both budgets.
+resume, egress redaction of every spawn field, each row of the project-tier write
+table (including guardian exclusion and headless denial), and oversize-input
+rejection at both budgets.
 
 ## Consequences
 
