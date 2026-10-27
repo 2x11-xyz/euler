@@ -69,7 +69,7 @@ fn validate_model_target(target: &str) -> Result<(), ModelTargetsError> {
         .any(|ch| ch.is_whitespace() || ch.is_control())
     {
         return Err(ModelTargetsError::new(format!(
-            "model target must not contain whitespace: {target}"
+            "model target must not contain whitespace or control characters: {target:?}"
         )));
     }
     match target.split_once("::") {
@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_model_targets_rejects_empty_whitespace_and_oversize_targets() {
+    fn validate_model_targets_rejects_empty_whitespace_control_and_oversize_targets() {
         assert!(validate_model_targets(&[], 3)
             .expect_err("empty list")
             .to_string()
@@ -126,6 +126,14 @@ mod tests {
             .expect_err("whitespace")
             .to_string()
             .contains("whitespace"));
+        // Control bytes are escaped, never echoed raw into an error surface.
+        let control = validate_model_targets(&owned(&["a::b\u{1b}[2J"]), 3)
+            .expect_err("control character")
+            .to_string();
+        assert_eq!(
+            control,
+            "model target must not contain whitespace or control characters: \"a::b\\u{1b}[2J\""
+        );
         let oversize = format!("p::{}", "m".repeat(MAX_MODEL_TARGET_BYTES));
         assert!(validate_model_targets(&[oversize], 3)
             .expect_err("oversize")

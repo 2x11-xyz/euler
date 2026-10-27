@@ -661,6 +661,14 @@ pub enum ModelTargetsConfirm {
 }
 
 impl ModelTargetsConfirm {
+    /// The Enter verb shown in the picker footer.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Self::CodeSwarmSave { .. } => "save",
+            Self::ExtensionRun { .. } => "run",
+        }
+    }
+
     pub fn action(&self, targets: Vec<String>) -> CommandAction {
         match self {
             Self::CodeSwarmSave { user_tier } => CommandAction::CodeSwarmSaveModels {

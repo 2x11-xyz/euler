@@ -182,15 +182,17 @@ impl ReplacementPicker {
         let selected_count = self.items.iter().filter(|item| item.current).count();
         match self.kind {
             PickerKind::ModelTargets => {
-                let max = self
+                let (max, verb) = self
                     .model_targets
                     .as_ref()
-                    .map_or(1, |selection| selection.max);
+                    .map_or((1, "save"), |selection| {
+                        (selection.max, selection.confirm.verb())
+                    });
                 PickerChrome {
                     title: self.title.clone(),
                     params: vec![format!("{selected_count} selected"), format!("1–{max}")],
                     footer: format!(
-                        "↑↓ move · space toggle · ⏎ save · ⌫ back · esc cancel · min 1 · max {max}"
+                        "↑↓ move · space toggle · ⏎ {verb} · ⌫ back · esc cancel · min 1 · max {max}"
                     ),
                     empty: "no matches",
                 }

@@ -157,18 +157,10 @@ impl AppCore {
                     crate::cli::extension_run::agent_only_control_line_error(&id, &command)
                 ));
             }
-            // `--flag value` text is whitespace-tokenized; values with spaces
-            // need the JSON form.
-            let input = match raw_args {
-                Some(raw) => crate::extension_cli::UserCommandInput::Flags(
-                    raw.split_whitespace().map(str::to_owned).collect(),
-                ),
-                None => crate::extension_cli::UserCommandInput::Json(input),
-            };
             let input = crate::extension_cli::resolve_user_command_input(
                 &format!("{id}.{command}"),
                 &descriptor,
-                input,
+                crate::extension_cli::UserCommandInput::from_slash_args(input, raw_args),
             )?;
             return Ok(ExtensionRunRequest {
                 id,

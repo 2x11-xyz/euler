@@ -16,6 +16,18 @@ pub(crate) enum UserCommandInput {
     Flags(Vec<String>),
 }
 
+impl UserCommandInput {
+    /// TUI slash input: `raw_args` text, when present, is whitespace-tokenized
+    /// into flags (values with spaces need the JSON form); otherwise `input`
+    /// is the JSON form.
+    pub(crate) fn from_slash_args(input: serde_json::Value, raw_args: Option<String>) -> Self {
+        match raw_args {
+            Some(raw) => Self::Flags(raw.split_whitespace().map(str::to_owned).collect()),
+            None => Self::Json(input),
+        }
+    }
+}
+
 /// Parse `Flags` against the declared args, then check the resulting (or
 /// supplied JSON) object against the same args. A model-targets argument
 /// reaches the extension as a JSON array of `provider::model` strings.
@@ -154,6 +166,34 @@ mod tests {
             resolve_user_command_input("ext.configure", &descriptor(false), flags(&[]))
                 .expect("optional"),
             json!({})
+        );
+    }
+
+    #[test]
+    fn from_slash_args_routes_tui_text_through_the_resolver() {
+        let resolve = |raw: Option<&str>| {
+            resolve_user_command_input(
+                "ext.configure",
+                &descriptor(true),
+                UserCommandInput::from_slash_args(
+                    json!({"models": ["openai::gpt-5.5"]}),
+                    raw.map(str::to_owned),
+                ),
+            )
+        };
+        assert_eq!(
+            resolve(Some("  --models   a::b,c::d ")).expect("flags"),
+            json!({"models": ["a::b", "c::d"]})
+        );
+        assert_eq!(
+            resolve(Some("--models a::b,a::b"))
+                .expect_err("duplicate")
+                .to_string(),
+            "--models: duplicate model target: a::b"
+        );
+        assert_eq!(
+            resolve(None).expect("json"),
+            json!({"models": ["openai::gpt-5.5"]})
         );
     }
 

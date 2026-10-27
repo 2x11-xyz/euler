@@ -287,6 +287,7 @@ fn code_swarm_picker_defaults_to_first_three_checked() {
         "lines: {lines}"
     );
     assert!(lines.contains("[ ] mistral::large-3"), "lines: {lines}");
+    assert!(lines.contains("⏎ save · ⌫ back"), "lines: {lines}");
     assert!(lines.contains("min 1 · max 5"), "lines: {lines}");
 }
 
@@ -1472,6 +1473,7 @@ fn model_targets_picker_bounds_selection_and_runs_with_target_strings() {
         picker.render_lines(120).join("\n")
     };
     assert!(lines.contains("0 selected · 1–2"), "lines: {lines}");
+    assert!(lines.contains("⏎ run · ⌫ back"), "lines: {lines}");
     assert!(lines.contains("min 1 · max 2"), "lines: {lines}");
 
     // Enter with nothing checked is refused and keeps the picker open.
