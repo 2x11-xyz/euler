@@ -260,18 +260,14 @@ pull requests that landed them; deeper design rationale lives in
   unchanged.
 - The spawn preflight error for an unconfigured provider no longer names a
   reviewer-model picker; it still points at `/login`.
-- An enabled extension may declare a model tool named `code_swarm_review`.
-  While it is enabled, requests advertise only that tool and its calls run the
-  extension; otherwise the built-in review tool keeps its existing
-  advertisement rule (ADR 0022 transitional rule).
 - A model-tool descriptor may declare `max_input_bytes`, from 1 byte up to a
   host cap of 320 KiB, as the budget for its whole serialized input. Without
   it the budget stays 64 KiB. Any other value fails manifest parsing and
   registration (ADR 0022).
 - A `user` command may declare a model-targets argument in its manifest
   `args`: 1 to `max` (at most 16) `provider::model` targets. The TUI opens the
-  authenticated-model picker for a required one (the same picker `/code-swarm`
-  uses), and `euler extension run` and the headless `extension_run` line take
+  authenticated-model picker for a required one, and `euler extension run` and
+  the headless `extension_run` line take
   `--<flag> a::b,c::d`. The host checks count, shape, and duplicates on every
   route, JSON input included, and the extension receives a JSON array of target
   strings (ADR 0022).
@@ -296,6 +292,21 @@ pull requests that landed them; deeper design rationale lives in
 - The maintained Python managed-process SDK and examples live in
   `euler-extensions`; Euler retains only an explicitly test-owned protocol
   fixture.
+
+### CodeSwarm leaves core
+
+- Core and the CLI no longer carry a CodeSwarm path: the built-in
+  `code_swarm_review` tool, its `.euler/code-swarm.json` and
+  `~/.euler/code-swarm.json` reviewer config, and the `/code-swarm` command
+  are gone. Reviews come from the `code-swarm` extension's own model tool,
+  configured through the extension's commands, which can import a legacy
+  reviewer file (ADR 0022).
+- Review results now arrive as an extension tool result, which is redacted
+  like every extension tool result; the reviewers' own events stay faithful.
+- A resumed session that ended mid-review is closed like any other
+  interrupted tool call, and older review events stay readable.
+- A test now fails if `euler-core`, `euler-sdk`, `euler-agents`, or
+  `euler-event` names a first-party extension outside test files.
 
 ### ChatGPT subscription compatibility
 

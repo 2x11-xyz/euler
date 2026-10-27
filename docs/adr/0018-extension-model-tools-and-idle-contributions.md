@@ -145,3 +145,8 @@ API.
   vocabulary; only accepted `continue` events are model-canvas inputs.
 - CodeSwarm remains an explicitly transitional special path until separately
   migrated or removed.
+
+Amendment (2026-10-27, ADR 0022): the CodeSwarm special path is removed.
+CodeSwarm is an ordinary extension that declares its review command as a
+model tool under this ADR, and core keeps no review-specific tool, config,
+or command.

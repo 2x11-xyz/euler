@@ -85,7 +85,7 @@ impl PickerKind {
 
 /// §4.2 chrome — the one shape every list-select surface renders in. There is
 /// no second picker style; a new surface fills this in rather than inventing
-/// a layout. The canonical reference is the `/code-swarm` submenu.
+/// a layout. The canonical reference is the model-targets checklist.
 struct PickerChrome {
     /// Scope token — the submenu name, first on the title line.
     title: String,
@@ -755,13 +755,12 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
         PickerSpec::ModelTargets {
             title,
             choices,
-            selected,
             confirm,
             ..
         } => (
             PickerKind::ModelTargets,
             title,
-            model_target_items(choices, &selected, &confirm),
+            model_target_items(choices, &confirm),
         ),
         PickerSpec::Compaction(settings) => (
             PickerKind::Compaction,
@@ -810,12 +809,8 @@ fn compaction_items(settings: CompactionSettings) -> Vec<PickerItem> {
 }
 
 /// Checklist rows for the model-targets picker. `current` is the checked
-/// state, seeded from `selected`.
-fn model_target_items(
-    choices: Vec<ModelChoice>,
-    selected: &[String],
-    confirm: &ModelTargetsConfirm,
-) -> Vec<PickerItem> {
+/// state; every row starts unchecked.
+fn model_target_items(choices: Vec<ModelChoice>, confirm: &ModelTargetsConfirm) -> Vec<PickerItem> {
     choices
         .into_iter()
         .map(|choice| {
@@ -825,7 +820,7 @@ fn model_target_items(
                 detail: None,
                 status: None,
                 group: None,
-                current: selected.contains(&target),
+                current: false,
                 provider_tag: Some(target),
                 // Placeholder: confirm_picker collects the checked set and
                 // dispatches one confirm action for the whole picker.

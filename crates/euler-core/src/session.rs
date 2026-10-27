@@ -73,7 +73,6 @@ pub use steering::{
     QueueChangeRetryOutcome, QueueError, QueueLifecycleTransition, QueuePosition, QueuedInput,
     QueuedInputMetadata, SteeringQueue, SteeringQueueSnapshot,
 };
-mod swarm_tool;
 mod tool_dispatch;
 pub use background::{
     AgentReporter, BackgroundAgent, BackgroundAgentPoll, BackgroundAgentReportDrain,
@@ -232,10 +231,6 @@ pub struct SessionConfig {
     /// `.euler/grants.json` is repo-controlled content and must never become
     /// authority without a matching user consent entry outside the repo.
     pub project_grant_consent_dir: Option<PathBuf>,
-    /// User-tier CodeSwarm reviewer config file (swarm contract). `None`
-    /// (default) limits the resolution chain to explicit models and the
-    /// project tier. Config is data, not authorization.
-    pub code_swarm_user_config_path: Option<PathBuf>,
     /// User-home directory holding the durable user-level grant store
     /// (`<dir>/user-grants.json` — prefix rules that persist across sessions
     /// AND projects). `None` (default) disables user rules entirely: reads
@@ -290,7 +285,6 @@ impl SessionConfig {
             compaction_keep_recent: DEFAULT_COMPACTION_KEEP_RECENT,
             round_observer: None,
             project_grant_consent_dir: None,
-            code_swarm_user_config_path: None,
             user_grant_dir: None,
             user_extensions_dir: None,
             permission_reviewer: PermissionReviewer::default(),
@@ -643,9 +637,6 @@ pub struct Session<D> {
     /// all canonical event appends and candidate validation stay on the
     /// session thread.
     shadow_compaction: Option<ShadowCompaction>,
-    /// Wired code-swarm extension backing the `code_swarm_review` tool; the
-    /// tool is advertised to the root session's model only when this is set.
-    code_swarm_extension: Option<Arc<dyn Extension>>,
     /// Credentials detected in faithful tool-call arguments this session
     /// (issue #100). In-memory only — NEVER persisted — so a bare `/scrub`
     /// knows what to remove after the warning. Holds the values, not labels.
@@ -1376,7 +1367,6 @@ impl<D> Session<D> {
             accepted_state_invalid: false,
             compaction_request: None,
             shadow_compaction: None,
-            code_swarm_extension: None,
             scrub_candidates: Vec::new(),
         };
         session.install_provider_secret_sink();
@@ -1478,7 +1468,6 @@ impl<D> Session<D> {
             ));
         }
         let active_target = self.active_target;
-        let code_swarm_extension = self.code_swarm_extension;
         let extensions = self.extensions;
         let provider_runtime_observer = self.provider_runtime_observer;
         let redactor = self.redactor;
@@ -1496,9 +1485,7 @@ impl<D> Session<D> {
         // constructor above bound it to the from_env one just replaced.
         fresh.install_provider_secret_sink();
         // Extension wiring is launch configuration, not session state: a
-        // fresh session in the same process keeps generic root contributions
-        // and the transitional CodeSwarm review-gate tool.
-        fresh.code_swarm_extension = code_swarm_extension;
+        // fresh session in the same process keeps generic root contributions.
         fresh.extensions = extensions;
         fresh.provider_runtime_observer = provider_runtime_observer;
         Ok(fresh)
@@ -1735,14 +1722,6 @@ impl<D> Session<D> {
     /// consumed only at a settled model-round boundary.
     pub fn set_compaction_request(&mut self, request: Arc<AtomicBool>) {
         self.compaction_request = Some(request);
-    }
-
-    /// Wire the code-swarm extension for the special `code_swarm_review`
-    /// tool (tools contract). Without this, the special tool is neither
-    /// advertised nor executable; an enabled extension that declares the
-    /// name still owns it (ADR 0022 transitional rule).
-    pub fn set_code_swarm_extension(&mut self, extension: Arc<dyn Extension>) {
-        self.code_swarm_extension = Some(extension);
     }
 
     pub fn open_event_wake(&self) -> Result<EventWakeRegistration, SessionError> {
@@ -2090,22 +2069,7 @@ impl<D> Session<D> {
         canvas: &[CanvasItem],
         tool_catalog: &extension_contributions::ExtensionToolCatalogSnapshot,
     ) -> ModelRequest {
-        // The review-gate tool is root-session only: companions build their
-        // requests through the companion loop and never see it (depth one).
-        // Transitional rule (ADR 0022): an enabled extension model tool of
-        // the same name replaces it, and dispatch follows the binding this
-        // catalog installs.
         let mut tools = self.tools.model_tools();
-        let extension_owns_review_tool = tool_catalog
-            .definitions()
-            .iter()
-            .any(|tool| tool.name == swarm_tool::CODE_SWARM_REVIEW_TOOL);
-        if self.code_swarm_extension.is_some()
-            && self.extension_enabled(swarm_tool::EXTENSION_ID)
-            && !extension_owns_review_tool
-        {
-            tools.push(swarm_tool::code_swarm_review_tool_definition());
-        }
         tools.extend(tool_catalog.definitions().iter().cloned());
         ModelRequest {
             model: target.model.clone(),
@@ -2869,7 +2833,7 @@ impl<D> Session<D> {
         &self.active_target
     }
 
-    /// Exposed so callers (e.g. the reviewer-model picker) can check which
+    /// Exposed so callers (e.g. the model-targets picker) can check which
     /// configured providers are actually authenticated before offering them
     /// as spawn targets, instead of discovering it via a burned spawn (#58).
     pub fn providers(&self) -> &ProviderSet {
@@ -3015,7 +2979,6 @@ impl<D> Session<D> {
             accepted_state_invalid: false,
             compaction_request: None,
             shadow_compaction: None,
-            code_swarm_extension: None,
             scrub_candidates: Vec::new(),
         };
         session.install_provider_secret_sink();

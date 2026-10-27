@@ -164,8 +164,7 @@ Redaction applies where text that arrived from OUTSIDE the model is
 persisted to the ledger (and from there replays into model context):
 
 - `tool.result` output and error — root session and companion loop (a
-  tool read in external data; the `code_swarm_review` result is reviewer
-  cognition and stays faithful);
+  tool read in external data), including extension model-tool results;
 - `patch.proposed` / `patch.applied` old/new content and `file.diff` diff
   fields;
 - provider `error` messages (HTTP error bodies can echo request
@@ -175,9 +174,9 @@ persisted to the ledger (and from there replays into model context):
   provider failure is also stringified into the agent failure result, and
   it is redacted at that conversion point — in the companion loop and the
   parallel-reviewer outcome recording — so the `agent.result` event,
-  `AgentOutcome`, the `code_swarm_review` tool result, and the consolidated
-  review artifact all inherit the redacted text. Only the ERROR field:
-  success output and reviewer findings stay faithful;
+  `AgentOutcome`, and any tool result or artifact an extension builds from
+  it all inherit the redacted text. Only the ERROR field: success output
+  and reviewer findings stay faithful in `agent.result`;
 - `context.slot.updated` content (extension-injected text that replays
   into every later round).
 

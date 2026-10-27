@@ -8,40 +8,7 @@ use crate::ui::theme::ThemeChoice;
 use euler_core::{ApprovalMode, ReasoningEffort, SkillCatalogEntry};
 use insta::assert_snapshot;
 
-/// Opens the `/code-swarm` checklist the way the palette does, so the
-/// command's default selection applies when `saved` is empty.
-fn code_swarm_picker_surface(saved: Vec<String>) -> BottomSurface {
-    let context = CommandContext {
-        model_target_choices: vec![
-            ModelChoice::new("openrouter", "z-ai/glm-5.2"),
-            ModelChoice::new("anthropic", "claude-opus-5"),
-            ModelChoice::new("openai", "gpt-5.5"),
-            ModelChoice::new("mistral", "large-3"),
-            ModelChoice::new("google", "gemini-3-pro"),
-            ModelChoice::new("fixture", "echo"),
-        ],
-        extension_items: vec![ExtensionManagerItem {
-            id: "code-swarm".to_owned(),
-            display_name: "CodeSwarm Review".to_owned(),
-            enabled: true,
-            materialization: Some("linked".to_owned()),
-            version: "0.1.0".to_owned(),
-            commands: vec![],
-            capabilities: vec![],
-            audit_status: None,
-        }],
-        code_swarm_models: saved,
-        ..CommandContext::default()
-    };
-    let CommandEffect::OpenPicker(spec) = dispatch_command("/code-swarm", &context) else {
-        panic!("/code-swarm should open its picker");
-    };
-    let mut surface = BottomSurface::new(context);
-    surface.open_picker(spec);
-    surface
-}
-
-fn code_swarm_checked(surface: &BottomSurface) -> usize {
+fn model_targets_checked(surface: &BottomSurface) -> usize {
     let BottomOwner::Picker(picker) = surface.owner() else {
         panic!("picker should own surface");
     };
@@ -110,56 +77,6 @@ fn extension_picker_row_states_each_fact_once() {
 }
 
 #[test]
-fn palette_confirm_on_code_swarm_opens_config_not_extension_run() {
-    // Review v2 §4: selecting /code-swarm from the palette must open the
-    // reviewer-model config, never dispatch a "swarm" command to the host.
-    let context = CommandContext {
-        model_choices: vec![
-            ModelChoice::new("openrouter", "z-ai/glm-5.2"),
-            ModelChoice::new("anthropic", "claude-sonnet-5"),
-        ],
-        extension_items: vec![crate::ui::commands::ExtensionManagerItem {
-            id: "code-swarm".to_owned(),
-            display_name: "CodeSwarm Review".to_owned(),
-            enabled: true,
-            materialization: Some("linked".to_owned()),
-            version: "0.1.0".to_owned(),
-            commands: vec![
-                ExtensionCommandItem::user("review-brief"),
-                ExtensionCommandItem::user("review-report"),
-            ],
-            capabilities: vec![],
-            audit_status: None,
-        }],
-        ..CommandContext::default()
-    };
-    let slash = crate::ui::commands::build_extension_slash_commands(&context.extension_items);
-    let mut context = context;
-    context.extension_slash_commands = slash;
-    let mut surface = BottomSurface::new(context);
-    surface.open_palette();
-    surface.palette_insert("code-swarm");
-    let event = surface.confirm();
-    assert_eq!(event, SurfaceEvent::None, "should open a picker, not act");
-    assert!(
-        surface.is_model_targets_picker(),
-        "code-swarm config picker should own the surface"
-    );
-
-    // A real extension command still dispatches to the host.
-    let mut surface2 = BottomSurface::new(surface.context.clone());
-    surface2.open_palette();
-    surface2.palette_insert("review-brief");
-    match surface2.confirm() {
-        SurfaceEvent::Action(CommandAction::ExtensionRun { id, command, .. }) => {
-            assert_eq!(id, "code-swarm");
-            assert_eq!(command, "review-brief");
-        }
-        other => panic!("expected extension run, got {other:?}"),
-    }
-}
-
-#[test]
 fn compaction_picker_shows_defaults_and_applies_independent_toggles() {
     let mut surface = BottomSurface::new(CommandContext {
         compaction: CompactionSettings {
@@ -199,8 +116,8 @@ fn palette_confirm_on_extension_entry_keeps_typed_arguments() {
     // looked accepted while executing without its input.
     let context = CommandContext {
         extension_items: vec![crate::ui::commands::ExtensionManagerItem {
-            id: "code-swarm".to_owned(),
-            display_name: "CodeSwarm Review".to_owned(),
+            id: "review-kit".to_owned(),
+            display_name: "Review Kit".to_owned(),
             enabled: true,
             materialization: Some("linked".to_owned()),
             version: "0.1.0".to_owned(),
@@ -223,7 +140,7 @@ fn palette_confirm_on_extension_entry_keeps_typed_arguments() {
         SurfaceEvent::Action(CommandAction::ExtensionRun {
             id, command, input, ..
         }) => {
-            assert_eq!(id, "code-swarm");
+            assert_eq!(id, "review-kit");
             assert_eq!(command, "review-brief");
             assert_eq!(input, serde_json::json!({"reviewers": ["tests"]}));
         }
@@ -238,8 +155,8 @@ fn palette_confirm_on_disabled_extension_returns_muted_notice_every_time() {
     // subsequent selection — no "only once per session" gating.
     let context = CommandContext {
         extension_items: vec![crate::ui::commands::ExtensionManagerItem {
-            id: "code-swarm".to_owned(),
-            display_name: "CodeSwarm Review".to_owned(),
+            id: "review-kit".to_owned(),
+            display_name: "Review Kit".to_owned(),
             enabled: false,
             materialization: Some("linked".to_owned()),
             version: "0.1.0".to_owned(),
@@ -257,93 +174,18 @@ fn palette_confirm_on_disabled_extension_returns_muted_notice_every_time() {
     context.extension_slash_commands = slash;
     let mut surface = BottomSurface::new(context);
     let expected = SurfaceEvent::Notice(crate::ui::commands::disabled_extension_teach(
-        "/code-swarm",
-        "code-swarm",
+        "/review-brief",
+        "review-kit",
     ));
 
     surface.open_palette();
-    surface.palette_insert("code-swarm");
+    surface.palette_insert("review-brief");
     assert_eq!(surface.confirm(), expected);
 
     // Invoke the same disabled command again: still teaches, not silenced.
     surface.open_palette();
-    surface.palette_insert("code-swarm");
+    surface.palette_insert("review-brief");
     assert_eq!(surface.confirm(), expected);
-}
-
-#[test]
-fn code_swarm_picker_defaults_to_first_three_checked() {
-    let surface = code_swarm_picker_surface(Vec::new());
-    assert_eq!(code_swarm_checked(&surface), 3);
-    let lines = {
-        let BottomOwner::Picker(picker) = surface.owner() else {
-            panic!("picker should own surface");
-        };
-        picker.render_lines(120).join("\n")
-    };
-    assert!(lines.contains("3 selected · 1–5"), "lines: {lines}");
-    assert!(
-        lines.contains("[x] openrouter::z-ai/glm-5.2"),
-        "lines: {lines}"
-    );
-    assert!(lines.contains("[ ] mistral::large-3"), "lines: {lines}");
-    assert!(lines.contains("⏎ save · ⌫ back"), "lines: {lines}");
-    assert!(lines.contains("min 1 · max 5"), "lines: {lines}");
-}
-
-#[test]
-fn code_swarm_picker_restores_saved_selection() {
-    let surface = code_swarm_picker_surface(vec![
-        "openai::gpt-5.5".to_owned(),
-        "google::gemini-3-pro".to_owned(),
-    ]);
-    assert_eq!(code_swarm_checked(&surface), 2);
-}
-
-#[test]
-fn code_swarm_toggle_enforces_cap_and_confirm_enforces_min() {
-    let mut surface = code_swarm_picker_surface(Vec::new());
-    // Check rows 4 and 5 (3 defaults + 2 = cap).
-    surface.move_selection_down();
-    surface.move_selection_down();
-    surface.move_selection_down();
-    assert_eq!(surface.model_targets_toggle(), Some(SurfaceEvent::None));
-    surface.move_selection_down();
-    assert_eq!(surface.model_targets_toggle(), Some(SurfaceEvent::None));
-    assert_eq!(code_swarm_checked(&surface), 5);
-    // Sixth check is refused.
-    surface.move_selection_down();
-    assert!(matches!(
-        surface.model_targets_toggle(),
-        Some(SurfaceEvent::Message(message)) if message.contains("5/5")
-    ));
-    assert_eq!(code_swarm_checked(&surface), 5);
-
-    // Save collects exactly the checked set.
-    match surface.confirm() {
-        SurfaceEvent::Action(CommandAction::CodeSwarmSaveModels { models, user_tier }) => {
-            assert!(!user_tier, "default save targets the project tier");
-            assert_eq!(models.len(), 5);
-            assert!(models.contains(&"mistral::large-3".to_owned()));
-            assert!(!models.contains(&"fixture::echo".to_owned()));
-        }
-        other => panic!("expected save action, got {other:?}"),
-    }
-
-    // Unchecking everything and saving is refused (min 1).
-    let mut empty = code_swarm_picker_surface(vec!["fixture::echo".to_owned()]);
-    // fixture::echo is the last row; move there and uncheck it.
-    for _ in 0..5 {
-        empty.move_selection_down();
-    }
-    assert_eq!(empty.model_targets_toggle(), Some(SurfaceEvent::None));
-    assert_eq!(code_swarm_checked(&empty), 0);
-    assert!(matches!(
-        empty.confirm(),
-        SurfaceEvent::Message(message) if message.contains("at least 1")
-    ));
-    // Picker stays open for correction.
-    assert!(matches!(empty.owner(), BottomOwner::Picker(_)));
 }
 
 #[test]
@@ -1268,11 +1110,11 @@ fn palette_selected_row_uses_full_width_select_bar_and_warning_text() {
     );
 }
 
-/// Issue #24: the `/code-swarm` checklist reuses the palette's select-bar
+/// Issue #24: the model-targets checklist reuses the palette's select-bar
 /// styling on its highlighted row.
 #[test]
-fn code_swarm_picker_selected_row_uses_same_select_bar_styling() {
-    let surface = code_swarm_picker_surface(Vec::new());
+fn model_targets_picker_selected_row_uses_same_select_bar_styling() {
+    let surface = model_targets_command_surface();
     let theme = Theme::warm_ledger();
     let width = 40u16;
 
@@ -1296,23 +1138,26 @@ fn code_swarm_picker_selected_row_uses_same_select_bar_styling() {
     assert_eq!(span.style.bg, Some(theme.palette.selection));
 }
 
-/// Issue #24: `⌫` steps back to the slash palette when the code-swarm
+/// Issue #24: `⌫` steps back to the slash palette when the model-targets
 /// picker's type-to-filter query is empty, restoring the composer draft
 /// that was present before `/` was originally typed.
 #[test]
-fn code_swarm_backspace_steps_back_to_palette_when_filter_is_empty() {
-    // Same path the app takes: composer -> palette -> code-swarm picker, so
+fn model_targets_backspace_steps_back_to_palette_when_filter_is_empty() {
+    // Same path the app takes: composer -> palette -> model-targets picker, so
     // `saved_draft` threads through the picker back to the palette.
     let mut surface = BottomSurface::new(CommandContext::default());
     surface.edit_composer(|draft| draft.insert_text("draft before slash"));
     surface.open_palette();
     let saved = surface.composer().clone();
     surface.open_picker(PickerSpec::ModelTargets {
-        title: "/code-swarm · reviewer models · project tier".to_owned(),
+        title: "/configure · models".to_owned(),
         choices: vec![ModelChoice::new("fixture", "echo")],
-        selected: Vec::new(),
         max: 5,
-        confirm: crate::ui::commands::ModelTargetsConfirm::CodeSwarmSave { user_tier: false },
+        confirm: crate::ui::commands::ModelTargetsConfirm::ExtensionRun {
+            id: "targets-example".to_owned(),
+            command: "configure".to_owned(),
+            flag: "models".to_owned(),
+        },
     });
 
     assert!(surface.picker_backspace_steps_back());
@@ -1321,9 +1166,9 @@ fn code_swarm_backspace_steps_back_to_palette_when_filter_is_empty() {
 }
 
 #[test]
-fn code_swarm_backspace_does_not_step_back_while_filter_has_text() {
-    let mut surface = code_swarm_picker_surface(Vec::new());
-    surface.palette_insert("gl");
+fn model_targets_backspace_does_not_step_back_while_filter_has_text() {
+    let mut surface = model_targets_command_surface();
+    surface.palette_insert("op");
     assert!(!surface.picker_backspace_steps_back());
     assert!(matches!(surface.owner(), BottomOwner::Picker(_)));
 }
@@ -1465,7 +1310,7 @@ fn model_targets_command_surface() -> BottomSurface {
 #[test]
 fn model_targets_picker_bounds_selection_and_runs_with_target_strings() {
     let mut surface = model_targets_command_surface();
-    assert_eq!(code_swarm_checked(&surface), 0, "no preselection");
+    assert_eq!(model_targets_checked(&surface), 0, "no preselection");
     let lines = {
         let BottomOwner::Picker(picker) = surface.owner() else {
             panic!("picker should own surface");
@@ -1491,7 +1336,7 @@ fn model_targets_picker_bounds_selection_and_runs_with_target_strings() {
         surface.model_targets_toggle(),
         Some(SurfaceEvent::Message(message)) if message.contains("2/2")
     ));
-    assert_eq!(code_swarm_checked(&surface), 2);
+    assert_eq!(model_targets_checked(&surface), 2);
 
     assert_eq!(
         surface.confirm(),

@@ -1872,8 +1872,8 @@ fn observe_unlinked_extension_id_is_an_honest_error() {
 #[test]
 fn linked_launch_consent_joins_the_session_extension_set() {
     // `extension enable` records linked launch consent only; a fresh session
-    // must still see the extension in its enabled set (tool advertisement,
-    // e.g. code-swarm) without a separate --extensions opt-in.
+    // must still see the extension in its enabled set (model-tool
+    // advertisement) without a separate --extensions opt-in.
     let _env_lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
     let home = tempfile::tempdir().expect("home");
     let _home_guard = EulerHomeEnvGuard::set(home.path());

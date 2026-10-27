@@ -3,7 +3,6 @@
 mod auth_commands;
 mod auth_validation;
 mod cli;
-mod code_swarm_config;
 mod companion_run;
 mod diagnostics;
 mod extension_cli;

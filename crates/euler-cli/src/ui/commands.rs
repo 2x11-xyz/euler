@@ -26,8 +26,6 @@ pub struct CommandContext {
     pub extension_slash_commands: Vec<ExtensionSlashCommand>,
     /// Read-only cache of the current session's immutable core skill catalog.
     pub skill_commands: Vec<SkillCatalogEntry>,
-    /// Saved `/code-swarm` reviewer model set (provider::model strings).
-    pub code_swarm_models: Vec<String>,
     /// Current session-local compaction controls for `/compaction`.
     pub compaction: CompactionSettings,
 }
@@ -527,16 +525,6 @@ pub enum CommandAction {
     CompanionRun {
         input: serde_json::Value,
     },
-    /// Persist the `/code-swarm` reviewer model set (1-5 provider::model)
-    /// to the project tier, or the user-global tier with `--user`.
-    CodeSwarmSaveModels {
-        models: Vec<String>,
-        user_tier: bool,
-    },
-    /// Remove one tier's persisted `/code-swarm` reviewer config.
-    CodeSwarmClear {
-        user_tier: bool,
-    },
     ShowStatus,
     /// Remove a credential from every provenance surface (issue #100). Bare
     /// (`value: None`) scrubs the values detected in tool-call arguments this
@@ -638,7 +626,6 @@ pub enum PickerSpec {
     ModelTargets {
         title: String,
         choices: Vec<ModelChoice>,
-        selected: Vec<String>,
         max: usize,
         confirm: ModelTargetsConfirm,
     },
@@ -650,8 +637,6 @@ pub enum PickerSpec {
 /// What the model-targets picker does with the checked set.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ModelTargetsConfirm {
-    /// `/code-swarm`: persist the reviewer set to one tier.
-    CodeSwarmSave { user_tier: bool },
     /// Run a `user` extension command with the targets under `flag`.
     ExtensionRun {
         id: String,
@@ -664,17 +649,12 @@ impl ModelTargetsConfirm {
     /// The Enter verb shown in the picker footer.
     pub fn verb(&self) -> &'static str {
         match self {
-            Self::CodeSwarmSave { .. } => "save",
             Self::ExtensionRun { .. } => "run",
         }
     }
 
     pub fn action(&self, targets: Vec<String>) -> CommandAction {
         match self {
-            Self::CodeSwarmSave { user_tier } => CommandAction::CodeSwarmSaveModels {
-                models: targets,
-                user_tier: *user_tier,
-            },
             Self::ExtensionRun { id, command, flag } => CommandAction::ExtensionRun {
                 id: id.clone(),
                 command: command.clone(),
@@ -907,21 +887,6 @@ pub fn build_extension_slash_commands(
     let mut claimed = core_tokens;
     let mut out = Vec::new();
     for item in items {
-        if item.id == "code-swarm" {
-            // TUI-side surface (picker + orchestration) keyed to this
-            // extension; dispatched by the explicit "/code-swarm" arm, never
-            // by the generic ExtensionRun fallback. v1 special case — see
-            // docs/reviews/extension-ux-code-swarm-2026-07-09.md.
-            claimed.insert("code-swarm".to_owned());
-            out.push(ExtensionSlashCommand {
-                token: "/code-swarm".to_owned(),
-                summary: format!("{} · reviewer swarm", item.id),
-                extension_id: item.id.clone(),
-                command: "review".to_owned(),
-                enabled: item.enabled,
-                required_model_targets: None,
-            });
-        }
         for command in &item.commands {
             // Agent-only commands mint no slash token: they are the agent's
             // to call, not the user's to drive.
@@ -1104,7 +1069,6 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
         "/timestamps" => CommandEffect::Action(CommandAction::ToggleTimestamps),
         "/diff" => CommandEffect::Action(CommandAction::ShowDiff),
         "/usage" => CommandEffect::Action(CommandAction::ShowUsage),
-        "/code-swarm" => code_swarm_effect(parsed.arg, context),
         token if token.starts_with("/skill:") => skill_effect(token, parsed.arg, context),
         token => extension_slash_or_unknown(token, parsed.arg, context),
     }
@@ -1134,83 +1098,6 @@ fn skill_effect(token: &str, arg: Option<&str>, context: &CommandContext) -> Com
     })
 }
 
-/// `/code-swarm` — set up the reviewer swarm; it does not run one.
-///
-/// No arg: open the reviewer-model checklist picker (selection IS the
-/// count); the save persists to the project tier, or the user tier with
-/// `--user`. `clear [--user]` removes one tier's config.
-///
-/// There is deliberately no run verb here. CodeSwarm is something the agent
-/// does when asked ("code swarm this"), through its `code_swarm_review` tool,
-/// so this surface configures the reviewers and the agent runs them.
-fn code_swarm_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
-    const USAGE: &str =
-        "usage: /code-swarm [--user]  ·  /code-swarm clear [--user]  —  configures reviewers; \
-         to run a review, ask the agent (e.g. \"code swarm this\")";
-    let enabled = context
-        .extension_items
-        .iter()
-        .find(|item| item.id == "code-swarm")
-        .is_some_and(|item| item.enabled);
-    if !enabled {
-        return CommandEffect::Notice(disabled_extension_teach("/code-swarm", "code-swarm"));
-    }
-    let arg = arg.map(str::trim).filter(|arg| !arg.is_empty());
-    match arg {
-        None => code_swarm_picker(context, false),
-        Some("--user") => code_swarm_picker(context, true),
-        Some("clear") => CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: false }),
-        Some("clear --user") => {
-            CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: true })
-        }
-        // `review` was a run verb here until CodeSwarm became agent-only.
-        // Users still have the muscle memory, so name the replacement rather
-        // than emit a bare usage line.
-        Some(arg) if arg == "review" || arg.starts_with("review ") => {
-            CommandEffect::Message(CODE_SWARM_AGENT_ONLY_TEACH.to_owned())
-        }
-        Some(_) => CommandEffect::Message(USAGE.to_owned()),
-    }
-}
-
-/// Shown wherever a user reaches for a CodeSwarm run verb. It names the one
-/// way in rather than only refusing.
-pub(crate) const CODE_SWARM_AGENT_ONLY_TEACH: &str =
-    "code-swarm has no run command: reviews are something the agent runs for you. \
-     Ask it in plain language — for example \"code swarm this diff\" or \"code swarm \
-     PR 123\" — and it will gather the needed material with ordinary tools, then call \
-     its code_swarm_review tool with explicit context. \
-     Use /code-swarm to choose which reviewer models it uses.";
-
-/// The `/code-swarm` reviewer checklist on the shared model-targets picker.
-/// With no saved set, the first three authenticated choices are pre-checked
-/// (the design's default of 3).
-fn code_swarm_picker(context: &CommandContext, user_tier: bool) -> CommandEffect {
-    let selected = if context.code_swarm_models.is_empty() {
-        context
-            .model_target_choices
-            .iter()
-            .take(3)
-            .map(|choice| format!("{}::{}", choice.provider, choice.model))
-            .collect()
-    } else {
-        context.code_swarm_models.clone()
-    };
-    let tier = if user_tier { "user" } else { "project" };
-    CommandEffect::OpenPicker(PickerSpec::ModelTargets {
-        title: format!("/code-swarm · reviewer models · {tier} tier"),
-        // #58: authenticated providers only. Never offer a target that burns
-        // a spawn slot to discover it has no credentials.
-        choices: context.model_target_choices.clone(),
-        selected,
-        max: CODE_SWARM_MAX_MODELS,
-        confirm: ModelTargetsConfirm::CodeSwarmSave { user_tier },
-    })
-}
-
-/// Swarm cap (mirrors the extension's MAX_SWARM_AGENTS).
-const CODE_SWARM_MAX_MODELS: usize = 5;
-
 fn extension_slash_or_unknown(
     token: &str,
     arg: Option<&str>,
@@ -1229,7 +1116,6 @@ fn extension_slash_or_unknown(
             return CommandEffect::OpenPicker(PickerSpec::ModelTargets {
                 title: format!("{} · {}", cmd.token, targets.flag),
                 choices: context.model_target_choices.clone(),
-                selected: Vec::new(),
                 max: targets.max,
                 confirm: ModelTargetsConfirm::ExtensionRun {
                     id: cmd.extension_id.clone(),
@@ -1275,9 +1161,6 @@ fn agent_only_teach(token: &str, context: &CommandContext) -> Option<String> {
                 command.invocation.is_agent_only() && command.name.eq_ignore_ascii_case(name)
             })
     })?;
-    if item.id == "code-swarm" {
-        return Some(CODE_SWARM_AGENT_ONLY_TEACH.to_owned());
-    }
     Some(format!(
         "{token} is not a user command: {} · {name} is run by the agent on your behalf. \
          Ask the agent for it in plain language.",
@@ -1876,28 +1759,14 @@ mod tests {
             .any(|spec| spec.token == "/timestamps"));
     }
 
-    fn code_swarm_context(enabled: bool) -> CommandContext {
-        let model_choices = vec![
-            ModelChoice::new("openrouter", "z-ai/glm-5.2"),
-            ModelChoice::new("anthropic", "claude-opus-5"),
-            ModelChoice::new("openai", "gpt-5.5"),
-            ModelChoice::new("mistral", "large-3"),
-        ];
+    fn agent_only_context() -> CommandContext {
         CommandContext {
-            // All four are "authenticated" in this fixture; the filtering
-            // behavior itself is covered by the dedicated picker-filter test
-            // below.
-            model_target_choices: model_choices.clone(),
-            model_choices,
             extension_items: vec![ExtensionManagerItem {
-                id: "code-swarm".to_owned(),
-                display_name: "CodeSwarm Review".to_owned(),
-                enabled,
+                id: "review-kit".to_owned(),
+                display_name: "Review Kit".to_owned(),
+                enabled: true,
                 materialization: Some("linked".to_owned()),
                 version: "0.1.0".to_owned(),
-                // Mirrors production: the real ReviewCommand descriptor is
-                // AgentOnly, so a fixture claiming otherwise would test a
-                // surface that does not exist.
                 commands: vec![ExtensionCommandItem {
                     name: "review".to_owned(),
                     invocation: euler_sdk::Invocation::AgentOnly,
@@ -1911,113 +1780,13 @@ mod tests {
     }
 
     #[test]
-    fn code_swarm_no_arg_opens_model_checklist_picker() {
-        let context = code_swarm_context(true);
-        match dispatch_command("/code-swarm", &context) {
-            CommandEffect::OpenPicker(PickerSpec::ModelTargets {
-                choices,
-                selected,
-                max: 5,
-                confirm: ModelTargetsConfirm::CodeSwarmSave { user_tier: false },
-                ..
-            }) => {
-                assert_eq!(choices.len(), 4);
-                // No saved set: the first three choices are pre-checked.
-                assert_eq!(
-                    selected,
-                    vec![
-                        "openrouter::z-ai/glm-5.2".to_owned(),
-                        "anthropic::claude-opus-5".to_owned(),
-                        "openai::gpt-5.5".to_owned(),
-                    ]
-                );
-            }
-            other => panic!("expected picker, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn code_swarm_user_flag_routes_picker_to_user_tier() {
-        let context = code_swarm_context(true);
-        match dispatch_command("/code-swarm --user", &context) {
-            CommandEffect::OpenPicker(PickerSpec::ModelTargets {
-                confirm: ModelTargetsConfirm::CodeSwarmSave { user_tier: true },
-                ..
-            }) => {}
-            other => panic!("expected user-tier picker, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn code_swarm_picker_uses_authenticated_choices_not_all_model_choices() {
-        // #58: the picker must not offer a provider that will burn a spawn
-        // slot to discover it isn't authenticated. model_target_choices
-        // is the pre-filtered list; the picker must read that field, not the
-        // unfiltered model_choices.
-        let mut context = code_swarm_context(true);
-        context.model_target_choices = vec![ModelChoice::new("openai", "gpt-5.5")];
-        match dispatch_command("/code-swarm", &context) {
-            CommandEffect::OpenPicker(PickerSpec::ModelTargets { choices, .. }) => {
-                assert_eq!(choices, vec![ModelChoice::new("openai", "gpt-5.5")]);
-            }
-            other => panic!("expected picker, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn code_swarm_clear_targets_one_tier() {
-        let context = code_swarm_context(true);
-        assert_eq!(
-            dispatch_command("/code-swarm clear", &context),
-            CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: false })
-        );
-        assert_eq!(
-            dispatch_command("/code-swarm clear --user", &context),
-            CommandEffect::Action(CommandAction::CodeSwarmClear { user_tier: true })
-        );
-    }
-
-    #[test]
-    fn code_swarm_has_no_run_verb_and_teaches_the_agent_path() {
-        // CodeSwarm is agent-only: /code-swarm configures reviewers, and the
-        // agent's code_swarm_review tool is the only way to run one. The old
-        // `review` verb has muscle memory behind it, so it must name the
-        // replacement rather than emit a bare usage line.
-        let context = code_swarm_context(true);
-        for input in [
-            "/code-swarm review",
-            "/code-swarm review --personas tests,safety --prompt focus on the retry logic",
-        ] {
-            match dispatch_command(input, &context) {
-                CommandEffect::Message(message) => {
-                    assert!(
-                        message.contains("code swarm this") && message.contains("/code-swarm"),
-                        "must name the agent path and the config surface: {message}"
-                    );
-                    assert!(
-                        !message.contains("--prompt"),
-                        "must not teach a flag that no longer exists: {message}"
-                    );
-                }
-                other => panic!("{input} must not run a review, got {other:?}"),
-            }
-        }
-        assert!(matches!(
-            dispatch_command("/code-swarm bogus", &context),
-            CommandEffect::Message(message) if message.contains("usage:")
-        ));
-    }
-
-    #[test]
     fn agent_only_command_mints_no_slash_token_but_is_still_listed() {
         // The command exists; it is simply not the user's to run. Hiding it
         // from the manager would be a different lie than offering to run it.
-        let context = code_swarm_context(true);
+        let context = agent_only_context();
         assert!(
-            !build_extension_slash_commands(&context.extension_items)
-                .iter()
-                .any(|cmd| cmd.token == "/review"),
-            "agent-only review must not mint /review"
+            build_extension_slash_commands(&context.extension_items).is_empty(),
+            "agent-only review must not mint a slash token"
         );
         let details = context.extension_items[0].details_text();
         assert!(
@@ -2028,12 +1797,12 @@ mod tests {
 
     #[test]
     fn agent_only_token_teaches_instead_of_unknown_command() {
-        // /review no longer resolves; "unknown command" would be a lie.
-        let context = code_swarm_context(true);
+        // /review does not resolve; "unknown command" would be a lie.
+        let context = agent_only_context();
         match dispatch_command("/review --prompt x", &context) {
             CommandEffect::Message(message) => {
                 assert!(
-                    message.contains("code swarm this"),
+                    message.contains("run by the agent on your behalf"),
                     "must name the agent path: {message}"
                 );
                 assert!(
@@ -2046,31 +1815,9 @@ mod tests {
     }
 
     #[test]
-    fn code_swarm_disabled_teaches_and_palette_entry_registers() {
-        let context = code_swarm_context(false);
-        assert_eq!(
-            dispatch_command("/code-swarm", &context),
-            CommandEffect::Notice(disabled_extension_teach("/code-swarm", "code-swarm"))
-        );
-
-        let cmds = build_extension_slash_commands(&context.extension_items);
-        let entry = cmds
-            .iter()
-            .find(|cmd| cmd.token == "/code-swarm")
-            .expect("code-swarm palette entry");
-        assert_eq!(entry.extension_id, "code-swarm");
-        assert!(entry.summary.contains("reviewer swarm"));
-        assert!(!entry.enabled);
-        // /code-swarm is the whole surface: it configures reviewers. The
-        // agent-only `review` command mints no companion token.
-        assert!(!cmds.iter().any(|cmd| cmd.token == "/review"));
-    }
-
-    #[test]
     fn extension_slash_arguments_parse_or_reject_never_drop() {
         // Generic slash-argument handling, exercised through a user-invocable
-        // command. (It used /review until CodeSwarm became agent-only; the
-        // behavior under test was never CodeSwarm-specific.)
+        // command.
         let context = CommandContext {
             extension_slash_commands: vec![ExtensionSlashCommand {
                 token: "/summarize".to_owned(),
@@ -2152,7 +1899,13 @@ mod tests {
             enabled: true,
             required_model_targets,
         };
+        // #58: the picker offers only authenticated targets
+        // (`model_target_choices`), never the unfiltered `model_choices`.
         let mut context = CommandContext {
+            model_choices: vec![
+                ModelChoice::new("openai", "gpt-5.5"),
+                ModelChoice::new("mistral", "large-3"),
+            ],
             model_target_choices: vec![ModelChoice::new("openai", "gpt-5.5")],
             extension_slash_commands: vec![command(required)],
             ..CommandContext::default()
@@ -2162,7 +1915,6 @@ mod tests {
             CommandEffect::OpenPicker(PickerSpec::ModelTargets {
                 title: "/configure · models".to_owned(),
                 choices: vec![ModelChoice::new("openai", "gpt-5.5")],
-                selected: Vec::new(),
                 max: 3,
                 confirm: ModelTargetsConfirm::ExtensionRun {
                     id: "targets-example".to_owned(),

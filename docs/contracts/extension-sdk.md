@@ -312,9 +312,9 @@ interrupted at this ask as one whose side effects may have occurred, not as
 one that never ran.
 Session callers state the origin: `execute_extension_command_gated` and
 `execute_extension_command` run a human-invoked `user` command, core's model
-tool paths (including `code_swarm_review`) run as a model tool, and idle,
-tick, and observer commands run as lifecycle hooks. An `ExtensionHost` that
-is not told an origin treats the command as a lifecycle hook.
+tool path runs as a model tool, and idle, tick, and observer commands run as
+lifecycle hooks. An `ExtensionHost` that is not told an origin treats the
+command as a lifecycle hook.
 
 ## Event Feed Checkpoint v0
 
@@ -432,11 +432,6 @@ capabilities.
 - Model-tool names must not collide with core tools or another enabled
   extension tool. Advertisement and execution both require the extension to be
   wired and enabled.
-- Transitional rule (ADR 0022): the session-level `code_swarm_review` tool
-  reserves no name. An extension may declare a model tool named
-  `code_swarm_review`, and while that extension is enabled each request
-  advertises only its tool and routes the calls to it. Otherwise the
-  session-level tool is unchanged.
 - Root sessions alone receive extension model tools. Companions and spawned
   agents retain their bounded core tool palettes.
 - Root-session contribution wiring is fixed at launch/resume in v0. Disabling

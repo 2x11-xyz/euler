@@ -200,9 +200,9 @@ the batch sibling of `spawn_agent`, built for reviewer fan-out (issue #32);
 - **Quota up front**: the whole batch counts against the same
   per-command-execution `MAX_SPAWNS_PER_COMMAND` (16) quota as sequential
   spawns. A batch that would exceed the remaining quota is rejected before
-  any event is emitted. The quota is per command execution (and per
-  `code_swarm_review` tool invocation) — never cumulative across a session,
-  so checkpoint-loop workflows that call the review gate repeatedly do not
+  any event is emitted. The quota is per command execution (including each
+  extension model-tool invocation), never cumulative across a session, so
+  checkpoint-loop workflows that call a review tool repeatedly do not
   starve.
 - **Review-brief children only (v0.2)**: batch tasks must be single-round,
   tool-free briefs — `max_turns = 1`, `max_tool_calls = 0`, and an empty
@@ -245,127 +245,21 @@ Providers must be shareable across worker threads (`ModelProvider` is
 `Send + Sync`); each worker owns only its provider stream and buffers its
 round data for the session thread to record.
 
-## CodeSwarm review: persisted config and the review gate tool
+## Review workflows are extensions (ADR 0022)
 
-CodeSwarm review is one orchestration (the `code-swarm` extension's
-`review` command, fanning out through `spawn_agents`) with exactly **one**
-entry point: the model-facing `code_swarm_review` tool.
+Core has no review-specific tool, config store, or command. A review
+workflow such as CodeSwarm is an ordinary extension: its command declares a
+model tool (ADR 0018) and fans out through `spawn_agents`, and it uses the
+ordinary extension braid (`tool.call`, operation-scoped `permission.*`, and
+`tool.result` with `extension_id` and `command` attribution). Like every
+extension tool it is root-session only. Reviewer resolution, personas, caps,
+result rendering, and the consolidated artifact belong to the extension;
+persistent reviewer choices use extension config documents and model-target
+arguments (extension SDK contract).
 
-The `review` command is declared `Invocation::AgentOnly` (extension-SDK
-contract), so every non-agent surface refuses it: it mints no slash command,
-the headless `extension_run code-swarm.review {...}` control line rejects it,
-and `euler extension run code-swarm.review` rejects it. A review is something
-the agent does when asked — "code swarm this diff" — not a verb the user
-drives. `/code-swarm` configures *which* reviewer models it uses; it does not
-run one.
-
-This is a product boundary, not a security one. The refusals exist so there is
-one honest story about what CodeSwarm is, not to contain the command: it runs
-with exactly the authority it declares wherever it is reached.
-
-### Persisted reviewer config (two tiers)
-
-Reviewer configuration persists as **data, not authorization** — spawning
-always rides the `agent-spawn` permission machinery unchanged.
-
-- **Project tier**: `<workspace root>/.euler/code-swarm.json`.
-- **User tier**: `<euler home>/code-swarm.json` (normally
-  `~/.euler/code-swarm.json`).
-
-File format (version 1):
-
-```json
-{
-  "version": 1,
-  "reviewers": [
-    { "target": "provider::model", "persona": "correctness" }
-  ],
-  "max_tokens": 8192
-}
-```
-
-- `reviewers`: 1–5 entries; `target` is `provider::model` (both parts
-  required); `persona` is an optional reviewer-charter label consumed by
-  the orchestration (unknown personas fail honestly at run time).
-- `max_tokens`: optional default per-reviewer **output**-token budget.
-
-Unlike project permission grants, this file needs no consent-store pairing:
-it grants nothing. A repo-shipped config can only choose which reviewers a
-swarm *the user already authorized* would use, and the resolved targets are
-recorded on each `agent.spawn` event.
-
-### Resolution chain (verbatim)
-
-1. Explicit models on the tool call's `models` override — wins outright when
-   present; one-shot, never mutates the stores.
-2. Otherwise the persisted project-tier config.
-3. Otherwise the persisted user-global config.
-4. Otherwise the honest unconfigured failure: the error names the one
-   remediation that works — the TUI picker (`/code-swarm`) — and never
-   dead-ends the user. It names no run command, because there is none; text
-   sending a stuck user to an invocation that refuses is worse than silence.
-
-A malformed config file at a tier is an error, not a silent fall-through to
-the next tier. Headless runs read the same project store the TUI wrote
-(derived from the run's workspace root).
-
-### `/code-swarm` configuration surface (TUI)
-
-`/code-swarm` opens the searchable, authenticated-only reviewer model
-picker; the selection (1–5 targets) persists to the **project tier** by
-default, or the user tier with `/code-swarm --user`. `/code-swarm clear
-[--user]` removes the tier's config.
-
-`/code-swarm` has no run verb, and there is no `/review`. Asking for a review
-in ordinary turn text is the only way in; a user who types `/code-swarm review`
-or `/review` is told so and pointed at the agent. One-off reviewer overrides
-come from the tool's `models` argument, which the agent passes only when the
-user names targets explicitly.
-
-### `code_swarm_review` (model-facing tool)
-
-A session-level tool advertised **only** to the root session when the
-`code-swarm` extension is wired and enabled — companions never see it
-(depth one). It is a stage-agnostic review gate: plans, diffs, analyses,
-drafts — the calling agent selects the subject with ordinary tools before it
-calls the gate. An enabled extension model tool with the same name replaces
-it (ADR 0022 transitional rule, extension SDK contract).
-
-- **Required focus and context.** `focus` is the concise review question
-  (at most 7 KiB); `context` is the exact review material (at most 256 KiB).
-  The calling agent uses normal `read_file`, `git_diff`, and other tools to
-  retrieve material under their ordinary permissions and then supplies the
-  selected excerpt here. Optional: `personas`, `models` (`provider::model`
-  one-shot override — only when the user explicitly named targets; the tool
-  must not guess providers), and `max_tokens`. On this model-facing surface,
-  an empty `models` array names no explicit target and is treated as omission
-  so persisted config can resolve. Direct extension inputs remain strict 1–5
-  target lists and reject empty input.
-- **No ambient canvas**: reviewers receive only the supplied `context` and
-  their small reviewer brief. They do not inherit parent session history,
-  unrelated tool output, or compacted-result stubs. The report records only
-  the explicit context's source (`agent-supplied`) and byte count, not a
-  second full copy of its contents.
-- **Gate**: `Capability::AgentSpawn` through the ordinary tool permission
-  machinery (prompt/grant/deny; covered grants do not re-prompt, so
-  repeated checkpoint-loop calls pay no repeat approval). The extension
-  execution it delegates to additionally carries `artifact-write` for the
-  host-mediated consolidated report, mirroring the round-observer's
-  manifest-grant precedent. It has no hidden source-acquisition authority:
-  retrieving material remains a prior, separately permissioned core-tool
-  action by the calling agent.
-- **Result (honest and complete, no adjudication)**: the tool result
-  carries the K-of-N succeeded summary, the consolidated review artifact
-  reference (relative path + persisted event id), and one block per
-  reviewer: resolved `provider::model`, persona, ok/error, and that
-  reviewer's **findings text bounded to 16 KiB per reviewer** — truncation
-  appends an explicit marker pointing at the artifact, which always holds
-  the full text. The tool performs no voting, filtering, or judgment;
-  adjudication belongs to the calling agent.
-- **Failure honesty**: every failure the tool can emit names the failure
-  and the concrete next action (run `/code-swarm`, pass explicit
-  `models`, enable the extension, …). Unconfigured is a failed tool
-  result, not a guessed provider (the round-3 lesson).
+Historical `code_swarm_review` events from the removed session-level tool
+stay readable as ordinary tool events. A resumed session whose tail is an
+unresolved legacy call is closed like any interrupted tool call.
 
 ### Headless auto-approve tiers
 

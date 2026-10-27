@@ -774,7 +774,7 @@ fn reviewer_provider_failure_result_carries_redacted_error() {
     // The redacted buffered error EVENT is not the only escape path: the
     // raw ProviderError was also stringified into the AgentResult failure
     // text, which agent.result serializes unchanged and every AgentOutcome
-    // consumer (code-swarm tool output, consolidated artifact) reuses.
+    // consumer (extension tool output, artifacts) reuses.
     // Redaction must happen at that string-conversion point too.
     let shaped = format!("sk-or-v1-{}", "abcdefghijklmnop");
     let mut providers = ProviderSet::new();
