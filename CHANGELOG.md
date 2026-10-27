@@ -210,6 +210,15 @@ pull requests that landed them; deeper design rationale lives in
   driver with a concurrent shadow terminalizes and fences both calls, so
   neither provider's late return can append events or swap the canvas.
 
+### Extension boundary redaction
+
+- Extensions now receive model-tool input redacted, and children spawned on
+  an extension's behalf send their task text, system prompt, explicit
+  context, and inherited parent canvas redacted. Only CodeSwarm's dedicated
+  tool did this before; every extension now gets it (ADR 0022). The session's
+  own provenance stays faithful, and `agent.spawn` marks these children with
+  `egress_redacted: true`.
+
 ### Research-neutral core prompts
 
 - The fixed root instructions now introduce Euler as a research and coding

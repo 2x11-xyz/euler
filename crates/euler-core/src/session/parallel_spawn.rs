@@ -222,6 +222,9 @@ impl<D: PermissionDecider> Session<D> {
             task.project_context(),
             project_context,
         );
+        if task.egress_redacted() {
+            super::redact_child_canvas_for_egress(&mut task_canvas, &self.redactor);
+        }
         let snapshot_payload =
             canvas_snapshot_payload(&task_canvas, self.config.auto_compaction, None, None);
         self.appender_as(writer, &child_agent_id).append(

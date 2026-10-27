@@ -145,6 +145,18 @@ runs a batch of single-round, tool-free, empty-capability child briefs
 quota. Determinism, event ordering, and failure honesty for both live in the
 multi-agent contract; hosts without live spawn support reject both calls.
 
+Everything an extension sends to a child's provider is redacted at the host
+(ADR 0022). `task`, `persona`, `system_prompt`, and `explicit_context` are
+redacted before the child task is built, so `agent.spawn` records the egress
+bytes and carries `egress_redacted: true`, and task bounds apply to the
+redacted bytes. Any inherited parent canvas is redacted at request assembly.
+Items whose exact bytes are bound elsewhere are dropped from the child's copy
+rather than edited when the redactor would change them: signed provider
+reasoning, and project-context or skill bodies (already redacted at
+admission, so only a later-registered secret drops them). Provenance of the
+parent session is unchanged. Core-authored spawns (guardian, observer) are not
+egress-redacted.
+
 `SpawnAgentTask::include_parent_canvas` is an explicit context boundary,
 honoured on **both** spawn paths: `spawn_agent` and `spawn_agents`. A task
 that sets it to `false` receives no parent canvas and its `canvas.snapshot`
@@ -339,6 +351,9 @@ capabilities.
   credential shape. The check runs both at wiring and immediately before
   advertisement, keeping the advertised schema identical to the schema used
   for input validation.
+- The extension receives a redacted copy of the validated model input: every
+  string value and object key passes through the session redactor (ADR 0022).
+  The `tool.call` event keeps the model's faithful arguments.
 - A successful model-tool result is a bounded JSON object. Core first redacts
   every string value and object key, retains post-redaction key collisions
   deterministically with `#N` suffixes, then format-validates, serializes, and

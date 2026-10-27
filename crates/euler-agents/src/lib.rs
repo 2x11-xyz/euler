@@ -174,6 +174,7 @@ pub struct AgentTask {
     capabilities: Vec<Capability>,
     budget: AgentBudget,
     result_schema: Option<Value>,
+    egress_redacted: bool,
 }
 
 impl AgentTask {
@@ -195,6 +196,7 @@ impl AgentTask {
             capabilities: Vec::new(),
             budget: AgentBudget::default(),
             result_schema: None,
+            egress_redacted: false,
         })
     }
 
@@ -214,6 +216,7 @@ impl AgentTask {
             capabilities: Vec::new(),
             budget: AgentBudget::default(),
             result_schema: None,
+            egress_redacted: false,
         })
     }
 
@@ -241,6 +244,15 @@ impl AgentTask {
 
     pub fn with_parent_canvas(mut self, include: bool) -> Self {
         self.include_parent_canvas = include;
+        self
+    }
+
+    /// Mark this child as spawned on an extension's behalf (ADR 0022). The
+    /// host then redacts the parent canvas it inherits before provider
+    /// egress; the task text, system prompt, and explicit context were
+    /// redacted before this task was built.
+    pub fn with_egress_redaction(mut self) -> Self {
+        self.egress_redacted = true;
         self
     }
 
@@ -289,6 +301,10 @@ impl AgentTask {
 
     pub fn includes_parent_canvas(&self) -> bool {
         self.include_parent_canvas
+    }
+
+    pub fn egress_redacted(&self) -> bool {
+        self.egress_redacted
     }
 
     pub fn project_context(&self) -> ProjectContextPolicy {
@@ -485,6 +501,9 @@ pub fn agent_spawn_payload(task: &AgentTask, child_agent_id: &str) -> JsonObject
         "project_context".to_owned(),
         task.project_context().as_str().into(),
     );
+    if task.egress_redacted() {
+        payload.insert("egress_redacted".to_owned(), true.into());
+    }
     if let Some(context) = task.explicit_context() {
         payload.insert("explicit_context_bytes".to_owned(), context.len().into());
     }

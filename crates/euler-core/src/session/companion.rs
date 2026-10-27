@@ -961,6 +961,9 @@ impl<D: PermissionDecider> CompanionLoop<'_, D> {
             self.task.project_context(),
             &project_context,
         );
+        if self.task.egress_redacted() {
+            super::redact_child_canvas_for_egress(&mut canvas, &self.redactor);
+        }
         Ok((canvas, project_context))
     }
 
