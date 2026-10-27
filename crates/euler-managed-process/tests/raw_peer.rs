@@ -7,10 +7,11 @@ use euler_managed_process::{
 use euler_sdk::{
     AgentOutcome, ArtifactRecord, ArtifactWrite, CancellationToken, Capability, CommandContext,
     CommandRegistrar, DiagnosticsPage, DiagnosticsQuery, EventFeedCheckpoint, Extension,
-    ExtensionCommand, ExtensionError, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
-    IdleContributionDescriptor, ManagedProcessEntrypoint, ModelToolDescriptor, PlanPresentation,
-    ProvenancePage, ProvenanceQuery, RequestTickDescriptor, SpawnAgentTask,
-    StaticCommandDescriptor, StaticExtensionDescriptor,
+    ExtensionCommand, ExtensionConfigDocuments, ExtensionConfigTier, ExtensionError,
+    HostAgentRecord, HostAgentResult, HostAgentTask, HostApi, IdleContributionDescriptor,
+    ManagedProcessEntrypoint, ModelToolDescriptor, PlanPresentation, ProvenancePage,
+    ProvenanceQuery, RequestTickDescriptor, SpawnAgentTask, StaticCommandDescriptor,
+    StaticExtensionDescriptor,
 };
 use serde_json::{json, Value};
 use std::cell::RefCell;
@@ -146,6 +147,15 @@ def exercise(peer, _input):
     many_task = dict(task)
     many_task["task"] = "many"
     spawned_many = peer.request("euler/host/spawn-agents", {"tasks": [many_task]})
+    config = peer.request("euler/host/read-extension-config", {})
+    config_write = peer.request("euler/host/write-extension-config", {
+        "tier": "project", "value": {"targets": ["provider::model"]},
+    })
+    try:
+        peer.request("euler/host/write-extension-config", {"tier": "team", "value": {}})
+        config_bad_tier_rejected = False
+    except RuntimeError:
+        config_bad_tier_rejected = True
     peer.progress("finished", 1.0)
     return {
         "events": len(page["events"]),
@@ -157,6 +167,9 @@ def exercise(peer, _input):
         "plan_result": plan_result,
         "spawned": spawned["child_agent_id"],
         "spawned_many": [outcome["child_agent_id"] for outcome in spawned_many],
+        "config": config,
+        "config_write": config_write,
+        "config_bad_tier_rejected": config_bad_tier_rejected,
     }
 
 serve({"exercise": exercise})
@@ -179,6 +192,19 @@ serve({"exercise": exercise})
     assert_eq!(output["plan_result"], json!({}));
     assert_eq!(output["spawned"], json!("child-live"));
     assert_eq!(output["spawned_many"], json!(["child-live-many"]));
+    assert_eq!(
+        output["config"],
+        json!({"project": null, "user": {"tier": "user"}})
+    );
+    assert_eq!(output["config_write"], json!({}));
+    assert_eq!(output["config_bad_tier_rejected"], json!(true));
+    assert_eq!(
+        host.config_writes.borrow().as_slice(),
+        [(
+            ExtensionConfigTier::Project,
+            json!({"targets": ["provider::model"]})
+        )]
+    );
     assert_eq!(
         host.queries.borrow()[0].through_event_id.as_deref(),
         Some("stable-cutoff")
@@ -1201,6 +1227,7 @@ struct FakeHost {
     diagnostics_line: String,
     query_delay: Option<Duration>,
     queries: RefCell<Vec<ProvenanceQuery>>,
+    config_writes: RefCell<Vec<(ExtensionConfigTier, Value)>>,
 }
 
 impl HostApi for FakeHost {
@@ -1291,6 +1318,22 @@ impl HostApi for FakeHost {
 
     fn update_plan_presentation(&self, plan: PlanPresentation) -> Result<(), ExtensionError> {
         self.plans.borrow_mut().push(plan);
+        Ok(())
+    }
+
+    fn read_extension_config(&self) -> Result<ExtensionConfigDocuments, ExtensionError> {
+        Ok(ExtensionConfigDocuments {
+            project: None,
+            user: json!({"tier": "user"}).as_object().cloned(),
+        })
+    }
+
+    fn write_extension_config(
+        &self,
+        tier: ExtensionConfigTier,
+        value: Value,
+    ) -> Result<(), ExtensionError> {
+        self.config_writes.borrow_mut().push((tier, value));
         Ok(())
     }
 

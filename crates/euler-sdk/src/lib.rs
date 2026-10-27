@@ -50,6 +50,8 @@ pub use plan_presentation::{
 };
 
 pub const MAX_CONTEXT_SLOT_CONTENT_BYTES: usize = 4096;
+/// Largest extension config document, read or written (ADR 0022).
+pub const MAX_EXTENSION_CONFIG_BYTES: usize = 16 * 1024;
 pub const MAX_CONTEXT_SLOTS_PER_SESSION: usize = 8;
 
 /// One cloneable cancellation source shared by a host and extension command.
@@ -417,6 +419,25 @@ pub struct AgentOutcome {
     pub result_event_id: String,
 }
 
+/// Which extension config document a write targets (ADR 0022). `Project` is
+/// `<workspace>/.euler/extensions/<id>/config.json`, shared with everyone who
+/// opens the workspace; `User` is `<euler home>/extensions/<id>/config.json`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExtensionConfigTier {
+    Project,
+    User,
+}
+
+/// The calling extension's config documents. `None` means the document does
+/// not exist; a malformed document is an error, never `None`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtensionConfigDocuments {
+    pub project: Option<JsonObject>,
+    pub user: Option<JsonObject>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArtifactWrite {
     pub display_name: String,
@@ -518,6 +539,8 @@ pub enum ExtensionError {
     Cancelled,
     #[error("plan presentation update failed: {0}")]
     PlanPresentationFailed(String),
+    #[error("extension config failed: {0}")]
+    ConfigFailed(String),
 }
 
 pub trait HostApi {
@@ -589,6 +612,27 @@ pub trait HostApi {
     ) -> Result<(), ExtensionError> {
         Err(ExtensionError::PlanPresentationFailed(
             "plan presentation unavailable".to_owned(),
+        ))
+    }
+    /// Read the calling extension's project and user config documents. The
+    /// host derives the extension id; config is data, not authority, so no
+    /// capability is required.
+    fn read_extension_config(&self) -> Result<ExtensionConfigDocuments, ExtensionError> {
+        Err(ExtensionError::ConfigFailed(
+            "extension config unavailable".to_owned(),
+        ))
+    }
+    /// Replace one of the calling extension's config documents with `value`,
+    /// a JSON object of at most `MAX_EXTENSION_CONFIG_BYTES`. Requires
+    /// `Capability::ConfigWrite`; project-tier writes are further governed by
+    /// who started the command (ADR 0022).
+    fn write_extension_config(
+        &self,
+        _tier: ExtensionConfigTier,
+        _value: serde_json::Value,
+    ) -> Result<(), ExtensionError> {
+        Err(ExtensionError::ConfigFailed(
+            "extension config unavailable".to_owned(),
         ))
     }
 }

@@ -1,7 +1,9 @@
 //! Round-boundary observer: a product-neutral brief -> companion -> apply
 //! chain run mid-turn at a configured cadence of driver rounds.
 
+use super::extension_bridge::ExtensionCommandBoundary;
 use super::{elapsed_ms, AgentResultSummary, Session};
+use crate::extensions::ExtensionInvocationOrigin;
 use crate::permissions::PermissionDecider;
 use euler_agents::{AgentBudget, AgentTask};
 use euler_sdk::{CancellationToken, Extension};
@@ -67,12 +69,15 @@ impl<D: PermissionDecider> Session<D> {
     ) -> Result<(), &'static str> {
         let granted = extension.manifest().capabilities;
         let brief = self
-            .execute_extension_command_cancellable(
+            .execute_extension_command_at_boundary(
                 extension,
                 &config.brief_command,
                 Value::Null,
                 granted.iter().copied(),
-                cancellation,
+                ExtensionCommandBoundary::ordinary(
+                    ExtensionInvocationOrigin::LifecycleHook,
+                    cancellation,
+                ),
             )
             .map_err(|_| "brief")?;
         let Some((task, apply)) = observer_task(&brief)? else {
@@ -89,12 +94,15 @@ impl<D: PermissionDecider> Session<D> {
             .spawn_companion_with_cancel(task, cancellation.clone())
             .map_err(|_| "companion")?;
         let input = json!({ "apply": apply, "companion": companion_payload(&summary) });
-        self.execute_extension_command_cancellable(
+        self.execute_extension_command_at_boundary(
             extension,
             &config.apply_command,
             input,
             granted,
-            cancellation,
+            ExtensionCommandBoundary::ordinary(
+                ExtensionInvocationOrigin::LifecycleHook,
+                cancellation,
+            ),
         )
         .map_err(|_| "apply")?;
         Ok(())

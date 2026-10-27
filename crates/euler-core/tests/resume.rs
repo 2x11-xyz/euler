@@ -1147,6 +1147,98 @@ fn extension_permission_decisions_do_not_satisfy_tool_prompts_or_tail_matching()
 }
 
 #[test]
+fn undecided_mid_command_config_ask_reports_possible_side_effects() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let call = tool_call(None, "call-configure", "configure_targets");
+    // The tool's capability batch was asked and allowed, then the command
+    // was registered (and so started) before its project config write asked
+    // a human (ADR 0022).
+    let batch_prompt = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::PERMISSION_PROMPT,
+        object([
+            ("capability", "config-write".into()),
+            ("capabilities", json!(["config-write"])),
+            ("reason", "extension resume-ext.configure".into()),
+            ("operation", "extension resume-ext.configure".into()),
+            ("batch", true.into()),
+            ("extension_id", "resume-ext".into()),
+            ("command", "configure".into()),
+        ]),
+    );
+    let batch_decision = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(batch_prompt.id.clone()),
+        EventKind::PERMISSION_DECISION,
+        object([
+            ("capability", "config-write".into()),
+            ("mode", "ask".into()),
+            ("allowed", true.into()),
+            ("decision", "allowed".into()),
+            ("batch", true.into()),
+            ("operation", "extension resume-ext.configure".into()),
+            ("extension_id", "resume-ext".into()),
+            ("command", "configure".into()),
+        ]),
+    );
+    let registration = extension_permission_decision(
+        Some(call.id.clone()),
+        "config-write",
+        true,
+        Some("configure"),
+    );
+    let prompt = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::PERMISSION_PROMPT,
+        object([
+            ("capability", "config-write".into()),
+            (
+                "reason",
+                "extension resume-ext.configure writes shared project config \
+                 .euler/extensions/resume-ext/config.json"
+                    .into(),
+            ),
+            ("operation", "extension resume-ext.configure".into()),
+            ("extension_id", "resume-ext".into()),
+            ("command", "configure".into()),
+        ]),
+    );
+    write_events(
+        &log,
+        &[
+            call.clone(),
+            batch_prompt,
+            batch_decision,
+            registration,
+            prompt,
+        ],
+    );
+
+    let outcome = resume_session_with_outcome(
+        fixture_config(temp.path()),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    let closures = recovery_closures(outcome.session.events());
+    assert_eq!(closures.len(), 1);
+    assert_eq!(closures[0].parent.as_deref(), Some(call.id.as_str()));
+    let message = payload_str(closures[0], "error").expect("closure message");
+    assert!(
+        message.contains("side effects may have occurred"),
+        "{message}"
+    );
+}
+
+#[test]
 fn partially_decided_permission_batch_stays_interrupted_on_resume() {
     let temp = tempfile::tempdir().expect("temp dir");
     let log = temp.path().join("events.jsonl");

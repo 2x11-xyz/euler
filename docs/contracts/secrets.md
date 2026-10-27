@@ -50,6 +50,11 @@ Euler must not execute a secret shell command that was written or modified by an
 
 A new or changed `!command` secret value may also prompt on first execution.
 
+Extension config documents (ADR 0022) are not a secret store. A
+`write_extension_config` value in which any key or string matches a known
+value or a known token shape (see "Redaction Rules") is refused, not redacted
+and written.
+
 ## Storage Rules
 
 - Euler does not need a built-in encrypted secrets database for v0.

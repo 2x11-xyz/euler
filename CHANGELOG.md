@@ -267,6 +267,16 @@ pull requests that landed them; deeper design rationale lives in
   `--<flag> a::b,c::d`. The host checks count, shape, and duplicates on every
   route, JSON input included, and the extension receives a JSON array of target
   strings (ADR 0022).
+- Extensions can keep persistent config: `read_extension_config` returns the
+  calling extension's project (`.euler/extensions/<id>/config.json`) and user
+  (`~/.euler/extensions/<id>/config.json`) documents, and
+  `write_extension_config` replaces one under `config-write`. Documents are
+  JSON objects of at most 16 KiB, written by temp file and rename; a malformed
+  document is an error and a value matching a known secret is refused. A
+  project-tier write from a model tool always asks a human (no grant or
+  session allowance covers it, the guardian never reviews it, headless runs
+  deny it), and lifecycle hooks cannot write the project tier. Both calls are
+  managed-process host methods (ADR 0022).
 - Extensions can publish bounded typed plan presentation through
   `plan-presentation`; core emits canonical structured `plan.update` events
   and renders one checklist cell without taking ownership of workflow policy.

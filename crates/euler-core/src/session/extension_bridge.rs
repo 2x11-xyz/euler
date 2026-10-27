@@ -3,11 +3,14 @@ use super::{
     SessionError,
 };
 use crate::extensions::{
-    ExtensionHost, ExtensionHostError, ExtensionSpawner, QueuedExtensionEvents,
+    ExtensionHost, ExtensionHostError, ExtensionInvocationOrigin, ExtensionSpawner,
+    ProjectConfigWriteApprover, QueuedExtensionEvents,
 };
+use crate::grants::GrantScope;
 use crate::permissions::PermissionDecider;
 use crate::permissions::{
-    ApprovalMode, PermissionDecisionOutcome, PermissionRequest, PermissionRequestBatch,
+    ApprovalMode, GrantDecision, PermissionDecisionOutcome, PermissionRequest,
+    PermissionRequestBatch,
 };
 use euler_agents::{AgentBudget, AgentError, AgentTask};
 use euler_event::{object, EventKind};
@@ -28,18 +31,42 @@ pub const MAX_SPAWNS_PER_COMMAND: usize = 16;
 pub(super) struct ExtensionCommandBoundary<'a> {
     extension_id: Option<&'a str>,
     provenance_cutoff: Option<&'a str>,
+    origin: ExtensionInvocationOrigin,
+    /// The model tool call that started the command, when one did. A
+    /// project-config write prompt is parented to it so resume recognizes
+    /// an interrupted ask as part of that pending call.
+    tool_call_event_id: Option<&'a str>,
     cancellation: &'a CancellationToken,
 }
 
 impl<'a> ExtensionCommandBoundary<'a> {
-    pub(super) fn ordinary(cancellation: &'a CancellationToken) -> Self {
+    pub(super) fn ordinary(
+        origin: ExtensionInvocationOrigin,
+        cancellation: &'a CancellationToken,
+    ) -> Self {
         Self {
             extension_id: None,
             provenance_cutoff: None,
+            origin,
+            tool_call_event_id: None,
             cancellation,
         }
     }
 
+    pub(super) fn model_tool(
+        tool_call_event_id: &'a str,
+        cancellation: &'a CancellationToken,
+    ) -> Self {
+        Self {
+            extension_id: None,
+            provenance_cutoff: None,
+            origin: ExtensionInvocationOrigin::ModelTool,
+            tool_call_event_id: Some(tool_call_event_id),
+            cancellation,
+        }
+    }
+
+    /// A request tick: a lifecycle hook pinned to one provenance cutoff.
     pub(super) fn at_cutoff(
         extension_id: &'a str,
         cutoff: &'a str,
@@ -48,6 +75,8 @@ impl<'a> ExtensionCommandBoundary<'a> {
         Self {
             extension_id: Some(extension_id),
             provenance_cutoff: Some(cutoff),
+            origin: ExtensionInvocationOrigin::LifecycleHook,
+            tool_call_event_id: None,
             cancellation,
         }
     }
@@ -79,14 +108,16 @@ impl ExtensionExecutionError {
     }
 }
 
-/// Fulfills `HostApi::spawn_agent` on the session thread while the extension
-/// command executes. The command blocks synchronously inside `spawn_agent`,
-/// so the `RefCell` borrow can never be contended.
+/// Fulfills `HostApi::spawn_agent` and project-config write approval on the
+/// session thread while the extension command executes. The command blocks
+/// synchronously inside each host call, so the `RefCell` borrow can never be
+/// contended.
 struct SessionSpawner<'s, D> {
     session: RefCell<&'s mut Session<D>>,
     queue: Arc<QueuedExtensionEvents>,
     spawned: Cell<usize>,
     cancellation: CancellationToken,
+    tool_call_event_id: Option<String>,
 }
 
 impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
@@ -138,6 +169,29 @@ impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
             .map_err(spawn_extension_error)?;
         self.spawned.set(self.spawned.get() + batch_len);
         Ok(summaries.into_iter().map(outcome_from_summary).collect())
+    }
+}
+
+impl<D: PermissionDecider> ProjectConfigWriteApprover for SessionSpawner<'_, D> {
+    fn approve_project_config_write(
+        &self,
+        extension_id: &str,
+        command: &str,
+        display_path: &str,
+    ) -> Result<(), ExtensionError> {
+        let mut session = self.session.borrow_mut();
+        // The prompt and decision append through the session bus; publish the
+        // command's already-queued events first so the parent chain holds.
+        session
+            .publish_queued_extension_events(&self.queue)
+            .map_err(|error| ExtensionError::ConfigFailed(error.to_string()))?;
+        session.decide_project_config_write(
+            extension_id,
+            command,
+            display_path,
+            self.tool_call_event_id.clone(),
+            &self.cancellation,
+        )
     }
 }
 
@@ -255,7 +309,11 @@ impl<D> Session<D> {
         // shape-only default (secrets contract).
         let mut host = host
             .with_run_id(self.active_run.clone())
-            .with_redactor(self.redactor.clone());
+            .with_redactor(self.redactor.clone())
+            .with_extension_config_locations(
+                Some(self.config.root.clone()),
+                self.config.user_extensions_dir.clone(),
+            );
         if let Some(cutoff) = provenance_cutoff {
             host = host.with_provenance_cutoff(cutoff.to_owned());
         }
@@ -484,6 +542,79 @@ impl<D> Session<D> {
         Ok(())
     }
 
+    /// Ask a human to approve one project-tier extension config write started
+    /// by an agent-invoked model tool (ADR 0022). The configured decider is
+    /// asked directly: no session allowance or grant covers the request, the
+    /// guardian never adjudicates it, and no grant is installed, so every
+    /// write asks again. A decider that cannot prompt (headless) denies.
+    /// `always-deny` still denies without a prompt.
+    pub(super) fn decide_project_config_write(
+        &mut self,
+        extension_id: &str,
+        command: &str,
+        display_path: &str,
+        tool_call_event_id: Option<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ExtensionError>
+    where
+        D: PermissionDecider,
+    {
+        let capability = Capability::ConfigWrite;
+        let denied = || ExtensionError::CapabilityDenied { capability };
+        if self.permissions.configured_mode(capability) == Some(ApprovalMode::AlwaysDeny) {
+            return Err(denied());
+        }
+        if cancellation.is_cancelled() {
+            return Err(ExtensionError::Cancelled);
+        }
+        let operation = format!("extension {extension_id}.{command}");
+        let reason = format!("{operation} writes shared project config {display_path}");
+        let prompt_id = self
+            .emit_with_parent(
+                EventKind::PERMISSION_PROMPT,
+                object([
+                    ("capability", capability.as_str().into()),
+                    ("reason", reason.clone().into()),
+                    ("operation", operation.clone().into()),
+                    ("extension_id", extension_id.into()),
+                    ("command", command.into()),
+                ]),
+                tool_call_event_id,
+            )
+            .map_err(|_| denied())?;
+        let request = PermissionRequest::new(capability, reason);
+        let verdict = match self
+            .permissions
+            .decider_mut()
+            .decide_cancellable(&request, cancellation)
+        {
+            PermissionDecisionOutcome::Decided(verdict) => verdict,
+            PermissionDecisionOutcome::Cancelled => return Err(ExtensionError::Cancelled),
+        };
+        // Whatever scope the human picked, this approval covers this write
+        // only: installing a grant would let a later write skip the human.
+        let decision = if verdict.allowed() {
+            GrantDecision::allow(capability, GrantScope::Once)
+        } else {
+            GrantDecision::deny(capability, verdict.instruction().map(str::to_owned))
+        };
+        let mut payload = permission_decision_payload(
+            &decision,
+            approval_mode_str(ApprovalMode::Ask),
+            ApprovalMode::Ask,
+        );
+        payload.insert("operation".to_owned(), operation.into());
+        payload.insert("extension_id".to_owned(), extension_id.into());
+        payload.insert("command".to_owned(), command.into());
+        self.emit_with_parent(EventKind::PERMISSION_DECISION, payload, Some(prompt_id))
+            .map_err(|_| denied())?;
+        if decision.allowed() {
+            Ok(())
+        } else {
+            Err(denied())
+        }
+    }
+
     /// [`Self::execute_extension_command`] behind user capability approval:
     /// the granted set is what [`Self::approve_extension_capabilities`] just
     /// approved, never a caller-asserted list.
@@ -529,8 +660,8 @@ impl<D> Session<D> {
         // happen to exist today. The surfaces still refuse with their own
         // wording (they can name a better next step); this is the backstop
         // that keeps a future caller from quietly reopening the door.
-        // The agent's own path is `execute_extension_command`, which is
-        // ungated by design and unaffected.
+        // The agent's own path (model tools) is ungated by design and
+        // unaffected.
         if crate::extensions::command_invocation(extension, command)
             .is_some_and(Invocation::is_agent_only)
         {
@@ -563,7 +694,10 @@ impl<D> Session<D> {
     ///
     /// `granted` is the caller's authority assertion: hosts that can ask the
     /// user must go through [`Self::execute_extension_command_gated`] instead
-    /// of passing a descriptor's declared capabilities here.
+    /// of passing a descriptor's declared capabilities here. The caller also
+    /// asserts that a human invoked this `user` command, so project-tier
+    /// config writes follow normal modes (ADR 0022). Core's model-tool and
+    /// lifecycle paths carry their own invocation origin instead.
     pub fn execute_extension_command(
         &mut self,
         extension: &dyn Extension,
@@ -599,7 +733,10 @@ impl<D> Session<D> {
             command,
             input,
             granted,
-            ExtensionCommandBoundary::ordinary(cancellation),
+            ExtensionCommandBoundary::ordinary(
+                ExtensionInvocationOrigin::UserCommand,
+                cancellation,
+            ),
         )
     }
 
@@ -626,14 +763,16 @@ impl<D> Session<D> {
             return Err(ExtensionExecutionError::Disabled { id: extension_id });
         }
         let started = Instant::now();
-        let (mut host, queue) =
+        let (host, queue) =
             self.extension_host_with_event_queue_at_cutoff(granted, boundary.provenance_cutoff)?;
+        let mut host = host.with_invocation_origin(boundary.origin);
         let result = {
             let spawner = SessionSpawner {
                 session: RefCell::new(&mut *self),
                 queue: Arc::clone(&queue),
                 spawned: Cell::new(0),
                 cancellation: boundary.cancellation.clone(),
+                tool_call_event_id: boundary.tool_call_event_id.map(str::to_owned),
             };
             let registration = match boundary.extension_id {
                 Some(_) => host.register_extension_for_command_with_identity(
@@ -648,6 +787,7 @@ impl<D> Session<D> {
                     host.execute_command_with_spawner_cancellable(
                         command,
                         input,
+                        Some(&spawner),
                         Some(&spawner),
                         boundary.cancellation,
                     )
@@ -798,3 +938,7 @@ mod tests {
 #[cfg(test)]
 #[path = "extension_egress_test.rs"]
 mod extension_egress_test;
+
+#[cfg(test)]
+#[path = "extension_config_origin_test.rs"]
+mod extension_config_origin_test;

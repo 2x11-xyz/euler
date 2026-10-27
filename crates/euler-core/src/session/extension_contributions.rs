@@ -2,12 +2,13 @@
 //! explicit model tools, deterministic request ticks, and one terminal-idle
 //! command.
 
+use super::extension_bridge::ExtensionCommandBoundary;
 use super::{
     elapsed_ms, EventSink, ExtensionExecutionError, RequestTickFailureLatch, Session, SessionError,
 };
 use crate::extensions::{
     extension_declaration, extension_request_tick, ExtensionDeclaration, ExtensionFailureKind,
-    ExtensionHostError,
+    ExtensionHostError, ExtensionInvocationOrigin,
 };
 use crate::permissions::PermissionDecider;
 use euler_event::{object, EventEnvelope, EventKind, JsonObject};
@@ -305,11 +306,7 @@ impl<D: PermissionDecider> Session<D> {
             &contributor.command,
             input,
             contributor.required_capabilities.iter().copied(),
-            super::extension_bridge::ExtensionCommandBoundary::at_cutoff(
-                &contributor.extension_id,
-                cutoff,
-                cancellation,
-            ),
+            ExtensionCommandBoundary::at_cutoff(&contributor.extension_id, cutoff, cancellation),
         );
         match result {
             Ok(Value::Object(_)) => Ok(()),
@@ -623,12 +620,12 @@ impl<D: PermissionDecider> Session<D> {
         // event keeps the model's faithful arguments.
         let mut delivered_input = call.input.clone();
         self.redactor.redact_value(&mut delivered_input);
-        let result = self.execute_extension_command_cancellable(
+        let result = self.execute_extension_command_at_boundary(
             binding.extension.as_ref(),
             &binding.command,
             delivered_input,
             binding.required_capabilities.iter().copied(),
-            cancellation,
+            ExtensionCommandBoundary::model_tool(&tool_call_event_id, cancellation),
         );
         let output = match result {
             Ok(output) => output,
@@ -882,12 +879,15 @@ impl<D: PermissionDecider> Session<D> {
         contributor: &IdleContributor,
         cancellation: &CancellationToken,
     ) -> Result<Value, ExtensionExecutionError> {
-        self.execute_extension_command_cancellable(
+        self.execute_extension_command_at_boundary(
             contributor.extension.as_ref(),
             &contributor.command,
             Value::Object(JsonObject::new()),
             contributor.required_capabilities.iter().copied(),
-            cancellation,
+            ExtensionCommandBoundary::ordinary(
+                ExtensionInvocationOrigin::LifecycleHook,
+                cancellation,
+            ),
         )
     }
 
