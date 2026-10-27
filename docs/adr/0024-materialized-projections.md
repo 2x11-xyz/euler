@@ -135,7 +135,7 @@ commit with the log; it only needs to prove which prefix it describes.
   before any projection is written, as the lifecycle refold after scrub does
   today (`provenance.md`). A session whose accepted state is invalid, and so
   reopen-only, writes no projection.
-- ADR 0023's `run.continued` and derived restart count, if accepted, are fold
+- ADR 0023's `run.continued` and derived restart count (accepted 2026-10-27) are fold
   fields like any other. Caching them does not store them; the log still
   derives them.
 - Other folds, such as usage and permission grants in `fold_session`, stay as
