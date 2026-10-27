@@ -32,6 +32,7 @@ fn managed_adapter_preserves_session_contribution_descriptors() {
             "required": [],
             "additionalProperties": false
         }),
+        max_input_bytes: Some(euler_sdk::MAX_DECLARED_MODEL_TOOL_INPUT_BYTES),
     };
     let idle = IdleContributionDescriptor {
         command: "idle".to_owned(),

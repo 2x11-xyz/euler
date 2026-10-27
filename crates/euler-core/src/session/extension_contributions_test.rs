@@ -577,6 +577,7 @@ fn standard_model_tool_descriptor() -> ModelToolDescriptor {
             "required": ["items"],
             "additionalProperties": false
         }),
+        max_input_bytes: None,
     }
 }
 
@@ -602,6 +603,7 @@ fn large_model_tool_descriptor(name: &str) -> ModelToolDescriptor {
             "required": [],
             "additionalProperties": false
         }),
+        max_input_bytes: None,
     }
 }
 
@@ -2581,6 +2583,27 @@ fn invalid_model_tool_input_fails_before_permission_or_execution() {
 }
 
 #[test]
+fn model_tool_input_budget_above_the_host_cap_fails_registration() {
+    let wire = |max_input_bytes| {
+        let temp = tempfile::tempdir().expect("temp");
+        let (provider, _) = CapturingProvider::new(Vec::new());
+        let mut config = super::super::SessionConfig::new(temp.path());
+        config.extensions_enabled.insert("workflow-ext".to_owned());
+        let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
+        let mut descriptor = standard_model_tool_descriptor();
+        descriptor.max_input_bytes = Some(max_input_bytes);
+        session.wire_extension(Arc::new(
+            TestExtension::model_tool_only().with_model_tool_descriptor(descriptor),
+        ))
+    };
+
+    wire(euler_sdk::MAX_DECLARED_MODEL_TOOL_INPUT_BYTES).expect("budget at the cap");
+    let error =
+        wire(euler_sdk::MAX_DECLARED_MODEL_TOOL_INPUT_BYTES + 1).expect_err("budget above the cap");
+    assert!(matches!(error, ExtensionExecutionError::RegistrationFailed));
+}
+
+#[test]
 fn exact_integer_bound_rejects_adjacent_input_before_permission_or_execution() {
     const MAXIMUM: u64 = 9_007_199_254_740_992;
     let temp = tempfile::tempdir().expect("temp");
@@ -2595,6 +2618,7 @@ fn exact_integer_bound_rejects_adjacent_input_before_permission_or_execution() {
             "required": ["value"],
             "additionalProperties": false
         }),
+        max_input_bytes: None,
     };
     let extension = TestExtension::model_tool_only()
         .with_capabilities(vec![Capability::FsWrite])
