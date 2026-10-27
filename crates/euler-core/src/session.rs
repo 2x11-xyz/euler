@@ -1737,9 +1737,10 @@ impl<D> Session<D> {
         self.compaction_request = Some(request);
     }
 
-    /// Wire the code-swarm extension for the `code_swarm_review` tool
-    /// (tools contract). Without this, the tool is neither advertised nor
-    /// executable.
+    /// Wire the code-swarm extension for the special `code_swarm_review`
+    /// tool (tools contract). Without this, the special tool is neither
+    /// advertised nor executable; an enabled extension that declares the
+    /// name still owns it (ADR 0022 transitional rule).
     pub fn set_code_swarm_extension(&mut self, extension: Arc<dyn Extension>) {
         self.code_swarm_extension = Some(extension);
     }

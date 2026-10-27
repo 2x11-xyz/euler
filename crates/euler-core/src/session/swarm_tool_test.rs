@@ -1268,13 +1268,14 @@ fn enabled_extension_review_model_tool_replaces_the_special_tool() {
 }
 
 #[test]
-fn enabling_the_declaring_extension_moves_the_review_tool_to_it() {
+fn toggling_the_declaring_extension_moves_the_review_tool_on_the_next_request() {
     let mut harness = review_model_tool_harness(
         "other-review",
         vec![
             FixtureResponse::Assistant("no review yet".to_owned()),
             FixtureResponse::ToolCalls(vec![raw_review_tool_call(json!({"focus": "the diff"}))]),
             FixtureResponse::Assistant("adjudicated".to_owned()),
+            FixtureResponse::Assistant("special tool again".to_owned()),
         ],
         &[],
     );
@@ -1285,6 +1286,8 @@ fn enabling_the_declaring_extension_moves_the_review_tool_to_it() {
         .session
         .run_turn("review the diff")
         .expect("second turn");
+    harness.session.set_extension_enabled("other-review", false);
+    harness.session.run_turn("thanks").expect("third turn");
 
     let requests = harness.requests.lock().expect("capture");
     let before = advertised_review_tools(&requests[0]);
@@ -1296,6 +1299,12 @@ fn enabling_the_declaring_extension_moves_the_review_tool_to_it() {
     let after = advertised_review_tools(&requests[1]);
     assert_eq!(after.len(), 1);
     assert_eq!(after[0].description, EXTENSION_REVIEW_DESCRIPTION);
+    let disabled_again = advertised_review_tools(&requests[3]);
+    assert_eq!(disabled_again.len(), 1);
+    assert_eq!(
+        disabled_again[0].description,
+        code_swarm_review_tool_definition().description
+    );
     let results = tool_results(&harness.session);
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].payload["extension_id"], json!("other-review"));

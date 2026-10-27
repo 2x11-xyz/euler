@@ -52,10 +52,12 @@ fn parse_live_extension_reference(reference: &str) -> Result<(String, String)> {
 }
 
 /// Attach a linked code-swarm extension, when one is present, so the session
-/// can execute the `code_swarm_review` tool (tools contract). Advertisement
-/// additionally requires the extension to be enabled for the session; wiring
-/// alone grants nothing, and every execution revalidates the linked package.
-/// With no code-swarm linked the tool is simply absent.
+/// can execute the special `code_swarm_review` tool (tools contract).
+/// Advertisement additionally requires the extension to be enabled for the
+/// session; wiring alone grants nothing, and every execution revalidates the
+/// linked package. With no code-swarm linked the special tool is absent; an
+/// enabled extension that declares the name is unaffected (ADR 0022
+/// transitional rule).
 pub(crate) fn wire_code_swarm<D>(session: &mut Session<D>) {
     match extension_cli::live_linked_extension_arc("code-swarm") {
         Ok(Some(extension)) => session.set_code_swarm_extension(extension),

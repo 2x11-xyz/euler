@@ -262,8 +262,8 @@ pull requests that landed them; deeper design rationale lives in
   reviewer-model picker; it still points at `/login`.
 - An enabled extension may declare a model tool named `code_swarm_review`.
   While it is enabled, requests advertise only that tool and its calls run the
-  extension; the built-in review tool is advertised again when no such
-  extension is enabled (ADR 0022 transitional rule).
+  extension; otherwise the built-in review tool keeps its existing
+  advertisement rule (ADR 0022 transitional rule).
 - A model-tool descriptor may declare `max_input_bytes`, from 1 byte up to a
   host cap of 320 KiB, as the budget for its whole serialized input. Without
   it the budget stays 64 KiB. Any other value fails manifest parsing and
