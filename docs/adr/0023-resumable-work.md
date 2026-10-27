@@ -96,9 +96,11 @@ today's closure. Nothing is inferred from a missing event. Clauses marked
 Replay needs an open run to land in, because late tool work after a run
 terminal is invalid (`provenance.md`). So:
 
-- **Continuation is explicit** (open question 1). `euler exec --resume <id>
-  --continue` asks resume to continue the open run; a prompt with
-  `--continue` is a usage error. Every other resume keeps today's closures and
+- **Continuation is explicit** (open question 1). `euler exec --resume
+  <path-or-id> --continue` asks resume to continue the open run; a prompt
+  argument with `--continue` is a usage error, and `--continue` never reads
+  piped stdin (without it, `exec` reads the prompt from stdin when no prompt
+  arguments are given). Every other resume keeps today's closures and
   `run.terminal` `interrupted`.
 - **Only a cleanly admitted open run continues.** The run's admission
   (`run.started` with its `user.message`) must be complete and it must have no
@@ -125,10 +127,24 @@ terminal is invalid (`provenance.md`). So:
 - **Then the driver resumes.** The live session re-dispatches each
   replay-eligible call (Decision 2) in call order, then starts a new model
   round in the same run. Follow-ups wait for the run's terminal.
-- **Only interrupted runs continue.** Cancellation already records a run
-  terminal, so an open run at reopen means the process died or was stopped
-  from a restart-only fence (`provenance.md`, `multi-agent.md`). Both count as
-  restarts (Decision 4).
+- **Only work that was cut off continues.** An open run at reopen does not
+  prove its work was cut off. The live session decides a run's outcome before
+  it appends the run terminal, and the decided outcome lives only in memory
+  until that append succeeds (`deferred_run_terminal` and
+  `pending_run_terminal` in `session.rs`), so a crash or an ambiguous append
+  can leave a completed, cancelled, or failed run open. `--continue` therefore
+  refuses before arming the resume marker, exiting nonzero and appending
+  nothing, when the run's root events after its admission show a decided
+  outcome: any `cancelled: true` model error or tool result, a provider model
+  error (transport retries persist nothing, so a persisted one ended the
+  run), the guardian turn-interrupt error, the tool-rounds-limit message, or
+  a `model.result` that requests no tools with no later steering
+  `user.message`. It also refuses, failing closed, unless the root work is
+  visibly in flight: an unresolved `model.call`, an unmatched `tool.call`, or
+  a settled tool batch or steering `user.message` not yet followed by a
+  `model.call`. A plain resume still closes such a run as today. A run without a decided outcome is open because the
+  process died or was stopped from a restart-only fence (`provenance.md`,
+  `multi-agent.md`). Both count as restarts (Decision 4).
 
 ### 2. Per-tool replay policy
 
@@ -183,28 +199,41 @@ durable record can re-run it.
 - **Ownership edge.** `agent.spawn` gains `owner_event_id`, the owning
   `tool.call` event id, and `spawn_key`. The key is the spawn's ordinal within
   that tool execution (`1`, `2`, and so on, batch tasks in task order) unless
-  the extension passes an explicit key. Explicit keys follow pi's nested-call
-  rule (non-empty, no `/`) and must not consist only of ASCII digits, so they
+  the extension passes an explicit key in a new optional
+  `SpawnAgentTask.spawn_key`. Explicit keys follow pi's nested-call rule
+  (non-empty, no `/`) and must not consist only of ASCII digits, so they
   never collide with ordinals. A key used twice in one execution is a host
-  error. Core records both fields from rollout step 1, so every log that can
-  replay an extension tool also carries its spawn keys.
+  error. `agent.spawn` also gains `explicit_context_sha256`, the SHA-256 of
+  the redacted explicit context, because today it records only the context's
+  length (`explicit_context_bytes`). Core records these fields from rollout
+  step 1, so every log that can replay an extension tool also carries its
+  spawn keys.
 - **Reattach.** During a replay of a replay-safe owner, a spawn with an
   existing `(owner_event_id, spawn_key)`:
   - with an `agent.result`: returns the recorded `AgentOutcome` and starts
     nothing;
   - without one: continues the same child id. Continuation has already closed
-    the child's unmatched tool calls and open model calls. The child then gets
-    a new model round under its recorded task and budget; rounds and tool
-    calls already in the log count against that budget. The host rebuilds the
-    open spawn entry from the log, and the child's single `agent.result`
-    completes the historical spawn. The continuing process builds a new exact
-    envelope for it and follows the existing exact-retry rule from there; the
-    crashed process's retained envelope did not survive and is not retried.
+    the child's unmatched tool calls and open model calls. The host rebuilds
+    the child's conversation from the child's own accepted events in log
+    order (model results, tool calls, and tool results, including those
+    closures) and gives it a new model round. The request uses the replayed
+    task's system prompt and explicit context, which the mismatch check below
+    has matched against the record. Rounds and tool calls already in the log
+    count against the recorded budget (`max_turns`, `max_tool_calls`). The
+    host rebuilds the open spawn entry from the log, and the child's single
+    `agent.result` completes the historical spawn. The continuing process
+    builds a new exact envelope for it and follows the existing exact-retry
+    rule from there; the crashed process's retained envelope did not survive
+    and is not retried.
     For today's batch children (single-round, tool-free briefs) this is one
     new `model.call`;
-  - with a task whose recorded `agent.spawn` fields (persona, target, brief,
-    capabilities, budget, context policies) differ: returns a host error to
-    the extension and appends nothing.
+  - with a task that differs from its recorded `agent.spawn` fields
+    (persona, target, brief, system prompt, capabilities, budget, context
+    policies, `explicit_context_sha256`): returns a host error to the
+    extension and appends nothing. The record holds redacted fields (ADR
+    0022, substrate 3), so the replayed task is compared after redaction with
+    the current redactor; a redactor change reads as a mismatch and fails
+    closed.
 - **Closed owners.** When the owner gets a closure instead of a replay, its
   children stay as today: child calls and model calls closed, spawn
   incomplete (open question 5). The order is already bottom-up, since
@@ -219,10 +248,13 @@ durable record can re-run it.
 
 - **Count.** A run's restart count is the number of `run.continued` events for
   that run after its latest progress, where a `retry: true` event starts the
-  count again at one. Progress is an accepted `model.result`, a `tool.result`
-  without `recovery_closure`, or an `agent.result` in that run. Closures are
-  not progress. The run fold derives the count from the log; nothing stores
-  it.
+  count again at one. Progress is a `tool.result` without `recovery_closure`,
+  an `agent.result`, or a root `model.result` that requests no tools, in that
+  run. Closures are not progress, and neither is a `model.result` that
+  requests tools: otherwise a tool that is unsafe to rerun and crashes every
+  time would reset the count on each new model round (continue, close the
+  call, the model requests it again, crash) and never park. The run fold
+  derives the count from the log; nothing stores it.
 - **Limit** (open question 2). A run whose count is 5, pi's default, is
   parked: it has had five continuations without progress. Continuation then
   refuses before arming the resume marker: no replay, no model round, and
@@ -250,16 +282,21 @@ Until #239 lands, replay stays off and continuation closes every call.
 
 - **Legacy logs.** No `replay` field means `unsafe`, no `owner_event_id`
   means no reattach, and no `run.continued` means a zero count. A plain resume
-  behaves as today, apart from the batch closures of rollout step 2.
+  behaves as today, apart from rollout step 2: a multi-call root batch
+  interrupted before all its results gets a closure for every unmatched
+  call.
 - **Rollback.** Older Euler rejects unknown event kinds during resume
   preflight (`preflight_event`, `ResumeError::UnknownKind`), so a log
   containing `run.continued` fails closed on an older binary. Some folds
   reject unknown fields (`events.md`, project-context items), so each PR
   states its rollback behavior for the new optional fields (`replay`,
-  `replayed`, `owner_event_id`, `spawn_key`, `retry`).
+  `replayed`, `owner_event_id`, `spawn_key`, `explicit_context_sha256`,
+  `retry`).
 - **Extension skew.** `ModelToolDescriptor` denies unknown fields, so a newer
   extension that declares `replay` fails registration on an older Euler,
   visibly, as in ADR 0022. An older extension on a newer Euler is `unsafe`.
+  `SpawnAgentTask` also denies unknown fields, so a newer extension that
+  passes a `spawn_key` fails that spawn on an older Euler.
 - **ADR 0020.** `run.continued` is a lifecycle event in the run fold. There is
   no parallel run model, and every run still ends with exactly one
   `run.terminal`.
@@ -273,22 +310,28 @@ Until #239 lands, replay stays off and continuation closes every call.
 
 ## Rollout
 
-Sequenced after ADR 0022 step 3, which also changes `ModelToolDescriptor` and
-extension tool dispatch. Steps 1 to 3 do not depend on #239 and ship on their
-own. One change per PR, each with tests that fail without it and its owning
-contract update:
+Sequenced after ADR 0022 step 3, so both ADR 0022 Euler steps are in place:
+step 1 changes `ModelToolDescriptor` (substrate 4, `max_input_bytes`) and
+step 3 removes core's special model-tool path. Steps 1 to 3 do not depend on
+#239 and ship on their own. One change per PR, each with tests that fail
+without it and its owning contract update:
 
 1. **Replay declaration and intent.** Core policy table,
-   `ModelToolDescriptor.replay`, `tool.call.replay`, and `owner_event_id` and
-   `spawn_key` on extension-driven `agent.spawn`. Recording only; resume is
-   unchanged. Contracts: `tools.md`, `extension-sdk.md`, `events.md`,
-   `multi-agent.md`.
+   `ModelToolDescriptor.replay`, `tool.call.replay`, and `owner_event_id`,
+   `spawn_key`, and `explicit_context_sha256` on extension-driven
+   `agent.spawn`. Recording only; resume is unchanged. Contracts:
+   `tools.md`, `extension-sdk.md`, `events.md`, `multi-agent.md`.
 2. **Per-call recovery classification.** Resume classifies every unmatched
    call of the interrupted root batch; every call still classifies as a
-   closure. This changes plain resume for one case: when a crash lands after
-   the first result of a multi-call batch, the tail is that result, so today
-   the batch's later calls stay without a result. They now get closures.
-   Contracts: `provenance.md`, `events.md`.
+   closure. This changes plain resume for any multi-call root batch
+   interrupted before all its results, because today only the batch's tail
+   is examined (`tail_unmatched_tool_call_index`). A crash during an earlier
+   call closes the last call, which never ran, with "side effects may have
+   occurred", and leaves the earlier calls without a result. A crash after a
+   result leaves the later calls without one. A permission prompt on an
+   earlier call closes nothing, because the prompt does not belong to the
+   tail call. Every unmatched call now gets a closure. Contracts:
+   `provenance.md`, `events.md`.
 3. **Run continuation with parking.** `run.continued`, its fold,
    `exec --resume --continue` with closures only, the derived restart count,
    the limit, and `--retry`. Parking lands with continuation so no release
@@ -299,25 +342,31 @@ contract update:
    None of them spawns children. Contracts: `events.md`, `provenance.md`,
    `tools.md`.
 5. **Extension tool replay and durable spawn ownership.** Extension-tool
-   eligibility, the idempotency key, reattach, and the mismatch and
-   duplicate-key errors. These ship together because replaying an extension
-   tool that spawns without reattach would duplicate its children.
+   eligibility, the idempotency key, the optional `SpawnAgentTask.spawn_key`,
+   reattach, and the mismatch and duplicate-key errors. These ship together
+   because replaying an extension tool that spawns without reattach would
+   duplicate its children.
    Contracts: `multi-agent.md`, `extension-sdk.md`, `events.md`.
 6. **euler-extensions.** Tools that qualify declare `replay: "safe"`, one PR
    each in that repository.
 
 Required regression tests across the steps: a plain resume of a legacy log
-appends the same closures as today, apart from step 2's batch case;
-`--continue` refuses a crash-partial admission and a prompt; a stored-safe
+appends the same closures as today, apart from step 2's multi-call batch
+cases (a crash during an earlier call, a crash after a result, and a pending
+permission prompt on an earlier call); `--continue` refuses a crash-partial
+admission and a prompt argument, and never reads piped stdin; `--continue`
+refuses an open run with a decided outcome (a cancelled run, and a completed
+run whose terminal was not persisted) and appends nothing; a stored-safe
 call with a current-unsafe declaration is closed; a removed tool is closed; an
 unverified root closes every call; the replayed result is parented to the
 original call and carries `replayed: true`; a headless replay that would
 prompt is denied; a completed child is returned without a provider call; a
 reattached child's earlier rounds count against its budget; a task mismatch
 and a duplicate key append nothing; the sixth continuation without progress
-is refused and appends nothing; `--retry` is refused for a run that is not
-parked and starts the count at one; a continuation after progress starts the
-count at one.
+is refused and appends nothing; a tool that is unsafe to rerun and crashes
+on every continuation parks the run; `--retry` is refused for a run that is
+not parked and starts the count at one; a continuation after progress starts
+the count at one.
 
 ## Open questions for Eli
 
