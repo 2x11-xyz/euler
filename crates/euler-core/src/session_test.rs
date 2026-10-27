@@ -5738,7 +5738,7 @@ fn gated_extension_run_refuses_an_agent_only_command() {
 #[test]
 fn ungated_extension_run_still_serves_the_agent_path() {
     // The agent reaches an agent-only command through execute_extension_command
-    // (what the code_swarm_review tool uses). That path is ungated by design:
+    // (what extension model tools use). That path is ungated by design:
     // if this guard leaked into it, agent-only would mean unreachable.
     let temp = tempfile::tempdir().expect("temp dir");
     let session_dir = temp.path().join(".euler").join("sessions");

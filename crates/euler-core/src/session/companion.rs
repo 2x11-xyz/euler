@@ -333,8 +333,8 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             // The loop's terminal error carries the raw provider message
             // (HTTP error bodies can echo request fragments — secrets
             // contract). This failure string becomes the agent.result error
-            // field and AgentOutcome.error, and from there the code-swarm
-            // tool output and consolidated artifact; redacting at this
+            // field and AgentOutcome.error, and from there the extension's
+            // tool output and artifacts; redacting at this
             // conversion point makes every downstream sink inherit it.
             // Success output is model cognition and stays faithful.
             Err(error) => {

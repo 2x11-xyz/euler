@@ -252,8 +252,8 @@ impl<D: PermissionDecider> Session<D> {
             max_output_tokens,
         }
         .for_target(&target.provider, &target.model);
-        // One oversized reviewer must not sink the batch: the swarm's K-of-N
-        // summary exists to report exactly this kind of partial failure, so
+        // One oversized reviewer must not sink the batch: a K-of-N summary
+        // exists to report exactly this kind of partial failure, so
         // record an error event for this child and let its siblings run. The
         // rejection precedes model.call: no provider lifecycle began.
         if let Some(message) = self.reviewer_context_overflow(&request) {
@@ -403,8 +403,8 @@ impl<D: PermissionDecider> Session<D> {
             // message (HTTP error bodies can echo request fragments —
             // secrets contract). This failure string becomes the
             // agent.result error field and AgentOutcome.error, and from
-            // there the code-swarm tool output and consolidated
-            // artifact; redacting at this conversion point makes every
+            // there the extension's tool output and artifacts;
+            // redacting at this conversion point makes every
             // downstream sink inherit it. Reviewer findings (success
             // output) are model cognition and stay faithful.
             (Err(error), buffered_error) => {

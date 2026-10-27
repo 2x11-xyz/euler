@@ -1314,7 +1314,7 @@ fn tail_unmatched_tool_call_index(events: &[EventEnvelope]) -> Option<usize> {
 
 /// Events that may legitimately sit between a pending `tool.call` and its
 /// (missing) `tool.result`: the permission ask itself, plus a bounded
-/// companion window — guardian review (ADR 0011) and `code_swarm_review`
+/// companion window: guardian review (ADR 0011) and extension agent
 /// fan-out both spawn child agents whose events interleave before the
 /// result lands. Child-attributed events (`agent` differs from the root
 /// agent that emitted the tool call) and the parent-side spawn/result/

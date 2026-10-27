@@ -164,7 +164,7 @@ fn companion_provider_failure_result_carries_redacted_error() {
     // The redacted error EVENT is not the only escape path: the raw
     // ProviderError was also stringified into the AgentResult failure text,
     // which agent.result serializes unchanged and every AgentOutcome
-    // consumer (code-swarm tool output, consolidated artifact) reuses.
+    // consumer (extension tool output, artifacts) reuses.
     // Redaction must happen at that string-conversion point too.
     struct RejectingProvider {
         message: String,

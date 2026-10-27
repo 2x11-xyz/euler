@@ -108,7 +108,6 @@ Semantics:
 | `run_shell` | ShellExec | Workspace root; timeout bounds. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
 | `git_status` / `git_diff` | FsRead | Workspace git views. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
 | `tool_result_get` | FsRead | Rehydrate a demoted, compacted, or previewed tool result from the **current session** by `event_id` (required); optional `offset_bytes` (default `0`) and `max_bytes` (default 64 KiB) select a byte window. Session-local and project-context-policy-aware for children. |
-| `code_swarm_review` | AgentSpawn | Session-level review gate over required explicit `focus` (≤7 KiB) and `context` (≤256 KiB). The calling agent gathers material first through ordinary tools, so this gate has no hidden file, git, GitHub, or network authority. It forwards only that supplied context and a small reviewer brief — never ambient session canvas — fans out the persisted reviewer set, and returns every finding for caller adjudication. Optional: `personas`, `models` (non-empty one-off override; an empty model-facing list is omission), `max_tokens`. Advertised only in the root session when the `code-swarm` extension is wired and enabled and no enabled extension declares a model tool with this name, which then replaces it in advertisement and dispatch (ADR 0022 transitional rule); companions never see it (depth one). Config, result shape, and failure honesty: multi-agent contract. |
 
 ## Structured file confinement
 
@@ -314,17 +313,10 @@ tool registry, preventing a nested Euler from falling through to the user's
 an explicit command-local value when the task requires one. Enforced sandbox
 profiles retain their documented private, minimal environment.
 
-`code_swarm_review` is not executed by the `ToolRegistry`: it is a
-session-level tool intercepted after the ordinary permission gate, because
-its execution spawns child agents through the session. It rides the same
-`tool.call` / `permission.*` / `tool.result` provenance shape as every
-other tool.
-
-`code_swarm_review` is deliberately not a source-acquisition tool. Its
-`context` is material the calling agent already selected using ordinary core
-tools, whose permissions and provenance remain visible at the retrieval step.
-This keeps the review gate's authority honest and its model-facing canvas
-small: reviewers receive only explicit context, not the parent canvas.
+Every core tool is executed by the `ToolRegistry`. Core has no session-level
+tool: review workflows are extension model tools (ADR 0022, multi-agent
+contract). A historical `code_swarm_review` call is an ordinary tool event
+on resume.
 
 Euler-owned shell and Git subprocesses run in a host-owned process group.
 Cancellation or timeout signals that group before reaping its leader, covering

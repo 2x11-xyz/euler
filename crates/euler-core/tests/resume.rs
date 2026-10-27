@@ -1018,7 +1018,7 @@ fn permission_gated_tail_closure_says_tool_never_executed() {
 
 #[test]
 fn guardian_interleaved_tail_still_appends_recovery_closure() {
-    // Security-audit finding: guardian review (and code-swarm fan-out)
+    // Security-audit finding: guardian review (and extension agent fan-out)
     // interleave companion events between a pending tool.call and its
     // result. A crash after a guardian ALLOW but before the tool result
     // persisted must still get the side-effect recovery closure — the
@@ -1103,6 +1103,126 @@ fn guardian_interleaved_tail_still_appends_recovery_closure() {
     assert_eq!(closures[0].parent.as_deref(), Some(call.id.as_str()));
     // The decision was ALLOW: the tool may have executed.
     let message = payload_str(closures[0], "error").expect("closure message");
+    assert!(message.contains("side effects may have occurred"));
+}
+
+/// Events a crashed root session left behind for one tool call that was
+/// allowed and fanned out to a reviewer child, with no `tool.result`.
+fn allowed_fan_out_tail(name: &str) -> (EventEnvelope, Vec<EventEnvelope>) {
+    let call = tool_call(None, "call-review", name);
+    let prompt = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::PERMISSION_PROMPT,
+        object([
+            ("capability", "agent-spawn".into()),
+            ("reason", format!("tool {name}").into()),
+        ]),
+    );
+    let decision = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(prompt.id.clone()),
+        EventKind::PERMISSION_DECISION,
+        object([
+            ("capability", "agent-spawn".into()),
+            ("mode", "ask".into()),
+            ("allowed", true.into()),
+            ("decision", "allowed".into()),
+        ]),
+    );
+    let spawn = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::AGENT_SPAWN,
+        object([("agent_id", "agent.reviewer-1".into())]),
+    );
+    let child_model_call = EventEnvelope::new(
+        "session",
+        "agent.reviewer-1",
+        Some(spawn.id.clone()),
+        EventKind::MODEL_CALL,
+        object([("provider", "fixture".into()), ("model", "echo".into())]),
+    );
+    let child_result = EventEnvelope::new(
+        "session",
+        "agent.reviewer-1",
+        Some(child_model_call.id.clone()),
+        EventKind::MODEL_RESULT,
+        object([("content", "finding".into())]),
+    );
+    let agent_result = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(spawn.id.clone()),
+        EventKind::AGENT_RESULT,
+        object([("ok", true.into())]),
+    );
+    let events = vec![
+        call.clone(),
+        prompt,
+        decision,
+        spawn,
+        child_model_call,
+        child_result,
+        agent_result,
+    ];
+    (call, events)
+}
+
+#[test]
+fn legacy_code_swarm_review_tail_resumes_like_any_interrupted_tool_call() {
+    // ADR 0022 compatibility: core no longer knows `code_swarm_review`, so a
+    // log that crashed mid-review must close exactly as an ordinary tool
+    // call in the same position does, and the session must keep working.
+    let resume_closure = |name: &str| {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log = temp.path().join("events.jsonl");
+        let (call, events) = allowed_fan_out_tail(name);
+        write_events(&log, &events);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = CapturingStaticProvider::new(
+            vec![completed_stream("continued")],
+            Arc::clone(&requests),
+        );
+        let outcome = resume_session_with_outcome(
+            fixture_config(temp.path()),
+            ProviderSet::single(provider),
+            CountingDecider::default(),
+            &log,
+        )
+        .expect("resume");
+        assert!(outcome.recovery_closure_appended, "{name}");
+        assert!(outcome.warnings.is_empty(), "{name}");
+        let mut session = outcome.session;
+        let closures = recovery_closures(session.events());
+        assert_eq!(closures.len(), 1, "{name}");
+        assert_eq!(closures[0].parent.as_deref(), Some(call.id.as_str()));
+        let mut payload = closures[0].payload.clone();
+
+        session.run_turn("continue").expect("continued turn");
+        let advertised = requests.lock().expect("request log")[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(payload.remove("name"), Some(name.into()));
+        (payload, advertised)
+    };
+
+    let (legacy, advertised) = resume_closure("code_swarm_review");
+    assert!(
+        !advertised.iter().any(|tool| tool == "code_swarm_review"),
+        "the legacy tool is not advertised after resume: {advertised:?}"
+    );
+    let (ordinary, _) = resume_closure("run_shell");
+    assert_eq!(legacy, ordinary);
+    let message = legacy
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .expect("closure message");
     assert!(message.contains("side effects may have occurred"));
 }
 

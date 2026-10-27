@@ -542,12 +542,10 @@ do not receive an extension host and cannot spawn (depth one in v0.1).
 `spawn_agent` is synchronous per call. `HostApi::spawn_agents` (v0.2) runs a
 batch of single-round, tool-free, empty-capability child briefs concurrently
 under the same gate and per-command quota; see the multi-agent contract for
-its determinism and event-ordering invariants. The session-level
-`code_swarm_review` tool is gated on this same capability through the
-ordinary tool permission machinery. Headless `euler exec --auto-approve`
-tiers set `agent-spawn` to session-allow in both tiers: children's own tool
-calls remain gated by the parent's tier-configured modes, so allowing spawn
-cannot escalate beyond the tier.
+its determinism and event-ordering invariants. Headless
+`euler exec --auto-approve` tiers set `agent-spawn` to session-allow in both
+tiers: children's own tool calls remain gated by the parent's tier-configured
+modes, so allowing spawn cannot escalate beyond the tier.
 
 Extension event-feed checkpoints are private extension state:
 

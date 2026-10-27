@@ -213,11 +213,6 @@ fn tool_input(case: &Case) -> Value {
             })
         }
         "write_file" => json!({ "path": case.subject, "content": "matrix" }),
-        "code_swarm_review" => json!({
-            "context": "permission matrix",
-            "focus": "permission matrix",
-            "models": ["fixture::echo"],
-        }),
         _ => json!({}),
     }
 }
@@ -552,24 +547,6 @@ const MATRIX: &[Case] = &[
     Case { name: "shell / always-deny / unscoped grant is ignored",
         capability: ShellExec, mode: Set(AlwaysDeny), grants: &[(Store::Session, "")],
         tool: "run_shell", subject: "ls", expected: Denied },
-    // ---------------------------------------------------- agent-spawn ---
-    Case { name: "agent-spawn / default ask / no grant",
-        capability: AgentSpawn, mode: DefaultMode, grants: &[],
-        tool: "code_swarm_review", subject: "", expected: Asks },
-    Case { name: "agent-spawn / explicit ask / unscoped session grant covers",
-        capability: AgentSpawn, mode: Set(Ask), grants: &[(Store::Session, "")],
-        tool: "code_swarm_review", subject: "", expected: CoveredBy(GrantSource::Session) },
-    // Contract-silent cell: patterned agent-spawn grants have no matching
-    // semantics — inert, fail closed to ask.
-    Case { name: "agent-spawn / ask / scoped pattern is inert",
-        capability: AgentSpawn, mode: DefaultMode, grants: &[(Store::Session, "review")],
-        tool: "code_swarm_review", subject: "", expected: Asks },
-    Case { name: "agent-spawn / session-allow",
-        capability: AgentSpawn, mode: Set(SessionAllow), grants: &[],
-        tool: "code_swarm_review", subject: "", expected: AllowedByMode },
-    Case { name: "agent-spawn / always-deny",
-        capability: AgentSpawn, mode: Set(AlwaysDeny), grants: &[],
-        tool: "code_swarm_review", subject: "", expected: Denied },
 ];
 
 #[test]
@@ -594,6 +571,54 @@ fn unconfigured_capability_gate_defaults_fail_closed() {
     gate.install_grant(Network, GrantScope::Session(ScopePattern::unscoped()))
         .expect("unscoped network grant");
     assert_eq!(gate.mode_for_request(&request), SessionAllow);
+}
+
+#[test]
+fn agent_spawn_gate_cells() {
+    // Agent spawn has no core tool (extensions spawn through the host API),
+    // so its cells are pinned at the gate like the network cell above.
+    let request = PermissionRequest::new(AgentSpawn, "extension agent spawn");
+
+    let mut gate = PermissionGate::new(ProbeDecider { calls: 0 });
+    let mode = gate.mode_for_request(&request);
+    assert_eq!(mode, Ask, "default ask");
+    assert_eq!(gate.granted_source(&request), None);
+    assert!(!gate.decide_detailed(&request, mode).allowed());
+    assert_eq!(gate.decider_mut().calls, 1, "the ask reached the decider");
+
+    // Contract-silent cell: patterned agent-spawn grants have no matching
+    // semantics, so they are inert and fail closed to ask.
+    gate.install_grant(
+        AgentSpawn,
+        GrantScope::Session(ScopePattern::new("review").expect("pattern")),
+    )
+    .expect("scoped agent-spawn grant");
+    assert_eq!(gate.mode_for_request(&request), Ask);
+    assert_eq!(gate.granted_source(&request), None);
+    assert!(!gate.decide_detailed(&request, Ask).allowed());
+    assert_eq!(gate.decider_mut().calls, 2, "the inert grant still asks");
+
+    let mut gate = PermissionGate::new(ProbeDecider { calls: 0 });
+    gate.install_grant(AgentSpawn, GrantScope::Session(ScopePattern::unscoped()))
+        .expect("unscoped agent-spawn grant");
+    gate.set_mode(AgentSpawn, Ask);
+    // The dispatcher consults grant coverage before deciding, so a covered
+    // ask never reaches the decider.
+    assert_eq!(gate.mode_for_request(&request), Ask);
+    assert_eq!(gate.granted_source(&request), Some(GrantSource::Session));
+
+    let mut gate = PermissionGate::new(ProbeDecider { calls: 0 });
+    gate.set_mode(AgentSpawn, SessionAllow);
+    assert!(gate.decide_detailed(&request, SessionAllow).allowed());
+    assert_eq!(gate.decider_mut().calls, 0);
+
+    let mut gate = PermissionGate::new(ProbeDecider { calls: 0 });
+    gate.install_grant(AgentSpawn, GrantScope::Session(ScopePattern::unscoped()))
+        .expect("unscoped agent-spawn grant");
+    gate.set_mode(AgentSpawn, AlwaysDeny);
+    assert_eq!(gate.mode_for_request(&request), AlwaysDeny);
+    assert!(!gate.decide_detailed(&request, AlwaysDeny).allowed());
+    assert_eq!(gate.decider_mut().calls, 0);
 }
 
 /// Symlink-shaped path cells (unix-only). Same harness, plus the fixture's

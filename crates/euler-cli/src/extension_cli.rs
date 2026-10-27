@@ -558,7 +558,7 @@ pub(crate) fn resolve_live_linked_process_command(
 
 pub(crate) use command_input::{resolve_user_command_input, UserCommandInput};
 pub(crate) use observer::{resolve_round_observer, ObserveOptions};
-pub(crate) use runtime::{live_linked_extension_arc, live_linked_session_extension_arc};
+pub(crate) use runtime::live_linked_session_extension_arc;
 
 /// Change linked-process launch consent through the same validation boundary
 /// as the CLI enable/disable actions. Returns `false` when `id` is not linked.

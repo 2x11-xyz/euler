@@ -556,10 +556,8 @@ impl BottomSurface {
                     ));
                 }
                 // Route through the same dispatch as typing the token: TUI-side
-                // surfaces (e.g. /code-swarm opening its config picker) and
-                // host-run extension commands both resolve there. Dispatching
-                // ExtensionRun directly sent surface markers like "swarm" to
-                // the host ("unknown command", review v2 §4). Use the full
+                // surfaces (e.g. a model-targets picker) and host-run
+                // extension commands both resolve there. Use the full
                 // confirmation input, not the bare token — anything typed
                 // after the command (JSON input, --flags) must travel with
                 // it instead of being silently dropped.
@@ -864,7 +862,7 @@ fn byte_index_for_char_offset(text: &str, offset: usize) -> usize {
 }
 
 /// Full-width select-bar row shared by the slash palette (#23) and the
-/// `/code-swarm` picker (#24): selection-token background spans the whole
+/// model-targets picker (#24): selection-token background spans the whole
 /// row (padded, not just the text), warning-token (gold) text — no
 /// hardcoded hex, both colors route through `Theme`.
 pub(super) fn select_bar_canvas_line(text: &str, width: u16, theme: &Theme) -> CanvasLine {

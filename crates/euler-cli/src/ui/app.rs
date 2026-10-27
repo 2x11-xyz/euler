@@ -1,5 +1,4 @@
 use self::activity::{ActivityTerminal, RunActivityProjection};
-use self::code_swarm::load_code_swarm_models_startup;
 use self::extension_runs::{list_extension_manager_items, ExtensionOutcome, ExtensionRunRequest};
 use self::notify::NotifyEvent;
 use self::queue_mutations::{
@@ -176,7 +175,6 @@ mod activity;
 #[cfg(test)]
 #[path = "app/chrome_test.rs"]
 mod chrome;
-mod code_swarm;
 mod extension_runs;
 mod notify;
 mod queue_mutations;
@@ -345,8 +343,6 @@ pub struct AppCore {
     editor: Box<dyn ExternalEditorRunner>,
     clipboard: Box<dyn ClipboardSink>,
     pending_runs: VecDeque<PendingRunRequest>,
-    /// Saved /code-swarm reviewer model set (provider::model), session copy.
-    code_swarm_models: Vec<String>,
     /// Pending user inputs, shared with the running turn's worker (issue
     /// #146). Entries explicitly tagged as steering are drained at model
     /// round boundaries into `user.message` events; ordinary follow-ups stay
@@ -1317,7 +1313,6 @@ impl AppCore {
             editor: Box::<SystemExternalEditor>::default(),
             clipboard: Box::<SystemClipboard>::default(),
             pending_runs: VecDeque::new(),
-            code_swarm_models: load_code_swarm_models_startup(),
             queued_inputs: initial_queue.queue,
             queue_mutations: QueueMutationBoundary::new(),
             failed_queue_drafts: VecDeque::new(),
@@ -1359,7 +1354,6 @@ impl AppCore {
             extension_items,
             extension_slash_commands,
             skill_commands: self.skill_commands.clone(),
-            code_swarm_models: self.code_swarm_models.clone(),
             compaction: self.current_compaction_settings(),
         };
         self.bottom.reset_context(command_context(
@@ -1382,7 +1376,6 @@ impl AppCore {
             extension_items,
             extension_slash_commands,
             skill_commands: self.skill_commands.clone(),
-            code_swarm_models: self.code_swarm_models.clone(),
             compaction: self.current_compaction_settings(),
         };
         self.bottom = BottomSurface::new(command_context(
@@ -3516,10 +3509,6 @@ impl AppCore {
                 raw_args,
             } => self.extension_run(id, command, input, raw_args),
             CommandAction::CompanionRun { input } => self.companion_run(input),
-            CommandAction::CodeSwarmSaveModels { models, user_tier } => {
-                self.code_swarm_save_models(models, user_tier)
-            }
-            CommandAction::CodeSwarmClear { user_tier } => self.code_swarm_clear(user_tier),
             CommandAction::ShowStatus => self.show_status(),
             CommandAction::Scrub { value } => self.scrub_current_session(value),
             CommandAction::Login { provider } => self.login_guidance(provider),
@@ -4410,9 +4399,8 @@ impl AppCore {
     /// confirmation/refusal: state guards ("waits for the active turn"),
     /// setting confirmations (/theme, /model set, /effort, /status, /usage,
     /// /compact, permission changes, extension toggles, timestamps toggle,
-    /// code-swarm save/config lines, resume refusal) — none of these are
-    /// failures, so none should read as one. Real failures go through
-    /// `error_item` instead.
+    /// resume refusal). None of these are failures, so none should read as
+    /// one. Real failures go through `error_item` instead.
     fn notice_item(&mut self, message: String) -> CoreEffect {
         self.push_notice_item(message);
         CoreEffect::Render
@@ -4442,11 +4430,6 @@ impl AppCore {
             source: "ui".to_owned(),
             message,
         });
-    }
-
-    fn summary_item(&mut self, text: String) -> CoreEffect {
-        self.push_finalized_visual_item(TranscriptItem::SessionSummary(text));
-        CoreEffect::Render
     }
 
     fn turn_status(&self) -> TurnStatus {
@@ -4718,7 +4701,6 @@ fn empty_command_context_parts(
         extension_items: Vec::new(),
         extension_slash_commands: Vec::new(),
         skill_commands,
-        code_swarm_models: Vec::new(),
         compaction,
     }
 }

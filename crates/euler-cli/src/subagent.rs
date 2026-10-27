@@ -33,11 +33,11 @@ impl SubagentDecider {
         match (tier, capability) {
             (_, Capability::FsRead) => ApprovalMode::SessionAllow,
             // Intentional tier decision (multi-agent contract): agent-spawn
-            // is allowed in BOTH tiers so headless checkpoint loops can call
-            // the code_swarm_review gate. This cannot escalate beyond the
-            // tier: batch reviewer children are tool-free by contract, and
-            // any capability-holding child's own tool calls remain gated by
-            // the modes this same tier configures.
+            // is allowed in BOTH tiers so headless checkpoint loops can run
+            // extension review tools that spawn agents. This cannot escalate
+            // beyond the tier: batch reviewer children are tool-free by
+            // contract, and any capability-holding child's own tool calls
+            // remain gated by the modes this same tier configures.
             (_, Capability::AgentSpawn) => ApprovalMode::SessionAllow,
             (AutoApproveTier::ReadOnly, Capability::FsWrite | Capability::ShellExec) => {
                 ApprovalMode::AlwaysDeny

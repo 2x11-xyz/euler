@@ -51,27 +51,9 @@ fn parse_live_extension_reference(reference: &str) -> Result<(String, String)> {
     Ok((id.to_owned(), command.to_owned()))
 }
 
-/// Attach a linked code-swarm extension, when one is present, so the session
-/// can execute the special `code_swarm_review` tool (tools contract).
-/// Advertisement additionally requires the extension to be enabled for the
-/// session; wiring alone grants nothing, and every execution revalidates the
-/// linked package. With no code-swarm linked the special tool is absent; an
-/// enabled extension that declares the name is unaffected (ADR 0022
-/// transitional rule).
-pub(crate) fn wire_code_swarm<D>(session: &mut Session<D>) {
-    match extension_cli::live_linked_extension_arc("code-swarm") {
-        Ok(Some(extension)) => session.set_code_swarm_extension(extension),
-        Ok(None) => {}
-        Err(error) => {
-            eprintln!("code-swarm tool unavailable: {error}");
-        }
-    }
-}
-
 /// Attach every enabled linked package that declares generic root-session
-/// contributions, then retain the transitional CodeSwarm special path.
-/// Wiring is inert: descriptor reads revalidate consent, and no managed
-/// process starts until an approved command actually executes.
+/// contributions. Wiring is inert: descriptor reads revalidate consent, and no
+/// managed process starts until an approved command actually executes.
 pub(crate) fn wire_session_extensions<D: PermissionDecider>(session: &mut Session<D>) {
     let enabled = session
         .extensions_enabled()
@@ -91,18 +73,11 @@ pub(crate) fn wire_session_extensions<D: PermissionDecider>(session: &mut Sessio
             }
         }
     }
-    wire_code_swarm(session);
 }
 
 /// Refusal text for an agent-only command reached through a control line.
 /// It names the way in rather than only saying no.
 pub(crate) fn agent_only_control_line_error(id: &str, command: &str) -> String {
-    if id == "code-swarm" {
-        return "code-swarm.review is agent-only: ask the agent for a review in ordinary turn \
-                text (e.g. \"code swarm this diff\") and it will call its code_swarm_review \
-                tool. Reviewer models come from the persisted /code-swarm config."
-            .to_owned();
-    }
     format!(
         "{id}.{command} is agent-only: it is run by the agent on your behalf, not by a control \
          line. Ask for it in ordinary turn text."

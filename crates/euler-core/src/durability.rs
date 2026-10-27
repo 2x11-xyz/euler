@@ -1,12 +1,12 @@
-//! Durability primitives shared by the state writers (grants, swarm config,
-//! session store, provenance, extension registry, auth storage): directory
-//! fsyncs and file syncs, routed through a test-only fault-injection seam so
-//! the error paths are testable. Outside `cfg(test)` the seam's check is an
-//! `#[inline(always)]` `Ok(())`, so release builds compile down to the direct
-//! `sync_data`/`sync_all` calls.
+//! Durability primitives shared by the state writers (grants, extension
+//! config documents, session store, provenance, extension registry, auth
+//! storage): directory fsyncs and file syncs, routed through a test-only
+//! fault-injection seam so the error paths are testable. Outside
+//! `cfg(test)` the seam's check is an `#[inline(always)]` `Ok(())`, so
+//! release builds compile down to the direct `sync_data`/`sync_all` calls.
 //!
 //! Background: the swallowed-fsync bug class (directory syncs silently
-//! dropped by grants/swarm writers, fixed in PR #194) was structurally
+//! dropped by state writers, fixed in PR #194) was structurally
 //! untestable because no harness could make `sync_data`/`sync_dir` fail.
 
 use std::fs::File;
