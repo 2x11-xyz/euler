@@ -64,6 +64,13 @@ Implementation is split into units, each its own PR, in this order:
 
 PR #217 remains open as the extraction source and is not merged as a unit.
 
+**Amendment (2026-10-27).** A sandbox probe that times out is reported as a
+timeout (`sandbox_unavailable_reason: probe_timed_out`) rather than as a host
+that cannot enforce the profile, and the process-wide backend probe result is
+never cached when it timed out, so the next session probes again. Definite
+results stay cached for the process. The fail-closed decision in row A′ is
+unchanged: a session whose probe timed out runs no sandbox-requiring command.
+
 Where Euler stays stricter than Codex, deliberately: per-command sandbox state
 in provenance; Full Access does not disable the sandbox; workspace
 snapshotting around shell commands; the tiered environment denylist.

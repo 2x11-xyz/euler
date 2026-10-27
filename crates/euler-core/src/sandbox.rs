@@ -99,6 +99,9 @@ pub enum SandboxUnavailableReason {
     GitMetadataSymlink,
     /// The platform launcher could not create the profile Euler requires.
     CannotEnforce,
+    /// The probe did not finish before its deadline, so nothing was learned
+    /// about the host. Unlike every other reason, it is not cached.
+    ProbeTimedOut,
     /// The selected workspace cannot be resolved to a directory.
     InvalidWorkspace,
 }
@@ -121,6 +124,10 @@ impl SandboxUnavailableReason {
             Self::CannotEnforce => {
                 "this host cannot enforce Euler's required workspace sandbox profile"
             }
+            Self::ProbeTimedOut => {
+                "the sandbox check timed out, so this session cannot run sandboxed commands; \
+start a new session to check again"
+            }
             Self::InvalidWorkspace => {
                 "workspace sandbox requires an accessible workspace directory"
             }
@@ -134,6 +141,7 @@ impl SandboxUnavailableReason {
             Self::SeatbeltMissing => "seatbelt_missing",
             Self::GitMetadataSymlink => "git_metadata_symlink",
             Self::CannotEnforce => "cannot_enforce",
+            Self::ProbeTimedOut => "probe_timed_out",
             Self::InvalidWorkspace => "invalid_workspace",
         }
     }
@@ -209,7 +217,10 @@ profile's mounts for this workspace"
             Self::SeatbeltProfileRejected => {
                 "macOS refused to apply Euler's required Seatbelt profile"
             }
-            Self::ProbeTimedOut => "the sandbox probe did not finish in time",
+            Self::ProbeTimedOut => {
+                "the sandbox probe did not finish in time, most likely because the host was \
+under heavy load"
+            }
             Self::InvalidWorkspace => "the workspace root is not an accessible directory",
             Self::UnsupportedPlatform => "this platform has no sandbox backend yet",
             Self::Unattributed => "Bubblewrap could not create a user namespace",
@@ -230,6 +241,7 @@ profile's mounts for this workspace"
             SandboxUnavailableReason::GitMetadataSymlink => Self::GitMetadataSymlink,
             SandboxUnavailableReason::InvalidWorkspace => Self::InvalidWorkspace,
             SandboxUnavailableReason::UnsupportedPlatform => Self::UnsupportedPlatform,
+            SandboxUnavailableReason::ProbeTimedOut => Self::ProbeTimedOut,
             SandboxUnavailableReason::CannotEnforce => match probe_sandbox_backend() {
                 // Namespaces demonstrably work, so the profile's own mounts
                 // are what this host rejected.
@@ -279,8 +291,9 @@ is not on a filesystem Bubblewrap cannot bind, such as an unusual FUSE mount"
                 "run Euler outside another macOS application sandbox; if the host is managed, ask the administrator to permit nested Seatbelt profiles"
             }
             Self::ProbeTimedOut => {
-                "try again on a less loaded machine; if it persists, run the platform launcher \
-directly (`bwrap` on Linux or `/usr/bin/sandbox-exec` on macOS) to see where it stops"
+                "start a new session or rerun `euler --check-sandbox` once the host is less busy; \
+if it keeps timing out, run the platform launcher directly (`bwrap` on Linux or \
+`/usr/bin/sandbox-exec` on macOS) to see where it stops"
             }
             Self::InvalidWorkspace => {
                 "start Euler in a directory that exists and that you can read"
@@ -341,11 +354,16 @@ impl SandboxStatus {
         let Self::Unavailable { cause, .. } = self else {
             return None;
         };
+        let retry = if cause == SandboxFailureCause::ProbeTimedOut {
+            "A timed-out probe is not cached, so the next session checks again."
+        } else {
+            "The probe result is cached for this process, so fixing the host takes effect \
+in a new run, not this one."
+        };
         Some(format!(
             "Euler could not start its subprocess sandbox: {}.\nTo fix it: {}.\n\
 Until then `run_shell` and the `git_*` tools fail closed; there is no automatic \
-fallback to host execution. The probe result is cached for this process, so \
-fixing the host takes effect in a new run, not this one.",
+fallback to host execution. {retry}",
             cause.description(),
             cause.remedy(),
         ))
@@ -396,9 +414,6 @@ pub(crate) struct WorkspaceSandbox {
     backend: SandboxBackend,
     launcher: Option<SandboxLauncher>,
     availability: SandboxAvailability,
-    /// How the profile probe ended, when one ran. `None` means the profile
-    /// was ruled out before any process started.
-    probe: Option<ProbeOutcome>,
 }
 
 impl WorkspaceSandbox {
@@ -455,14 +470,13 @@ impl WorkspaceSandbox {
                 SandboxUnavailableReason::BubblewrapMissing,
             );
         };
-        let (availability, outcome) = probe_bwrap_profile(&bwrap, &workspace, &runtime, profile);
+        let availability = probe_bwrap_profile(&bwrap, &workspace, &runtime, profile);
         Self {
             workspace: Some(workspace),
             runtime,
             backend,
             launcher: Some(SandboxLauncher::Bubblewrap(bwrap)),
             availability,
-            probe: Some(outcome),
         }
     }
 
@@ -496,19 +510,14 @@ impl WorkspaceSandbox {
             git_metadata,
             git_metadata_resolved,
         };
-        let outcome = probe_seatbelt_profile(&launcher, &workspace, &runtime, profile);
-        let availability = if outcome.succeeded() {
-            SandboxAvailability::Enforced(profile)
-        } else {
-            SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
-        };
+        let availability =
+            probe_seatbelt_profile(&launcher, &workspace, &runtime, profile).availability(profile);
         Self {
             workspace: Some(workspace),
             runtime,
             backend,
             launcher: Some(launcher),
             availability,
-            probe: Some(outcome),
         }
     }
 
@@ -524,7 +533,6 @@ impl WorkspaceSandbox {
             backend,
             launcher: None,
             availability: SandboxAvailability::Unavailable(reason),
-            probe: None,
         }
     }
 
@@ -544,11 +552,8 @@ impl WorkspaceSandbox {
         };
         SandboxStatus::Unavailable {
             reason,
-            // A probe that never finished taught us nothing, so naming the
-            // mounts or the namespace would be a guess.
-            cause: match (self.backend, self.probe) {
-                (_, Some(ProbeOutcome::TimedOut)) => SandboxFailureCause::ProbeTimedOut,
-                (SandboxBackend::Seatbelt, _) => match reason {
+            cause: match self.backend {
+                SandboxBackend::Seatbelt => match reason {
                     SandboxUnavailableReason::SeatbeltMissing => {
                         SandboxFailureCause::SeatbeltMissing
                     }
@@ -564,6 +569,7 @@ impl WorkspaceSandbox {
                     SandboxUnavailableReason::BubblewrapMissing => {
                         SandboxFailureCause::BubblewrapMissing
                     }
+                    SandboxUnavailableReason::ProbeTimedOut => SandboxFailureCause::ProbeTimedOut,
                     SandboxUnavailableReason::CannotEnforce => match probe_sandbox_backend() {
                         SandboxStatus::Unavailable { cause, .. } => cause,
                         _ => SandboxFailureCause::SeatbeltProfileRejected,
@@ -1180,10 +1186,35 @@ pub fn probe_workspace_sandbox(workspace: &Path) -> SandboxStatus {
 /// workflow instead, tracked as issue #230.
 pub fn probe_sandbox_backend() -> SandboxStatus {
     // The backend is a property of the host, not of a workspace, and cannot
-    // change under a running process: probe it once. The per-workspace profile
-    // probe still runs for every registry.
+    // change under a running process: probe it once, or until a probe finishes.
+    // The per-workspace profile probe still runs for every registry.
     static BACKEND: OnceLock<SandboxStatus> = OnceLock::new();
-    *BACKEND.get_or_init(probe_sandbox_backend_uncached)
+    cache_unless_timed_out(&BACKEND, probe_sandbox_backend_uncached)
+}
+
+/// Remember a definite probe result for the rest of the process.
+///
+/// A timeout is not an answer about the host, only about how busy it was, so
+/// a result whose cause is a timeout is returned but not remembered, and the
+/// next caller probes again. Callers racing on an empty cache may each run a
+/// probe; the first definite result stored is the one every caller sees from
+/// then on, including a racer whose own probe timed out.
+fn cache_unless_timed_out(
+    cache: &OnceLock<SandboxStatus>,
+    probe: impl FnOnce() -> SandboxStatus,
+) -> SandboxStatus {
+    if let Some(status) = cache.get() {
+        return *status;
+    }
+    let status = probe();
+    if let SandboxStatus::Unavailable {
+        cause: SandboxFailureCause::ProbeTimedOut,
+        ..
+    } = status
+    {
+        return cache.get().copied().unwrap_or(status);
+    }
+    *cache.get_or_init(|| status)
 }
 
 fn probe_sandbox_backend_uncached() -> SandboxStatus {
@@ -1204,14 +1235,13 @@ fn probe_sandbox_backend_uncached() -> SandboxStatus {
             ])
             .arg("/usr/bin/true");
         mark_inherited_fds_close_on_exec(&mut command);
-        let cause = match run_probe_to_completion(command) {
-            ProbeOutcome::Succeeded => return SandboxStatus::Enforced(SandboxBackend::Seatbelt),
-            ProbeOutcome::TimedOut => SandboxFailureCause::ProbeTimedOut,
-            ProbeOutcome::Refused => SandboxFailureCause::SeatbeltProfileRejected,
-        };
-        return SandboxStatus::Unavailable {
-            reason: SandboxUnavailableReason::CannotEnforce,
-            cause,
+        return match run_probe_to_completion(command) {
+            ProbeOutcome::Succeeded => SandboxStatus::Enforced(SandboxBackend::Seatbelt),
+            ProbeOutcome::TimedOut => PROBE_TIMED_OUT,
+            ProbeOutcome::Refused => SandboxStatus::Unavailable {
+                reason: SandboxUnavailableReason::CannotEnforce,
+                cause: SandboxFailureCause::SeatbeltProfileRejected,
+            },
         };
     }
     if !cfg!(target_os = "linux") {
@@ -1232,16 +1262,24 @@ fn probe_sandbox_backend_uncached() -> SandboxStatus {
     // Debian 11 predate; that is its own cause, not a userns problem.
     command.args(PROFILE_ISOLATION_FLAGS);
     command.args(["--unshare-net", "--ro-bind", "/", "/", "/bin/true"]);
-    let cause = match run_probe_to_completion(command) {
-        ProbeOutcome::Succeeded => return SandboxStatus::Enforced(SandboxBackend::Bwrap),
-        ProbeOutcome::TimedOut => SandboxFailureCause::ProbeTimedOut,
-        ProbeOutcome::Refused => attribute_isolation_failure(&bwrap),
-    };
-    SandboxStatus::Unavailable {
-        reason: SandboxUnavailableReason::CannotEnforce,
-        cause,
+    match run_probe_to_completion(command) {
+        ProbeOutcome::Succeeded => SandboxStatus::Enforced(SandboxBackend::Bwrap),
+        ProbeOutcome::TimedOut => PROBE_TIMED_OUT,
+        // The refusal is definite even when attributing it times out; that
+        // timed-out cause is what keeps the result out of the cache.
+        ProbeOutcome::Refused => SandboxStatus::Unavailable {
+            reason: SandboxUnavailableReason::CannotEnforce,
+            cause: attribute_isolation_failure(&bwrap),
+        },
     }
 }
+
+/// A probe that ran out of time. It says nothing about the host, so it
+/// carries its own reason and, like any timed-out cause, is never cached.
+const PROBE_TIMED_OUT: SandboxStatus = SandboxStatus::Unavailable {
+    reason: SandboxUnavailableReason::ProbeTimedOut,
+    cause: SandboxFailureCause::ProbeTimedOut,
+};
 
 /// Decide why the isolation flags failed, by trying the same probe without
 /// the newest one.
@@ -1321,7 +1359,7 @@ fn probe_bwrap_profile(
     workspace: &Path,
     runtime: &RuntimeRoots,
     profile: SandboxProfile,
-) -> (SandboxAvailability, ProbeOutcome) {
+) -> SandboxAvailability {
     // `test -d` for the workspace, not `test -w`: the mount is what the probe
     // is checking, and a read-only checkout is a workspace Euler can still
     // read. `/tmp` must be writable, because the sandbox home, cache and
@@ -1355,13 +1393,7 @@ fn probe_bwrap_profile(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let outcome = run_probe_to_completion(command);
-    let availability = if outcome.succeeded() {
-        SandboxAvailability::Enforced(profile)
-    } else {
-        SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
-    };
-    (availability, outcome)
+    run_probe_to_completion(command).availability(profile)
 }
 
 fn probe_seatbelt_profile(
@@ -1447,8 +1479,17 @@ enum ProbeOutcome {
 }
 
 impl ProbeOutcome {
-    const fn succeeded(self) -> bool {
-        matches!(self, Self::Succeeded)
+    /// What a profile probe that ended this way means for the session.
+    const fn availability(self, profile: SandboxProfile) -> SandboxAvailability {
+        match self {
+            Self::Succeeded => SandboxAvailability::Enforced(profile),
+            Self::Refused => {
+                SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
+            }
+            Self::TimedOut => {
+                SandboxAvailability::Unavailable(SandboxUnavailableReason::ProbeTimedOut)
+            }
+        }
     }
 }
 
@@ -2765,6 +2806,109 @@ token = \"secret\"\n",
         assert!(SandboxFailureCause::BubblewrapTooOld
             .remedy()
             .contains("0.8.0"));
+    }
+
+    #[test]
+    fn a_timed_out_backend_probe_is_not_cached_so_the_next_probe_can_succeed() {
+        let cache = OnceLock::new();
+
+        assert_eq!(
+            cache_unless_timed_out(&cache, || PROBE_TIMED_OUT),
+            PROBE_TIMED_OUT
+        );
+        let enforced = SandboxStatus::Enforced(SandboxBackend::Seatbelt);
+        assert_eq!(cache_unless_timed_out(&cache, || enforced), enforced);
+        assert_eq!(
+            cache_unless_timed_out(&cache, || panic!("a definite result is cached")),
+            enforced
+        );
+    }
+
+    #[test]
+    fn a_definite_backend_failure_after_a_timeout_stays_cached() {
+        let cache = OnceLock::new();
+        let refused = SandboxStatus::Unavailable {
+            reason: SandboxUnavailableReason::CannotEnforce,
+            cause: SandboxFailureCause::SeatbeltProfileRejected,
+        };
+
+        assert_eq!(
+            cache_unless_timed_out(&cache, || PROBE_TIMED_OUT),
+            PROBE_TIMED_OUT
+        );
+        assert_eq!(cache_unless_timed_out(&cache, || refused), refused);
+        assert_eq!(
+            cache_unless_timed_out(&cache, || SandboxStatus::Enforced(SandboxBackend::Seatbelt)),
+            refused
+        );
+    }
+
+    /// A refusal is definite, but a cause that timed out is still a guess, so
+    /// the next probe gets the chance to attribute it.
+    #[test]
+    fn a_refusal_whose_attribution_timed_out_is_not_cached() {
+        let cache = OnceLock::new();
+        let unattributed = SandboxStatus::Unavailable {
+            reason: SandboxUnavailableReason::CannotEnforce,
+            cause: SandboxFailureCause::ProbeTimedOut,
+        };
+        let attributed = SandboxStatus::Unavailable {
+            reason: SandboxUnavailableReason::CannotEnforce,
+            cause: SandboxFailureCause::UserNamespacesDisabled,
+        };
+
+        assert_eq!(
+            cache_unless_timed_out(&cache, || unattributed),
+            unattributed
+        );
+        assert_eq!(cache_unless_timed_out(&cache, || attributed), attributed);
+    }
+
+    #[test]
+    fn a_racer_whose_probe_timed_out_returns_the_definite_result_stored_meanwhile() {
+        let cache = OnceLock::new();
+        let enforced = SandboxStatus::Enforced(SandboxBackend::Bwrap);
+
+        let status = cache_unless_timed_out(&cache, || {
+            cache.set(enforced).expect("the racer stores first");
+            PROBE_TIMED_OUT
+        });
+
+        assert_eq!(status, enforced);
+    }
+
+    /// A timed-out profile probe must read as a timeout on `session.start`
+    /// and in `euler --check-sandbox`, not as a host that refused the
+    /// profile: the next session probes again and may well succeed.
+    #[test]
+    fn a_timed_out_profile_probe_is_reported_as_a_timeout() {
+        let profile = SandboxProfile::WorkspaceNoNetwork;
+        let SandboxAvailability::Unavailable(reason) = ProbeOutcome::TimedOut.availability(profile)
+        else {
+            panic!("a timed-out probe must fail closed");
+        };
+        assert_eq!(reason.as_str(), "probe_timed_out");
+        assert!(reason.message().contains("timed out"), "{reason}");
+        assert_eq!(
+            ProbeOutcome::Refused.availability(profile),
+            SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
+        );
+
+        for backend in [SandboxBackend::Seatbelt, SandboxBackend::Bwrap] {
+            let status =
+                WorkspaceSandbox::unavailable(None, RuntimeRoots::default(), backend, reason)
+                    .status();
+            assert_eq!(status, PROBE_TIMED_OUT);
+            let diagnostic = status
+                .diagnostic()
+                .expect("an unavailable sandbox explains itself");
+            assert!(
+                diagnostic.contains("did not finish in time"),
+                "{diagnostic}"
+            );
+            assert!(diagnostic.contains("not cached"), "{diagnostic}");
+            assert!(!diagnostic.contains("refused"), "{diagnostic}");
+        }
     }
 
     #[test]
