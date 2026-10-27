@@ -577,11 +577,17 @@ admission, or authority over another extension's workflow state.
 but every execution records a permission decision event. Root-session
 `extension-state`, `context-slot`, and `plan-presentation` also default to
 `session-allow`; each is extension-attributed and bounded as described above.
+Root-session `artifact-write` also defaults to `session-allow`: the host
+writes the bytes content-addressed into the calling extension's
+session-private artifact directory, records an attributed `extension.artifact`
+event, and grants the extension no filesystem authority.
 `fs-write`, `shell-exec`, and root-session `agent-spawn` default to `ask`.
 Unconfigured capabilities remain `always-deny`; child-agent gates start
 deny-all and inherit only their explicit attenuated envelope. Headless
 auto-approve tiers override these root defaults with the explicit mapping
-above.
+above; the root-session extension defaults (`extension-state`,
+`context-slot`, `plan-presentation`, `artifact-write`) are outside that
+mapping and stay `session-allow`.
 
 **Sensitive-basename ask.** A blanket `session-allow` never covers a tool
 request whose path names a categorically sensitive file. When a path-taking

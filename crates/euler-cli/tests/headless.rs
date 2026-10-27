@@ -6681,7 +6681,9 @@ fn tty_line_mode_denies_linked_capabilities_before_process_launch() {
     let mut line = PtyHarness::spawn_with_args(home.path(), &["--no-tty", "--provider", "fixture"]);
     line.write("extension_run python-tty-permission.inspect {}\r");
     assert!(
-        line.wait_for_screen("permission: allow provenance-read, artifact-write"),
+        // `artifact-write` is session-allow in a root session, so only
+        // `provenance-read` reaches the prompt.
+        line.wait_for_screen("permission: allow provenance-read for extension"),
         "TTY line mode did not ask for capability approval:\n{}",
         line.screen_text()
     );

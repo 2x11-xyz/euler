@@ -249,6 +249,13 @@ pull requests that landed them; deeper design rationale lives in
 - Session-private extension state now has its own `extension-state` capability.
   Root sessions allow it and bounded, namespaced `context-slot` updates by
   default so removable workflows can probe absent or resumed state.
+- Root sessions now allow `artifact-write` by default, alongside
+  `extension-state`, `context-slot`, and `plan-presentation`, so an extension
+  model tool writes its host-mediated artifact without a prompt (ADR 0022).
+  Headless `euler exec` tiers keep this default. Child and companion gates are
+  unchanged.
+- The spawn preflight error for an unconfigured provider no longer names a
+  reviewer-model picker; it still points at `/login`.
 - Extensions can publish bounded typed plan presentation through
   `plan-presentation`; core emits canonical structured `plan.update` events
   and renders one checklist cell without taking ownership of workflow policy.

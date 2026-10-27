@@ -231,6 +231,27 @@ fn subagent_tiers_map_to_existing_approval_modes() {
 }
 
 #[test]
+fn exec_tiers_keep_the_root_session_artifact_write_default() {
+    // ADR 0022: `artifact-write` is a root-session default, so headless exec
+    // writes host-mediated extension artifacts in both tiers.
+    use euler_provider::ScriptedProvider;
+    for tier in [AutoApproveTier::ReadOnly, AutoApproveTier::TrustedLocal] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::new(
+            euler_core::SessionConfig::new(temp.path()),
+            ScriptedProvider::new(Vec::new()),
+            SubagentDecider::new(tier),
+        );
+        SubagentDecider::apply_tier(tier, &mut session);
+
+        assert_eq!(
+            session.configured_mode(Capability::ArtifactWrite),
+            Some(ApprovalMode::SessionAllow)
+        );
+    }
+}
+
+#[test]
 fn guardian_reviewer_restores_ask_modes_over_exec_tiers() {
     // ADR 0011: tiers leave no capability in `ask` mode, so a configured
     // guardian would silently review nothing. With the guardian on, the

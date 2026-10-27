@@ -395,6 +395,7 @@ impl<D> PermissionGate<D> {
                 (Capability::ExtensionState, ApprovalMode::SessionAllow),
                 (Capability::ContextSlot, ApprovalMode::SessionAllow),
                 (Capability::PlanPresentation, ApprovalMode::SessionAllow),
+                (Capability::ArtifactWrite, ApprovalMode::SessionAllow),
             ]),
             session_grants: GrantList::new(),
             project_grants: GrantList::new(),
@@ -1116,17 +1117,20 @@ mod tests {
     #[test]
     fn root_extension_scaffolding_defaults_to_session_allow() {
         let gate = PermissionGate::new(PanicDecider);
+        let child_gate = PermissionGate::new_deny_all(PanicDecider);
 
         for capability in [
             Capability::ExtensionState,
             Capability::ContextSlot,
             Capability::PlanPresentation,
+            Capability::ArtifactWrite,
         ] {
             assert_eq!(
                 gate.configured_mode(capability),
                 Some(ApprovalMode::SessionAllow)
             );
             assert_eq!(gate.mode(capability), ApprovalMode::SessionAllow);
+            assert_eq!(child_gate.configured_mode(capability), None);
         }
     }
 
