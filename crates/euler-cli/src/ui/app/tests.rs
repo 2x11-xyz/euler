@@ -8750,7 +8750,7 @@ fn wait_for_idle(core: &mut AppCore) {
 #[test]
 fn code_swarm_picker_choices_survive_rebuild_while_turn_in_flight() {
     let mut core = core();
-    let idle_choices = core.bottom.context().code_swarm_model_choices.clone();
+    let idle_choices = core.bottom.context().model_target_choices.clone();
     assert!(
         !idle_choices.is_empty(),
         "idle session with an authenticated provider offers reviewer targets"
@@ -8767,7 +8767,7 @@ fn code_swarm_picker_choices_survive_rebuild_while_turn_in_flight() {
     core.rebuild_bottom_surface();
 
     assert_eq!(
-        core.bottom.context().code_swarm_model_choices,
+        core.bottom.context().model_target_choices,
         idle_choices,
         "the reviewer-model picker must never shrink because a turn is in flight"
     );

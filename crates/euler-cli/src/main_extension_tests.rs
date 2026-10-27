@@ -269,7 +269,36 @@ fn extension_parse_accepts_run_with_input_file() {
     assert_eq!(run.id, "session-export");
     assert_eq!(run.command, "session-export");
     assert_eq!(run.target, PathBuf::from("research-session"));
-    assert_eq!(run.input, json!({"limit": 2, "scan_limit": 7}));
+    assert_eq!(
+        run.input,
+        crate::extension_cli::UserCommandInput::Json(json!({"limit": 2, "scan_limit": 7}))
+    );
+}
+
+#[test]
+fn extension_parse_defers_declared_flags_to_the_live_descriptor() {
+    let args = parse_args(&[
+        "extension",
+        "run",
+        "targets-example.configure",
+        "research-session",
+        "--models",
+        "openai::gpt-5.5,anthropic::claude-opus-4-1",
+    ]);
+
+    let Command::Extension(extension) = args.command else {
+        panic!("expected extension command");
+    };
+    let ExtensionAction::Run(run) = extension.action else {
+        panic!("expected extension run");
+    };
+    assert_eq!(
+        run.input,
+        crate::extension_cli::UserCommandInput::Flags(vec![
+            "--models".to_owned(),
+            "openai::gpt-5.5,anthropic::claude-opus-4-1".to_owned(),
+        ])
+    );
 }
 
 #[test]
@@ -416,8 +445,20 @@ fn extension_parse_rejects_invalid_shapes() {
                 "session",
                 "--limit",
                 "2",
+                "--input-file",
+                "input.json",
             ],
-            "session-export.session-export accepts only --input-file <json-object-file> until it is loaded as a managed-process package",
+            "session-export.session-export: --input-file cannot be combined with declared --flag arguments",
+        ),
+        (
+            &[
+                "extension",
+                "run",
+                "session-export.session-export",
+                "session",
+                "extra",
+            ],
+            "session-export.session-export accepts --input-file <json-object-file> or its declared --flag arguments, not `extra`",
         ),
         (
             &[

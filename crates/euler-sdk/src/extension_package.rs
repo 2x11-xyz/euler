@@ -1,6 +1,6 @@
 use crate::{
-    validate_model_tool_descriptor, Capability, IdleContributionDescriptor, ModelToolDescriptor,
-    RequestTickDescriptor,
+    validate_model_tool_descriptor, ArgSpec, ArgValueKind, Capability, IdleContributionDescriptor,
+    ModelToolDescriptor, RequestTickDescriptor, MAX_MODEL_TARGETS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -85,6 +85,10 @@ pub struct StaticCommandDescriptor {
     pub invocation: crate::Invocation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tool: Option<ModelToolDescriptor>,
+    /// Declared `--flag` arguments of a `user` command. Absent in manifests
+    /// and link inventories written before the field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<ArgSpec>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -674,6 +678,7 @@ fn parse_commands(
                 "required_capabilities",
                 "invocation",
                 "model_tool",
+                "args",
             ],
             &scope,
         )?;
@@ -709,6 +714,7 @@ fn parse_commands(
                 "{scope} model_tool requires invocation \"agent-only\""
             )));
         }
+        let args = parse_args(object, &scope, invocation)?;
         parsed.push(StaticCommandDescriptor {
             name,
             display_name,
@@ -716,6 +722,7 @@ fn parse_commands(
             required_capabilities,
             invocation,
             model_tool,
+            args,
         });
     }
     Ok(parsed)
@@ -733,6 +740,82 @@ fn parse_model_tool(
     validate_model_tool_descriptor(&descriptor)
         .map_err(|error| invalid(format!("{scope} model_tool is invalid: {error}")))?;
     Ok(Some(descriptor))
+}
+
+/// Manifest argument entries are `{"flag", "kind", ...kind fields,
+/// "required"}`. The flag is also the input key. `model-targets` is the only
+/// kind, with `max` in 1..=`MAX_MODEL_TARGETS`, at most once per command.
+fn parse_args(
+    object: &Map<String, Value>,
+    scope: &str,
+    invocation: crate::Invocation,
+) -> Result<Vec<ArgSpec>, ExtensionPackageError> {
+    let Some(value) = object.get("args") else {
+        return Ok(Vec::new());
+    };
+    if invocation.is_agent_only() {
+        return Err(invalid(format!(
+            "{scope} args requires invocation \"user\""
+        )));
+    }
+    let entries = value
+        .as_array()
+        .ok_or_else(|| invalid(format!("{scope} args must be an array")))?;
+    let mut parsed: Vec<ArgSpec> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let arg_scope = format!("{scope} args #{index}");
+        let arg = entry
+            .as_object()
+            .ok_or_else(|| invalid(format!("{arg_scope} must be an object")))?;
+        let flag = required_identifier(arg, "flag", &format!("{arg_scope} flag"))?;
+        // `euler extension run` owns `--input-file` for JSON input.
+        if flag == "input-file" {
+            return Err(invalid(format!(
+                "{arg_scope} flag `input-file` is reserved"
+            )));
+        }
+        let kind = arg
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| invalid(format!("{arg_scope} kind must be a string")))?;
+        let value_kind = match kind {
+            "model-targets" => {
+                validate_fields(arg, &["flag", "kind", "max", "required"], &arg_scope)?;
+                let max = arg
+                    .get("max")
+                    .and_then(Value::as_u64)
+                    .filter(|max| (1..=MAX_MODEL_TARGETS as u64).contains(max))
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "{arg_scope} max must be an integer 1..={MAX_MODEL_TARGETS}"
+                        ))
+                    })?;
+                if parsed
+                    .iter()
+                    .any(|spec| matches!(spec.value_kind, ArgValueKind::ModelTargets { .. }))
+                {
+                    return Err(invalid(format!(
+                        "{scope} args declares more than one model-targets argument"
+                    )));
+                }
+                ArgValueKind::ModelTargets { max: max as usize }
+            }
+            other => return Err(invalid(format!("{arg_scope} kind is unknown: {other}"))),
+        };
+        let required = match arg.get("required") {
+            None => false,
+            Some(Value::Bool(required)) => *required,
+            Some(_) => return Err(invalid(format!("{arg_scope} required must be a boolean"))),
+        };
+        parsed.push(ArgSpec {
+            input_key: flag.clone(),
+            flag,
+            value_kind,
+            required,
+            repeatable: false,
+        });
+    }
+    Ok(parsed)
 }
 
 /// `invocation` is absent in manifests written before the field existed, and

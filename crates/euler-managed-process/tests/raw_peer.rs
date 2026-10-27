@@ -54,6 +54,7 @@ fn managed_adapter_preserves_session_contribution_descriptors() {
                 required_capabilities: Vec::new(),
                 invocation: euler_sdk::Invocation::AgentOnly,
                 model_tool: Some(model_tool.clone()),
+                args: Vec::new(),
             },
             StaticCommandDescriptor {
                 name: "idle".to_owned(),
@@ -62,6 +63,7 @@ fn managed_adapter_preserves_session_contribution_descriptors() {
                 required_capabilities: Vec::new(),
                 invocation: euler_sdk::Invocation::AgentOnly,
                 model_tool: None,
+                args: Vec::new(),
             },
         ],
         observer: None,
@@ -1084,6 +1086,7 @@ fn extension(
             required_capabilities: capabilities,
             invocation: euler_sdk::Invocation::User,
             model_tool: None,
+            args: Vec::new(),
         }],
         observer: None,
         idle_contribution: None,

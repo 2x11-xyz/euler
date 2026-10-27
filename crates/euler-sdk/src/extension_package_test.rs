@@ -488,6 +488,7 @@ fn linked_extension(
                 display_name: "Inspect".to_owned(),
                 summary: "Inspect provenance.".to_owned(),
                 required_capabilities: vec!["provenance-read".to_owned()],
+                args: Vec::new(),
             }],
             observer: None,
             idle_contribution: None,
@@ -776,4 +777,125 @@ fn manifest_rejects_missing_or_user_request_tick_commands() {
     assert!(error
         .to_string()
         .contains("request_tick command `update` must be agent-only"));
+}
+
+fn model_targets_manifest(command: serde_json::Value) -> serde_json::Value {
+    json!({
+        "version": 1,
+        "id": "targets-example",
+        "display_name": "Targets example",
+        "extension_version": "0.1.0",
+        "runtime_kind": "native-rust",
+        "capabilities": [],
+        "commands": [command]
+    })
+}
+
+#[test]
+fn manifest_model_targets_arg_round_trips_through_the_link_inventory() {
+    let manifest = model_targets_manifest(json!({
+        "name": "configure",
+        "display_name": "Configure",
+        "summary": "Pick target models.",
+        "required_capabilities": [],
+        "args": [{"flag": "models", "kind": "model-targets", "max": 5, "required": true}]
+    }));
+    let descriptor =
+        parse_extension_manifest_bytes(&serde_json::to_vec(&manifest).expect("manifest json"))
+            .expect("valid model-targets manifest");
+    assert_eq!(
+        descriptor.commands[0].args,
+        vec![crate::ArgSpec {
+            flag: "models".to_owned(),
+            input_key: "models".to_owned(),
+            value_kind: crate::ArgValueKind::ModelTargets { max: 5 },
+            required: true,
+            repeatable: false,
+        }]
+    );
+
+    let mut linked = linked_extension("targets-example", LinkedExtensionStatus::NeedsReview, None);
+    linked.descriptor = descriptor.clone();
+    let links = BTreeMap::from([("targets-example".to_owned(), linked)]);
+    let encoded = encode_link_inventory(&links).expect("encode");
+    let decoded =
+        decode_link_inventory(std::str::from_utf8(&encoded).expect("utf8")).expect("decode");
+    assert_eq!(decoded["targets-example"].descriptor, descriptor);
+
+    // `required` defaults to false.
+    let optional = model_targets_manifest(json!({
+        "name": "configure",
+        "display_name": "Configure",
+        "summary": "Pick target models.",
+        "required_capabilities": [],
+        "args": [{"flag": "models", "kind": "model-targets", "max": 1}]
+    }));
+    let descriptor =
+        parse_extension_manifest_bytes(&serde_json::to_vec(&optional).expect("manifest json"))
+            .expect("optional model-targets manifest");
+    assert!(!descriptor.commands[0].args[0].required);
+}
+
+#[test]
+fn manifest_rejects_invalid_model_targets_args() {
+    let arg = json!({"flag": "models", "kind": "model-targets", "max": 5});
+    let command = |extra: serde_json::Value| {
+        let mut command = json!({
+            "name": "configure",
+            "display_name": "Configure",
+            "summary": "Pick target models.",
+            "required_capabilities": []
+        });
+        for (key, value) in extra.as_object().expect("extra object") {
+            command[key] = value.clone();
+        }
+        command
+    };
+    let with_arg = |patch: serde_json::Value| {
+        let mut arg = arg.clone();
+        for (key, value) in patch.as_object().expect("patch object") {
+            arg[key] = value.clone();
+        }
+        command(json!({"args": [arg]}))
+    };
+    let cases = [
+        (
+            command(json!({"invocation": "agent-only", "args": [arg.clone()]})),
+            "args requires invocation \"user\"",
+        ),
+        (with_arg(json!({"max": 0})), "max must be an integer 1..=16"),
+        (
+            with_arg(json!({"max": 17})),
+            "max must be an integer 1..=16",
+        ),
+        (
+            with_arg(json!({"kind": "json-object-file"})),
+            "kind is unknown",
+        ),
+        (with_arg(json!({"flag": "input-file"})), "is reserved"),
+        (
+            with_arg(json!({"flag": "Models"})),
+            "not a valid extension identifier",
+        ),
+        (
+            with_arg(json!({"required": "yes"})),
+            "required must be a boolean",
+        ),
+        (with_arg(json!({"extra": 1})), "unknown field"),
+        (
+            command(json!({"args": [arg.clone(), arg.clone()]})),
+            "more than one model-targets argument",
+        ),
+        (command(json!({"args": {}})), "args must be an array"),
+    ];
+    for (command, expected) in cases {
+        let manifest = model_targets_manifest(command.clone());
+        let error =
+            parse_extension_manifest_bytes(&serde_json::to_vec(&manifest).expect("manifest"))
+                .expect_err(&command.to_string());
+        assert!(
+            error.to_string().contains(expected),
+            "{command}: {error} should mention {expected}"
+        );
+    }
 }

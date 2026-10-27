@@ -8261,6 +8261,143 @@ serve({"inspect": inspect})
     assert!(result["result"]["seen_events"].as_u64().unwrap() >= 1);
 }
 
+/// ADR 0022 substrate 2: a declared model-targets argument is validated by
+/// the host on `euler extension run` and the headless control line, and the
+/// extension receives only the target strings.
+#[cfg(unix)]
+#[test]
+fn model_targets_arg_reaches_the_extension_as_target_strings() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": "targets-proof",
+        "display_name": "Targets proof",
+        "extension_version": "0.1.0",
+        "runtime_kind": "managed-process",
+        "entrypoint": {"command": ["python3", "-B", "-u", "extension.py"]},
+        "capabilities": [],
+        "commands": [{
+            "name": "configure",
+            "display_name": "Configure",
+            "summary": "Echo the chosen targets.",
+            "required_capabilities": [],
+            "args": [{"flag": "models", "kind": "model-targets", "max": 2, "required": true}]
+        }]
+    });
+    fs::write(
+        extension_dir
+            .path()
+            .join(euler_core::EXTENSION_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write manifest");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        raw_managed_process_script(
+            r#"
+from pathlib import Path
+
+def configure(_peer, command_input):
+    Path("invoked").write_text("yes", encoding="utf-8")
+    return {"input": command_input}
+
+serve({"configure": configure})
+"#,
+        ),
+    )
+    .expect("write Python extension");
+    configure_linked_extension(exe, &home, extension_dir.path(), "targets-proof");
+
+    let session_dir = tempfile::tempdir().expect("session dir");
+    let log = session_dir.path().join("events.jsonl");
+    write_events(&log, &[session_start("fixture", "echo")]);
+    let run = |models: &str| {
+        command_with_home(exe, &home)
+            .args([
+                "extension",
+                "run",
+                "targets-proof.configure",
+                path_str(&log),
+                "--models",
+                models,
+            ])
+            .output()
+            .expect("run targets-proof")
+    };
+
+    let rejected = run("openai::gpt-5.5,anthropic::claude-opus-5,fixture::echo");
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("--models: expected 1 to 2 provider::model targets, got 3"),
+        "stderr: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert!(
+        !extension_dir.path().join("invoked").exists(),
+        "a rejected argument must not launch the extension"
+    );
+
+    let accepted = run("openai::gpt-5.5, anthropic::claude-opus-5");
+    assert!(
+        accepted.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    let accepted: serde_json::Value = serde_json::from_slice(&accepted.stdout).expect("run json");
+    assert_eq!(
+        accepted["input"],
+        serde_json::json!({"models": ["openai::gpt-5.5", "anthropic::claude-opus-5"]})
+    );
+
+    let root = tempfile::tempdir().expect("root dir");
+    let mut child = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .arg("--provenance")
+        .arg(path_str(&root.path().join("events.jsonl")))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(
+            b"extension_run targets-proof.configure --models openai::gpt-5.5\n\
+              extension_run targets-proof.configure {\"models\": \"openai::gpt-5.5\"}\n",
+        )
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait euler");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = String::from_utf8(output.stdout)
+        .expect("stdout utf8")
+        .lines()
+        .filter(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("line json"))
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 2, "lines: {lines:?}");
+    assert_eq!(lines[0]["type"], serde_json::json!("extension_run_result"));
+    assert_eq!(
+        lines[0]["result"]["input"],
+        serde_json::json!({"models": ["openai::gpt-5.5"]})
+    );
+    assert_eq!(lines[1]["type"], serde_json::json!("error"));
+    assert_eq!(
+        lines[1]["message"],
+        serde_json::json!(
+            "targets-proof.configure input `models` must be an array of provider::model strings"
+        )
+    );
+}
+
 /// Like [`run_euler_with_input`], but from an explicit working directory —
 /// resumes must run in the workspace the session was recorded in (ADR 0017
 /// same-workspace resume).

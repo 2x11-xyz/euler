@@ -1,6 +1,7 @@
 //! Extension management CLI and linked-package registry workflow;
 //! runtime-specific observer logic lives in focused submodules.
 
+mod command_input;
 mod observer;
 mod output;
 mod runtime;
@@ -134,7 +135,7 @@ pub(super) struct ExtensionRunArgs {
     pub(super) id: String,
     pub(super) command: String,
     pub(super) target: PathBuf,
-    pub(super) input: serde_json::Value,
+    pub(super) input: UserCommandInput,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -401,13 +402,18 @@ fn run_extension(run: ExtensionRunArgs, stdout: &mut dyn Write) -> Result<()> {
                 run.command
             ));
         }
+        let input = resolve_user_command_input(
+            &format!("{}.{}", run.id, run.command),
+            &command,
+            run.input,
+        )?;
         announce_managed_process_capability_grant(&run.id, &command);
         let output = execute_offline_extension_run(OfflineExtensionRun {
             extension_id: &run.id,
             command: &command,
             extension: &extension,
             target: run.target,
-            input: run.input,
+            input,
         })?;
         writeln!(stdout, "{}", serde_json::to_string(&output)?)?;
         return Ok(());
@@ -550,6 +556,7 @@ pub(crate) fn resolve_live_linked_process_command(
     Ok(Some((extension, descriptor)))
 }
 
+pub(crate) use command_input::{resolve_user_command_input, UserCommandInput};
 pub(crate) use observer::{resolve_round_observer, ObserveOptions};
 pub(crate) use runtime::{live_linked_extension_arc, live_linked_session_extension_arc};
 
@@ -617,21 +624,34 @@ fn parse_extension_run(args: &mut impl Iterator<Item = String>) -> Result<Extens
     })
 }
 
+/// `--input-file <json>` or the command's declared `--flag value` arguments,
+/// which are parsed once the live descriptor is resolved.
 fn parse_managed_process_input(
     reference: &str,
     args: &mut impl Iterator<Item = String>,
-) -> Result<serde_json::Value> {
+) -> Result<UserCommandInput> {
     let Some(flag) = args.next() else {
-        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+        return Ok(UserCommandInput::Json(serde_json::Value::Object(
+            serde_json::Map::new(),
+        )));
     };
-    if flag != "--input-file" {
+    if flag == "--input-file" {
+        let input = parse_json_object_file(args, "input-file", 64 * 1024, None)?;
+        ensure_no_extra_args("managed-process extension run", args)?;
+        return Ok(UserCommandInput::Json(input));
+    }
+    if !flag.starts_with("--") {
         return Err(anyhow!(
-            "{reference} accepts only --input-file <json-object-file> until it is loaded as a managed-process package"
+            "{reference} accepts --input-file <json-object-file> or its declared --flag arguments, not `{flag}`"
         ));
     }
-    let input = parse_json_object_file(args, "input-file", 64 * 1024, None)?;
-    ensure_no_extra_args("managed-process extension run", args)?;
-    Ok(input)
+    let flags = std::iter::once(flag).chain(args).collect::<Vec<_>>();
+    if flags.iter().any(|token| token == "--input-file") {
+        return Err(anyhow!(
+            "{reference}: --input-file cannot be combined with declared --flag arguments"
+        ));
+    }
+    Ok(UserCommandInput::Flags(flags))
 }
 
 fn parse_extension_search(args: &mut impl Iterator<Item = String>) -> Result<ExtensionSearchArgs> {

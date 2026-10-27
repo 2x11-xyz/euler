@@ -2208,8 +2208,8 @@ impl AppCore {
                 self.bottom.move_selection_up();
                 CoreEffect::Render
             }
-            KeyCode::Char(' ') if self.bottom.is_code_swarm_picker() => {
-                if let Some(event) = self.bottom.code_swarm_toggle() {
+            KeyCode::Char(' ') if self.bottom.is_model_targets_picker() => {
+                if let Some(event) = self.bottom.model_targets_toggle() {
                     return self.surface_event(event);
                 }
                 CoreEffect::None

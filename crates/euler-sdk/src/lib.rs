@@ -3,6 +3,7 @@
 pub mod event_checkpoint;
 pub mod event_wake;
 pub mod extension_package;
+pub mod model_targets;
 pub mod model_text;
 pub mod model_tool;
 pub mod plan_presentation;
@@ -29,6 +30,10 @@ pub use extension_package::{
     ExtensionPackageError, LinkedExtension, LinkedExtensionStatus, LoadedExtensionPackage,
     ManagedProcessEntrypoint, StaticCommandDescriptor, StaticExtensionDescriptor,
     EXTENSION_MANIFEST_FILE, MAX_EXTENSION_MANIFEST_BYTES,
+};
+pub use model_targets::{
+    parse_model_targets_list, validate_model_targets, ModelTargetsError, MAX_MODEL_TARGETS,
+    MAX_MODEL_TARGET_BYTES,
 };
 pub use model_text::extension_model_text_is_format_safe;
 pub use model_tool::{
@@ -283,7 +288,7 @@ pub struct RequestTickDescriptor {
     pub command: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ArgSpec {
     pub flag: String,
     /// Key under which the parsed value is inserted into the command input
@@ -296,7 +301,8 @@ pub struct ArgSpec {
     pub repeatable: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ArgValueKind {
     PositiveInt {
         max: Option<usize>,
@@ -308,6 +314,11 @@ pub enum ArgValueKind {
     JsonObjectFile {
         max_bytes: usize,
         reject_wrapper_key: Option<String>,
+    },
+    /// 1 to `max` `provider::model` targets (ADR 0022), delivered to the
+    /// command as a JSON array of strings. `max` is 1..=`MAX_MODEL_TARGETS`.
+    ModelTargets {
+        max: usize,
     },
 }
 

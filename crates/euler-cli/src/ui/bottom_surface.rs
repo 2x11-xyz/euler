@@ -1,7 +1,8 @@
 use super::commands::{
     dispatch_command, filter_palette_entries, CheckpointItem, CommandAction, CommandContext,
     CommandEffect, CompactionSettings, EffortChoice, ExtensionManagerItem, ModelChoice,
-    PaletteEntry, PaletteEntryKind, PermissionChoice, PickerSpec, ResumeItem, ThemeChoiceItem,
+    ModelTargetsConfirm, PaletteEntry, PaletteEntryKind, PermissionChoice, PickerSpec, ResumeItem,
+    ThemeChoiceItem,
 };
 use super::composer::ComposerDraft;
 use super::search::TranscriptSearch;
@@ -251,10 +252,10 @@ impl BottomSurface {
         )
     }
 
-    pub fn is_code_swarm_picker(&self) -> bool {
+    pub fn is_model_targets_picker(&self) -> bool {
         matches!(
             &self.owner,
-            BottomOwner::Picker(picker) if picker.kind == PickerKind::CodeSwarmModels
+            BottomOwner::Picker(picker) if picker.kind == PickerKind::ModelTargets
         )
     }
 
@@ -293,7 +294,7 @@ impl BottomSurface {
             return false;
         }
         let saved_draft = picker.saved_draft.clone();
-        if picker.kind != PickerKind::CodeSwarmModels {
+        if picker.kind != PickerKind::ModelTargets {
             return false;
         }
         self.composer = saved_draft.clone();
@@ -599,20 +600,23 @@ impl BottomSurface {
     }
 
     fn confirm_picker(&mut self, picker: ReplacementPicker) -> SurfaceEvent {
-        // Code-swarm checklist: Enter saves the whole checked set.
-        if picker.kind == PickerKind::CodeSwarmModels {
-            let models: Vec<String> = picker
+        // Model-targets checklist: Enter hands the whole checked set to the
+        // picker's confirm action.
+        if let Some(selection) = picker.model_targets.clone() {
+            let targets: Vec<String> = picker
                 .items
                 .iter()
                 .filter(|item| item.current)
                 .filter_map(|item| item.provider_tag.clone())
                 .collect();
-            if models.is_empty() {
+            if targets.is_empty() {
                 self.owner = BottomOwner::Picker(picker);
-                return SurfaceEvent::Message("select at least 1 model (min 1 · max 5)".to_owned());
+                return SurfaceEvent::Message(format!(
+                    "select at least 1 model (min 1 · max {})",
+                    selection.max
+                ));
             }
-            let user_tier = picker.code_swarm_user_tier;
-            return self.apply_action(CommandAction::CodeSwarmSaveModels { models, user_tier });
+            return self.apply_action(selection.confirm.action(targets));
         }
         if picker.kind == PickerKind::Compaction {
             if matches!(
