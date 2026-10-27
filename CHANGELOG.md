@@ -57,6 +57,10 @@ pull requests that landed them; deeper design rationale lives in
   changes". The command runs; the tool text leads with `file observation
   incomplete: <reason>; changes may be unreported`, and the result carries an
   `observation` object (`{status, reason, bound}`). The bound is configurable.
+- The macOS local test gate no longer fails on two Linux assumptions: the
+  invalid-workspace sandbox test expects the workspace check that Seatbelt
+  now performs, and the non-UTF-8 user-skill path test runs only on Linux,
+  where the filesystem can create its fixture.
 
 ### Shell command safety
 

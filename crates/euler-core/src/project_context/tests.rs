@@ -2467,7 +2467,9 @@ fn user_skill_changes_do_not_change_project_acknowledgment_digest() {
     assert_ne!(first.candidate_digest, second.candidate_digest);
 }
 
-#[cfg(unix)]
+// The fixture needs a non-UTF-8 directory name. Linux accepts one; macOS
+// refuses it with EILSEQ on every volume, so the fixture cannot exist there.
+#[cfg(target_os = "linux")]
 #[test]
 fn user_skill_path_diagnostics_do_not_change_project_acknowledgment_digest() {
     use std::ffi::OsString;
