@@ -261,7 +261,7 @@ Historical `code_swarm_review` events from the removed session-level tool
 stay readable as ordinary tool events. A resumed session whose tail is an
 unresolved legacy call is closed like any interrupted tool call.
 
-### Headless auto-approve tiers
+## Headless auto-approve tiers
 
 `euler exec --auto-approve` tiers set `agent-spawn` to session-allow in
 **both** tiers (`read-only` and `trusted-local`): batch children are

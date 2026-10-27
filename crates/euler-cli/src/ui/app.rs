@@ -4399,9 +4399,8 @@ impl AppCore {
     /// confirmation/refusal: state guards ("waits for the active turn"),
     /// setting confirmations (/theme, /model set, /effort, /status, /usage,
     /// /compact, permission changes, extension toggles, timestamps toggle,
-    /// resume refusal) — none of these are
-    /// failures, so none should read as one. Real failures go through
-    /// `error_item` instead.
+    /// resume refusal). None of these are failures, so none should read as
+    /// one. Real failures go through `error_item` instead.
     fn notice_item(&mut self, message: String) -> CoreEffect {
         self.push_notice_item(message);
         CoreEffect::Render

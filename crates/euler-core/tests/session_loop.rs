@@ -408,6 +408,44 @@ fn scripted_session_records_read_edit_shell_summary_sequence() {
 }
 
 #[test]
+fn removed_code_swarm_review_call_fails_as_unsupported_without_an_agent_spawn_prompt() {
+    // ADR 0022: core no longer gates or executes `code_swarm_review`. With no
+    // extension declaring it, a model call to that name is an ordinary
+    // unsupported tool: no agent-spawn permission prompt, no reviewer spawn.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-review".to_owned(),
+            name: "code_swarm_review".to_owned(),
+            input: json!({"context": "diff", "focus": "bugs", "models": ["fixture::echo"]}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    )
+    .with_provenance(ProvenanceWriter::new(log.clone()).expect("provenance writer"));
+
+    session.run_turn("review the diff").expect("turn");
+
+    let events = logged_events(&log);
+    assert_eq!(count_kind(&events, EventKind::PERMISSION_PROMPT), 0);
+    assert_eq!(count_kind(&events, EventKind::AGENT_SPAWN), 0);
+    let result = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .expect("tool result");
+    assert_eq!(result.payload.get("ok"), Some(&json!(false)));
+    assert_eq!(
+        result.payload.get("error"),
+        Some(&json!("unsupported tool `code_swarm_review`"))
+    );
+}
+
+#[test]
 fn canvas_snapshot_selects_tool_call_with_result() {
     let temp = tempfile::tempdir().expect("temp dir");
     fs::write(temp.path().join("note.txt"), "alpha\n").expect("write fixture");
