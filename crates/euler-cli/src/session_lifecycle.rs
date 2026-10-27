@@ -246,6 +246,8 @@ pub(crate) fn session_config(
     config.user_skills_root = EulerHome::resolve().ok().map(|home| home.skills_dir());
     config.project_grant_consent_dir = euler_home.clone();
     config.user_grant_dir = euler_home;
+    // User-tier extension config documents (ADR 0022): data, not authority.
+    config.user_extensions_dir = EulerHome::resolve().ok().map(|home| home.extensions_dir());
     config
 }
 

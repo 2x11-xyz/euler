@@ -6,8 +6,8 @@ Implementation status: commands, explicitly declared model tools, one
 terminal-idle contribution per root session, deterministic root request ticks,
 the bounded event feed, bounded
 diagnostics reads, artifact writes, agent task records, checkpoints, context
-slot updates, typed plan presentation, the local wake primitive, and a generic
-managed-process adapter exist today.
+slot updates, typed plan presentation, extension config documents, the local
+wake primitive, and a generic managed-process adapter exist today.
 Explicitly enabled local packages run through offline and live command surfaces
 and may participate in the generic round-observer composition by declaring an
  observer command pair in their manifest. The observer chain runs only at a
@@ -255,6 +255,66 @@ Returning a raw directory is one honest read/write scope: extension runtimes
 are trusted code, not OS sandboxes, so the host cannot enforce separate reads
 and writes after returning the path. This capability does not authorize
 workspace reads or writes.
+
+## Extension Config Documents v0
+
+`HostApi::read_extension_config()` returns the calling extension's two config
+documents (ADR 0022):
+
+- project: `<workspace>/.euler/extensions/<id>/config.json`
+- user: `<euler home>/extensions/<id>/config.json`
+
+The host derives `<id>` from the command's registration; it is never a
+parameter, so an extension reads and writes only its own documents. Config is
+data, not authority: reading needs no capability, and nothing in a document
+grants anything. The result is `{ "project": object | null, "user": object |
+null }`; `null` means the file does not exist. A document that is not a
+regular file holding a JSON object of at most 16 KiB
+(`MAX_EXTENSION_CONFIG_BYTES`) is an error, never a silent `null`. A symlink
+at the document or at any directory below the workspace root (`.euler`,
+`.euler/extensions`, `<id>`) or below `<euler home>/extensions` (`<id>`) is
+refused on read and write. A session without a
+resolvable Euler home has no user tier: it reads as `null` and writes fail.
+`euler extension run` uses the current directory as its workspace, as every
+other CLI entry point does.
+
+`HostApi::write_extension_config(tier, value)` replaces one document and
+requires `config-write`. `tier` is `project` or `user`. The value must be a
+JSON object whose serialized form (pretty-printed, newline-terminated) is at
+most 16 KiB, and it is refused if any key or string matches a registered
+secret value or recognized credential shape. Validation runs before any
+prompt. The host writes a same-directory temp file, syncs it, and renames it
+over the document, so readers see the old or the new document and never a
+partial one. Writers are not serialized: the last rename wins. The user
+document is owner-only (`0600`); the project document is workspace content
+and keeps ordinary permissions.
+
+A user-tier write follows the normal modes: the command's approved
+`config-write` covers it. A project-tier write is governed by who started the
+command, because the file is shared with everyone who opens the workspace:
+
+| Write started by | Rule |
+|---|---|
+| A `user` command the human invoked (TUI, headless `extension_run`, or `euler extension run`) | Normal modes |
+| An agent-invoked model tool | Always asks a human, for every write. No session allow or grant covers it, and the guardian never adjudicates it. Unattended runs therefore deny it |
+| A lifecycle hook (idle contributor, request tick, observer) | Refused, since hooks never prompt |
+
+The model-tool ask is recorded as a `permission.prompt` for `config-write`
+parented to the model's `tool.call`, carrying `operation`, `extension_id`,
+and `command`, and one child `permission.decision`. An allow is recorded and
+applied as `grant_scope: "once"` whatever scope the human picked; no grant is
+installed. The request is marked `once_only`, so approval surfaces offer only
+allow-once for it. A configured `always-deny` for `config-write` denies
+without a prompt. A denial reaches the extension as a `config-write`
+capability denial.
+The command is already running when it asks, so resume closes a call
+interrupted at this ask as one whose side effects may have occurred, not as
+one that never ran.
+Session callers state the origin: `execute_extension_command_gated` and
+`execute_extension_command` run a human-invoked `user` command, core's model
+tool paths (including `code_swarm_review`) run as a model tool, and idle,
+tick, and observer commands run as lifecycle hooks. An `ExtensionHost` that
+is not told an origin treats the command as a lifecycle hook.
 
 ## Event Feed Checkpoint v0
 
@@ -563,6 +623,8 @@ The current host request methods map one-for-one to `HostApi`:
 | `euler/host/update-plan-presentation` | `PlanPresentation` JSON | `{}` |
 | `euler/host/spawn-agent` | `SpawnAgentTask` JSON | `AgentOutcome` JSON |
 | `euler/host/spawn-agents` | `{ tasks: SpawnAgentTask[] }` | `AgentOutcome[]` JSON |
+| `euler/host/read-extension-config` | `{}` | `{ project: object \| null, user: object \| null }` |
+| `euler/host/write-extension-config` | `{ tier: "project" \| "user", value: object }` | `{}` |
 
 The DTO field names are the `serde` names in `euler-sdk`; the maintained
 [Python SDK](https://github.com/2x11-xyz/euler-extensions/tree/main/sdks/python/euler-managed-process-sdk)
@@ -739,8 +801,9 @@ Rules:
   refuses agent-only commands itself, before any approval is spent. Surfaces
   still refuse in their own words (they can name a better next step), but the
   boundary does not depend on the set of surfaces that happens to exist.
-  `execute_extension_command` is the agent's ungated path and is deliberately
-  exempt: guarding it too would make agent-only mean unreachable.
+  The agent's model-tool and lifecycle paths are ungated by design and
+  deliberately exempt: guarding them too would make agent-only mean
+  unreachable.
 - **Listed, not hidden.** `/extension` still shows agent-only commands, marked
   `(agent-only)`. Hiding them would trade one wrong answer for another.
 - **Absent means `user`.** The manifest field and the persisted link inventory

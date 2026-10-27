@@ -97,6 +97,9 @@ use. Rules (normative; enforced in code, not only in the guardian prompt):
 - Guardian allows are once-scoped; the guardian never installs session or
   project grants. Requests covered by existing grants run under those grants
   and are not guardian-reviewed.
+- The guardian never adjudicates a project-tier extension config write
+  started by a model tool (ADR 0022): that ask always goes to the human
+  decider. See `config-write` below.
 - The guardian adjudicates only requests it can see **verbatim** (ADR 0011
   amendment): if the command was truncated at the retention bound, or the
   task brief's own field bound would alter the command or path, the guardian
@@ -452,7 +455,8 @@ D), and is never routed to the guardian reviewer: it must reach a human. No gran
 and every capability mode short of `always-deny` is escalated to `ask` for
 that one request, so a forced `rm` prompts even under a blanket
 `session-allow`. `always-deny` still denies without prompting, and a
-never-prompt decider denies on the same path.
+never-prompt decider denies on the same path. The approval panel offers no
+grant for it: every allow row, chosen by key or by Enter, allows once.
 
 **Auto-approval under `ask`.** When `shell-exec` is in `ask` mode, a
 statically-safe command runs without a prompt. The run is recorded as a
@@ -567,6 +571,23 @@ Extension event-feed checkpoints are private extension state:
 extension command to append bounded `context.slot.updated` events for slots
 namespaced to that extension id. It does not grant raw provenance reads,
 arbitrary canvas control, or cross-extension slot writes.
+
+`config-write` gates `HostApi::write_extension_config`, which replaces the
+calling extension's own project or user config document (ADR 0022; extension
+SDK contract, "Extension Config Documents v0"). Reading those documents needs
+no capability: config is data, not authority. A user-tier write, and a
+project-tier write from a `user` command the human invoked, follow the normal
+modes: the command's approved `config-write` covers them. A project-tier
+write started by an agent-invoked model tool always asks a human, once per
+write: the host asks the configured decider directly, so no session
+allowance, `session-allow` mode, or session, project, or user grant covers it,
+the guardian never adjudicates it, and no grant is installed whatever scope
+the human picks. A decider that cannot prompt denies it, so unattended runs
+(headless `euler exec`) cannot commit a shared config change; they can still
+propose one as an artifact. A configured `always-deny` denies without a
+prompt. Lifecycle hooks (terminal idle, request tick, observer) never prompt,
+so their project-tier writes are refused even with standing authority. Writes
+whose value matches a known secret are refused before any prompt.
 
 `plan-presentation` gates host-mediated typed plan presentation. It permits an
 extension command to append bounded, attributed `plan.update` events. It does

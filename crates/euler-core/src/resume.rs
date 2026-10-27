@@ -1263,7 +1263,7 @@ fn tool_recovery_closure(
     }
     let call_id = payload_str(call, "id")?;
     let name = payload_str(call, "name")?;
-    let permission_undecided = permission_prompt_without_decision(&events[call_index + 1..]);
+    let permission_undecided = permission_undecided_before_execution(&events[call_index + 1..]);
     let message = if permission_undecided {
         "accepted prefix ended without a persisted result; interrupted before execution \
          (permission undecided); the tool did not run"
@@ -1377,11 +1377,25 @@ fn permission_suffix_belongs_to_call(call: &EventEnvelope, suffix: &[EventEnvelo
     true
 }
 
-fn permission_prompt_without_decision(suffix: &[EventEnvelope]) -> bool {
-    suffix
-        .iter()
-        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_PROMPT)
-        .any(|prompt| !permission_prompt_is_resolved(suffix, prompt))
+/// Whether the call was interrupted at a permission ask before it ran. An
+/// extension command's static registration grant is recorded only once it
+/// starts executing, so an undecided ask after one (the per-write project
+/// config ask of ADR 0022) interrupted a command that may already have had
+/// side effects.
+fn permission_undecided_before_execution(suffix: &[EventEnvelope]) -> bool {
+    for event in suffix {
+        if event.kind.as_str() == EventKind::PERMISSION_DECISION
+            && extension_permission_decision(event)
+        {
+            return false;
+        }
+        if event.kind.as_str() == EventKind::PERMISSION_PROMPT
+            && !permission_prompt_is_resolved(suffix, event)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn permission_prompt_is_resolved(events: &[EventEnvelope], prompt: &EventEnvelope) -> bool {

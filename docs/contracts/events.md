@@ -471,7 +471,9 @@ extension error does not consume the later result.
   `operation`, `batch: true`, `extension_id`, and `command`. A batch is
   settled only when it has one child `permission.decision` for every member of
   `capabilities`; readers must not treat its first decision as a complete
-  answer.
+  answer. The per-write ask for a project-tier extension config write started
+  by a model tool (ADR 0022) carries `operation`, `extension_id`, and
+  `command` without `batch`, and is parented to that model's `tool.call`.
 - `permission.decision`: `capability`, `mode`, `allowed`, `decision`.
   `mode` is the approval mode label (`ask` | `session-allow` |
   `always-deny`), or `static-grant` for extension registration grants, or
@@ -492,7 +494,9 @@ extension error does not consume the later result.
 
   Operation-batch decisions add `batch: true`, `operation`, `extension_id`,
   and `command`. Each remains a separate capability decision and parents the
-  shared `permission.prompt`.
+  shared `permission.prompt`. A project-tier extension config write decision
+  adds `operation`, `extension_id`, and `command`, and an allow is always
+  `grant_scope: "once"`.
 
   Additive optional fields for guardian-reviewed decisions (ADR 0011 /
   `docs/contracts/capabilities.md`):

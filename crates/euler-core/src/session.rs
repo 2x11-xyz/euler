@@ -243,6 +243,11 @@ pub struct SessionConfig {
     /// intersection applies — the store is user-authored in the user-owned
     /// euler home and never repo-controlled content.
     pub user_grant_dir: Option<PathBuf>,
+    /// `<euler home>/extensions`, under which each extension's user-tier
+    /// config document lives (`<id>/config.json`, ADR 0022). `None`
+    /// (default) disables the user tier: reads report no document and writes
+    /// fail.
+    pub user_extensions_dir: Option<PathBuf>,
     /// Who resolves uncovered `ask` permission decisions (ADR 0011).
     /// Default: the configured decider (the user). `Guardian` routes asks
     /// to a companion reviewer; the decider remains the abstain fallback.
@@ -287,6 +292,7 @@ impl SessionConfig {
             project_grant_consent_dir: None,
             code_swarm_user_config_path: None,
             user_grant_dir: None,
+            user_extensions_dir: None,
             permission_reviewer: PermissionReviewer::default(),
             project_context: None,
             user_skills_root: None,

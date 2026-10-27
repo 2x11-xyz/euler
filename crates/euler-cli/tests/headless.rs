@@ -8398,6 +8398,145 @@ serve({"configure": configure})
     );
 }
 
+/// ADR 0022 substrate 1: both CLI surfaces that run a human-invoked `user`
+/// command (`euler extension run` and the headless `extension_run` line) read
+/// the user tier from the Euler home and write the project tier in the
+/// current workspace under normal modes.
+#[cfg(unix)]
+#[test]
+fn extension_config_reaches_both_tiers_from_cli_user_commands() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": "config-proof",
+        "display_name": "Config proof",
+        "extension_version": "0.1.0",
+        "runtime_kind": "managed-process",
+        "entrypoint": {"command": ["python3", "-B", "-u", "extension.py"]},
+        "capabilities": ["config-write"],
+        "commands": [{
+            "name": "configure",
+            "display_name": "Configure",
+            "summary": "Read config and write the project tier.",
+            "required_capabilities": ["config-write"]
+        }]
+    });
+    fs::write(
+        extension_dir
+            .path()
+            .join(euler_core::EXTENSION_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write manifest");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        raw_managed_process_script(
+            r#"
+def configure(peer, command_input):
+    documents = peer.request("euler/host/read-extension-config", {})
+    peer.request("euler/host/write-extension-config", {
+        "tier": "project",
+        "value": {"targets": [command_input["tag"]]},
+    })
+    return {"read": documents}
+
+serve({"configure": configure})
+"#,
+        ),
+    )
+    .expect("write Python extension");
+    configure_linked_extension(exe, &home, extension_dir.path(), "config-proof");
+    let user_document = home
+        .path()
+        .join(".euler/extensions/config-proof/config.json");
+    fs::create_dir_all(user_document.parent().expect("user config dir")).expect("user config dir");
+    fs::write(&user_document, r#"{"targets": ["user::model"]}"#).expect("user config");
+    let project_document = |workspace: &Path| {
+        let bytes = fs::read(workspace.join(".euler/extensions/config-proof/config.json"))
+            .expect("project config document");
+        serde_json::from_slice::<serde_json::Value>(&bytes).expect("project config json")
+    };
+    let expected_read = serde_json::json!({
+        "project": null,
+        "user": {"targets": ["user::model"]},
+    });
+
+    let offline_workspace = tempfile::tempdir().expect("offline workspace");
+    let log = offline_workspace.path().join("events.jsonl");
+    write_events(&log, &[session_start("fixture", "echo")]);
+    let input = offline_workspace.path().join("input.json");
+    fs::write(&input, r#"{"tag":"offline"}"#).expect("write extension input");
+    let offline = command_with_home(exe, &home)
+        .current_dir(offline_workspace.path())
+        .args([
+            "extension",
+            "run",
+            "config-proof.configure",
+            path_str(&log),
+            "--input-file",
+            path_str(&input),
+        ])
+        .output()
+        .expect("run config-proof offline");
+    assert!(
+        offline.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&offline.stderr)
+    );
+    let offline: serde_json::Value = serde_json::from_slice(&offline.stdout).expect("run json");
+    assert_eq!(offline["read"], expected_read);
+    assert_eq!(
+        project_document(offline_workspace.path()),
+        serde_json::json!({"targets": ["offline"]})
+    );
+
+    let live_workspace = tempfile::tempdir().expect("live workspace");
+    let mut child = command_with_home(exe, &home)
+        .current_dir(live_workspace.path())
+        .arg("--provenance")
+        .arg(path_str(&live_workspace.path().join("events.jsonl")))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"extension_run config-proof.configure {\"tag\":\"live\"}\n")
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait euler");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = String::from_utf8(output.stdout)
+        .expect("stdout utf8")
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("result json"))
+        .expect("extension result");
+    assert_eq!(
+        result["type"],
+        serde_json::json!("extension_run_result"),
+        "result: {result}"
+    );
+    assert_eq!(result["result"]["read"], expected_read);
+    assert_eq!(
+        project_document(live_workspace.path()),
+        serde_json::json!({"targets": ["live"]})
+    );
+    // Both writes went to the project tier only.
+    assert_eq!(
+        fs::read_to_string(&user_document).expect("user config"),
+        r#"{"targets": ["user::model"]}"#
+    );
+}
+
 /// Like [`run_euler_with_input`], but from an explicit working directory —
 /// resumes must run in the workspace the session was recorded in (ADR 0017
 /// same-workspace resume).

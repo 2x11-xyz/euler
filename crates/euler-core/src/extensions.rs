@@ -1,10 +1,11 @@
 //! Extension host registration and host API implementations.
 //! Justification for >1000 lines: this file currently owns native command
 //! registration, capability decisions, artifact writes, checkpoints, agent
-//! records, context slot updates, and plan presentation; split by host API
-//! family after SDK registration consolidates.
+//! records, context slot updates, plan presentation, and extension config
+//! documents; split by host API family after SDK registration consolidates.
 use crate::canvas::fold_context_slot_state;
 use crate::durability::sync_dir;
+use crate::extension_config;
 use crate::home::{containing_dir, ensure_private_dir, private_open_options, set_file_mode_0600};
 use crate::{query_provenance, ProvenanceQuery, ProvenanceWriter};
 use euler_agents::ExtensionAgentRecordContext;
@@ -23,6 +24,7 @@ use euler_sdk::{
     MAX_CONTEXT_SLOT_CONTENT_BYTES,
 };
 use euler_sdk::{DiagnosticsPage, DiagnosticsQuery};
+use euler_sdk::{ExtensionConfigDocuments, ExtensionConfigTier};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
@@ -87,6 +89,46 @@ pub struct ExtensionHost {
     /// constructed without an explicit redactor still get the token-shape
     /// layer via the default.
     redactor: crate::redaction::SecretRedactor,
+    config_locations: ExtensionConfigLocations,
+    invocation_origin: ExtensionInvocationOrigin,
+}
+
+/// Who started the command being executed. It decides only whether a
+/// project-tier extension config write may proceed (ADR 0022): the shared
+/// workspace file is exposed to a manipulated agent, not to extension code.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ExtensionInvocationOrigin {
+    /// A `user` command the human invoked: normal modes apply.
+    UserCommand,
+    /// An agent-invoked model tool: every project-tier write asks a human
+    /// through the session's [`ProjectConfigWriteApprover`].
+    ModelTool,
+    /// Idle contributor, request tick, or observer. Hooks never prompt, so
+    /// project-tier writes are refused. The default, so a host that was not
+    /// told who started a command fails closed.
+    #[default]
+    LifecycleHook,
+}
+
+/// Where the calling extension's config documents live. `None` disables that
+/// tier: reads report no document and writes fail.
+#[derive(Clone, Debug, Default)]
+struct ExtensionConfigLocations {
+    workspace_root: Option<PathBuf>,
+    user_extensions_dir: Option<PathBuf>,
+}
+
+/// Session-side service that asks a human to approve one project-tier config
+/// write started by an agent-invoked model tool (ADR 0022). Implementations
+/// must not consult grants, session allowances, or the guardian, and must
+/// deny when no human can answer.
+pub trait ProjectConfigWriteApprover {
+    fn approve_project_config_write(
+        &self,
+        extension_id: &str,
+        command: &str,
+        display_path: &str,
+    ) -> Result<(), ExtensionError>;
 }
 
 #[derive(Clone)]
@@ -139,6 +181,8 @@ impl ExtensionHost {
             commands: BTreeMap::new(),
             provenance_cutoff: None,
             redactor: crate::redaction::SecretRedactor::default(),
+            config_locations: ExtensionConfigLocations::default(),
+            invocation_origin: ExtensionInvocationOrigin::default(),
         }
     }
 
@@ -164,6 +208,8 @@ impl ExtensionHost {
             commands: BTreeMap::new(),
             provenance_cutoff: None,
             redactor: crate::redaction::SecretRedactor::default(),
+            config_locations: ExtensionConfigLocations::default(),
+            invocation_origin: ExtensionInvocationOrigin::default(),
         }
     }
 
@@ -189,6 +235,8 @@ impl ExtensionHost {
             commands: BTreeMap::new(),
             provenance_cutoff: None,
             redactor: crate::redaction::SecretRedactor::default(),
+            config_locations: ExtensionConfigLocations::default(),
+            invocation_origin: ExtensionInvocationOrigin::default(),
         };
         (host, queue)
     }
@@ -210,6 +258,29 @@ impl ExtensionHost {
     /// not only token shapes. Hosts without one keep the shape-only default.
     pub fn with_redactor(mut self, redactor: crate::redaction::SecretRedactor) -> Self {
         self.redactor = redactor;
+        self
+    }
+
+    /// Locate the calling extension's config documents: the project tier
+    /// under `workspace_root/.euler/extensions/<id>/` and the user tier under
+    /// `user_extensions_dir/<id>/` (`<euler home>/extensions`).
+    pub fn with_extension_config_locations(
+        mut self,
+        workspace_root: Option<PathBuf>,
+        user_extensions_dir: Option<PathBuf>,
+    ) -> Self {
+        self.config_locations = ExtensionConfigLocations {
+            workspace_root,
+            user_extensions_dir,
+        };
+        self
+    }
+
+    /// Record who started the commands this host executes. Without it the
+    /// host treats commands as lifecycle hooks and refuses project-tier
+    /// config writes.
+    pub fn with_invocation_origin(mut self, origin: ExtensionInvocationOrigin) -> Self {
+        self.invocation_origin = origin;
         self
     }
 
@@ -386,18 +457,23 @@ impl ExtensionHost {
             command,
             input,
             spawner,
+            None,
             &CancellationToken::new(),
         )
     }
 
     /// Cancellable command execution. Cancellation is host-owned and is not
     /// recorded as an extension failure: cooperative interruption says
-    /// nothing about the extension's health.
+    /// nothing about the extension's health. `config_write_approver` asks a
+    /// human for project-tier config writes when the host's origin is
+    /// [`ExtensionInvocationOrigin::ModelTool`]; without one those writes
+    /// fail.
     pub fn execute_command_with_spawner_cancellable(
         &mut self,
         command: &str,
         input: serde_json::Value,
         spawner: Option<&dyn ExtensionSpawner>,
+        config_write_approver: Option<&dyn ProjectConfigWriteApprover>,
         cancellation: &CancellationToken,
     ) -> Result<serde_json::Value, ExtensionHostError> {
         let record = self
@@ -425,6 +501,9 @@ impl ExtensionHost {
             provenance_cutoff: self.provenance_cutoff.clone(),
             spawner,
             redactor: self.redactor.clone(),
+            config_locations: self.config_locations.clone(),
+            invocation_origin: self.invocation_origin,
+            config_write_approver,
         };
         let outcome = catch_extension_unwind(|| {
             runner.execute_cancellable(CommandContext { input }, &host, cancellation)
@@ -608,6 +687,9 @@ struct CommandHost<'a> {
     provenance_cutoff: Option<String>,
     spawner: Option<&'a dyn ExtensionSpawner>,
     redactor: crate::redaction::SecretRedactor,
+    config_locations: ExtensionConfigLocations,
+    invocation_origin: ExtensionInvocationOrigin,
+    config_write_approver: Option<&'a dyn ProjectConfigWriteApprover>,
 }
 impl CommandRegistrar for PendingRegistrar {
     fn register_command(&mut self, name: &str, command: Box<dyn ExtensionCommand>) {
@@ -900,6 +982,63 @@ impl HostApi for CommandHost<'_> {
             })
             .map(|_| ())
             .map_err(|error| context_slot_failed(error.to_string()))
+    }
+
+    fn read_extension_config(&self) -> Result<ExtensionConfigDocuments, ExtensionError> {
+        let _guard = ExtensionPanicSuppressionGuard::suspend_for_host_api();
+        let locations = &self.config_locations;
+        let project = match &locations.workspace_root {
+            Some(root) => extension_config::read_document(
+                root,
+                &extension_config::project_config_path(root, &self.extension_id),
+            )?,
+            None => None,
+        };
+        let user = match &locations.user_extensions_dir {
+            Some(dir) => extension_config::read_document(
+                dir,
+                &extension_config::user_config_path(dir, &self.extension_id),
+            )?,
+            None => None,
+        };
+        Ok(ExtensionConfigDocuments { project, user })
+    }
+
+    fn write_extension_config(
+        &self,
+        tier: ExtensionConfigTier,
+        value: Value,
+    ) -> Result<(), ExtensionError> {
+        let _guard = ExtensionPanicSuppressionGuard::suspend_for_host_api();
+        self.require_capability(Capability::ConfigWrite)?;
+        let bytes = extension_config::encode_document(&value, &self.redactor)?;
+        match tier {
+            ExtensionConfigTier::User => {
+                let dir = self
+                    .config_locations
+                    .user_extensions_dir
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ExtensionError::ConfigFailed("user config location unavailable".to_owned())
+                    })?;
+                let path = extension_config::user_config_path(dir, &self.extension_id);
+                extension_config::write_document(dir, &path, &bytes, true)
+            }
+            ExtensionConfigTier::Project => {
+                let root = self
+                    .config_locations
+                    .workspace_root
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ExtensionError::ConfigFailed(
+                            "project config location unavailable".to_owned(),
+                        )
+                    })?;
+                let path = extension_config::project_config_path(root, &self.extension_id);
+                self.authorize_project_config_write(root, &path)?;
+                extension_config::write_document(root, &path, &bytes, false)
+            }
+        }
     }
 
     fn update_plan_presentation(
@@ -1542,6 +1681,40 @@ fn checkpoint_name_from_file(file_name: &str) -> Option<&str> {
 impl CommandHost<'_> {
     fn take_provenance_failure(&self) -> Option<String> {
         recover_mutex(&self.provenance_failure).take()
+    }
+
+    /// The project-tier write table of ADR 0022: a human-invoked command
+    /// writes under its approved capabilities, a model tool asks a human for
+    /// every write, and a lifecycle hook is refused because hooks never
+    /// prompt.
+    fn authorize_project_config_write(
+        &self,
+        workspace_root: &Path,
+        path: &Path,
+    ) -> Result<(), ExtensionError> {
+        match self.invocation_origin {
+            ExtensionInvocationOrigin::UserCommand => Ok(()),
+            ExtensionInvocationOrigin::ModelTool => {
+                let approver = self.config_write_approver.ok_or_else(|| {
+                    ExtensionError::ConfigFailed(
+                        "project config writes from a model tool need a human approver".to_owned(),
+                    )
+                })?;
+                let display_path = path
+                    .strip_prefix(workspace_root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned();
+                approver.approve_project_config_write(
+                    &self.extension_id,
+                    &self.command_name,
+                    &display_path,
+                )
+            }
+            ExtensionInvocationOrigin::LifecycleHook => Err(ExtensionError::ConfigFailed(
+                "lifecycle hooks cannot write project config".to_owned(),
+            )),
+        }
     }
 
     fn require_capability(&self, capability: Capability) -> Result<(), ExtensionError> {

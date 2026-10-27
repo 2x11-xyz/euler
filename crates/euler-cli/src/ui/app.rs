@@ -2952,6 +2952,15 @@ impl AppCore {
         }
         match self.approval_selection {
             ApprovalOption::AllowOnce => self.reply_to_modal(PermissionReply::AllowOnce),
+            // Rows that offer no grant read "Allow once", so Enter on them
+            // allows once, exactly as their `a`/`p` keys do.
+            ApprovalOption::AllowSession
+            | ApprovalOption::AllowProject
+            | ApprovalOption::AllowUser
+                if !self.modal_offers_grants() =>
+            {
+                self.reply_to_modal(PermissionReply::AllowOnce)
+            }
             ApprovalOption::AllowSession => {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
@@ -2972,11 +2981,12 @@ impl AppCore {
     }
 
     /// Whether the live ask may offer a grant at all. A danger-flagged
-    /// command is covered by no grant in any mode, so installing one would
-    /// be a promise the gate breaks on the next identical command.
+    /// command is covered by no grant in any mode, and a once-only ask
+    /// installs none, so offering one would be a promise the next identical
+    /// request breaks.
     fn modal_offers_grants(&self) -> bool {
         self.modal_permission_request()
-            .is_none_or(|request| !request.dangerous_command)
+            .is_none_or(PermissionRequest::offers_grants)
     }
 
     fn modal_scope_prefix(&self) -> Option<String> {
@@ -4602,7 +4612,7 @@ impl AppCore {
                     selected_option: self.approval_selection,
                     scope_prefix,
                     user_rule_prefix: self.modal_user_rule_prefix(),
-                    grants_offerable: !request.dangerous_command,
+                    grants_offerable: request.offers_grants(),
                     companion_name: self.in_flight_companion_name.clone(),
                 })
             }

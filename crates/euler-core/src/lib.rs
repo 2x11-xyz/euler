@@ -12,6 +12,7 @@ pub mod command_safety;
 pub mod compaction;
 mod diagnostics;
 mod durability;
+mod extension_config;
 pub mod extension_registry;
 pub mod extensions;
 pub mod file_diff;

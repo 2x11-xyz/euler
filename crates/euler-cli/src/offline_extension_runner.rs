@@ -1,7 +1,7 @@
 use crate::session_lifecycle::resolve_resume_target;
 use anyhow::{anyhow, Result};
-use euler_core::extensions::ExtensionHost;
-use euler_core::{read_resume_prefix, ProvenanceWriter};
+use euler_core::extensions::{ExtensionHost, ExtensionInvocationOrigin};
+use euler_core::{read_resume_prefix, EulerHome, ProvenanceWriter};
 use euler_event::EventEnvelope;
 use euler_sdk::{CommandDescriptor, Extension};
 use std::path::PathBuf;
@@ -32,6 +32,9 @@ pub(super) fn execute_offline_extension_run(
     let writer = Arc::new(ProvenanceWriter::new(target.log_path.clone())?);
     // Offline runs have no live session redactor; env-seeded known values
     // plus the token-shape layer still cover host-API emissions.
+    // `euler extension run` is a human-invoked user command, so its project
+    // config writes follow normal modes; the workspace is the current
+    // directory, as for every other CLI entry point.
     let mut host = ExtensionHost::with_artifact_writer(
         &target.log_path,
         session_id.clone(),
@@ -39,7 +42,12 @@ pub(super) fn execute_offline_extension_run(
         writer,
         run.command.required_capabilities.iter().copied(),
     )
-    .with_redactor(euler_core::redaction::SecretRedactor::from_env());
+    .with_redactor(euler_core::redaction::SecretRedactor::from_env())
+    .with_extension_config_locations(
+        std::env::current_dir().ok(),
+        EulerHome::resolve().ok().map(|home| home.extensions_dir()),
+    )
+    .with_invocation_origin(ExtensionInvocationOrigin::UserCommand);
     host.register_extension_for_command(run.extension, &run.command.name)
         .map_err(|error| {
             anyhow!(

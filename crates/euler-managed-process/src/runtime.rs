@@ -9,10 +9,11 @@ use base64::Engine;
 use euler_sdk::{
     managed_process_entrypoint_from_manifest_bytes, AgentOutcome, ArtifactRecord, ArtifactWrite,
     CancellationToken, Capability, CommandContext, CommandDescriptor, CommandRegistrar,
-    DiagnosticsPage, EventFeedCheckpoint, Extension, ExtensionCommand, ExtensionError,
-    ExtensionManifest, HostAgentRecord, HostAgentResult, HostAgentTask, HostApi,
-    IdleContributionDescriptor, LoadedExtensionPackage, ManagedProcessEntrypoint, PlanPresentation,
-    ProvenancePage, RequestTickDescriptor, SpawnAgentTask, StaticExtensionDescriptor,
+    DiagnosticsPage, EventFeedCheckpoint, Extension, ExtensionCommand, ExtensionConfigDocuments,
+    ExtensionConfigTier, ExtensionError, ExtensionManifest, HostAgentRecord, HostAgentResult,
+    HostAgentTask, HostApi, IdleContributionDescriptor, LoadedExtensionPackage,
+    ManagedProcessEntrypoint, PlanPresentation, ProvenancePage, RequestTickDescriptor,
+    SpawnAgentTask, StaticExtensionDescriptor,
 };
 use io::{finish_io_thread, spawn_stderr_drain, spawn_stdin_writer, spawn_stdout_reader, IoThread};
 use serde::Deserialize;
@@ -940,6 +941,16 @@ fn dispatch_host_request(
             let outcomes: Vec<AgentOutcome> = host_result(host.spawn_agents(tasks.tasks))?;
             to_json(outcomes)
         }
+        "euler/host/read-extension-config" => {
+            require_empty_params(params)?;
+            let documents: ExtensionConfigDocuments = host_result(host.read_extension_config())?;
+            to_json(documents)
+        }
+        "euler/host/write-extension-config" => {
+            let request: ExtensionConfigWrite = decode(params)?;
+            host_result(host.write_extension_config(request.tier, request.value))?;
+            Ok(Value::Object(Map::new()))
+        }
         _ => Err(HostRequestError::MethodNotFound),
     }
 }
@@ -1039,4 +1050,11 @@ struct ContextSlotUpdate {
 #[serde(deny_unknown_fields)]
 struct SpawnAgentTasks {
     tasks: Vec<SpawnAgentTask>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtensionConfigWrite {
+    tier: ExtensionConfigTier,
+    value: Value,
 }
