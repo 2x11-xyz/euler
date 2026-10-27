@@ -213,6 +213,24 @@ pub fn take_pending_signal() -> Option<PendingSignal> {
     }
 }
 
+/// Whether terminal input is waiting unread in the kernel's tty queue. The
+/// TUI requires a terminal stdin, and crossterm reads stdin when it is one.
+#[cfg(unix)]
+pub fn stdin_has_unread_input() -> bool {
+    use std::os::fd::AsRawFd;
+    let mut unread: libc::c_int = 0;
+    // Safety: FIONREAD writes one c_int through the pointer, which refers to
+    // a stack-local; the request only observes the input queue.
+    let status = unsafe { libc::ioctl(io::stdin().as_raw_fd(), libc::FIONREAD, &mut unread) };
+    status == 0 && unread > 0
+}
+
+/// The stranded-input case is specific to crossterm's Unix event source.
+#[cfg(not(unix))]
+pub fn stdin_has_unread_input() -> bool {
+    false
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct BandMeasurement {
     band_rows: u16,
@@ -939,6 +957,12 @@ where
     #[cfg(test)]
     pub(crate) fn cursor_position_authoritative(&self) -> bool {
         self.cursor_position_authoritative
+    }
+
+    /// Ask the terminal for a cursor report and discard it. Only the reply
+    /// matters: it is fresh tty input (see `App::poll_terminal`).
+    pub(crate) fn request_cursor_report(&mut self) -> io::Result<()> {
+        self.queried_cursor_position().map(|_| ())
     }
 
     fn queried_cursor_position(&mut self) -> io::Result<Position> {

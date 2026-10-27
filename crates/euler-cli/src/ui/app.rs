@@ -865,6 +865,16 @@ impl App {
                 }
             }
         }
+        if saw_resize_event && terminal::stdin_has_unread_input() {
+            // crossterm 0.29 returns a Resize and drops the rest of that
+            // readiness batch (crossterm-rs/crossterm#1126). Its tty readiness
+            // is edge-triggered, so input that arrived with the resize stays
+            // unread until another byte arrives, however long that takes. A
+            // cursor report is such a byte: crossterm reads it together with
+            // the stranded input and queues that input for the next poll. A
+            // terminal that does not answer leaves the input where it was.
+            let _ = self.terminal.request_cursor_report();
+        }
         if !saw_resize_event {
             if let Some(size) = self.terminal.observed_size_change()? {
                 metrics::record(metrics::Metric::ResizeEvent);
