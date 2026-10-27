@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-10-27). Sequenced after the ADR 0022 rollout and coordinated
+Accepted (2026-10-27). Sequenced after the ADR 0022 rollout and coordinated
 with issue #239. No contract changes until the rollout PRs land; each PR
 updates its owning contract.
 
@@ -89,14 +89,14 @@ ADR 0021.
 Honest closure stays the default. Each new path either produces a fresh
 result from a re-execution that provenance marks as one, or falls back to
 today's closure. Nothing is inferred from a missing event. Clauses marked
-"(open question N)" are the proposed answer to that question below.
+"(resolved question N)" record the answer listed under Resolved questions below.
 
 ### 1. Run continuation
 
 Replay needs an open run to land in, because late tool work after a run
 terminal is invalid (`provenance.md`). So:
 
-- **Continuation is explicit** (open question 1). `euler exec --resume
+- **Continuation is explicit** (resolved question 1). `euler exec --resume
   <path-or-id> --continue` asks resume to continue the open run; a prompt
   argument with `--continue` is a usage error, and `--continue` never reads
   piped stdin (without it, `exec` reads the prompt from stdin when no prompt
@@ -110,7 +110,7 @@ terminal is invalid (`provenance.md`). So:
   nothing.
 - **One transaction.** Resume appends today's closures for every call that
   will not replay and every unresolved model call, `queue.cancelled` for the
-  run's pending steering as today (open question 4), then a new lifecycle
+  run's pending steering as today (resolved question 4), then a new lifecycle
   event, `run.continued`, for the open run. It appends no `run.terminal`.
   `run.continued` becomes the eighth lifecycle kind beside ADR 0020's seven.
   `RunLifecycleProjection` folds it as keeping an open run open, and a later
@@ -152,7 +152,7 @@ terminal is invalid (`provenance.md`). So:
   omitted policy is `unsafe`. Core: `read_file`, `git_status`, `git_diff`,
   `tool_result_get`, and `skill_read` are `safe`. `edit_file`, `write_file`,
   `apply_patch`, and `run_shell` are `unsafe`, including statically safe shell
-  commands (open question 7). Extension model tools declare `replay: "safe"`
+  commands (resolved question 7). Extension model tools declare `replay: "safe"`
   on `ModelToolDescriptor`.
 - **Intent.** `record_tool_call` writes `replay: "safe"` on `tool.call` when
   the policy resolved at call time is `safe`; absent means `unsafe`. The call
@@ -171,7 +171,7 @@ terminal is invalid (`provenance.md`). So:
   permission and companion events between a call and its missing result do
   not match it (`is_pending_tool_window_event`).
 - **Re-execution.** A replay goes through ordinary dispatch, including the
-  permission braid (open question 3). It is decided as a new operation under
+  permission braid (resolved question 3). It is decided as a new operation under
   the resumed session's modes and grants, which resume already folds without
   reviving a grant from an interrupted batch
   (`fold_session_permission_decision`). No once-decision recorded for the
@@ -236,7 +236,7 @@ durable record can re-run it.
     closed.
 - **Closed owners.** When the owner gets a closure instead of a replay, its
   children stay as today: child calls and model calls closed, spawn
-  incomplete (open question 5). The order is already bottom-up, since
+  incomplete (resolved question 5). The order is already bottom-up, since
   `recovery_closures` emits child closures before the owner's.
 - **Cancellation is unchanged.** Synchronous companion and parallel-review
   spawn paths record terminal `agent.result` events before returning
@@ -255,7 +255,7 @@ durable record can re-run it.
   time would reset the count on each new model round (continue, close the
   call, the model requests it again, crash) and never park. The run fold
   derives the count from the log; nothing stores it.
-- **Limit** (open question 2). A run whose count is 5, pi's default, is
+- **Limit** (resolved question 2). A run whose count is 5, pi's default, is
   parked: it has had five continuations without progress. Continuation then
   refuses before arming the resume marker: no replay, no model round, and
   nothing appended. It exits nonzero with reason `restart_limit`, the count,
@@ -368,25 +368,28 @@ on every continuation parks the run; `--retry` is refused for a run that is
 not parked and starts the count at one; a continuation after progress starts
 the count at one.
 
-## Open questions for Eli
+## Resolved questions (2026-10-27)
 
-1. Should continuation stay behind `--continue`, or become the default for
-   `exec --resume` without a prompt? Should the TUI get `/continue` in this
-   rollout or later?
-2. Should the restart limit stay fixed at 5 or be configurable?
-3. On replay, should permission be decided again (proposed), or should a
-   recorded allow for that exact call be honored?
-4. On continuation, should pending steering be cancelled (proposed, today's
-   behavior) or delivered into the continued run?
-5. For a closed owner, should its incomplete children stay without a result
-   (proposed), or get a parent-authored `agent.result` with
-   `recovery_closure: true`? The second changes `multi-agent.md`'s rule that
-   resume never synthesizes one.
-6. Should replay wait for #239 (proposed), or ship earlier behind an interim
-   gate of canonical path equality with no relocation planned?
-7. Should statically safe `run_shell` commands stay `unsafe` (proposed)?
-8. Should `code_swarm_review` declare `safe` once reattach lands? Each run
-   writes a review artifact.
+1. Continuation stays behind an explicit `--continue`, because it re-executes
+   work. The TUI gets `/continue` in a later change, after headless use.
+2. The restart limit stays fixed at 5. It becomes configurable only if real
+   runs show a need.
+3. A replay decides permission again. A recorded allow belonged to the crashed
+   attempt under older modes and grants; an unattended run that would need a
+   prompt denies honestly.
+4. Continuation cancels pending steering, as today. That steering addressed
+   the interrupted turn, and ADR 0020 keeps it recoverable.
+5. A closed owner's incomplete children stay without a result. Synthesizing a
+   parent-authored `agent.result` would break `multi-agent.md`'s rule that
+   resume never invents one.
+6. Replay waits for #239. Root identity is the safety gate; canonical path
+   equality misses a moved or replaced workspace. Rollout steps 1 to 3 still
+   ship on their own; only the step that re-executes calls needs #239 first.
+7. Statically safe `run_shell` commands stay `unsafe`. Static safety is a
+   heuristic, and the reads worth replaying already have `safe` tools.
+8. `code_swarm_review` declares `safe` once reattach lands, provided the
+   extension keys its review artifact on the owning `tool.call` id so a replay
+   cannot write a duplicate.
 
 ## Consequences
 
