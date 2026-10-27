@@ -49,5 +49,6 @@ rather than being backfilled or reused.
 | [0019](0019-extension-request-tick.md) | Extension request tick | Accepted 2026-08-01 |
 | [0020](0020-durable-run-and-queue-lifecycle.md) | Durable run and queue lifecycle | Accepted 2026-09-05 |
 | [0021](0021-subprocess-authority-and-sandboxing.md) | Subprocess authority, sandbox backends, and approval shape | Accepted 2026-09-06 |
+| [0022](0022-code-swarm-as-ordinary-extension.md) | CodeSwarm as an ordinary extension | Accepted 2026-10-24 |
 
-Next number: **0022**.
+Next number: **0023**.
