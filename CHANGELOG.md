@@ -61,6 +61,11 @@ pull requests that landed them; deeper design rationale lives in
   invalid-workspace sandbox test expects the workspace check that Seatbelt
   now performs, and the non-UTF-8 user-skill path test runs only on Linux,
   where the filesystem can create its fixture.
+- Resume-equivalence tests pin the subprocess sandbox to `Host`, so their
+  transcript comparison no longer depends on probe timing. Each compared
+  session probed its workspace sandbox profile under the probe's 2s deadline,
+  so on a loaded machine one run could record Seatbelt and the other an
+  unavailable sandbox. Production probing is unchanged.
 
 ### Shell command safety
 
