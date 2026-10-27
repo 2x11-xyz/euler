@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (2026-10-27). Sequenced behind the adversarial persistence tests in
+Accepted (2026-10-27). Sequenced behind the adversarial persistence tests in
 rollout step 0. Independent of the ADR 0022 and ADR 0023 rollouts. No contract
 changes until the rollout PRs land; each PR updates its owning contract.
 
@@ -150,7 +150,7 @@ its own contract (last bullet):
 
 - **Place.** Only store-managed sessions (`~/.euler/sessions/<id>/`) keep
   projection files, in a `projections/` directory next to `events.jsonl`
-  (open question 4). Projection files in the directory of a session with a
+  (resolved question 4). Projection files in the directory of a session with a
   Deleted tombstone are ignored, like the rest of that directory.
 - **Header.** Every file under `projections/` records the projection kind,
   projection schema version, the writing binary's package version and build
@@ -200,13 +200,13 @@ its own contract (last bullet):
 ### 4. Validation on resume
 
 - Resume keeps folding the writer-bound prefix from the first event (proposed
-  answer to open question 2). For each file under `projections/` whose header
+  answer to resolved question 2). For each file under `projections/` whose header
   matches and whose key names a boundary of that prefix, resume compares the
   file with its own fold at that boundary.
 - Equal: the file stays. Different: resume rewrites the file from its fold and
   adds a `ResumeWarning` naming the projection and the boundary, because with
   the same binary a disagreement means a fold bug, a damaged file, or a
-  rewrite inside the trust boundary (open question 3). A key that names a
+  rewrite inside the trust boundary (resolved question 3). A key that names a
   longer log than the accepted prefix gets the same warning, because appends
   never shorten the log. Stale or unreadable: resume rewrites it, without a
   warning. If a rewrite fails, resume deletes the file.
@@ -215,7 +215,9 @@ its own contract (last bullet):
 
 ### 5. Writer-refreshed listing projection
 
-Proposed for this rollout (open question 5).
+Deferred (resolved question 5): the turn-boundary write below ships only
+when a benchmark shows listing the active session is slow. The post-resume
+comparison in this section ships in rollout step 2.
 
 - The live session extends its incremental projection with the listing fields
   `session.json` caches (today's `status_from_events`, `name_from_events`,
@@ -252,7 +254,7 @@ Proposed for this rollout (open question 5).
 Decision 2 removes the cost ADR 0020 records, and resume parses the whole log
 anyway, so a run lifecycle file would speed up nothing today. The first on-disk
 projection beyond `session.json` lands with a consumer that does not parse the
-whole log, plus a benchmark showing that its fold matters (open question 1).
+whole log, plus a benchmark showing that its fold matters (resolved question 1).
 The session index (`index.jsonl`, ids and timestamps) stays as it is.
 
 ## Compatibility
@@ -307,8 +309,9 @@ contract update:
    4 has only `session.json` to check until step 4. Contracts:
    `provenance.md`, `events.md` (`session.renamed` projection caching),
    `secrets.md`.
-3. **Writer-refreshed listing projection** (Decision 5). Contracts:
-   `events.md`.
+3. **Writer-refreshed listing projection** (Decision 5), deferred until a
+   benchmark shows listing the active session is slow (resolved question
+   5). Contracts: `events.md`.
 4. **Later projection files**, each with its consumer and benchmark (Decision
    6). The first one ships the `projections/` header, writer, reader, scrub
    deletion, and resume validation, with their tests.
@@ -336,25 +339,25 @@ it; a crash between a log append and a projection write leaves an older key
 whose suffix fold equals the full fold; a file holds no authored content
 after a session with queued input; a scrub deletes the files.
 
-## Open questions for Eli
+## Resolved questions (2026-10-27)
 
-1. Should a run lifecycle projection file land now for long-log resume, or
-   wait for a consumer that does not parse the whole log (proposed)?
-2. On resume, should the full fold stay authoritative and check each file
-   (proposed), or should resume trust a header- and key-matching file and fold
-   only the suffix? The second is faster on long logs, but a file would then
-   drive recovery closures, which are mutations, under a trust bound that
-   today only governs display. It would amend Decision 1 and `provenance.md`'s
-   resume boundary ("Every public `FoldedSession` projection is recomputed").
-3. On a mismatch under a matching header and key, should resume warn and
-   rebuild (proposed), rebuild silently, or refuse to resume?
-4. Should logs at explicit `--provenance` paths get no projection files
-   (proposed), or a sibling `<log>.projections/` directory?
-5. Should Decision 5 (writer-refreshed `session.json`) ship in this rollout
-   (proposed), or should the turn-boundary touch keep dropping the key?
-6. Should later projections such as usage totals and permission grants
-   (`fold_session`) move to the incremental model in this ADR, or each in its
-   own change when measured (proposed)?
+1. No run lifecycle projection file lands now. It waits for a consumer that
+   does not parse the whole log, plus a benchmark showing its fold matters.
+2. The full fold stays authoritative on resume and checks each file. Resume
+   performs mutations such as recovery closures, which must not rest on a
+   cache whose trust bound today governs only display.
+3. A mismatch under a matching header and key warns and rebuilds. It is
+   evidence of a bug or tampering and should be visible; refusing to resume
+   would punish the user for a cache.
+4. Logs at explicit `--provenance` paths get no projection files. Those logs
+   are user-placed, and Euler does not write sibling directories into
+   user-chosen locations.
+5. The writer-refreshed listing projection (Decision 5's turn-boundary write)
+   is deferred. The measured problem is the run lifecycle fold; listing cost
+   is unmeasured, and question 6 sets the bar that each projection moves when
+   measured. The post-resume `session.json` comparison still ships in step 2.
+6. Later projections such as usage totals and permission grants each move to
+   the incremental model in their own change, when measured.
 
 ## Consequences
 
