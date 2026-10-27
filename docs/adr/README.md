@@ -51,5 +51,6 @@ rather than being backfilled or reused.
 | [0021](0021-subprocess-authority-and-sandboxing.md) | Subprocess authority, sandbox backends, and approval shape | Accepted 2026-09-06 |
 | [0022](0022-code-swarm-as-ordinary-extension.md) | CodeSwarm as an ordinary extension | Accepted 2026-10-24 |
 | [0023](0023-resumable-work.md) | Resumable work: replay policy, durable subagent ownership, crash-loop parking | Accepted 2026-10-27 |
+| [0024](0024-materialized-projections.md) | Materialized projections next to the event log | Accepted 2026-10-27 |
 
-Next number: **0024**.
+Next number: **0025**.
