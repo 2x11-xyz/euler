@@ -12,6 +12,7 @@
 //! concrete next action in euler's real vocabulary. The tool never guesses
 //! providers or models.
 
+use super::extension_bridge::ExtensionCommandBoundary;
 use super::{elapsed_ms, ExtensionExecutionError, Session, SessionError};
 use crate::permissions::PermissionDecider;
 use crate::swarm::{resolve_swarm_config, SwarmReviewer, MAX_SWARM_REVIEWERS};
@@ -97,7 +98,7 @@ impl<D: PermissionDecider> Session<D> {
         F: FnMut(&EventEnvelope),
     {
         let started = Instant::now();
-        let outcome = self.run_code_swarm_review(&call.input, cancellation);
+        let outcome = self.run_code_swarm_review(&call.input, &tool_call_event_id, cancellation);
         let ok = outcome.is_ok();
         if matches!(
             &outcome,
@@ -143,6 +144,7 @@ impl<D: PermissionDecider> Session<D> {
     fn run_code_swarm_review(
         &mut self,
         input: &Value,
+        tool_call_event_id: &str,
         cancellation: &CancellationToken,
     ) -> Result<String, ReviewToolFailure> {
         if cancellation.is_cancelled() {
@@ -183,13 +185,15 @@ impl<D: PermissionDecider> Session<D> {
         // The tool's permission gate decided AgentSpawn; ArtifactWrite rides
         // the manifest-grant precedent set by the round observer — the write
         // is the host-mediated consolidated report, not filesystem authority.
+        // The model started this command, so it runs with the model-tool
+        // origin (ADR 0022), never as a human-invoked user command.
         let result = self
-            .execute_extension_command_cancellable(
+            .execute_extension_command_at_boundary(
                 extension.as_ref(),
                 REVIEW_COMMAND,
                 Value::Object(review_input),
                 [Capability::AgentSpawn, Capability::ArtifactWrite],
-                cancellation,
+                ExtensionCommandBoundary::model_tool(tool_call_event_id, cancellation),
             )
             .map_err(map_execution_error)?;
         Ok(render_review_result(&result))

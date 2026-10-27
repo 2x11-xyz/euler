@@ -455,7 +455,8 @@ D), and is never routed to the guardian reviewer: it must reach a human. No gran
 and every capability mode short of `always-deny` is escalated to `ask` for
 that one request, so a forced `rm` prompts even under a blanket
 `session-allow`. `always-deny` still denies without prompting, and a
-never-prompt decider denies on the same path.
+never-prompt decider denies on the same path. The approval panel offers no
+grant for it: every allow row, chosen by key or by Enter, allows once.
 
 **Auto-approval under `ask`.** When `shell-exec` is in `ask` mode, a
 statically-safe command runs without a prompt. The run is recorded as a

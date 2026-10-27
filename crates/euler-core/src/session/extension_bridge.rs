@@ -582,7 +582,7 @@ impl<D> Session<D> {
                 tool_call_event_id,
             )
             .map_err(|_| denied())?;
-        let request = PermissionRequest::new(capability, reason);
+        let request = PermissionRequest::new(capability, reason).with_once_only();
         let verdict = match self
             .permissions
             .decider_mut()
@@ -717,6 +717,9 @@ impl<D> Session<D> {
         )
     }
 
+    /// [`Self::execute_extension_command`] with a caller cancellation token,
+    /// under the same caller assertions: `granted` is authority the caller
+    /// vouches for, and a human invoked this `user` command.
     pub fn execute_extension_command_cancellable(
         &mut self,
         extension: &dyn Extension,

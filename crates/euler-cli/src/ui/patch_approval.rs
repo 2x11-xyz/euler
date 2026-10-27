@@ -218,7 +218,7 @@ pub(crate) fn panel_lines(
             // Durable user rules are shell-command prefix rules and never
             // apply here.
             None,
-            !modal.request.dangerous_command,
+            modal.request.offers_grants(),
             selected_option,
         )
         .into_iter()

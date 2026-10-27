@@ -55,6 +55,11 @@ pub struct PermissionRequest {
     /// `always-deny` skips its prompt
     /// ([`PermissionGate::mode_for_request`]) — ADR 0021 decision D.
     pub dangerous_command: bool,
+    /// True when an allow covers this one request only, whatever scope the
+    /// human picks: the asking path installs no grant. Set for the per-write
+    /// project config ask from a model tool (ADR 0022), so approval surfaces
+    /// offer allow-once rather than a session or project scope.
+    pub once_only: bool,
 }
 
 impl PermissionRequest {
@@ -68,7 +73,23 @@ impl PermissionRequest {
             workspace_root: None,
             sensitive_path: false,
             dangerous_command: false,
+            once_only: false,
         }
+    }
+
+    /// Mark the request once-only. The flag only shapes what approval
+    /// surfaces offer; the caller must itself install no grant from the
+    /// verdict.
+    pub fn with_once_only(mut self) -> Self {
+        self.once_only = true;
+        self
+    }
+
+    /// Whether an approval surface may offer a session or project grant for
+    /// this request. A danger-flagged command is covered by no grant, and a
+    /// once-only request installs none.
+    pub fn offers_grants(&self) -> bool {
+        !self.dangerous_command && !self.once_only
     }
 
     pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {

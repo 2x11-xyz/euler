@@ -303,16 +303,18 @@ The model-tool ask is recorded as a `permission.prompt` for `config-write`
 parented to the model's `tool.call`, carrying `operation`, `extension_id`,
 and `command`, and one child `permission.decision`. An allow is recorded and
 applied as `grant_scope: "once"` whatever scope the human picked; no grant is
-installed. A configured `always-deny` for `config-write` denies without a
-prompt. A denial reaches the extension as a `config-write` capability denial.
+installed. The request is marked `once_only`, so approval surfaces offer only
+allow-once for it. A configured `always-deny` for `config-write` denies
+without a prompt. A denial reaches the extension as a `config-write`
+capability denial.
 The command is already running when it asks, so resume closes a call
 interrupted at this ask as one whose side effects may have occurred, not as
 one that never ran.
 Session callers state the origin: `execute_extension_command_gated` and
 `execute_extension_command` run a human-invoked `user` command, core's model
-tool path runs as a model tool, and idle, tick, and observer commands run as
-lifecycle hooks. An `ExtensionHost` that is not told an origin treats the
-command as a lifecycle hook.
+tool paths (including `code_swarm_review`) run as a model tool, and idle,
+tick, and observer commands run as lifecycle hooks. An `ExtensionHost` that
+is not told an origin treats the command as a lifecycle hook.
 
 ## Event Feed Checkpoint v0
 

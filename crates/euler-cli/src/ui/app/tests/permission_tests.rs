@@ -603,6 +603,71 @@ fn scoped_shell_labels_and_replies_use_command_prefix() {
 }
 
 #[test]
+fn once_only_ask_offers_only_allow_once() {
+    // The per-write project config ask from a model tool installs no grant
+    // (ADR 0022), so the panel must not offer a session or project scope.
+    let request = PermissionRequest::new(
+        Capability::ConfigWrite,
+        "extension config-ext.configure writes shared project config".to_owned(),
+    )
+    .with_once_only();
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    core.modal = Some(Modal::Permission(request.clone()));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(
+        !contents.contains("for this session"),
+        "contents: {contents}"
+    );
+    assert!(
+        !contents.contains("in this project"),
+        "contents: {contents}"
+    );
+    assert!(contents.contains("a  Allow once (this command always asks)"));
+
+    assert_grantless_rows_allow_once(&request);
+}
+
+#[test]
+fn danger_rows_allow_once_from_keys_and_enter() {
+    // Enter on a danger row used to reply with an unscoped session scope,
+    // installing a shell-exec grant that covered later safe commands.
+    let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
+        .with_command("rm -rf build");
+    assert!(request.dangerous_command);
+
+    assert_grantless_rows_allow_once(&request);
+}
+
+/// Every way of choosing the session or project row on a panel that offers
+/// no grant (its key, or Enter on the selected row) allows once, which
+/// installs nothing.
+fn assert_grantless_rows_allow_once(request: &PermissionRequest) {
+    let choices = [
+        vec![key(KeyCode::Char('a'))],
+        vec![key(KeyCode::Char('p'))],
+        vec![key(KeyCode::Down), key(KeyCode::Enter)],
+        vec![key(KeyCode::Down), key(KeyCode::Down), key(KeyCode::Enter)],
+    ];
+    for (index, inputs) in choices.into_iter().enumerate() {
+        let mut core = core();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        core.reply_tx = reply_tx;
+        core.modal = Some(Modal::Permission(request.clone()));
+        for input in inputs {
+            core.handle_input(input);
+        }
+        assert_eq!(
+            reply_rx.recv().expect("reply"),
+            PermissionReply::AllowOnce,
+            "choice {index}"
+        );
+    }
+}
+
+#[test]
 fn user_rule_option_renders_and_replies_when_enabled() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
     let mut core = core();

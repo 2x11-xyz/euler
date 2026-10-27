@@ -102,6 +102,10 @@ pull requests that landed them; deeper design rationale lives in
   `.npmrc`, `.netrc`, and shell startup files, and applies to a path's
   canonicalized form as well as its spelling, so an in-workspace symlink
   cannot read through it.
+- Pressing Enter on a flagged command's "Allow once" session or project row
+  in the approval panel now allows once, as its key already did. Before, it
+  installed an unscoped session `shell-exec` grant that then covered later
+  unflagged shell commands.
 
 ### Structured file writes and rollback
 
@@ -274,9 +278,10 @@ pull requests that landed them; deeper design rationale lives in
   JSON objects of at most 16 KiB, written by temp file and rename; a malformed
   document is an error and a value matching a known secret is refused. A
   project-tier write from a model tool always asks a human (no grant or
-  session allowance covers it, the guardian never reviews it, headless runs
-  deny it), and lifecycle hooks cannot write the project tier. Both calls are
-  managed-process host methods (ADR 0022).
+  session allowance covers it, the approval panel offers only allow-once, the
+  guardian never reviews it, headless runs deny it), and lifecycle hooks
+  cannot write the project tier. Both calls are managed-process host methods
+  (ADR 0022).
 - Extensions can publish bounded typed plan presentation through
   `plan-presentation`; core emits canonical structured `plan.update` events
   and renders one checklist cell without taking ownership of workflow policy.

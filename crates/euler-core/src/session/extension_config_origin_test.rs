@@ -153,14 +153,17 @@ impl ExtensionCommand for ConfigExtension {
 }
 
 /// A decider with no human behind it, as in a headless run: every ask is
-/// denied. Counts asks so a test can prove the request reached it.
+/// denied. Records each request so a test can prove what reached it.
 struct HeadlessDecider {
-    asks: Arc<Mutex<usize>>,
+    asks: Arc<Mutex<Vec<PermissionRequest>>>,
 }
 
 impl PermissionDecider for HeadlessDecider {
-    fn decide(&mut self, _request: &PermissionRequest) -> crate::permissions::DeciderVerdict {
-        *self.asks.lock().unwrap_or_else(PoisonError::into_inner) += 1;
+    fn decide(&mut self, request: &PermissionRequest) -> crate::permissions::DeciderVerdict {
+        self.asks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.clone());
         DeciderVerdict::Deny
     }
 }
@@ -369,7 +372,7 @@ fn headless_model_tool_project_write_is_denied() {
         Surface::ModelTool,
         Action::Write(ExtensionConfigTier::Project),
     );
-    let asks = Arc::new(Mutex::new(0));
+    let asks = Arc::new(Mutex::new(Vec::new()));
     let mut session = fixture.session(
         model_tool_turn(),
         HeadlessDecider {
@@ -388,7 +391,10 @@ fn headless_model_tool_project_write_is_denied() {
         })
     ));
     assert!(!fixture.project_path().exists());
-    assert_eq!(*asks.lock().unwrap_or_else(PoisonError::into_inner), 1);
+    let asks = asks.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(asks.len(), 1);
+    // The ask installs no grant, so approval surfaces offer allow-once only.
+    assert!(!asks[0].offers_grants());
     let decisions = asked_decisions(session.events());
     assert_eq!(decisions.len(), 1);
     assert_eq!(decisions[0].payload["allowed"], json!(false));
@@ -398,7 +404,7 @@ fn headless_model_tool_project_write_is_denied() {
 #[test]
 fn project_write_ask_under_always_deny_is_denied_without_a_prompt() {
     let fixture = Fixture::new();
-    let asks = Arc::new(Mutex::new(0));
+    let asks = Arc::new(Mutex::new(Vec::new()));
     let mut session = fixture.session(
         Vec::new(),
         HeadlessDecider {
@@ -422,7 +428,10 @@ fn project_write_ask_under_always_deny_is_denied_without_a_prompt() {
             capability: Capability::ConfigWrite
         })
     ));
-    assert_eq!(*asks.lock().unwrap_or_else(PoisonError::into_inner), 0);
+    assert!(asks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty());
     assert!(kind_events(session.events(), EventKind::PERMISSION_PROMPT).is_empty());
 }
 
