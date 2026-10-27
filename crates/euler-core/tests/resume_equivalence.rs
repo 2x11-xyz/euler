@@ -3,7 +3,7 @@ use euler_core::canvas::{assemble_canvas, canvas_prompt, AutoCompactionPolicy};
 use euler_core::permissions::{DeciderVerdict, PermissionDecider, PermissionRequest};
 use euler_core::{
     read_resume_prefix, resume_session_with_outcome, ApprovalMode, ProvenanceWriter, Session,
-    SessionConfig, SteeringQueue,
+    SessionConfig, SteeringQueue, SubprocessSandbox,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
@@ -1098,6 +1098,9 @@ fn session_parts(root: &Path, provider_plan: ProviderPlan) -> (SessionConfig, Pr
     let mut config = SessionConfig::new(root);
     config.session_id = "session".to_owned();
     config.agent_id = "agent".to_owned();
+    // Each session probes its workspace sandbox profile under a 2s deadline,
+    // so under load the compared runs could record different backends.
+    config.subprocess_sandbox = SubprocessSandbox::Host;
     match provider_plan {
         ProviderPlan::Fixture(responses) => {
             let providers = ProviderSet::single(euler_provider::ScriptedProvider::new(responses));
