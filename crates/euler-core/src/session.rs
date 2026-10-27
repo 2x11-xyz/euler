@@ -2091,8 +2091,18 @@ impl<D> Session<D> {
     ) -> ModelRequest {
         // The review-gate tool is root-session only: companions build their
         // requests through the companion loop and never see it (depth one).
+        // Transitional rule (ADR 0022): an enabled extension model tool of
+        // the same name replaces it, and dispatch follows the binding this
+        // catalog installs.
         let mut tools = self.tools.model_tools();
-        if self.code_swarm_extension.is_some() && self.extension_enabled(swarm_tool::EXTENSION_ID) {
+        let extension_owns_review_tool = tool_catalog
+            .definitions()
+            .iter()
+            .any(|tool| tool.name == swarm_tool::CODE_SWARM_REVIEW_TOOL);
+        if self.code_swarm_extension.is_some()
+            && self.extension_enabled(swarm_tool::EXTENSION_ID)
+            && !extension_owns_review_tool
+        {
             tools.push(swarm_tool::code_swarm_review_tool_definition());
         }
         tools.extend(tool_catalog.definitions().iter().cloned());

@@ -401,9 +401,6 @@ impl<D: PermissionDecider> Session<D> {
             .into_iter()
             .map(|tool| tool.name)
             .collect::<BTreeSet<_>>();
-        // Transitional special tools reserve their names even when disabled,
-        // so later enablement cannot silently change dispatch ownership.
-        names.insert(super::swarm_tool::CODE_SWARM_REVIEW_TOOL.to_owned());
         for (id, extension) in &self.extensions {
             let existing = extension_declaration(extension.as_ref())
                 .map_err(ExtensionExecutionError::from_host_error)?;
@@ -464,7 +461,6 @@ impl<D: PermissionDecider> Session<D> {
             .into_iter()
             .map(|tool| tool.name)
             .collect::<BTreeSet<_>>();
-        names.insert(super::swarm_tool::CODE_SWARM_REVIEW_TOOL.to_owned());
         let extensions = self
             .extensions
             .iter()
