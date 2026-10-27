@@ -200,6 +200,15 @@ pull requests that landed them; deeper design rationale lives in
   boundedly observed file-change evidence. Interrupt also clears queued
   activities visibly while preserving queued user steering.
 
+### TUI input across a resize
+
+- A key pressed while the terminal is being resized is no longer held until
+  the next keystroke. crossterm 0.29 dropped input that arrived in the same
+  wakeup as a resize (crossterm-rs/crossterm#1126); euler now detects input
+  left in the tty queue and requests a cursor report so the reader picks it
+  up. This was the cause of the intermittent fold-toggle-after-resize test
+  failure on loaded Linux runners (#177).
+
 ### Compaction resilience
 
 - Automatic and manual compaction now use a fixed shadow canvas when tool-result

@@ -6178,7 +6178,7 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
     // Narrow the window and IMMEDIATELY toggle: the toggle's replay is the
     // first repaint after the size change (repro 4). Then let the debounced
     // settled replay run too.
-    tui.resize(24, 72);
+    let resize_offset = tui.resize(24, 72);
     tui.write("\x0f");
     // Unlike the stable-window toggles above, this wait spans a debounced
     // repaint pipeline: the size change has to be observed, the toggle's
@@ -6186,12 +6186,11 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
     // narrowed width, and the settled replay lands one debounce later,
     // resetting the quiet interval when it does. RESIZE_REPLAY_SETTLE is that
     // floor. Measured cost is 240-869ms unloaded and 1040ms worst of 28 runs
-    // at 40x oversubscription (~1.9x the floor), while the shared runner this
-    // expired on (#228) needed more than the 5s idle-screen ceiling, i.e.
-    // upwards of 9x. 32x the floor restores roughly the earlier 20s ceiling
-    // with a derivation that tracks the repaint pipeline, while still
-    // surfacing a stuck debounce in seconds. The wait returns as soon as the
-    // screen is quiet, so a fast run never pays it.
+    // at 40x oversubscription (~1.9x the floor). The generous ceiling only
+    // bounds a failure: the wait returns as soon as the screen is quiet.
+    // Expiries here on loaded Linux runners (#177, #228) were the toggle key
+    // stranded behind the resize, not a slow pipeline; see
+    // `tui_pty_input_that_arrives_with_a_resize_is_read_without_further_input`.
     assert!(
         tui.wait_for_stable_screen(RESIZE_REPLAY_SETTLE.saturating_mul(32), |screen| {
             screen.contains("tool-line-15")
@@ -6199,7 +6198,15 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
         "post-resize expand did not reveal folded output:\n{}",
         tui.screen_text()
     );
-    std::thread::sleep(Duration::from_millis(1200));
+    // The toggle's replay and the debounced settled replay each purge
+    // scrollback, in either order relative to the resize action. The second
+    // purge is the settled replay, so the final collapse runs on settled
+    // geometry.
+    assert!(
+        tui.wait_for_output_count_after(resize_offset, b"\x1b[3J", 2),
+        "resize did not complete its settled history replay:\n{}",
+        tui.screen_text()
+    );
     // Final collapse so the settled state is compact: the vt100 test
     // emulator cannot page scrollback deeper than one screen height, and
     // the void being asserted on is exactly the head of the transcript.
@@ -6209,7 +6216,6 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
         "final collapse did not restore the fold affordance:\n{}",
         tui.screen_text()
     );
-    std::thread::sleep(Duration::from_millis(300));
     tui.quit();
 
     let resizes = tui.resizes.clone();
@@ -6232,6 +6238,63 @@ fn tui_pty_fold_toggle_replay_after_resize_keeps_history_intact() {
         failures.is_empty(),
         "fold-toggle replays corrupted history:\n{}\nFinal emulator state:\n{state}",
         failures.join("\n")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_pty_input_that_arrives_with_a_resize_is_read_without_further_input() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if nested_seatbelt_blocks_agent_subprocesses() {
+        return;
+    }
+    // crossterm 0.29 returns a Resize from a readiness batch and drops the
+    // rest of the batch (crossterm-rs/crossterm#1126). Its tty readiness is
+    // edge-triggered, so input that arrived with the resize stays unread
+    // until another byte arrives. The external editor holds the UI thread
+    // away from its event poll, so the resize and the typed input are
+    // pending together, signal first, when the TUI polls again. No byte is
+    // written after the release: the input must arrive on its own.
+    let temp = tempfile::tempdir().expect("temp dir");
+    let started = temp.path().join("editor-started");
+    let release = temp.path().join("editor-release");
+    let editor = temp.path().join("gated-editor.sh");
+    fs::write(
+        &editor,
+        format!(
+            "#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\n",
+            started.display(),
+            release.display()
+        ),
+    )
+    .expect("write editor");
+    fs::set_permissions(&editor, fs::Permissions::from_mode(0o755)).expect("editor mode");
+    let mut tui = PtyHarness::spawn_with_args_and_env(
+        temp.path(),
+        &[("EDITOR", editor.as_path())],
+        &["tui", "--provider", "fixture"],
+    );
+    assert!(tui.wait_ready_composer(), "{}", tui.screen_text());
+
+    tui.write("\x18");
+    assert!(
+        tui.wait_for_path(&started),
+        "external editor did not start:\n{}",
+        tui.screen_text()
+    );
+    tui.resize(24, 72);
+    tui.write("stranded");
+    fs::write(&release, "").expect("release editor");
+
+    assert!(
+        tui.wait_for_stable_screen(Duration::from_secs(5), |screen| {
+            screen
+                .lines()
+                .any(|line| line.trim_start().starts_with('\u{258c}') && line.contains("stranded"))
+        }),
+        "input typed with the resize never reached the composer:\n{}",
+        tui.screen_text()
     );
 }
 
@@ -7168,6 +7231,20 @@ impl PtyHarness {
     /// so project-context discovery scans a controlled folder rather than the
     /// test's own CWD.
     fn spawn_with_args_in_dir(home: &Path, workspace: Option<&Path>, args: &[&str]) -> Self {
+        Self::spawn_with_args_dir_and_env(home, workspace, &[], args)
+    }
+
+    /// Like `spawn_with_args` with extra environment variables for the TUI.
+    fn spawn_with_args_and_env(home: &Path, env: &[(&str, &Path)], args: &[&str]) -> Self {
+        Self::spawn_with_args_dir_and_env(home, None, env, args)
+    }
+
+    fn spawn_with_args_dir_and_env(
+        home: &Path,
+        workspace: Option<&Path>,
+        env: &[(&str, &Path)],
+        args: &[&str],
+    ) -> Self {
         record_recent_catalog_refresh_for_test(home);
         let pty = native_pty_system()
             .openpty(PtySize {
@@ -7180,6 +7257,9 @@ impl PtyHarness {
         let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_euler"));
         cmd.args(args);
         cmd.env("HOME", home.as_os_str());
+        for (key, value) in env {
+            cmd.env(key, value.as_os_str());
+        }
         if let Some(workspace) = workspace {
             cmd.cwd(workspace.as_os_str());
         }
@@ -7299,23 +7379,42 @@ impl PtyHarness {
         home_session_persisted_event_count(home, kind).is_some_and(|count| count >= expected)
     }
 
-    /// Wait for a terminal sequence emitted after a specific output offset.
-    /// Resize replays use the scrollback purge as their observable completion
-    /// point, so the next submission cannot race the debounce/repaint path.
-    fn wait_for_output_after(&mut self, offset: usize, needle: &[u8]) -> bool {
+    /// Wait for `path` to exist while continuing to drain the PTY.
+    fn wait_for_path(&mut self, path: &Path) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if self.output[offset..]
-                .windows(needle.len())
-                .any(|window| window == needle)
-            {
+            if path.exists() {
                 return true;
             }
             self.read_next_chunk(deadline);
         }
-        self.output[offset..]
-            .windows(needle.len())
-            .any(|window| window == needle)
+        path.exists()
+    }
+
+    /// Wait for a terminal sequence emitted after a specific output offset.
+    /// Resize replays use the scrollback purge as their observable completion
+    /// point, so the next submission cannot race the debounce/repaint path.
+    fn wait_for_output_after(&mut self, offset: usize, needle: &[u8]) -> bool {
+        self.wait_for_output_count_after(offset, needle, 1)
+    }
+
+    /// Wait for at least `count` occurrences of a terminal sequence emitted
+    /// after a specific output offset.
+    fn wait_for_output_count_after(&mut self, offset: usize, needle: &[u8], count: usize) -> bool {
+        let occurrences = |output: &[u8]| {
+            output[offset..]
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if occurrences(&self.output) >= count {
+                return true;
+            }
+            self.read_next_chunk(deadline);
+        }
+        occurrences(&self.output) >= count
     }
 
     fn wait_for_stable_screen(

@@ -472,6 +472,15 @@ trade-off, not an oversight: it is strictly better than the fossil-copy
 corruption it replaces, but it does mean a user who resizes their terminal
 loses pre-euler scrollback history.
 
+**Input across a resize.** Input that arrives together with a resize is read
+without waiting for another keystroke. crossterm 0.29 drops the rest of a
+readiness batch after it returns a resize (crossterm-rs/crossterm#1126), and
+its tty readiness is edge-triggered, so that input would otherwise stay unread
+until the next byte arrives. When unread input remains in the tty queue after
+a resize, euler requests a cursor report; the reply is a fresh byte, and the
+reader takes the stranded input with it. A terminal that never answers leaves
+the input until the next keystroke.
+
 Full-repaint invariants (settled-resize replay, `ctrl+o` fold toggle, theme
 switch, resume — anything that clears the surface and rebuilds it):
 
