@@ -47,9 +47,10 @@ first event:
 
 The 2026-09-05 repository audit asks for the same discipline: rebuildable
 indexes that "advance only through accepted records" and "Do not treat a stale
-index as authoritative provenance" (O1, O2), a test row "Projections agree
-with canonical history", and "deterministic fault injection for writes, scrub,
-and shutdown" (`docs/reviews/2026-09-05-repository-audit.md`). Seeds exist:
+index as authoritative provenance" (O1), incremental folds whose caches are
+disposable (O2), a test row "Projections agree with canonical history", and
+"deterministic fault injection for writes, scrub, and shutdown"
+(`docs/reviews/2026-09-05-repository-audit.md`). Seeds exist:
 `append_surfaces_injected_log_sync_failure_and_keeps_accepted_prefix`
 (`provenance_test.rs`), and
 `injected_sidecar_sync_failure_surfaces_and_previous_sidecar_survives` and
@@ -116,7 +117,9 @@ commit with the log; it only needs to prove which prefix it describes.
   (session, agent) owner (ADR 0020's open-run index), the open model calls the
   recovery-closure check needs, the queue ids seen, and any transaction group
   still incomplete at the end of the applied prefix (a crash-partial admission
-  or terminal batch).
+  or terminal batch). It also carries the state today's whole-prefix checks
+  derive before the per-event loop: the lifecycle writer frontier, the stream
+  owner (session id and root agent), and the captured async lanes.
 - A batch commits all or nothing without cloning the projection or the bus
   prefix: it is validated completely, or its changes are staged and swapped,
   so an error leaves the projection unchanged, as feed reconciliation requires
@@ -125,7 +128,9 @@ commit with the log; it only needs to prove which prefix it describes.
   grows with the history (the id set and the bus), as it does today.
 - Batch boundaries never change results: for every accepted prefix and every
   split of it into batches, applying the batches in order gives the same
-  projection, or an error of the same kind, as one fold of the whole prefix.
+  projection as one fold of the whole prefix, or fails exactly when that fold
+  fails. Which error is reported may differ, because today's fold runs its
+  whole-prefix frontier and owner checks before its per-event checks.
 - A log rewrite (scrub) rebuilds the live projection from the rewritten prefix
   before any projection is written, as the lifecycle refold after scrub does
   today (`provenance.md`). A session whose accepted state is invalid, and so
@@ -145,13 +150,15 @@ its own contract (last bullet):
 
 - **Place.** Only store-managed sessions (`~/.euler/sessions/<id>/`) keep
   projection files, in a `projections/` directory next to `events.jsonl`
-  (open question 4). Deleting a session deletes its directory, files
-  included.
+  (open question 4). Projection files in the directory of a session with a
+  Deleted tombstone are ignored, like the rest of that directory.
 - **Header.** Every file under `projections/` records the projection kind,
   projection schema version, the writing binary's package version and build
   revision, session id, and the prefix key: `accepted_byte_len` and
-  `tail_event_id`, as `session.json` uses. A binary without a known build
-  revision writes no file under `projections/` and accepts none.
+  `tail_event_id`, as `session.json` uses. A binary without a known clean
+  build revision (an `unknown` revision or a dirty build, as recorded in
+  `RuntimeIdentity`) writes no file under `projections/` and accepts none,
+  because dirty builds with different fold code share a revision.
 - **Writer.** Only the process holding the session's writer lock writes, and
   only for a prefix the accepted-event feed has confirmed (write, file sync,
   directory sync). It uses `session.json`'s atomic replace. A failed write
@@ -165,17 +172,21 @@ its own contract (last bullet):
   and the last non-blank line at or before it is an accepted event with id
   `tail_event_id`, found with the bounded backward scan `session.json` key
   observation uses (a tail event larger than that window gets no cache, as
-  today). It observes the accepted end once, as `session.json` key
-  observation does, and folds only up to it. It then applies the suffix
-  through the same apply step and checks as the live fold (Decisions 2 and
-  5). Any mismatch, parse failure, or I/O error means a full fold. The trust
-  bound is `session.json`'s: a same-length rewrite that keeps the tail id
-  stays inside the session-directory trust boundary. Resume's comparison
+  today). It observes the accepted end with `session.json`'s double
+  observation (a second read on a fresh file handle, rejecting disagreement)
+  and folds only up to it. It then applies the suffix through the same apply
+  step and checks as the live fold (Decisions 2 and 5). Any mismatch, parse
+  failure, or I/O error means a full fold. The trust bound is
+  `session.json`'s: a same-length rewrite that keeps the tail id stays inside
+  the session-directory trust boundary. Resume's comparison
   (Decision 4) catches it at the next resume by the same binary.
 - **Rewrites.** Scrub, the only log rewrite, deletes the session's projection
   files before it replaces the log, because a length-preserving rewrite would
   keep the key while byte offsets inside the file moved. A scrub error leaves
-  them deleted.
+  them deleted. In the same pass, scrub drops `projected_events` and its
+  sibling version fields from `session.json`, whether or not the file held a
+  secret, because a scrub can shorten the log and a kept key would then name
+  a longer log (Decision 4).
 - **`session.json`** keeps its place, its key, its writers, and its existing
   contract; the header rule above does not apply to it. It gains the schema
   version, package version, and build revision as siblings of
@@ -183,7 +194,8 @@ its own contract (last bullet):
   `accepted_byte_len` and `tail_event_id`, as today, so a listing may serve a
   projection another binary folded until the next append or resume. The
   post-resume comparison (Decision 5) runs only when the siblings match its
-  own binary, so an upgrade never warns.
+  own binary and that binary has a known clean build revision, so an upgrade
+  never warns.
 
 ### 4. Validation on resume
 
@@ -216,15 +228,24 @@ Proposed for this rollout (open question 5).
   re-verified, which is the trust a listing cache hit already has.
 - At the turn boundary the host writes `session.json`'s projection from that
   live fold under the key of the prefix it describes, instead of dropping the
-  key. Both are read under the Session's feed reconciliation, so no feed drain
-  falls between them. A later append makes the key stale, which only costs a
-  fold at the next listing. Listing the active session after a turn then
-  observes the key but does not fold the log.
-- After resume, the host calls `refresh_session_metadata`, which refolds the
-  log because resume's appends left the key stale. Before replacing the
-  cached projection, it applies Decision 4's comparison at the cached key and
-  reports a mismatch beside the resume warnings. This host step, not core
-  resume, owns the `session.json` comparison.
+  key. Name, root, and kind keep the sidecar fallback
+  `session_projection_from_events_or_sidecar` applies today: when the log has
+  no matching event, the write carries the sidecar's value forward, so a
+  session created or renamed before those events existed keeps its identity.
+  The key and the live fold are read under the Session's feed reconciliation,
+  so no feed drain falls between them. A later append makes the key stale,
+  which only costs a fold at the next listing. Listing the active session
+  after a turn then observes the key but does not fold the log.
+- After resume returns and before the first turn, the host applies Decision
+  4's comparison to `session.json`: when the cached key names a boundary of
+  the accepted prefix, it folds the listing fields of the log up to that key
+  and compares them with the cached projection, then reports a mismatch beside
+  the resume warnings and rewrites the cache from the fold. A cached key that
+  names a longer log warns too, as in Decision 4. It cannot wait for
+  `refresh_session_metadata`: hosts call that only after a turn or at exit,
+  resume often appends nothing (the resume marker is lazy), and a fresh key is
+  served without folding. This host step, not core resume, owns the
+  `session.json` comparison.
 
 ### 6. No run lifecycle file yet
 
@@ -243,9 +264,10 @@ The session index (`index.jsonl`, ids and timestamps) stays as it is.
   fields), and reads `session.json` as today. A newer binary ignores files
   from another version by header. Old `session.json` keys stay valid: the key
   format is unchanged.
-- **Scrub** deletes projection files (Decision 3) and rebuilds the live
-  projection (Decision 2), so no projection describes the pre-scrub bytes.
-  `session.json` stays a scrub surface as today.
+- **Scrub** deletes projection files and drops the `session.json` key and
+  version fields (Decision 3) and rebuilds the live projection (Decision 2),
+  so no projection describes the pre-scrub bytes. `session.json` stays a
+  scrub surface as today.
 - **ADR 0020** stands: `RunLifecycleProjection` stays the sole owner of run and
   queue state; it becomes incremental. ADR 0020 gains a note that its open-run
   follow-up landed here.
@@ -273,34 +295,46 @@ contract update:
    - property tests over generated lifecycle streams: listing status, resume,
      and the live projection agree with a full fold of the same prefix.
    Contracts: none, unless a test exposes drift.
-1. **Incremental run lifecycle projection** (Decision 2), with the
-   split-invariance property test and a long-log benchmark (for example 10k,
-   50k, and 100k events) that shows per-batch cost no longer grows with
-   history. Contracts: `provenance.md` (feed reconciliation), ADR 0020 note.
-2. **Projection rules and resume validation** (Decisions 1, 3, 4): the rules
-   as contract text, the `session.json` version fields, scrub deleting
-   projection files, and the post-resume `session.json` comparison.
-   Contracts: `provenance.md`, `events.md` (`session.renamed` projection
-   caching), `secrets.md`.
+1. **Incremental run lifecycle projection** (Decision 2), with a property
+   test for batch-boundary invariance as Decision 2 states it and a long-log
+   benchmark (for example 10k, 50k, and 100k events) that shows per-batch
+   cost no longer grows with history. Contracts: `provenance.md` (feed
+   reconciliation), ADR 0020 note.
+2. **Projection rules and the `session.json` check** (Decisions 1, 3, 4, and
+   the post-resume comparison in Decision 5): the rules as contract text, the
+   `session.json` version fields, scrub dropping the `session.json` key and
+   its version fields, and the post-resume `session.json` comparison. Decision
+   4 has only `session.json` to check until step 4. Contracts:
+   `provenance.md`, `events.md` (`session.renamed` projection caching),
+   `secrets.md`.
 3. **Writer-refreshed listing projection** (Decision 5). Contracts:
    `events.md`.
 4. **Later projection files**, each with its consumer and benchmark (Decision
-   6).
+   6). The first one ships the `projections/` header, writer, reader, scrub
+   deletion, and resume validation, with their tests.
 
-Required regression tests across the steps: incremental and full folds agree
-for every split of generated streams, including crash-partial admission and
-terminal batches; a projection file with any mismatched header field or key
-is ignored and the result equals a full fold; a key naming a longer log
-warns on resume; a binary without a build revision writes and accepts no file
-under `projections/`; an older `session.json` reader ignores the new sibling
-fields; a corrupted file under a matching key yields a resume warning and a
-rewritten file, and resume appends the same events as without it; a crash
-between a log append and a projection write leaves an older key whose suffix
-fold equals the full fold; a projection file holds no authored content after
-a session with queued input; a scrub deletes the projection files, and the
-next turn-boundary `session.json` carries the scrubbed title; a turn boundary
-leaves `session.json` with a fresh key, and the next listing does not fold the
-log; a missing blob in an applied batch leaves no key in `session.json`.
+Required regression tests for steps 1 to 3: incremental and full folds accept
+and reject the same prefixes and agree on every accepted one, for every split
+of generated streams, including crash-partial admission and terminal batches;
+a `session.json` key naming a longer log warns after resume; an older
+`session.json` reader ignores the new sibling fields; a corrupted cached
+title under a matching `session.json` key warns on an open-and-inspect resume
+that appends nothing; after a scrub that shortens the log, resume gives no
+warning; a scrub drops the `session.json` key, and the next turn-boundary
+`session.json` carries the scrubbed title; a turn boundary leaves
+`session.json` with a fresh key, and the next listing does not fold the log;
+an old session whose sidecar holds a name, root, or kind with no matching
+event keeps that value after a turn; a missing blob in an applied batch
+leaves no key in `session.json`.
+
+Required regression tests for the first file under `projections/` (step 4):
+a file with any mismatched header field or key is ignored and the result
+equals a full fold; a binary without a known clean build revision writes and
+accepts no file; a corrupted file under a matching key yields a resume
+warning and a rewritten file, and resume appends the same events as without
+it; a crash between a log append and a projection write leaves an older key
+whose suffix fold equals the full fold; a file holds no authored content
+after a session with queued input; a scrub deletes the files.
 
 ## Open questions for Eli
 
