@@ -2684,6 +2684,48 @@ fn multi_capability_model_tool_uses_one_operation_prompt() {
 }
 
 #[test]
+fn artifact_write_model_tool_runs_without_a_prompt_in_a_root_session() {
+    let temp = tempfile::tempdir().expect("temp");
+    let extension =
+        TestExtension::model_tool_only().with_capabilities(vec![Capability::ArtifactWrite]);
+    let state = Arc::clone(&extension.state);
+    // No scripted verdicts: a prompt would deny the tool.
+    let (mut session, _) = session_with_extension(
+        &temp,
+        extension,
+        vec![
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-update".to_owned(),
+                name: "update_workflow".to_owned(),
+                input: json!({"items": []}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ],
+        Vec::new(),
+    );
+
+    session.run_turn("do the work").expect("turn");
+
+    assert!(session
+        .events()
+        .iter()
+        .all(|event| event.kind.as_str() != EventKind::PERMISSION_PROMPT));
+    let result = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .expect("tool result");
+    assert_eq!(result.payload["ok"], json!(true));
+    assert_eq!(
+        state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .model_tool_calls,
+        1
+    );
+}
+
+#[test]
 fn accepted_idle_continuation_starts_a_fresh_round_without_user_forgery() {
     let temp = tempfile::tempdir().expect("temp");
     let extension = TestExtension::new(

@@ -252,7 +252,8 @@ pull requests that landed them; deeper design rationale lives in
 - Root sessions now allow `artifact-write` by default, alongside
   `extension-state`, `context-slot`, and `plan-presentation`, so an extension
   model tool writes its host-mediated artifact without a prompt (ADR 0022).
-  Child and companion gates are unchanged.
+  Headless `euler exec` tiers keep this default. Child and companion gates are
+  unchanged.
 - The spawn preflight error for an unconfigured provider no longer names a
   reviewer-model picker; it still points at `/login`.
 - Extensions can publish bounded typed plan presentation through

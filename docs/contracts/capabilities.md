@@ -585,7 +585,9 @@ event, and grants the extension no filesystem authority.
 Unconfigured capabilities remain `always-deny`; child-agent gates start
 deny-all and inherit only their explicit attenuated envelope. Headless
 auto-approve tiers override these root defaults with the explicit mapping
-above.
+above; the root-session extension defaults (`extension-state`,
+`context-slot`, `plan-presentation`, `artifact-write`) are outside that
+mapping and stay `session-allow`.
 
 **Sensitive-basename ask.** A blanket `session-allow` never covers a tool
 request whose path names a categorically sensitive file. When a path-taking
