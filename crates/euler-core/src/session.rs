@@ -1737,9 +1737,10 @@ impl<D> Session<D> {
         self.compaction_request = Some(request);
     }
 
-    /// Wire the code-swarm extension for the `code_swarm_review` tool
-    /// (tools contract). Without this, the tool is neither advertised nor
-    /// executable.
+    /// Wire the code-swarm extension for the special `code_swarm_review`
+    /// tool (tools contract). Without this, the special tool is neither
+    /// advertised nor executable; an enabled extension that declares the
+    /// name still owns it (ADR 0022 transitional rule).
     pub fn set_code_swarm_extension(&mut self, extension: Arc<dyn Extension>) {
         self.code_swarm_extension = Some(extension);
     }
@@ -2091,8 +2092,18 @@ impl<D> Session<D> {
     ) -> ModelRequest {
         // The review-gate tool is root-session only: companions build their
         // requests through the companion loop and never see it (depth one).
+        // Transitional rule (ADR 0022): an enabled extension model tool of
+        // the same name replaces it, and dispatch follows the binding this
+        // catalog installs.
         let mut tools = self.tools.model_tools();
-        if self.code_swarm_extension.is_some() && self.extension_enabled(swarm_tool::EXTENSION_ID) {
+        let extension_owns_review_tool = tool_catalog
+            .definitions()
+            .iter()
+            .any(|tool| tool.name == swarm_tool::CODE_SWARM_REVIEW_TOOL);
+        if self.code_swarm_extension.is_some()
+            && self.extension_enabled(swarm_tool::EXTENSION_ID)
+            && !extension_owns_review_tool
+        {
             tools.push(swarm_tool::code_swarm_review_tool_definition());
         }
         tools.extend(tool_catalog.definitions().iter().cloned());

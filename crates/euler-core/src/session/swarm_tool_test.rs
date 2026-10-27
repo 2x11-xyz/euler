@@ -1062,3 +1062,318 @@ fn missing_explicit_context_fails_honestly_before_any_spawn() {
         .iter()
         .all(|event| event.kind.as_str() != EventKind::AGENT_SPAWN));
 }
+
+const EXTENSION_REVIEW_DESCRIPTION: &str = "Extension-owned review.";
+
+/// Declares its own `code_swarm_review` model tool on an agent-only `review`
+/// command, the shape ADR 0022 gives the `code-swarm` extension.
+struct ReviewModelToolExtension {
+    id: &'static str,
+    calls: Arc<Mutex<usize>>,
+}
+
+impl Extension for ReviewModelToolExtension {
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            id: self.id.to_owned(),
+            version: "0.0.0-test".to_owned(),
+            display_name: "Review model tool (test double)".to_owned(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        registrar.register_command(
+            "review",
+            Box::new(ReviewModelToolCommand {
+                calls: Arc::clone(&self.calls),
+            }),
+        );
+        Ok(())
+    }
+}
+
+struct ReviewModelToolCommand {
+    calls: Arc<Mutex<usize>>,
+}
+
+impl ExtensionCommand for ReviewModelToolCommand {
+    fn descriptor(&self) -> euler_sdk::CommandDescriptor {
+        euler_sdk::CommandDescriptor {
+            invocation: euler_sdk::Invocation::AgentOnly,
+            name: "review".to_owned(),
+            display_name: "review".to_owned(),
+            summary: "test review".to_owned(),
+            required_capabilities: Vec::new(),
+            args: Vec::new(),
+            accepts_session_id: false,
+            model_tool: Some(euler_sdk::ModelToolDescriptor {
+                name: "code_swarm_review".to_owned(),
+                description: EXTENSION_REVIEW_DESCRIPTION.to_owned(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "focus": {"type": "string", "maxLength": 1024}
+                    },
+                    "required": ["focus"],
+                    "additionalProperties": false
+                }),
+                max_input_bytes: None,
+            }),
+        }
+    }
+
+    fn execute(
+        &self,
+        context: CommandContext,
+        _host: &dyn HostApi,
+    ) -> Result<Value, ExtensionError> {
+        *self.calls.lock().expect("calls") += 1;
+        Ok(json!({"reviewed_by": "extension", "focus": context.input["focus"]}))
+    }
+}
+
+struct CapturingMainProvider {
+    scripted: ScriptedProvider,
+    requests: Arc<Mutex<Vec<ProviderModelRequest>>>,
+}
+
+impl euler_provider::ModelProvider for CapturingMainProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn invoke(
+        &self,
+        request: ProviderModelRequest,
+    ) -> Result<euler_provider::ProviderStream, euler_provider::ProviderError> {
+        self.requests.lock().expect("capture").push(request.clone());
+        self.scripted.invoke(request)
+    }
+}
+
+struct ReviewModelToolHarness {
+    _temp: tempfile::TempDir,
+    session: Session<ScriptedDecider>,
+    root: std::path::PathBuf,
+    requests: Arc<Mutex<Vec<ProviderModelRequest>>>,
+    extension_calls: Arc<Mutex<usize>>,
+}
+
+/// The special path wired as the CLI wires it, plus an extension declaring a
+/// `code_swarm_review` model tool. Only `code-swarm` is enabled.
+fn review_model_tool_harness(
+    extension_id: &'static str,
+    main_script: Vec<FixtureResponse>,
+    reviewers: &[(&str, Vec<FixtureResponse>)],
+) -> ReviewModelToolHarness {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let root = temp.path().join("workspace");
+    std::fs::create_dir_all(&root).expect("workspace root");
+    let writer = ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut providers = reviewer_provider_set(reviewers);
+    providers.insert_named(
+        "fixture".to_owned(),
+        CapturingMainProvider {
+            scripted: ScriptedProvider::new(main_script),
+            requests: Arc::clone(&requests),
+        },
+    );
+    let mut config = SessionConfig::new(&root);
+    config.session_id = "session-swarm-tool".to_owned();
+    config.provider = "fixture".to_owned();
+    config.model = "fixture-model".to_owned();
+    config.provider_transport_retries = 0;
+    config.provider_transport_retry_backoff_ms = Vec::new();
+    config.extensions_enabled = ["code-swarm".to_owned()].into_iter().collect();
+    config.code_swarm_user_config_path = Some(temp.path().join("home").join("code-swarm.json"));
+    let mut session =
+        Session::new_with_providers(config, providers, ScriptedDecider::new(Vec::new()))
+            .with_provenance(writer);
+    session.set_permission_mode(Capability::AgentSpawn, ApprovalMode::SessionAllow);
+    session.set_code_swarm_extension(Arc::new(FakeCodeSwarm));
+    let extension_calls = Arc::new(Mutex::new(0));
+    session
+        .wire_extension(Arc::new(ReviewModelToolExtension {
+            id: extension_id,
+            calls: Arc::clone(&extension_calls),
+        }))
+        .expect("the special tool does not reserve its name against extensions");
+    ReviewModelToolHarness {
+        _temp: temp,
+        session,
+        root,
+        requests,
+        extension_calls,
+    }
+}
+
+fn advertised_review_tools(request: &ProviderModelRequest) -> Vec<&ToolDefinition> {
+    request
+        .tools
+        .iter()
+        .filter(|tool| tool.name == "code_swarm_review")
+        .collect()
+}
+
+#[test]
+fn enabled_extension_review_model_tool_replaces_the_special_tool() {
+    // The code-swarm package itself, and a different extension while the
+    // special path stays wired and enabled.
+    for extension_id in ["code-swarm", "other-review"] {
+        let mut harness = review_model_tool_harness(
+            extension_id,
+            vec![
+                FixtureResponse::ToolCalls(vec![raw_review_tool_call(
+                    json!({"focus": "the diff"}),
+                )]),
+                FixtureResponse::Assistant("adjudicated".to_owned()),
+            ],
+            &[],
+        );
+        harness.session.set_extension_enabled(extension_id, true);
+
+        harness.session.run_turn("review the diff").expect("turn");
+
+        let requests = harness.requests.lock().expect("capture");
+        let tools = advertised_review_tools(&requests[0]);
+        assert_eq!(tools.len(), 1, "{extension_id}: exactly one review tool");
+        assert_eq!(tools[0].description, EXTENSION_REVIEW_DESCRIPTION);
+        let call = harness
+            .session
+            .events()
+            .iter()
+            .find(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+            .expect("tool call");
+        let results = tool_results(&harness.session);
+        assert_eq!(results.len(), 1);
+        for event in [call, &results[0]] {
+            assert_eq!(event.payload["extension_id"], json!(extension_id));
+            assert_eq!(event.payload["command"], json!("review"));
+        }
+        assert_eq!(results[0].payload["ok"], json!(true), "{:?}", results[0]);
+        assert_eq!(
+            serde_json::from_str::<Value>(results[0].payload["output"].as_str().expect("output"))
+                .expect("JSON output"),
+            json!({"reviewed_by": "extension", "focus": "the diff"})
+        );
+        assert_eq!(*harness.extension_calls.lock().expect("calls"), 1);
+        assert!(harness
+            .session
+            .events()
+            .iter()
+            .all(|event| event.kind.as_str() != EventKind::AGENT_SPAWN));
+    }
+}
+
+#[test]
+fn toggling_the_declaring_extension_moves_the_review_tool_on_the_next_request() {
+    let mut harness = review_model_tool_harness(
+        "other-review",
+        vec![
+            FixtureResponse::Assistant("no review yet".to_owned()),
+            FixtureResponse::ToolCalls(vec![raw_review_tool_call(json!({"focus": "the diff"}))]),
+            FixtureResponse::Assistant("adjudicated".to_owned()),
+            FixtureResponse::Assistant("special tool again".to_owned()),
+        ],
+        &[],
+    );
+
+    harness.session.run_turn("hello").expect("first turn");
+    harness.session.set_extension_enabled("other-review", true);
+    harness
+        .session
+        .run_turn("review the diff")
+        .expect("second turn");
+    harness.session.set_extension_enabled("other-review", false);
+    harness.session.run_turn("thanks").expect("third turn");
+
+    let requests = harness.requests.lock().expect("capture");
+    let before = advertised_review_tools(&requests[0]);
+    assert_eq!(before.len(), 1);
+    assert_eq!(
+        before[0].description,
+        code_swarm_review_tool_definition().description
+    );
+    let after = advertised_review_tools(&requests[1]);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].description, EXTENSION_REVIEW_DESCRIPTION);
+    let disabled_again = advertised_review_tools(&requests[3]);
+    assert_eq!(disabled_again.len(), 1);
+    assert_eq!(
+        disabled_again[0].description,
+        code_swarm_review_tool_definition().description
+    );
+    let results = tool_results(&harness.session);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].payload["extension_id"], json!("other-review"));
+    assert_eq!(results[0].payload["ok"], json!(true), "{:?}", results[0]);
+    assert_eq!(*harness.extension_calls.lock().expect("calls"), 1);
+}
+
+#[test]
+fn second_extension_declaring_the_review_tool_name_still_collides() {
+    let mut harness = review_model_tool_harness("other-review", Vec::new(), &[]);
+
+    let error = harness
+        .session
+        .wire_extension(Arc::new(ReviewModelToolExtension {
+            id: "code-swarm",
+            calls: Arc::new(Mutex::new(0)),
+        }))
+        .expect_err("two extensions cannot both own one model tool name");
+
+    assert!(
+        error
+            .to_string()
+            .contains("model tool name collision: code_swarm_review"),
+        "{error}"
+    );
+}
+
+#[test]
+fn special_review_tool_is_unchanged_while_the_declaring_extension_is_disabled() {
+    let mut harness = review_model_tool_harness(
+        "other-review",
+        vec![
+            FixtureResponse::ToolCalls(vec![review_tool_call(json!({"focus": "the plan"}))]),
+            FixtureResponse::Assistant("adjudicated".to_owned()),
+        ],
+        &[(
+            "p1",
+            vec![FixtureResponse::Assistant(
+                "finding: no rollback".to_owned(),
+            )],
+        )],
+    );
+    write_project_config(&harness.root, &["p1::m1"]);
+
+    harness.session.run_turn("review my plan").expect("turn");
+
+    let requests = harness.requests.lock().expect("capture");
+    let tools = advertised_review_tools(&requests[0]);
+    assert_eq!(
+        tools.len(),
+        1,
+        "exactly one code_swarm_review is advertised"
+    );
+    assert_eq!(
+        tools[0].description,
+        code_swarm_review_tool_definition().description
+    );
+    let call = harness
+        .session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .expect("tool call");
+    assert!(call.payload.get("extension_id").is_none());
+    let results = tool_results(&harness.session);
+    assert_eq!(results[0].payload["ok"], json!(true), "{:?}", results[0]);
+    assert!(results[0].payload["output"]
+        .as_str()
+        .expect("output")
+        .contains("1/1 reviewers succeeded"));
+    assert_eq!(*harness.extension_calls.lock().expect("calls"), 0);
+}

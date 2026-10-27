@@ -178,6 +178,8 @@ impl<D: PermissionDecider> Session<D> {
             self.emit_cancelled_tool_result(call, tool_call_event_id, None, None)?;
             return Err(SessionError::Cancelled);
         }
+        // Reached only when no extension binding owns the name: an extension
+        // model tool named `code_swarm_review` was dispatched above (ADR 0022).
         if call.name == super::swarm_tool::CODE_SWARM_REVIEW_TOOL {
             return self.execute_code_swarm_review_tool(
                 call,

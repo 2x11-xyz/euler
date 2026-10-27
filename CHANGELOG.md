@@ -260,6 +260,10 @@ pull requests that landed them; deeper design rationale lives in
   unchanged.
 - The spawn preflight error for an unconfigured provider no longer names a
   reviewer-model picker; it still points at `/login`.
+- An enabled extension may declare a model tool named `code_swarm_review`.
+  While it is enabled, requests advertise only that tool and its calls run the
+  extension; otherwise the built-in review tool keeps its existing
+  advertisement rule (ADR 0022 transitional rule).
 - A model-tool descriptor may declare `max_input_bytes`, from 1 byte up to a
   host cap of 320 KiB, as the budget for its whole serialized input. Without
   it the budget stays 64 KiB. Any other value fails manifest parsing and
