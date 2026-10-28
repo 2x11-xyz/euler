@@ -6,6 +6,13 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### `command -v` probes are no longer flagged dangerous
+
+- The danger walk now recognizes `command`'s POSIX options `-p`, `-v`,
+  and `-V`. Before, `command -v X` (the usual "is X installed" check)
+  failed closed on the unrecognized `-v`, so it always prompted and no
+  grant could cover it. `command -p rm -rf x` is still flagged.
+
 ### Approval panel without grants says why (#267)
 
 - A danger-flagged or once-only permission ask now shows only `y  Allow

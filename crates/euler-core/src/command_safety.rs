@@ -1363,8 +1363,12 @@ const WRAPPERS: &[(&str, WrapperSpec)] = &[
     (
         "command",
         WrapperSpec {
+            // POSIX options: `-p` (default PATH) and `-v`/`-V` (look the
+            // name up). The operands are still walked as a wrapped
+            // command, so `command -v rm -rf x` over-flags, which is the
+            // safe direction.
             short_value: "",
-            short_bool: "",
+            short_bool: "pvV",
             short_script: "",
             long_value: &[],
             long_bool: &[],
@@ -2704,6 +2708,41 @@ mod tests {
             "sh -c -e 'rm -f file'",
             "rm --forc file",
             "rm --recursi dir",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn danger_walk_accepts_command_lookup_options() {
+        // `command -v X` is the idiomatic "is X installed" probe. With no
+        // enumerated options, `-v` failed closed and every probe was
+        // danger-flagged, so it always prompted and no grant covered it.
+        for command in [
+            "command -v herdr",
+            "command -V herdr",
+            "command -v curl cargo brew npm 2>&1",
+            "command -v herdr; herdr --version 2>&1 | head -5; echo \"---\"; uname -a; \
+             echo \"---\"; ls ~/.local/bin ~/.cargo/bin 2>/dev/null | grep -i herdr; \
+             echo \"---\"; command -v curl cargo brew npm 2>&1",
+        ] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
+        // `-p` still runs the wrapped command, so its danger still shows.
+        // The operands stay walked after a lookup option, in a cluster, or
+        // after `--`, and an unenumerated letter still fails closed.
+        for command in [
+            "command -p rm -rf x",
+            "command -v rm -rf x",
+            "command -pv rm -rf x",
+            "command -- rm -rf x",
+            "command -vx herdr",
         ] {
             assert!(
                 contains_dangerous_command(command),
