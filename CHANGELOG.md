@@ -254,6 +254,17 @@ pull requests that landed them; deeper design rationale lives in
   own provenance stays faithful, and `agent.spawn` marks these children with
   `egress_redacted: true`.
 
+### Extension user messages (#163)
+
+- A failing extension command can now tell the user and the model why, through
+  `ExtensionError::UserMessage` or a managed-process
+  `error.data.user_message`. The host redacts it and keeps it only when it is
+  at most 1 KiB, free of control characters other than newline and tab, and
+  format-safe. It then reads `extension command failed: <message>` in the
+  failed tool result and user command output, and is recorded as
+  `user_message` on the extension `error` event. Anything else keeps the
+  generic failure (ADR 0018 amendment).
+
 ### Session lock release (#243)
 
 - Dropping a provenance writer now releases its session lock even while a

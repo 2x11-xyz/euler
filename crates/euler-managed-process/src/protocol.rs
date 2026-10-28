@@ -20,7 +20,11 @@ pub(crate) enum IncomingMessage {
 #[derive(Debug)]
 pub(crate) enum ResponseBody {
     Result(Value),
-    Error,
+    /// A JSON-RPC error. Only the opt-in string `error.data.user_message` is
+    /// retained; the rest of the error body never leaves the protocol layer.
+    Error {
+        user_message: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,7 +69,12 @@ pub(crate) fn decode_message(bytes: &[u8]) -> Result<IncomingMessage, ProtocolEr
         }),
         (None, Some(error)) if error.is_object() => Ok(IncomingMessage::Response {
             id,
-            body: ResponseBody::Error,
+            body: ResponseBody::Error {
+                user_message: error
+                    .pointer("/data/user_message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            },
         }),
         _ => Err(ProtocolError::InvalidMessage),
     }

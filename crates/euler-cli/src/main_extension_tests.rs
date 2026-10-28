@@ -575,6 +575,93 @@ fn extension_run_on_locked_session_log_fails_without_executing_command() {
     assert_eq!(std::fs::read(&log).expect("log after"), before);
 }
 
+#[test]
+fn offline_extension_run_prints_the_validated_user_message() {
+    use crate::offline_extension_runner::{execute_offline_extension_run, OfflineExtensionRun};
+
+    struct ValidatingExtension(&'static str);
+
+    impl euler_sdk::Extension for ValidatingExtension {
+        fn manifest(&self) -> euler_sdk::ExtensionManifest {
+            euler_sdk::ExtensionManifest {
+                id: "validating-extension".to_owned(),
+                version: "0.0.0-test".to_owned(),
+                display_name: "Validating Extension (test double)".to_owned(),
+                capabilities: Vec::new(),
+            }
+        }
+
+        fn register(
+            &self,
+            registrar: &mut dyn euler_sdk::CommandRegistrar,
+        ) -> Result<(), euler_sdk::ExtensionError> {
+            registrar.register_command("validate", Box::new(ValidatingCommand(self.0)));
+            Ok(())
+        }
+    }
+
+    struct ValidatingCommand(&'static str);
+
+    impl euler_sdk::ExtensionCommand for ValidatingCommand {
+        fn execute(
+            &self,
+            _context: euler_sdk::CommandContext,
+            _host: &dyn euler_sdk::HostApi,
+        ) -> Result<serde_json::Value, euler_sdk::ExtensionError> {
+            Err(euler_sdk::ExtensionError::UserMessage(self.0.to_owned()))
+        }
+    }
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let session_dir = temp.path().join("sessions").join("session-offline");
+    std::fs::create_dir_all(&session_dir).expect("session dir");
+    let log = session_dir.join("events.jsonl");
+    ProvenanceWriter::new(log.clone())
+        .expect("writer")
+        .append(&[euler_event::EventEnvelope::new(
+            "session-offline",
+            "agent-1",
+            None,
+            EventKind::SESSION_START,
+            serde_json::Map::from_iter([
+                ("provider".to_owned(), json!("fixture")),
+                ("model".to_owned(), json!("echo")),
+            ]),
+        )])
+        .expect("append session start");
+    let command = euler_sdk::CommandDescriptor {
+        invocation: euler_sdk::Invocation::User,
+        name: "validate".to_owned(),
+        display_name: "validate".to_owned(),
+        summary: "test command".to_owned(),
+        required_capabilities: Vec::new(),
+        args: Vec::new(),
+        accepts_session_id: false,
+        model_tool: None,
+    };
+
+    let run = |user_message: &'static str| {
+        execute_offline_extension_run(OfflineExtensionRun {
+            extension_id: "validating-extension",
+            command: &command,
+            extension: &ValidatingExtension(user_message),
+            target: log.clone(),
+            input: json!({}),
+        })
+        .expect_err("command error")
+        .to_string()
+    };
+
+    assert_eq!(
+        run("population_size must be in range 1..=8"),
+        "validating-extension.validate failed: extension command failed: \
+         population_size must be in range 1..=8"
+    );
+    let invalid = run("bad \u{1b}[31mESCAPED_DETAIL");
+    assert!(!invalid.contains('\u{1b}'), "{invalid:?}");
+    assert!(!invalid.contains("ESCAPED_DETAIL"), "{invalid:?}");
+}
+
 fn companion_test_session(
     responses: Vec<FixtureResponse>,
 ) -> (tempfile::TempDir, Session<CliDecider>) {

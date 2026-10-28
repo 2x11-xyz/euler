@@ -53,6 +53,8 @@ pub const MAX_CONTEXT_SLOT_CONTENT_BYTES: usize = 4096;
 /// Largest extension config document, read or written (ADR 0022).
 pub const MAX_EXTENSION_CONFIG_BYTES: usize = 16 * 1024;
 pub const MAX_CONTEXT_SLOTS_PER_SESSION: usize = 8;
+/// Largest post-redaction [`ExtensionError::UserMessage`] the host surfaces.
+pub const MAX_EXTENSION_USER_MESSAGE_BYTES: usize = 1024;
 
 /// One cloneable cancellation source shared by a host and extension command.
 ///
@@ -541,6 +543,13 @@ pub enum ExtensionError {
     PlanPresentationFailed(String),
     #[error("extension config failed: {0}")]
     ConfigFailed(String),
+    /// Opt-in failure text for the user and the model (ADR 0018 amendment).
+    /// The host redacts it and surfaces it only when it is nonblank, at most
+    /// [`MAX_EXTENSION_USER_MESSAGE_BYTES`], free of control characters other
+    /// than newline and tab, and format-safe; otherwise the command fails with
+    /// the generic host text.
+    #[error("{0}")]
+    UserMessage(String),
 }
 
 pub trait HostApi {

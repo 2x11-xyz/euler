@@ -995,8 +995,11 @@ extension error does not consume the later result.
   preserves the call's optional `purpose` without asserting `cancelled`. When
   `source` is `extension`, optional `extension_id`, `command`, and
   `failure` (`command_error` | `panic`) fields attribute the host-observed
-  failure. Extension error messages in persisted events are host-generated
-  summaries, not raw extension error text or panic payloads.
+  failure. `message` is always a host-generated summary. An optional
+  `user_message` on a `command_error` carries the extension's redacted,
+  host-validated user message (ADR 0018 amendment); it is extension-authored,
+  so feed consumers treat it as untrusted text. No other raw extension error
+  text or panic payload is persisted.
 - `extension.artifact`: `extension_id`, `display_name`, `media_type`, `path`,
   `sha256`, `byte_len`, `source_event_ids`, `metadata`. The artifact bytes are
   stored outside the event payload under the session-scoped extension artifact
