@@ -419,7 +419,10 @@ distinct nodes.
 substitutions, expansions, redirection arguments, and the scripts carried by
 `sh -c`, `eval`, `env -S`, and `trap` — and unwraps `sudo`, `doas`, `su`,
 `env`, `nohup`, `time`, `timeout`, `nice`, `ionice`, `chrt`, `stdbuf`,
-`setsid`, `flock`, `xargs`, `command`, `builtin`, and `exec`. It **must
+`setsid`, `flock`, `xargs`, `command`, `builtin`, and `exec`. `command`'s
+POSIX options `-p`, `-v`, and `-V` are recognized, so a `command -v X`
+lookup is not itself danger (its operands are still walked as a command).
+It **must
 never be used to prove safety**. It fails closed on a parse error, on a
 dynamic command name, on a dynamic argument of a dangerous or wrapper
 command, on an unrecognized `env` option, and past a wrapper depth of eight;
