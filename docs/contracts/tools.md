@@ -109,6 +109,19 @@ Semantics:
 | `git_status` / `git_diff` | FsRead | Workspace git views. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
 | `tool_result_get` | FsRead | Rehydrate a demoted, compacted, or previewed tool result from the **current session** by `event_id` (required); optional `offset_bytes` (default `0`) and `max_bytes` (default 64 KiB) select a byte window. Session-local and project-context-policy-aware for children. |
 
+## Replay policy
+
+Every tool has a replay policy, `safe` or `unsafe` (ADR 0023). `read_file`,
+`git_status`, `git_diff`, `tool_result_get`, and `skill_read` are `safe`.
+`edit_file`, `write_file`, `apply_patch`, and `run_shell` are `unsafe`,
+including statically safe shell commands, and so is any name core does not
+own. An extension model tool takes the `replay` its `ModelToolDescriptor`
+declares, `unsafe` when omitted (extension SDK contract).
+
+A root `tool.call` records `replay: "safe"` when the policy resolved at call
+time is `safe` (events contract). This is recording only: resume closes an
+interrupted call the same way whatever its policy, and nothing re-runs.
+
 ## Structured file confinement
 
 `read_file`, `edit_file`, `write_file`, and `apply_patch` never hand a joined

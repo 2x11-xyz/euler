@@ -3198,3 +3198,27 @@ fn a_repository_without_submodules_gets_no_submodule_notice() {
         execution.output
     );
 }
+
+#[test]
+fn replay_policy_table_marks_only_read_only_core_tools_safe() {
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = ToolRegistry::new(temp.path());
+    for name in [
+        "read_file",
+        "git_status",
+        "git_diff",
+        "tool_result_get",
+        "skill_read",
+    ] {
+        assert_eq!(registry.replay_policy(name), ReplayPolicy::Safe, "{name}");
+    }
+    for name in [
+        "edit_file",
+        "write_file",
+        "apply_patch",
+        "run_shell",
+        "no_such_tool",
+    ] {
+        assert_eq!(registry.replay_policy(name), ReplayPolicy::Unsafe, "{name}");
+    }
+}

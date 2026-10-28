@@ -119,8 +119,26 @@ struct SessionSpawner<'s, D> {
     session: RefCell<&'s mut Session<D>>,
     queue: Arc<QueuedExtensionEvents>,
     spawned: Cell<usize>,
+    /// Spawn keys issued in this execution (ADR 0023). A task takes the next
+    /// ordinal once it passes the field checks, before the spawn runs, so a
+    /// spawn that fails afterwards still consumes it and a key is never
+    /// reused within one execution.
+    spawn_ordinals: Cell<usize>,
     cancellation: CancellationToken,
     tool_call_event_id: Option<String>,
+}
+
+impl<D> SessionSpawner<'_, D> {
+    /// Record a model-tool spawn's owning `tool.call` and its ordinal key
+    /// (ADR 0023). Spawns outside a model tool have no owner.
+    fn with_next_spawn_owner(&self, task: AgentTask) -> AgentTask {
+        let Some(owner_event_id) = &self.tool_call_event_id else {
+            return task;
+        };
+        let ordinal = self.spawn_ordinals.get() + 1;
+        self.spawn_ordinals.set(ordinal);
+        task.with_spawn_owner(owner_event_id.clone(), ordinal.to_string())
+    }
 }
 
 impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
@@ -131,7 +149,7 @@ impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
             )));
         }
         let mut session = self.session.borrow_mut();
-        let agent_task = convert_spawn_task(task, &session.redactor)?;
+        let agent_task = self.with_next_spawn_owner(convert_spawn_task(task, &session.redactor)?);
         // Companion events append through the session bus. Sync already-queued
         // extension events into the bus first, so the durable parent chain the
         // post-command publish asserts stays intact.
@@ -162,7 +180,10 @@ impl<D: PermissionDecider> ExtensionSpawner for SessionSpawner<'_, D> {
         let agent_tasks = tasks
             .into_iter()
             .map(|task| convert_spawn_task(task, &session.redactor))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|task| self.with_next_spawn_owner(task))
+            .collect::<Vec<_>>();
         let batch_len = agent_tasks.len();
         session
             .publish_queued_extension_events(&self.queue)
@@ -777,6 +798,7 @@ impl<D> Session<D> {
                 session: RefCell::new(&mut *self),
                 queue: Arc::clone(&queue),
                 spawned: Cell::new(0),
+                spawn_ordinals: Cell::new(0),
                 cancellation: boundary.cancellation.clone(),
                 tool_call_event_id: boundary.tool_call_event_id.map(str::to_owned),
             };
@@ -948,3 +970,7 @@ mod extension_egress_test;
 #[cfg(test)]
 #[path = "extension_config_origin_test.rs"]
 mod extension_config_origin_test;
+
+#[cfg(test)]
+#[path = "spawn_ownership_test.rs"]
+mod spawn_ownership_test;

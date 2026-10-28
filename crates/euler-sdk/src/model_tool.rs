@@ -762,6 +762,7 @@ mod tests {
                 "additionalProperties": false
             }),
             max_input_bytes: None,
+            replay: crate::ReplayPolicy::Unsafe,
         }
     }
 
@@ -851,6 +852,7 @@ mod tests {
                 "additionalProperties": false
             }),
             max_input_bytes,
+            replay: crate::ReplayPolicy::Unsafe,
         }
     }
 
@@ -916,6 +918,30 @@ mod tests {
     }
 
     #[test]
+    fn replay_declaration_defaults_to_unsafe_and_rejects_unknown_policies() {
+        let mut declared = serde_json::to_value(descriptor()).expect("serialize");
+        assert!(
+            declared.get("replay").is_none(),
+            "an unsafe descriptor serializes as before ADR 0023"
+        );
+        let omitted: crate::ModelToolDescriptor =
+            serde_json::from_value(declared.clone()).expect("omitted replay");
+        assert_eq!(omitted.replay, crate::ReplayPolicy::Unsafe);
+
+        declared["replay"] = json!("safe");
+        let safe: crate::ModelToolDescriptor =
+            serde_json::from_value(declared.clone()).expect("safe replay");
+        assert_eq!(safe.replay, crate::ReplayPolicy::Safe);
+        assert_eq!(
+            serde_json::to_value(&safe).expect("serialize")["replay"],
+            json!("safe")
+        );
+
+        declared["replay"] = json!("sometimes");
+        assert!(serde_json::from_value::<crate::ModelToolDescriptor>(declared).is_err());
+    }
+
+    #[test]
     fn numeric_bounds_are_exact_beyond_f64_integer_precision() {
         const F64_EXACT_INTEGER_EDGE: u64 = 9_007_199_254_740_992;
         let bounded_integer = crate::ModelToolDescriptor {
@@ -933,6 +959,7 @@ mod tests {
                 "additionalProperties": false
             }),
             max_input_bytes: None,
+            replay: crate::ReplayPolicy::Unsafe,
         };
         validate_model_tool_descriptor(&bounded_integer).expect("valid exact bound");
         validate_model_tool_input(&bounded_integer, &json!({"value": F64_EXACT_INTEGER_EDGE}))

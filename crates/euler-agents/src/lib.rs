@@ -4,6 +4,7 @@
 use euler_event::{EventEnvelope, EventKind, JsonObject};
 use euler_sdk::{Capability, HostAgentRecord, HostAgentResult, HostAgentTask};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::io::{self, Write};
 use thiserror::Error;
@@ -175,6 +176,15 @@ pub struct AgentTask {
     budget: AgentBudget,
     result_schema: Option<Value>,
     egress_redacted: bool,
+    spawn_owner: Option<SpawnOwner>,
+}
+
+/// The model `tool.call` whose extension execution requested a spawn, and the
+/// spawn's key within that execution (ADR 0023).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SpawnOwner {
+    owner_event_id: String,
+    spawn_key: String,
 }
 
 impl AgentTask {
@@ -197,6 +207,7 @@ impl AgentTask {
             budget: AgentBudget::default(),
             result_schema: None,
             egress_redacted: false,
+            spawn_owner: None,
         })
     }
 
@@ -217,6 +228,7 @@ impl AgentTask {
             budget: AgentBudget::default(),
             result_schema: None,
             egress_redacted: false,
+            spawn_owner: None,
         })
     }
 
@@ -253,6 +265,21 @@ impl AgentTask {
     /// redacted before this task was built.
     pub fn with_egress_redaction(mut self) -> Self {
         self.egress_redacted = true;
+        self
+    }
+
+    /// Record the owning model `tool.call` and the spawn key on `agent.spawn`
+    /// (ADR 0023). Set only for spawns an extension requests while it runs as
+    /// a model tool.
+    pub fn with_spawn_owner(
+        mut self,
+        owner_event_id: impl Into<String>,
+        spawn_key: impl Into<String>,
+    ) -> Self {
+        self.spawn_owner = Some(SpawnOwner {
+            owner_event_id: owner_event_id.into(),
+            spawn_key: spawn_key.into(),
+        });
         self
     }
 
@@ -506,6 +533,17 @@ pub fn agent_spawn_payload(task: &AgentTask, child_agent_id: &str) -> JsonObject
     }
     if let Some(context) = task.explicit_context() {
         payload.insert("explicit_context_bytes".to_owned(), context.len().into());
+        payload.insert(
+            "explicit_context_sha256".to_owned(),
+            format!("{:x}", Sha256::digest(context.as_bytes())).into(),
+        );
+    }
+    if let Some(owner) = &task.spawn_owner {
+        payload.insert(
+            "owner_event_id".to_owned(),
+            owner.owner_event_id.clone().into(),
+        );
+        payload.insert("spawn_key".to_owned(), owner.spawn_key.clone().into());
     }
     payload.insert(
         "capabilities".to_owned(),

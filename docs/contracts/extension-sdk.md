@@ -187,8 +187,13 @@ host bridge.
 
 `SpawnAgentTask::explicit_context` carries up to 256 KiB of caller-assembled
 context as a separate child input item for both single and parallel spawn.
-Spawn provenance records its byte count, not its contents, so a multi-reviewer
-batch does not duplicate the review subject in every `agent.spawn` event.
+Spawn provenance records its byte count and the SHA-256 of its redacted bytes,
+not its contents, so a multi-reviewer batch does not duplicate the review
+subject in every `agent.spawn` event.
+
+A spawn requested while the command runs as a model tool records the owning
+`tool.call` event id and a spawn key on `agent.spawn` (ADR 0023; multi-agent
+contract). Spawns from any other command execution record neither.
 
 ## Context Slot Update v0
 
@@ -423,6 +428,13 @@ capabilities.
   absent. A declared budget must be 1 to 320 KiB
   (`MAX_DECLARED_MODEL_TOOL_INPUT_BYTES`); any other value fails registration
   and manifest parsing (ADR 0022).
+- The descriptor's optional `replay` is `"safe"` or `"unsafe"`, and an
+  omitted value is `"unsafe"` (ADR 0023). Any other value fails registration
+  and manifest parsing. `"safe"` is the extension's promise that re-running an
+  interrupted call is harmless; core records it on the call's `tool.call` as
+  `replay: "safe"` and does not yet act on it. An unsafe descriptor serializes
+  without the field, so it stays readable by older hosts; a descriptor that
+  declares `replay` fails registration on a host older than this field.
 - Numeric `minimum`/`maximum` ordering and input checks compare the exact
   canonical JSON decimals represented by `serde_json::Number`, without
   converting integers through `f64`; adjacent integers above `2^53` therefore

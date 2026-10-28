@@ -15,7 +15,7 @@ use euler_event::{object, EventEnvelope, EventKind, JsonObject};
 use euler_provider::{ToolCall, ToolDefinition};
 use euler_sdk::{
     validate_model_tool_input, CancellationToken, Capability, Extension, ModelToolDescriptor,
-    MAX_MODEL_TOOL_OUTPUT_BYTES,
+    ReplayPolicy, MAX_MODEL_TOOL_OUTPUT_BYTES,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -562,6 +562,15 @@ impl<D: PermissionDecider> Session<D> {
         self.active_extension_tools
             .get(name)
             .map(|tool| (tool.extension_id.as_str(), tool.command.as_str()))
+    }
+
+    /// The replay policy of the tool a call names (ADR 0023): the active
+    /// extension tool's declaration, otherwise the core table.
+    pub(super) fn tool_replay_policy(&self, name: &str) -> ReplayPolicy {
+        match self.active_extension_tools.get(name) {
+            Some(tool) => tool.descriptor.replay,
+            None => self.tools.replay_policy(name),
+        }
     }
 
     pub(super) fn active_extension_tool(&self, name: &str) -> Option<ActiveExtensionTool> {
