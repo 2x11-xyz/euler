@@ -81,6 +81,16 @@ fn companion_batched_tool_calls_replay_as_calls_then_outputs() {
         .expect("companion");
 
     assert!(summary.result.ok());
+    // ADR 0023: only root calls record `replay`, even for a safe tool.
+    let companion_calls = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .collect::<Vec<_>>();
+    assert_eq!(companion_calls.len(), 2);
+    for call in companion_calls {
+        assert!(call.payload.get("replay").is_none(), "{:?}", call.payload);
+    }
     let requests = requests.lock().expect("requests");
     assert_eq!(
         requests.len(),

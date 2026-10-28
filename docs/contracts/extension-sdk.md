@@ -434,7 +434,9 @@ capabilities.
   interrupted call is harmless; core records it on the call's `tool.call` as
   `replay: "safe"` and does not yet act on it. An unsafe descriptor serializes
   without the field, so it stays readable by older hosts; a descriptor that
-  declares `replay` fails registration on a host older than this field.
+  declares `replay` fails registration on a host older than this field, and
+  once such an extension is linked or installed, an older host cannot read
+  the persisted link inventory at all.
 - Numeric `minimum`/`maximum` ordering and input checks compare the exact
   canonical JSON decimals represented by `serde_json::Number`, without
   converting integers through `f64`; adjacent integers above `2^53` therefore

@@ -120,9 +120,9 @@ struct SessionSpawner<'s, D> {
     queue: Arc<QueuedExtensionEvents>,
     spawned: Cell<usize>,
     /// Spawn keys issued in this execution (ADR 0023). A task takes the next
-    /// ordinal once it passes the field checks, before the spawn runs, so a
-    /// spawn that fails afterwards still consumes it and a key is never
-    /// reused within one execution.
+    /// ordinal once it (for a batch, every task in it) passes the field
+    /// checks, before the spawn runs, so a spawn that fails afterwards still
+    /// consumes it and a key is never reused within one execution.
     spawn_ordinals: Cell<usize>,
     cancellation: CancellationToken,
     tool_call_event_id: Option<String>,

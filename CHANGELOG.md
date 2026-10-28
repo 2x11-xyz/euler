@@ -16,7 +16,7 @@ pull requests that landed them; deeper design rationale lives in
   line instead of silently reading `~/.euler`, and the `USERPROFILE` fallback
   is gone (the Euler home requires `HOME` or `EULER_HOME`).
 
-### Replay declaration (ADR 0023, step 1)
+### Replay declaration (ADR 0023 step 1, #259)
 
 - Root `tool.call` events record `replay: "safe"` when the tool's replay
   policy is `safe`: the core read-only tools (`read_file`, `git_status`,

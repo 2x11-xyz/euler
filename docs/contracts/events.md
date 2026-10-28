@@ -1046,11 +1046,11 @@ extension error does not consume the later result.
   requested while running as a model tool (ADR 0023): `owner_event_id` is the
   owning `tool.call` event id, and `spawn_key` is the spawn's decimal ordinal
   within that tool execution (`"1"`, `"2"`, and so on, batch tasks in task
-  order). The host assigns the ordinal once a task passes its field checks,
-  so a spawn that fails afterwards (an unconfigured target, for example)
-  still consumes it: keys may skip numbers but never repeat within one
-  execution. Other spawns carry neither field. These fields are recorded only; resume does not read them
-  yet.
+  order). The host assigns the ordinal once the task (for a batch, every task
+  in it) passes its field checks, so a spawn that fails afterwards (an
+  unconfigured target, for example) still consumes it: keys may skip numbers
+  but never repeat within one execution. Other spawns carry neither field.
+  These fields are recorded only; resume does not read them yet.
 - `agent.message`: `from_agent_id`, `to_agent_id`, `spawn_event_id`,
   `queued_ts`, `payload`. This is a parent-drained child-to-parent report from
   a live current-process background child, not transcript content and not a

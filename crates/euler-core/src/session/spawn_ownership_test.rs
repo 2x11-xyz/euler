@@ -92,6 +92,11 @@ impl ExtensionCommand for SpawningToolCommand {
         host: &dyn HostApi,
     ) -> Result<Value, ExtensionError> {
         if self.rejected_batch_first {
+            // A batch whose second task fails conversion consumes no ordinal,
+            // not even for its valid first task.
+            let mut empty_task = brief(None);
+            empty_task.task = String::new();
+            assert!(host.spawn_agents(vec![brief(None), empty_task]).is_err());
             let mut two_rounds = brief(None);
             two_rounds.max_turns = Some(2);
             assert!(host.spawn_agents(vec![two_rounds]).is_err());
