@@ -13,7 +13,7 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-5";
 
 const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 // 4096 starved adaptive-thinking models: a single deep reasoning pass
 // consumed the whole budget and truncated rounds with zero content.
 // All current Anthropic models accept far larger output ceilings.
@@ -136,11 +136,30 @@ impl AnthropicApiKey {
 }
 
 fn request_body(request: &ModelRequest) -> Value {
+    messages_request_body(
+        request,
+        &MessagesRoute {
+            provider: "anthropic",
+            adaptive_thinking: model_supports_adaptive_thinking(&request.model),
+        },
+    )
+}
+
+/// The provider-specific inputs to a Messages API request, so a custom
+/// provider can reuse this adapter under its own provider id.
+pub(crate) struct MessagesRoute<'a> {
+    /// Provider id that recorded the reasoning items this request replays.
+    pub(crate) provider: &'a str,
+    /// Whether the model accepts adaptive thinking and an effort level.
+    pub(crate) adaptive_thinking: bool,
+}
+
+pub(crate) fn messages_request_body(request: &ModelRequest, route: &MessagesRoute<'_>) -> Value {
     let mut body = json!({
         "model": request.model,
         "max_tokens": request.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
         "stream": true,
-        "messages": anthropic_messages(&request.model, &request.input),
+        "messages": anthropic_messages(route.provider, &request.model, &request.input),
     });
     if !request.instructions.is_empty() {
         body["system"] = Value::String(request.instructions.clone());
@@ -148,13 +167,13 @@ fn request_body(request: &ModelRequest) -> Value {
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(request.tools.iter().map(tool_definition).collect());
     }
-    if let Some(effort) = anthropic_effort(request) {
+    if route.adaptive_thinking {
         body["thinking"] = json!({
             "type": "adaptive",
             "display": "summarized",
         });
         body["output_config"] = json!({
-            "effort": effort,
+            "effort": anthropic_effort(request.reasoning_effort),
         });
     }
     body
@@ -162,29 +181,26 @@ fn request_body(request: &ModelRequest) -> Value {
 
 /// Maps the requested reasoning effort onto the Messages API
 /// `output_config.effort` scale (low/medium/high/xhigh/max).
-fn anthropic_effort(request: &ModelRequest) -> Option<&'static str> {
-    if !model_supports_adaptive_thinking(&request.model) {
-        return None;
-    }
-    Some(match request.reasoning_effort {
+fn anthropic_effort(effort: ReasoningEffort) -> &'static str {
+    match effort {
         ReasoningEffort::XSmall => "low",
         ReasoningEffort::Small => "medium",
         ReasoningEffort::Medium => "high",
         ReasoningEffort::Large => "xhigh",
         ReasoningEffort::XLarge => "max",
         ReasoningEffort::Max => "max",
-    })
+    }
 }
 
 fn model_supports_adaptive_thinking(model: &str) -> bool {
     crate::catalog::built_in_model_supports_reasoning(crate::catalog::ANTHROPIC_PROVIDER_ID, model)
 }
 
-fn anthropic_messages(model: &str, input: &[ModelInputItem]) -> Vec<Value> {
+fn anthropic_messages(provider: &str, model: &str, input: &[ModelInputItem]) -> Vec<Value> {
     let mut messages = Vec::new();
     let mut current: Option<MessageBuilder> = None;
     for item in input {
-        let Some((role, block)) = anthropic_content_block(model, item) else {
+        let Some((role, block)) = anthropic_content_block(provider, model, item) else {
             continue;
         };
         if current.as_ref().is_some_and(|message| message.role != role) {
@@ -239,7 +255,11 @@ impl MessageBuilder {
     }
 }
 
-fn anthropic_content_block(model: &str, item: &ModelInputItem) -> Option<(AnthropicRole, Value)> {
+fn anthropic_content_block(
+    target_provider: &str,
+    model: &str,
+    item: &ModelInputItem,
+) -> Option<(AnthropicRole, Value)> {
     match item {
         // Project context becomes one user-role text block; the core-framed
         // rendered bytes pass through verbatim (never trimmed, normalized,
@@ -260,14 +280,10 @@ fn anthropic_content_block(model: &str, item: &ModelInputItem) -> Option<(Anthro
             fidelity,
             content,
             artifact,
-        } => reasoning_content_block(
-            model,
-            provider,
-            reasoning_model,
-            *fidelity,
-            content,
-            artifact.as_deref(),
-        ),
+        } if provider == target_provider && reasoning_model == model => {
+            reasoning_content_block(*fidelity, content, artifact.as_deref())
+        }
+        ModelInputItem::Reasoning { .. } => None,
         ModelInputItem::ToolCall {
             call_id,
             name,
@@ -314,30 +330,23 @@ fn message_content_block(role: ModelRole, content: &str) -> Option<(AnthropicRol
 }
 
 fn reasoning_content_block(
-    model: &str,
-    provider: &str,
-    reasoning_model: &str,
     fidelity: ReasoningFidelity,
     content: &str,
     artifact: Option<&str>,
 ) -> Option<(AnthropicRole, Value)> {
-    if provider != "anthropic" || reasoning_model != model {
-        return None;
-    }
+    // The API rejects a thinking block without its signature and a redacted
+    // block without its data. Unsigned reasoning (for example recorded by a
+    // Chat Completions route before the model moved to Messages) cannot be
+    // replayed, so drop it.
+    let artifact = artifact?;
     let mut block = reasoning_block_value(fidelity, content, artifact);
     if !matches!(fidelity, ReasoningFidelity::Opaque) {
-        if let Some(signature) = artifact {
-            block["signature"] = Value::String(signature.to_owned());
-        }
+        block["signature"] = Value::String(artifact.to_owned());
     }
     Some((AnthropicRole::Assistant, block))
 }
 
-fn reasoning_block_value(
-    fidelity: ReasoningFidelity,
-    content: &str,
-    artifact: Option<&str>,
-) -> Value {
+fn reasoning_block_value(fidelity: ReasoningFidelity, content: &str, artifact: &str) -> Value {
     match fidelity {
         // Older session logs mislabeled Anthropic signed thinking as summaries.
         // Normalize that legacy spelling here, at the Anthropic replay boundary,
@@ -349,7 +358,7 @@ fn reasoning_block_value(
         }),
         ReasoningFidelity::Opaque => json!({
             "type": "redacted_thinking",
-            "data": artifact.unwrap_or_default(),
+            "data": artifact,
         }),
     }
 }
@@ -448,6 +457,11 @@ struct AnthropicStream {
     parser: AnthropicSseParser,
     queued: std::vec::IntoIter<Result<ModelStreamEvent, ProviderError>>,
     done: bool,
+}
+
+/// Wraps a Messages API SSE response body as a model event stream.
+pub(crate) fn messages_stream(reader: impl Read + Send + 'static) -> ProviderStream {
+    Box::new(AnthropicStream::new(reader))
 }
 
 impl AnthropicStream {

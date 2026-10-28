@@ -6,6 +6,25 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Custom providers speak Anthropic Messages
+
+- **New `api_family: "anthropic_messages"`** for `providers.json`. It reuses
+  the native Anthropic adapter, so signed thinking blocks are replayed on
+  later turns (keeping thinking continuity and prompt caching) and reasoning
+  effort maps to adaptive thinking when the model entry declares
+  `supports_reasoning: true`.
+- **Per-model `api_family`.** A model entry may override its provider's
+  family, so one gateway can serve some models over Messages and the rest
+  over Chat Completions. Both families share the provider's `base_url`: a
+  `/v1` root serves `/v1/chat/completions` and `/v1/messages`, and a bare
+  host root also works for Messages.
+- New load warnings: a model with an unknown `api_family`, a model family that
+  a full-endpoint `base_url` cannot serve, and `compat` on a Messages model
+  (Chat Completions only, ignored).
+- Reasoning recorded without a signature is no longer replayed over Messages,
+  including on the built-in `anthropic` provider. The API rejects unsigned
+  thinking blocks, so such a request previously failed.
+
 ### Custom provider config location (#258)
 
 - **`providers.json` now honors `EULER_HOME`.** Custom providers are read from

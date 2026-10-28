@@ -202,3 +202,39 @@ output limit, tool and reasoning support, compat), which is how an unlisted
 `--model` is treated. A provider whose `models` is empty, is not an array, or
 holds no valid entries, or that omits `models` without a valid string
 `default_model`, is ignored with a warning that names both fixes.
+
+### API families and endpoints
+
+A provider's `api_family` is `openai_chat_completions` or
+`anthropic_messages`. A model entry may set its own `api_family`, which
+overrides the provider's for that model; an unlisted `--model` uses the
+provider's. A model entry whose `api_family` is unknown is ignored with a
+warning.
+
+Every family shares the provider's `base_url`, auth, and headers. Each family
+derives its endpoint from `base_url`:
+
+- `openai_chat_completions` appends `/chat/completions`;
+- `anthropic_messages` appends `/messages` when `base_url` ends in `/v1`, and
+  `/v1/messages` otherwise.
+
+A `base_url` that already ends with a family's path is that family's full
+endpoint and is used as is. A full endpoint serves only its own family: a
+model entry that overrides the provider's family to one the full endpoint
+cannot serve is ignored with a warning. So one `/v1` root serves both
+families, and a bare host root also serves Messages.
+
+`anthropic_messages` requests use the built-in Anthropic Messages adapter
+(request shape, `anthropic-version: 2023-06-01`, SSE parsing). Auth is the
+provider's: `auth_header: true` sends `Authorization: Bearer <api_key>`, and
+an `x-api-key` entry in `headers` sends the key the way Anthropic's own API
+expects. A configured `anthropic-version` header replaces the default. A
+model that declares `supports_reasoning: true` requests adaptive thinking
+with the same effort mapping as the built-in `anthropic` provider; any other
+model requests no thinking. Recorded thinking blocks are replayed with their
+signatures only to the same provider and model; reasoning recorded without a
+signature (for example by a Chat Completions route) is not replayed. The same
+rule applies to the built-in `anthropic` provider. `compat`
+applies only to `openai_chat_completions`; on a Messages model it is ignored
+with a warning. As on the Chat Completions path, an HTTP rejection is
+classified by status and its body is not read.

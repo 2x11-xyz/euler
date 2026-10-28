@@ -129,9 +129,10 @@ Facts are never silently lost; only bulky result content is demoted.
 
 ## Custom providers (local models)
 
-Any OpenAI-compatible chat-completions endpoint can be registered as a
-provider in `providers.json` under the Euler home: `$EULER_HOME/providers.json`
-when `EULER_HOME` is set, otherwise `~/.euler/providers.json`:
+Any OpenAI-compatible chat-completions or Anthropic-compatible Messages
+endpoint can be registered as a provider in `providers.json` under the Euler
+home: `$EULER_HOME/providers.json` when `EULER_HOME` is set, otherwise
+`~/.euler/providers.json`:
 
 ```json
 {
@@ -165,8 +166,9 @@ euler exec --provider local --model qwen3:32b --provenance ./run.jsonl "..."
 
 Rules, enforced at load with warnings for anything malformed:
 
-- `api_family` must be `openai_chat_completions` (the only family in this
-  release); `base_url` is required.
+- `api_family` is `openai_chat_completions` or `anthropic_messages`;
+  `base_url` is required. A model entry may set its own `api_family` to
+  override the provider's (see the gateway example below).
 - `http` URLs are accepted for loopback hosts only (`localhost`, `127.0.0.1`,
   `::1`); anything remote must be `https`.
 - An `Authorization: Bearer` header is sent only when `auth_header` is
@@ -184,6 +186,47 @@ Rules, enforced at load with warnings for anything malformed:
   passing an unlisted `--model`. A provider with neither field, or whose
   `models` is present but empty or not an array (even with `default_model`
   set), is ignored with a warning.
+
+### One gateway, two API families
+
+A gateway such as a LiteLLM proxy serves Claude models natively over
+Anthropic Messages (`POST /v1/messages`) and everything over OpenAI Chat
+Completions (`POST /v1/chat/completions`). Route Claude models to Messages so
+their signed thinking blocks are replayed across tool rounds:
+
+```json
+{
+  "version": 1,
+  "providers": {
+    "litellm": {
+      "api_family": "openai_chat_completions",
+      "base_url": "https://litellm.example.com/v1",
+      "auth_header": true,
+      "api_key": "$LITELLM_API_KEY",
+      "default_model": "claude-sonnet",
+      "models": [
+        { "id": "claude-sonnet", "api_family": "anthropic_messages",
+          "context_window_tokens": 1000000, "supports_tools": true, "supports_reasoning": true },
+        { "id": "gpt-large", "supports_tools": true, "supports_reasoning": true,
+          "compat": { "reasoning": { "request_format": "openai_reasoning_effort" } } }
+      ]
+    }
+  }
+}
+```
+
+Both families share `base_url`. Chat Completions appends `/chat/completions`.
+Messages appends `/messages` to a root ending in `/v1` and `/v1/messages` to
+any other root, so `https://litellm.example.com/v1` reaches both
+`/v1/chat/completions` and `/v1/messages`. A `base_url` that is already a full
+endpoint (ending in `/chat/completions` or `/messages`) serves only that
+family, so a model that overrides the family needs a root `base_url`.
+
+On a Messages model, `supports_reasoning: true` turns on adaptive thinking at
+the requested `--reasoning-effort`, the same mapping as the built-in
+`anthropic` provider. `compat` applies only to Chat Completions models. For
+Anthropic's own API, which expects `x-api-key` rather than a bearer token, use
+`"headers": { "x-api-key": "$ANTHROPIC_API_KEY" }` instead of `auth_header`.
 
 ## Detached launches
 
