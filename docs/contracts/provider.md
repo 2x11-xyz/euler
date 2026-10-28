@@ -205,25 +205,26 @@ holds no valid entries, or that omits `models` without a valid string
 
 ### API families and endpoints
 
-A provider's `api_family` is `openai_chat_completions` or
-`anthropic_messages`. A model entry may set its own `api_family`, which
-overrides the provider's for that model; an unlisted `--model` uses the
-provider's. A model entry whose `api_family` is unknown is ignored with a
-warning.
+A provider's `api_family` is `openai_chat_completions`,
+`anthropic_messages`, or `openai_responses`. A model entry may set its own
+`api_family`, which overrides the provider's for that model; an unlisted
+`--model` uses the provider's. A model entry whose `api_family` is unknown is
+ignored with a warning.
 
 Every family shares the provider's `base_url`, auth, and headers. Each family
 derives its endpoint from `base_url`:
 
 - `openai_chat_completions` appends `/chat/completions`;
 - `anthropic_messages` appends `/messages` when `base_url` ends in `/v1`, and
-  `/v1/messages` otherwise.
+  `/v1/messages` otherwise;
+- `openai_responses` appends `/responses`.
 
 A `base_url` that already ends with a family's path is that family's full
 endpoint and is used as is. A full endpoint serves only its own family: a
 provider whose own `api_family` the full endpoint cannot serve is ignored
 with a warning, and so is a model entry that overrides the provider's family
-to one the full endpoint cannot serve. So one `/v1` root serves both
-families, and a bare host root also serves Messages.
+to one the full endpoint cannot serve. So one `/v1` root serves every
+family, and a bare host root also serves Messages.
 
 `anthropic_messages` requests use the built-in Anthropic Messages adapter
 (request shape, `anthropic-version: 2023-06-01`, SSE parsing). Auth is the
@@ -238,7 +239,19 @@ model requests no thinking. When a request sets no `max_output_tokens`,
 Recorded thinking blocks are replayed with their signatures only to the same
 provider and model; reasoning recorded without a signature, or with a Chat
 Completions `reasoning_details` array in place of one, is not replayed. The
-same rule applies to the built-in `anthropic` provider. `compat`
-applies only to `openai_chat_completions`; on a Messages model it is ignored
-with a warning. As on the Chat Completions path, an HTTP rejection is
-classified by status and its body is not read.
+same rule applies to the built-in `anthropic` provider.
+
+`openai_responses` requests use the built-in ChatGPT Responses adapter
+(request shape with `store: false`, flat function tools, SSE parsing) without
+its ChatGPT-only headers or its check of the effort against the built-in
+catalog, so an effort the gateway rejects fails as a rejected request. Auth is
+the provider's. A model that declares `supports_reasoning: true` requests
+`reasoning: {effort, summary: "auto"}` with the same effort mapping as the
+built-in `chatgpt` provider; any other model sends no `reasoning` field. A
+request's `max_output_tokens` is sent as `max_output_tokens`. Errors read from
+the stream name the custom provider. As on the built-in `chatgpt` provider,
+recorded reasoning is not replayed on later turns.
+
+`compat` applies only to `openai_chat_completions`; on a Messages or
+Responses model it is ignored with a warning. On every family, an HTTP
+rejection is classified by status and its body is not read.

@@ -129,10 +129,10 @@ Facts are never silently lost; only bulky result content is demoted.
 
 ## Custom providers (local models)
 
-Any OpenAI-compatible chat-completions or Anthropic-compatible Messages
-endpoint can be registered as a provider in `providers.json` under the Euler
-home: `$EULER_HOME/providers.json` when `EULER_HOME` is set, otherwise
-`~/.euler/providers.json`:
+Any OpenAI-compatible Chat Completions or Responses endpoint, or
+Anthropic-compatible Messages endpoint, can be registered as a provider in
+`providers.json` under the Euler home: `$EULER_HOME/providers.json` when
+`EULER_HOME` is set, otherwise `~/.euler/providers.json`:
 
 ```json
 {
@@ -166,9 +166,9 @@ euler exec --provider local --model qwen3:32b --provenance ./run.jsonl "..."
 
 Rules, enforced at load with warnings for anything malformed:
 
-- `api_family` is `openai_chat_completions` or `anthropic_messages`;
-  `base_url` is required. A model entry may set its own `api_family` to
-  override the provider's (see the gateway example below).
+- `api_family` is `openai_chat_completions`, `anthropic_messages`, or
+  `openai_responses`; `base_url` is required. A model entry may set its own
+  `api_family` to override the provider's (see the gateway example below).
 - `http` URLs are accepted for loopback hosts only (`localhost`, `127.0.0.1`,
   `::1`); anything remote must be `https`.
 - An `Authorization: Bearer` header is sent only when `auth_header` is
@@ -187,12 +187,15 @@ Rules, enforced at load with warnings for anything malformed:
   `models` is present but empty or not an array (even with `default_model`
   set), is ignored with a warning.
 
-### One gateway, two API families
+### One gateway, several API families
 
 A gateway such as a LiteLLM proxy serves Claude models natively over
-Anthropic Messages (`POST /v1/messages`) and everything over OpenAI Chat
-Completions (`POST /v1/chat/completions`). Route Claude models to Messages so
-their signed thinking blocks are replayed across tool rounds:
+Anthropic Messages (`POST /v1/messages`), OpenAI models over Responses
+(`POST /v1/responses`), and everything over OpenAI Chat Completions
+(`POST /v1/chat/completions`). Route Claude models to Messages so their
+signed thinking blocks are replayed across tool rounds, and route
+Responses-native models (such as Codex models) to Responses so the gateway
+does not translate them to Chat Completions:
 
 ```json
 {
@@ -208,26 +211,34 @@ their signed thinking blocks are replayed across tool rounds:
         { "id": "claude-sonnet", "api_family": "anthropic_messages",
           "context_window_tokens": 1000000, "supports_tools": true, "supports_reasoning": true },
         { "id": "gpt-large", "supports_tools": true, "supports_reasoning": true,
-          "compat": { "reasoning": { "request_format": "openai_reasoning_effort" } } }
+          "compat": { "reasoning": { "request_format": "openai_reasoning_effort" } } },
+        { "id": "gpt-codex", "api_family": "openai_responses",
+          "supports_tools": true, "supports_reasoning": true }
       ]
     }
   }
 }
 ```
 
-Both families share `base_url`. Chat Completions appends `/chat/completions`.
-Messages appends `/messages` to a root ending in `/v1` and `/v1/messages` to
-any other root, so `https://litellm.example.com/v1` reaches both
-`/v1/chat/completions` and `/v1/messages`. A `base_url` that is already a full
-endpoint (ending in `/chat/completions` or `/messages`) serves only that
-family, so a model that overrides the family needs a root `base_url`.
+All families share `base_url`. Chat Completions appends `/chat/completions`
+and Responses appends `/responses`. Messages appends `/messages` to a root
+ending in `/v1` and `/v1/messages` to any other root, so
+`https://litellm.example.com/v1` reaches `/v1/chat/completions`,
+`/v1/responses`, and `/v1/messages`. A `base_url` that is already a full
+endpoint (ending in `/chat/completions`, `/responses`, or `/messages`) serves
+only that family, so a model that overrides the family needs a root
+`base_url`.
 
 On a Messages model, `supports_reasoning: true` turns on adaptive thinking at
 the requested `--reasoning-effort`, the same mapping as the built-in
 `anthropic` provider. Messages requires `max_tokens`. Without
 `--max-output-tokens`, Euler sends 32000, or the model entry's
 `max_output_tokens` when that is lower, so declare that field for a model
-with a lower output limit. `compat` applies only to Chat Completions models. For
+with a lower output limit. On a Responses model, `supports_reasoning: true`
+requests reasoning (with streamed summaries) at the requested
+`--reasoning-effort`; without it no reasoning field is sent. Recorded
+reasoning is not replayed on Responses models, as on the built-in `chatgpt`
+provider. `compat` applies only to Chat Completions models. For
 Anthropic's own API, which expects `x-api-key` rather than a bearer token, use
 `"headers": { "x-api-key": "$ANTHROPIC_API_KEY" }` instead of `auth_header`.
 

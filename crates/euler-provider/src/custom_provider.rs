@@ -109,6 +109,7 @@ impl CustomOpenAiProvider {
                 self.send_chat_completions(request, resolved, observer)
             }
             ApiFamily::AnthropicMessages => self.send_messages(request, resolved, observer),
+            ApiFamily::OpenAiResponses => self.send_responses(request, resolved, observer),
         }
     }
 
@@ -203,6 +204,49 @@ impl CustomOpenAiProvider {
             ))),
         }
     }
+
+    fn send_responses(
+        &self,
+        request: ModelRequest,
+        resolved: ResolvedHeaders,
+        observer: Option<ProviderTransportObserver>,
+    ) -> Result<ProviderStream, ProviderError> {
+        let reasoning = self
+            .config
+            .models
+            .get(&request.model)
+            .and_then(|model| model.supports_reasoning)
+            == Some(true);
+        let body = crate::chatgpt::responses_request_body(
+            &request,
+            &crate::chatgpt::ResponsesRoute {
+                reasoning,
+                send_max_output_tokens: true,
+            },
+        );
+        let endpoint = family_endpoint(&self.config.base_url, ApiFamily::OpenAiResponses)?;
+        let agent = observed_http_agent(observer.as_ref());
+        let mut call = agent
+            .post(&endpoint)
+            .set("Content-Type", "application/json")
+            .set("Accept", "text/event-stream");
+        for (name, value) in &resolved.headers {
+            call = call.set(name, value.expose());
+        }
+        match call.send_json(body) {
+            Ok(response) => Ok(crate::chatgpt::responses_stream(
+                &self.label,
+                TransportReader::new(response.into_reader(), observer),
+            )),
+            // As on the Chat Completions path, the rejection body is dropped
+            // unread.
+            Err(ureq::Error::Status(status, _)) => Err(classify_http_error(&self.label, status)),
+            Err(error) => Err(ProviderError::transport(scrub_secrets(
+                format!("{} request failed: {error}", self.label),
+                &resolved.secrets,
+            ))),
+        }
+    }
 }
 
 impl CustomOpenAiProvider {
@@ -252,10 +296,10 @@ struct ResolvedHeaders {
 
 /// Joins a family's endpoint path onto `base_url`. A `base_url` that already
 /// ends with the family's path is used as is. Chat Completions appends
-/// `/chat/completions` (the root conventionally ends in `/v1`). Messages
-/// appends `/messages` to a root ending in `/v1` and `/v1/messages` to any
-/// other root, so one `/v1` root serves both families and a bare host root
-/// also works for Messages.
+/// `/chat/completions` and Responses appends `/responses` (the root
+/// conventionally ends in `/v1`). Messages appends `/messages` to a root
+/// ending in `/v1` and `/v1/messages` to any other root, so one `/v1` root
+/// serves every family and a bare host root also works for Messages.
 fn family_endpoint(base_url: &str, api_family: ApiFamily) -> Result<String, ProviderError> {
     let mut url = Url::parse(base_url)
         .map_err(|_| ProviderError::transport("custom provider base_url is invalid"))?;

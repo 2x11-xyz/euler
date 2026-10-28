@@ -793,6 +793,182 @@ fn custom_provider_messages_stream_errors_include_custom_label() {
 }
 
 #[test]
+fn custom_provider_responses_endpoint_appends_responses_once() {
+    let responses =
+        |base_url| endpoint_for_test(base_url, ApiFamily::OpenAiResponses).expect("endpoint");
+    assert_eq!(
+        responses("https://proxy.example.test/v1"),
+        "https://proxy.example.test/v1/responses"
+    );
+    assert_eq!(
+        responses("https://proxy.example.test/v1/"),
+        "https://proxy.example.test/v1/responses"
+    );
+    assert_eq!(
+        responses("https://proxy.example.test/v1/responses"),
+        "https://proxy.example.test/v1/responses"
+    );
+    assert_eq!(
+        responses("https://proxy.example.test"),
+        "https://proxy.example.test/responses"
+    );
+}
+
+#[test]
+fn custom_provider_routes_responses_model_with_reasoning_and_tool_round() {
+    let (base_url, request_rx) = spawn_sse_server_with_sse(concat!(
+        "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Need the tool.\"}\n\n",
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"b.txt\\\"}\"}}\n\n",
+        "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":7,\"output_tokens_details\":{\"reasoning_tokens\":5}}}}\n\n",
+    ));
+    let provider = CustomOpenAiProvider::from_config(responses_model_config(&base_url))
+        .expect("custom provider");
+    let mut request = model_request("responses-model");
+    request.max_output_tokens = Some(2048);
+    request.tools = vec![ToolDefinition {
+        name: "read_file".to_owned(),
+        description: "Read a file".to_owned(),
+        parameters: json!({"type": "object"}),
+    }];
+    request.input.extend([
+        ModelInputItem::Reasoning {
+            provider: "local-openai".to_owned(),
+            model: "responses-model".to_owned(),
+            fidelity: crate::ReasoningFidelity::Summary,
+            content: "Need a.txt.".to_owned(),
+            artifact: None,
+        },
+        ModelInputItem::ToolCall {
+            call_id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: json!({"path": "a.txt"}),
+        },
+        ModelInputItem::ToolOutput {
+            call_id: "call_1".to_owned(),
+            name: "read_file".to_owned(),
+            ok: true,
+            output: Some("contents".to_owned()),
+            error: None,
+            exit_code: None,
+        },
+    ]);
+
+    let events = provider
+        .invoke(request)
+        .expect("invoke")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stream");
+
+    assert_eq!(
+        events[0],
+        ModelStreamEvent::ReasoningDelta(crate::ReasoningChunk::summary("Need the tool."))
+    );
+    assert!(matches!(
+        &events[1],
+        ModelStreamEvent::ToolCall(call) if call.id == "call_2" && call.input == json!({"path": "b.txt"})
+    ));
+    assert!(matches!(
+        &events[2],
+        ModelStreamEvent::Finished {
+            stop_reason: crate::StopReason::ToolUse,
+            usage: Some(_)
+        }
+    ));
+    let request = request_rx.recv().expect("server request");
+    assert!(request.starts_with("POST /v1/responses "), "{request}");
+    let lowercase = request.to_ascii_lowercase();
+    assert!(lowercase.contains("authorization: bearer literal-secret"));
+    assert!(!lowercase.contains("chatgpt-account-id"));
+    assert!(!lowercase.contains("originator"));
+    let body = request_json(&request);
+    assert_eq!(body["model"], "responses-model");
+    assert_eq!(body["instructions"], "be direct");
+    assert_eq!(
+        body["reasoning"],
+        json!({"effort": "medium", "summary": "auto"})
+    );
+    assert_eq!(body["max_output_tokens"], 2048);
+    assert_eq!(body["tools"][0]["name"], "read_file");
+    // Recorded reasoning is not replayed: the input is the message, the
+    // tool call, and its output.
+    assert_eq!(body["input"].as_array().map(Vec::len), Some(3));
+    assert_eq!(body["input"][1]["type"], "function_call");
+    assert_eq!(body["input"][2]["type"], "function_call_output");
+    assert_eq!(body["input"][2]["output"], "contents");
+}
+
+#[test]
+fn custom_provider_responses_model_without_declared_reasoning_omits_reasoning() {
+    let (base_url, request_rx) =
+        spawn_sse_server_with_sse("data: {\"type\":\"response.completed\"}\n\n");
+    let mut config = responses_model_config(&base_url);
+    if let Some(model) = config.models.get_mut("responses-model") {
+        model.supports_reasoning = None;
+    }
+    let provider = CustomOpenAiProvider::from_config(config).expect("custom provider");
+
+    provider
+        .invoke(model_request("responses-model"))
+        .expect("invoke")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stream");
+
+    let body = request_json(&request_rx.recv().expect("server request"));
+    assert_eq!(body.get("reasoning"), None);
+}
+
+#[test]
+fn custom_provider_responses_http_rejection_is_classified_without_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+    let address = listener.local_addr().expect("addr");
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let _ = read_http_request(&mut stream);
+        let body = "{\"error\":\"bad key literal-secret\"}";
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+    });
+    let provider =
+        CustomOpenAiProvider::from_config(responses_model_config(&format!("http://{address}/v1")))
+            .expect("custom provider");
+
+    let error = match provider.invoke(model_request("responses-model")) {
+        Ok(_) => panic!("HTTP 401 must fail the request"),
+        Err(error) => error,
+    };
+
+    assert_eq!(
+        error,
+        ProviderError::auth("custom provider `local-openai` credentials were rejected")
+    );
+}
+
+#[test]
+fn custom_provider_responses_stream_errors_include_custom_label() {
+    let (base_url, _request_rx) = spawn_sse_server_with_sse(
+        "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}\n\n",
+    );
+    let provider = CustomOpenAiProvider::from_config(responses_model_config(&base_url))
+        .expect("custom provider");
+
+    let error = provider
+        .invoke(model_request("responses-model"))
+        .expect("invoke")
+        .find_map(Result::err)
+        .expect("failed response");
+
+    assert_eq!(
+        error,
+        ProviderError::rate_limit("custom provider `local-openai` response failed: rate limit")
+    );
+}
+
+#[test]
 fn custom_provider_stream_errors_include_custom_label() {
     let events = crate::chat_completions::parse_conformance_sse(
         "custom provider `local-openai`",
@@ -1033,6 +1209,26 @@ fn messages_model_config(base_url: &str) -> CustomProviderConfig {
             id: "messages-model".to_owned(),
             display_name: "messages-model".to_owned(),
             api_family: ApiFamily::AnthropicMessages,
+            context_window_tokens: None,
+            max_output_tokens: None,
+            supports_tools: Some(true),
+            supports_reasoning: Some(true),
+            compat: None,
+        },
+    );
+    config
+}
+
+/// A Chat Completions provider whose `responses-model` entry overrides its
+/// family to OpenAI Responses.
+fn responses_model_config(base_url: &str) -> CustomProviderConfig {
+    let mut config = custom_config(base_url, Some("literal-secret"), []);
+    config.models.insert(
+        "responses-model".to_owned(),
+        CustomModelConfig {
+            id: "responses-model".to_owned(),
+            display_name: "responses-model".to_owned(),
+            api_family: ApiFamily::OpenAiResponses,
             context_window_tokens: None,
             max_output_tokens: None,
             supports_tools: Some(true),

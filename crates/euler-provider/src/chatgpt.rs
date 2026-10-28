@@ -11,7 +11,7 @@ pub use crate::chatgpt_device::{
 
 use crate::auth::{AuthFile, ChatGptCredentials};
 use crate::chatgpt_websocket::{self, ConnectError};
-use crate::sse::SseParser;
+use crate::sse::{SseParser, CHATGPT_LABEL};
 use crate::{
     observed_http_agent, ModelInputItem, ModelProvider, ModelRequest, ModelStreamEvent,
     ProviderError, ProviderStream, ProviderTransportObserver, ToolDefinition, TransportReader,
@@ -179,10 +179,10 @@ impl ChatGptProvider {
             }
         };
 
-        Ok(Box::new(ChatGptStream::new(TransportReader::new(
-            response.into_reader(),
-            observer,
-        ))))
+        Ok(responses_stream(
+            CHATGPT_LABEL,
+            TransportReader::new(response.into_reader(), observer),
+        ))
     }
 }
 
@@ -270,22 +270,52 @@ impl ChatGptRequestCredentials {
 }
 
 fn request_body(request: &ModelRequest) -> Value {
+    // The ChatGPT subscription endpoint rejects the Responses API
+    // `max_output_tokens` field with HTTP 400. Euler still accounts for the
+    // requested cap and enforces companion output budgets after the call.
+    responses_request_body(
+        request,
+        &ResponsesRoute {
+            reasoning: true,
+            send_max_output_tokens: false,
+        },
+    )
+}
+
+/// The provider-specific inputs to a Responses API request, so a custom
+/// provider can reuse this adapter.
+pub(crate) struct ResponsesRoute {
+    /// Whether to request reasoning at the request's effort. A model without
+    /// reasoning support rejects the `reasoning` field.
+    pub(crate) reasoning: bool,
+    /// Whether a requested `max_output_tokens` cap goes on the wire.
+    pub(crate) send_max_output_tokens: bool,
+}
+
+pub(crate) fn responses_request_body(request: &ModelRequest, route: &ResponsesRoute) -> Value {
     let mut body = json!({
         "model": request.model,
         "instructions": request.instructions,
         "input": request.input.iter().filter_map(input_item).collect::<Vec<_>>(),
         "stream": true,
         "store": false,
+    });
+    if route.reasoning {
         // `summary: auto` makes the Responses API stream
         // `response.reasoning_summary*.delta` events during the reasoning
         // phase. Without it a long silent think produces zero semantic
         // events, the semantic-idle liveness deadline fires, and the round
         // is abandoned even though the provider was working.
-        "reasoning": {
+        body["reasoning"] = json!({
             "effort": request.reasoning_effort.compat_level(),
             "summary": "auto",
-        },
-    });
+        });
+    }
+    if route.send_max_output_tokens {
+        if let Some(max_output_tokens) = request.max_output_tokens {
+            body["max_output_tokens"] = json!(max_output_tokens);
+        }
+    }
     if !request.tools.is_empty() {
         body["tools"] = json!(request
             .tools
@@ -294,9 +324,6 @@ fn request_body(request: &ModelRequest) -> Value {
             .collect::<Vec<_>>());
         body["tool_choice"] = json!("auto");
     }
-    // The ChatGPT subscription endpoint rejects the Responses API
-    // `max_output_tokens` field with HTTP 400. Euler still accounts for the
-    // requested cap and enforces companion output budgets after the call.
     body
 }
 
@@ -383,17 +410,25 @@ pub(crate) fn scrub_error_message(
 }
 
 struct ChatGptStream {
+    label: String,
     reader: Box<dyn Read + Send>,
     parser: SseParser,
     queued: std::vec::IntoIter<Result<ModelStreamEvent, ProviderError>>,
     done: bool,
 }
 
+/// Wraps a Responses API SSE response body as a model event stream whose
+/// errors name `label` (for example "ChatGPT" or a custom provider label).
+pub(crate) fn responses_stream(label: &str, reader: impl Read + Send + 'static) -> ProviderStream {
+    Box::new(ChatGptStream::new(label, reader))
+}
+
 impl ChatGptStream {
-    fn new(reader: impl Read + Send + 'static) -> Self {
+    fn new(label: &str, reader: impl Read + Send + 'static) -> Self {
         Self {
+            label: label.to_owned(),
             reader: Box::new(reader),
-            parser: SseParser::new(),
+            parser: SseParser::with_label(label),
             queued: Vec::new().into_iter(),
             done: false,
         }
@@ -423,9 +458,10 @@ impl Iterator for ChatGptStream {
                 }
                 Err(_) => {
                     self.done = true;
-                    return Some(Err(ProviderError::transport(
-                        "ChatGPT provider stream read failed",
-                    )));
+                    return Some(Err(ProviderError::transport(format!(
+                        "{} provider stream read failed",
+                        self.label
+                    ))));
                 }
             }
         }
