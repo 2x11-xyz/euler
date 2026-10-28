@@ -39,6 +39,7 @@ pub enum DecidedRunOutcome {
     Completed,
     Cancelled,
     ProviderError,
+    SessionError,
     GuardianInterrupt,
     ToolRoundsLimit,
 }
@@ -49,6 +50,7 @@ impl DecidedRunOutcome {
             Self::Completed => "had already finished",
             Self::Cancelled => "had already been cancelled",
             Self::ProviderError => "had already failed with a provider error",
+            Self::SessionError => "had already failed",
             Self::GuardianInterrupt => "had already been stopped by the guardian",
             Self::ToolRoundsLimit => "had already reached its tool-round limit",
         }
@@ -321,6 +323,19 @@ fn decided_outcome(driver_work: &[&EventEnvelope]) -> Option<DecidedRunOutcome> 
             EventKind::ERROR if text("source") == Some("provider") => {
                 Some(DecidedRunOutcome::ProviderError)
             }
+            // The driver records a session error just before it fails the
+            // run. A resume's unknown-outcome model closure uses the same
+            // source and leaves the run continuable.
+            EventKind::ERROR
+                if text("source") == Some("session")
+                    && event
+                        .payload
+                        .get("recovery_closure")
+                        .and_then(Value::as_bool)
+                        != Some(true) =>
+            {
+                Some(DecidedRunOutcome::SessionError)
+            }
             EventKind::ERROR
                 if text("source") == Some("guardian")
                     && text("message") == Some(GUARDIAN_TURN_INTERRUPT_MESSAGE) =>
@@ -571,6 +586,11 @@ mod tests {
                 DecidedRunOutcome::ProviderError,
             ),
             (
+                serde_json::json!({"source": "session", "message": "context budget exhausted"}),
+                EventKind::ERROR,
+                DecidedRunOutcome::SessionError,
+            ),
+            (
                 serde_json::json!({"source": "guardian", "message": GUARDIAN_TURN_INTERRUPT_MESSAGE}),
                 EventKind::ERROR,
                 DecidedRunOutcome::GuardianInterrupt,
@@ -598,7 +618,86 @@ mod tests {
     }
 
     #[test]
-    fn a_final_answer_followed_by_steering_is_still_in_flight() {
+    fn a_session_error_after_a_settled_tool_batch_refuses_continuation() {
+        // `prepare_model_request` records the error before any `model.call`,
+        // so the run would otherwise read as a settled batch in flight.
+        let (_, events) = settled_run_then(vec![
+            model_call(""),
+            model_result("", serde_json::json!([{"id": "c1", "name": "read_file"}])),
+            root_event(
+                EventKind::TOOL_CALL,
+                "",
+                serde_json::json!({"id": "c1", "name": "read_file", "input": {}}),
+            ),
+            root_event(
+                EventKind::TOOL_RESULT,
+                "",
+                serde_json::json!({"id": "c1", "name": "read_file", "ok": true, "output": "x"}),
+            ),
+            root_event(
+                EventKind::ERROR,
+                "",
+                serde_json::json!({"source": "session", "message": "context budget exhausted"}),
+            ),
+        ]);
+
+        let refused = outcome_of(&events).expect_err("refused");
+
+        assert!(
+            matches!(
+                refused,
+                ResumeError::ContinuationRefused(ContinuationRefusal::DecidedOutcome {
+                    outcome: DecidedRunOutcome::SessionError,
+                    ..
+                })
+            ),
+            "{refused}"
+        );
+    }
+
+    #[test]
+    fn an_older_unmatched_tool_call_that_resume_cannot_close_refuses_continuation() {
+        // Resume closes only the tail call outside an interrupted batch, so
+        // `c1` stays unmatched after the closures and nothing is appended.
+        let (run_id, events) = settled_run_then(vec![
+            model_call(""),
+            model_result("", serde_json::json!([{"id": "c1", "name": "read_file"}])),
+            root_event(
+                EventKind::TOOL_CALL,
+                "",
+                serde_json::json!({"id": "c1", "name": "read_file", "input": {}}),
+            ),
+            model_call(""),
+            model_result("", serde_json::json!([{"id": "c2", "name": "read_file"}])),
+            root_event(
+                EventKind::TOOL_CALL,
+                "",
+                serde_json::json!({"id": "c2", "name": "read_file", "input": {}}),
+            ),
+            root_event(
+                EventKind::TOOL_RESULT,
+                "",
+                serde_json::json!({"id": "c2", "name": "read_file", "ok": true, "output": "x"}),
+            ),
+        ]);
+        let lifecycle = fold_run_lifecycle(&events).expect("lifecycle");
+
+        let refused = plan_run_continuation(&events, &lifecycle, false).expect_err("refused");
+
+        let ResumeError::ContinuationRefused(refusal) = refused else {
+            panic!("expected a continuation refusal, got {refused}");
+        };
+        assert_eq!(
+            refusal,
+            ContinuationRefusal::UnclosedToolCall {
+                run_id,
+                call_id: "c1".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_final_answer_followed_by_steering_is_not_a_decided_outcome() {
         let (_, events) = settled_run_then(vec![
             model_call(""),
             model_result("", serde_json::json!([])),

@@ -3,7 +3,7 @@
 //! is the accepted prefix a crash leaves behind.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -90,16 +90,34 @@ fn continue_with_open_stdin(workspace: &Workspace) -> Output {
         .spawn()
         .expect("spawn euler");
     let stdin = child.stdin.take().expect("stdin");
+    // Drain output while polling so a full pipe cannot pass for a stdin read.
+    let stdout = drain(child.stdout.take().expect("stdout"));
+    let stderr = drain(child.stderr.take().expect("stderr"));
     let deadline = Instant::now() + Duration::from_secs(60);
-    while child.try_wait().expect("poll euler").is_none() {
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll euler") {
+            break status;
+        }
         if Instant::now() > deadline {
             child.kill().expect("kill euler");
             panic!("euler exec --continue blocked on stdin");
         }
         std::thread::sleep(Duration::from_millis(20));
-    }
+    };
     drop(stdin);
-    child.wait_with_output().expect("wait euler")
+    Output {
+        status,
+        stdout: stdout.join().expect("stdout reader"),
+        stderr: stderr.join().expect("stderr reader"),
+    }
+}
+
+fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).expect("read euler output");
+        bytes
+    })
 }
 
 fn log_arg(workspace: &Workspace) -> &str {

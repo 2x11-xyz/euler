@@ -184,8 +184,9 @@ applicable, then `user.message`). Run termination owns one exact atomic batch
 terminal batch remains outside the accepted live bus even if its complete bytes
 are visible on disk, and becomes live exactly once only after exact retry
 confirms durability. Replay likewise leaves every crash-prefix `run_*`
-`queue.cancelled` row inert until a matching `run.terminal` completes the
-logical batch; a later complete retry supersedes those physical fragments.
+`queue.cancelled` row inert until a matching `run.terminal` or
+`run.continued` completes the logical batch; a later complete retry supersedes
+those physical fragments.
 The terminal cutoff closes steering and samples the already-classified enqueue
 generation under the queue lock. Earlier generations settle first; the
 terminal batch then owns the writer before any later follow-up enqueue. The
@@ -361,7 +362,8 @@ recovery pass idempotent.
 (ADR 0023). It takes no prompt and never reads stdin. The run must be cleanly
 admitted, must have no partial terminal batch, must show no outcome the live
 session had already decided (a `cancelled: true` model error or tool result, a
-provider model error, the guardian turn interrupt, the tool-rounds-limit
+provider model error, a root `source: "session"` error that is not a resume
+`recovery_closure`, the guardian turn interrupt, the tool-rounds-limit
 message, or a `model.result` requesting no tools without a later steering
 `user.message`), and its root work must be visibly in flight (an unresolved
 `model.call`, an unmatched `tool.call`, or a settled tool batch, steering
