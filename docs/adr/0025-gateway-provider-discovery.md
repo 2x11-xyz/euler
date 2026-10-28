@@ -16,7 +16,9 @@ per-model `api_family` override and its base-URL rule
 (`core/providers-optional-models`), and `providers.json` under `EULER_HOME`
 (`core/providers-euler-home`). This ADR emits the shapes those changes
 define; it does not define them. No contract changes until the rollout PRs
-land.
+land. If no per-model `api_family` override lands, the extension
+contributes one provider per family (for example `litellm` and
+`litellm_messages`), which the A1 id rule already allows.
 
 ## Context
 
@@ -47,7 +49,8 @@ Distribution is simpler than it first appears. Python extensions in
 euler-extensions run `python3` against the SDK checked into that repository,
 with no build step. Today `euler extension install` records an inert entry
 that `enable` refuses (the install consent flow and git sources are
-unimplemented; the link lane is complete), so the working path is `git clone`, `euler extension link <dir> --scope user`, and
+unimplemented; the link lane is complete), so the working path is
+`git clone`, `euler extension link <dir> --scope user`, and
 `euler extension enable`. No Rust toolchain is needed; managed-process
 extensions run only on Unix hosts.
 
@@ -60,14 +63,23 @@ carry the key as `Authorization: Bearer`.
 1. **Discover.**
    - `GET <root>/model/info`. A 200 with at least one row is the source. A
      wildcard route (a `model_name` containing `*`) expands to the concrete
-     `GET <root>/v1/models` ids it matches, each inheriting the row's
-     metadata; an explicit row wins, unmatched ids are not added, and a
-     failed expansion fails discovery.
+     `GET <root>/v1/models` ids it matches, each inheriting the metadata of
+     the most specific matching wildcard row (LiteLLM's pattern order, as
+     pi does); an explicit row wins and unmatched ids are not added. A
+     failed expansion fails discovery, a deliberate choice stricter than
+     pi's (which keeps the explicit rows), matching "a failed discovery
+     writes nothing".
    - On 401, 403, 404, or an empty list: `GET <root>/v1/models`. An empty
      list ends the chain.
    - On 401, 403, or 404 from that: `GET <root>/health` with a longer
-     deadline, taking the route names of healthy endpoints. It makes LiteLLM
-     probe every deployment, so it is the last resort.
+     deadline. It reports backend `litellm_params.model` values, not public
+     route names, so, as pi does, each healthy endpoint's `model_id` is
+     correlated through `GET <root>/model/info?litellm_model_id=<id>`
+     (bounded concurrency) to its public `model_name`; the health value is
+     the fallback when that lookup fails, and it may not be an addressable
+     route. Proxies that refused the list often refuse the lookup too. It
+     makes LiteLLM probe every
+     deployment, so it is the last resort.
    - Any other status, a redirect (never followed), a timeout, a malformed
      body, or zero usable models fails discovery with the endpoint and
      status named, and changes nothing. If every step answered 401 or 403,
@@ -81,13 +93,15 @@ carry the key as `Authorization: Bearer`.
    `supports_reasoning` are true only when every deployment says so; a field
    missing anywhere is omitted. Chat-completions models that support
    reasoning get `compat.reasoning.request_format:
-   "openai_reasoning_effort"`. Ids from `/v1/models` or `/health` carry no
-   claims, the treatment an unlisted model gets today.
+   "openai_reasoning_effort"`. Ids from `/v1/models`, and `/health` ids
+   without correlated detail, carry no claims, the treatment an unlisted
+   model gets today.
 3. **Route** each deployment, keeping a family only when all deployments of
    the route agree:
    - `anthropic_messages` when `litellm_provider` is `anthropic`, `mode` is
-     `chat`, and `supported_endpoints` is null or lists `/v1/messages`. This
-     path replays Claude thinking blocks, which chat completions drops.
+     `chat`, and `supported_endpoints` is null or lists `/v1/messages`
+     (proposed, Q9). This path replays Claude thinking blocks, which chat
+     completions drops.
    - `openai_responses` when `mode` is `responses` (proposed, Q9).
    - `openai_chat_completions` otherwise, including disagreeing routes,
      which are listed.
@@ -96,8 +110,13 @@ carry the key as `Authorization: Bearer`.
    `<root>/v1`, through the per-model base-URL rule.
 
 Not ported: models.dev enrichment, pi's catalog lookups, vendor quirks
-(Moonshot, Azure version gating), prices, budgets, MCP, the Skills Gateway,
-image models, and SSO login.
+(Moonshot, Azure version gating, `dropToolReasoning`), prices, budgets, MCP,
+the Skills Gateway, image models, SSO login, the gcloud ADC token source,
+`LITELLM_HEADERS`, `LITELLM_DISCOVERY_TIMEOUT_MS`, and pi's wider routing:
+Claude behind Bedrock or Vertex adapters and OpenAI-family models without
+endpoint evidence route to chat completions in v1 (proposed, Q9). Pi's
+multi-proxy `LITELLM_PROVIDERS` and `LITELLM_PROVIDER_<NAME>_*` map to the
+`provider` input and `<extension-id>_*` ids (A7).
 
 ## Option A: a `litellm` extension contributing provider configuration
 
@@ -107,10 +126,15 @@ Onboarding:
 git clone https://github.com/2x11-xyz/euler-extensions
 euler extension link euler-extensions/extensions/litellm --scope user
 euler extension enable litellm
-export LITELLM_BASE_URL=https://litellm.example.com   # pi users: already set
+export LITELLM_BASE_URL=https://litellm.example.com   # pi env-var users: already set
 export LITELLM_API_KEY=...                            # or: euler login --provider litellm
-euler extension run litellm.sync                      # or /litellm.sync in the TUI
+euler extension run litellm.sync                      # or /sync in the TUI
 ```
+
+Pi `/login` users keep the base URL and key in pi's credential file, not in
+the shell: they pass `base_url` and an `api_key` `!command` spec that reads
+pi's stored key as `litellm.sync` input, or run
+`euler login --provider litellm`.
 
 Euler core adds six product-neutral pieces (A1 to A6); the extension (A7)
 holds every LiteLLM noun.
@@ -120,8 +144,9 @@ holds every LiteLLM noun.
 An enabled extension may contribute one document with exactly the
 `providers.json` schema, stored by the host at
 `<euler home>/extensions/<id>/providers.json` (owner-only, temp file and
-rename, the config documents' symlink and file-type rules, machine-managed). The host derives `<id>` from the calling command,
-as for ADR 0022 config documents. Contributed models name a core
+rename, the config documents' symlink and file-type rules,
+machine-managed). The host derives `<id>` from the calling command, as for
+ADR 0022 config documents. Contributed models name a core
 `api_family`; a contribution cannot add transport. Provider ids must equal
 the extension id or start with `<extension-id>_`; extension ids cannot
 contain `_`, so contributions never collide (proposed, Q2).
@@ -137,8 +162,9 @@ changed.
 
 The write runs `ProviderConfigRegistry::with_json` strictly: any validation
 warning refuses the whole write, including an unknown `api_family`. Added
-rules: the id rule, a 256 KiB cap (about a thousand models), and secrets only as `$NAME` or `!command`
-specs or the host credential (A3); literals are refused (proposed, Q3). At
+rules: the id rule, a 256 KiB cap (about a thousand models), and secrets
+only as `$NAME` or `!command` specs or the host credential (A3); literals
+are refused (proposed, Q3). At
 load the same parser runs leniently, like `providers.json`.
 
 Precedence (proposed, Q2): built-in ids stay reserved; on an id collision
@@ -146,7 +172,10 @@ the user's `providers.json` entry wins whole, with a warning naming both
 files; contributions load only while their extension is enabled, and a
 session that selects or resumes a provider whose extension is disabled fails
 with an error naming the extension. Contributions load at startup with
-`providers.json`; no extension code runs then.
+`providers.json`; no extension code runs then. A user who already
+hand-wrote a `litellm` provider in `providers.json` shadows the whole
+contribution, so sync reports the shadowing and tells the user to remove
+or rename the hand-written entry.
 
 ### A3. Host-owned credential for custom providers
 
@@ -162,23 +191,30 @@ secret. The login works before the provider exists, so a user can log in and
 then sync. It is a new prompt, but only inside a command the user runs to
 enter a key, and it stays a plain owner-only file, not the vault the secrets
 contract rules out; that contract's auth-file section widens from
-subscription tokens to custom-provider keys. It serves hand-written `providers.json` providers too.
+subscription tokens to custom-provider keys. It serves hand-written
+`providers.json` providers too.
 
 ### A4. Network: `HostApi::http_get`
 
 The `network` capability gains a host primitive (proposed, Q5). GET only;
 `https`, or `http` to a loopback host; redirects not followed; body capped
 at 4 MiB and passed through the redactor (a session-less run builds one with
-the same seeding a session uses); 30-second deadline, up to 120 on request. Auth headers are never values the extension holds: a header
-is `{"secret": "<spec>", "prefix": "Bearer "}` or
-`{"credential": "<provider-id>", "prefix": "Bearer "}` for a provider the
-extension owns, and the host resolves it. Secret headers bind to one origin
-(scheme, host, port) per invocation; a credential header also goes only to
-the origin of that provider's current base URL once a contribution exists.
-The host adds the origin to the command output.
+the same seeding a session uses); 30-second deadline, up to 120 on request.
+Auth headers are never values the extension holds: a header is
+`{"secret": "<spec>", "prefix": "Bearer "}` or
+`{"credential": "<provider-id>", "prefix": "Bearer "}` for a provider id the
+extension may contribute (A1), and the host resolves it. Both kinds bind to
+one origin (scheme, host, port) per invocation, which on a first sync is the
+base URL being synced; once a contribution exists, a credential header also
+goes only to the origin of that provider's current base URL. The host adds
+the origin to the command output.
 `secret-resolve` is required for secret headers. Human-invoked `user`
-commands only. In a session, calls are recorded content-free in
-diagnostics.
+commands only. Calls are recorded content-free in the session's
+diagnostics or, session-less, in the run log (A6). Host-resolved specs keep
+keys out of extension memory, output, and redaction gaps by discipline and
+audit; per the capability contract's trust model this is not containment
+of a hostile extension, which can read the user's credential files
+directly.
 
 ### A5. Declared environment passthrough
 
@@ -201,10 +237,20 @@ Without it, the host runs the command with no session: session-scoped host
 APIs (provenance, artifacts, extension state, context slots, plan
 presentation, agent spawn and record, diagnostics) fail with an error naming
 the capability. User-tier config, `http_get`, and contribution writes work.
-Such a run has no event log: its record is the command output (with the
-spec and origin echoes) and the contribution, whose digest `provider_source`
-captures when the provider is used. A command whose declared
-capabilities all need a session is refused before launch.
+A command whose declared capabilities all need a session is refused before
+launch.
+
+Approval is unchanged: `euler extension run` already grants an explicitly
+named command its declared capabilities for that run with a stderr notice,
+the piped-run rule in the capability contract, so no new prompt is added.
+The contract makes the `static-grant` and `permission.decision` records
+mandatory, and today they go to the session's event log. Session-less, the
+host writes them to a host-owned run log, one events file per run under
+`<euler home>/extension-runs/` (created on first use, owner-only, same
+envelope), together with
+the content-free `http_get` records and the contribution digest; the
+command output carries the spec and origin echoes and names the log
+(proposed, Q13). A failed append fails the run, as in a session.
 
 ### A7. The `litellm` extension
 
@@ -217,15 +263,20 @@ so nothing enters the prompt.
   (`base_url`, `api_key` spec, `provider`, `default_model`, `dry_run`) is
   stored in the extension's user config and wins over the environment.
   - Base URL: input, else `LITELLM_BASE_URL`, else an error naming both.
-  - Key, in pi's order: the input spec; else `!eval "$LITELLM_API_KEY_HELPER"`
-    when that variable is set (the host's shell expands it at request time);
-    else `$LITELLM_API_KEY` when set; else the host credential. An
+  - Key, in pi's order (a stored key wins over the environment): the input
+    spec; else the host credential when `euler login` stored one (the host
+    reports only whether it exists); else
+    `!eval "$LITELLM_API_KEY_HELPER"` when that variable is set (the host's
+    shell expands it at request time); else `$LITELLM_API_KEY` when set. An
     unresolved key fails with an error naming all the ways to provide one.
   - Runs the dialect through `http_get`, writes the contribution, and
     reports the source, counts per family, ids added and removed, and any
     shadowing. A failed or empty discovery writes nothing. `dry_run` writes
-    nothing.
-- `litellm.status`, offline: settings, key source kind, last sync time and
+    nothing. Run as `/sync` in the TUI, it says the change applies to
+    sessions started afterwards, since contributions load at startup
+    (proposed, Q7).
+- `litellm.status` (`/litellm.status` in the TUI, since core owns
+  `/status`), offline: settings, key source kind, last sync time and
   source, counts per family, and whether the contribution is active,
   shadowed, or invalid.
 
@@ -242,7 +293,13 @@ with the proxy's error.
 ### A9. Recording
 
 Selecting a contributed provider records `provider_source`: the extension
-id and the SHA-256 of the document (proposed, Q10).
+id and the SHA-256 of the document (proposed, Q10). It is an additive
+optional field on `session.start`, `model.switched`, and `session.resumed`,
+which the events contract allows without a version bump. A resume after a
+re-sync changed the digest proceeds against the current contribution,
+records the new digest, and reports the change; a model the re-sync
+removed gets the unlisted-model treatment and fails with the proxy's error
+if the proxy dropped it.
 
 ## Option B (fallback): a discovery setting in `providers.json`
 
@@ -269,8 +326,10 @@ cache; after a key change the list may be stale until the next refresh.
 refreshes in the background when the cache is missing or older than 24
 hours, only for keys that need no shell command. Headless runs never fetch.
 The `litellm` dialect puts one product's nouns in core, so it is a boundary
-exception (invariant: zero-install adoption; reason: no build-free extension
-install; exit: move to Option A). It needs only A3 from the list above, and
+exception (invariant: zero-install adoption; reason: no one-command
+extension install, because install consent and git sources are
+unimplemented, so setup needs a clone and a link; exit: move to Option A
+once install from a git source works). It needs only A3 from the list above, and
 no extension.
 
 ## Comparison
@@ -303,7 +362,8 @@ no extension.
 
 ## Rollout
 
-- **Option A:** Euler A3 and A6 first (useful on their own), then A1, A2,
+- **Option A:** Euler A3 and A6 first (useful on their own) with
+  `secrets.md`, `capabilities.md`, and `extension-sdk.md`, then A1, A2,
   A4, A5, and A9 with `extension-sdk.md`, `capabilities.md`, `secrets.md`,
   `provider.md`, and `events.md`; then the `litellm` extension with the MIT
   notice, fixture tests from recorded `/model/info`, `/v1/models`, and
@@ -342,14 +402,23 @@ no extension.
    `LITELLM_BASE_URL`, `LITELLM_API_KEY`, and `LITELLM_API_KEY_HELPER` work
    unchanged.
 7. Refresh only through `litellm.sync` in v1, deferring a startup refresh
-   hook? **Proposed: yes.** Proxy model lists change rarely, and a startup
-   hook needs standing network and secret authority without a prompt.
+   hook, with a sync applying to sessions started afterwards? **Proposed:
+   yes.** Proxy model lists change rarely, and a startup hook needs
+   standing network and secret authority without a prompt.
 8. Make the session optional in `euler extension run`, with session-scoped
    APIs failing clearly? **Proposed: yes.**
-9. Route to Responses only on `mode: responses`, not whenever
-   `supported_endpoints` lists `/v1/responses` (pi's wider rule)?
-   **Proposed: yes** for v1; revisit after the `openai_responses` live
-   checks.
+9. Route narrower than pi in v1? Pi routes to Responses on
+   `mode: responses`, when `supported_endpoints` lists `/v1/responses`, and
+   for any OpenAI-family deployment without endpoint evidence that is not
+   behind an Azure adapter (LiteLLM's Responses bridge), because GPT-5.5
+   and later reject `reasoning_effort` with tools on chat completions. Pi
+   also routes Claude to Messages behind `bedrock`, `bedrock_converse`,
+   `vertex_ai`, and `vertex_ai-anthropic_models`, not only `anthropic`.
+   **Proposed: yes**, Responses only on `mode: responses` and Messages only
+   for `litellm_provider: anthropic`: a live check against a LiteLLM proxy
+   passed GPT tool rounds on chat completions with a reasoning effort set,
+   so the GPT-5.5 quirk does not bite on every proxy. Revisit both
+   after the `openai_responses` and `anthropic_messages` live checks.
 10. Record `provider_source` when a contributed provider is selected?
     **Proposed: yes.**
 11. Accept the new block: model tools and lifecycle hooks cannot write
@@ -358,3 +427,10 @@ no extension.
 12. If Option B is chosen: the `litellm` dialect as a documented boundary
     exception, automatic refresh only for non-shell keys, and whole
     replacement by user `models` entries? **Proposed: yes.**
+13. Where does a session-less `euler extension run` record its mandatory
+    capability decisions? **Proposed: a host-owned run log**, one events
+    file per run under `<euler home>/extension-runs/`, keeping the
+    capability contract's provenance rule unchanged. The alternative is an
+    amendment to `capabilities.md` letting session-less user runs record
+    decisions only in command output, which is simpler but leaves no
+    durable audit trail.
