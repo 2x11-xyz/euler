@@ -714,6 +714,76 @@ fn interrupted_tool_tail_resume_equivalence_uses_canonical_closure() {
     );
 }
 
+/// ADR 0023 step 2 on a live driver log: every unmatched call of an
+/// interrupted multi-call root batch gets a closure, and only the first
+/// unmatched call can have started.
+#[test]
+fn interrupted_multi_call_batch_resume_closes_every_unmatched_call() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let baseline = temp.path().join("batch-baseline");
+    write_fixture_file(&baseline, "note.txt", "alpha\n");
+    let baseline_log = baseline.join("events.jsonl");
+    let read = |id: &str| ToolCall {
+        id: id.to_owned(),
+        name: "read_file".to_owned(),
+        input: json!({"path": "note.txt"}),
+    };
+    run_fresh_session(
+        &baseline,
+        &baseline_log,
+        RunPlan {
+            provider_plan: ProviderPlan::Fixture(vec![
+                FixtureResponse::ToolCalls(vec![read("call-a"), read("call-b"), read("call-c")]),
+                FixtureResponse::Assistant("read all".to_owned()),
+            ]),
+            decisions: vec![],
+            steps: vec![Step::Turn("read three times")],
+        },
+    );
+    let baseline_events = read_resume_prefix(&baseline_log).expect("baseline read");
+    let resume_cut = |name: &str, cut: usize| {
+        let resumed = temp.path().join(name);
+        write_fixture_file(&resumed, "note.txt", "alpha\n");
+        let resumed_log = resumed.join("events.jsonl");
+        copy_log_prefix(&baseline_log, &resumed_log, cut + 1);
+        run_resumed_session(
+            &resumed,
+            &resumed_log,
+            RunPlan {
+                provider_plan: ProviderPlan::Fixture(vec![]),
+                decisions: vec![],
+                steps: vec![],
+            },
+        );
+        let resumed_events = read_resume_prefix(&resumed_log).expect("resumed read");
+        assert_equivalent_projections(name, &baseline_events[..=cut], &resumed_events[..=cut]);
+        resumed_events
+    };
+    let call =
+        |id: &str| &baseline_events[find_tool_event(&baseline_events, EventKind::TOOL_CALL, id)];
+    let never_started = "interrupted before execution (an earlier call in the same batch had not \
+                         finished); the tool did not run";
+    let side_effects =
+        "execution and/or result persistence was interrupted, and side effects may have occurred";
+
+    // Crash during the first call: the whole batch is recorded, no result.
+    let cut = find_tool_event(&baseline_events, EventKind::TOOL_CALL, "call-c");
+    let events = resume_cut("crash-during-first-call", cut);
+    assert_recovery_closure(&events[cut + 1], call("call-a"), side_effects);
+    assert_recovery_closure(&events[cut + 2], call("call-b"), never_started);
+    assert_recovery_closure(&events[cut + 3], call("call-c"), never_started);
+    assert_run_recovery_terminal(&events[cut + 4], &events[cut + 3], call("call-a"));
+    assert_eq!(non_lifecycle_recovery_closure_count(&events), 3);
+
+    // Crash after the first result: the next call is the executing one.
+    let cut = find_tool_event(&baseline_events, EventKind::TOOL_RESULT, "call-a");
+    let events = resume_cut("crash-after-a-result", cut);
+    assert_recovery_closure(&events[cut + 1], call("call-b"), side_effects);
+    assert_recovery_closure(&events[cut + 2], call("call-c"), never_started);
+    assert_run_recovery_terminal(&events[cut + 3], &events[cut + 2], call("call-a"));
+    assert_eq!(non_lifecycle_recovery_closure_count(&events), 2);
+}
+
 #[test]
 fn interrupted_model_tail_resume_idle_equivalence() {
     let temp = tempfile::tempdir().expect("temp dir");
