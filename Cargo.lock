@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "euler-agents"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "euler-event",
  "euler-sdk",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "euler-cli"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "euler-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "diffy",
  "euler-agents",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "euler-event"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "serde",
@@ -524,7 +524,7 @@ dependencies = [
 
 [[package]]
 name = "euler-managed-process"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64",
  "euler-sdk",
@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "euler-provider"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -550,7 +550,7 @@ dependencies = [
 
 [[package]]
 name = "euler-sdk"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "euler-event",
  "serde",

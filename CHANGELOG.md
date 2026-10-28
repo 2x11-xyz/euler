@@ -4,7 +4,7 @@ All notable changes to Euler are documented here. Entries reference the
 pull requests that landed them; deeper design rationale lives in
 `docs/contracts/` and the GitHub issue ledger.
 
-## Unreleased
+## 0.1.5 (2026-10-28)
 
 ### Custom providers speak OpenAI Responses (#264)
 
