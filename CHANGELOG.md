@@ -38,10 +38,11 @@ pull requests that landed them; deeper design rationale lives in
   with neither field, is still ignored, and the warning now says how to fix
   it.
 
-### Per-call recovery closures (ADR 0023 step 2)
+### Per-call recovery closures (ADR 0023 step 2, #262)
 
 - Resume now closes every unmatched call of an interrupted multi-call root
-  batch, not only the tail call. The first unmatched call keeps today's
+  batch, not only the tail call, when its results show the batch ran in
+  order (the normal case). The first unmatched call keeps today's
   closure (permission undecided, or side effects may have occurred); each
   later call's closure says it never started because an earlier call in the
   same batch had not finished. Previously a crash during an earlier call

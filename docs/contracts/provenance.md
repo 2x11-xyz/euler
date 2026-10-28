@@ -330,7 +330,10 @@ closure must be an `error` with `source: "session"` and
 purpose plus any provider/model fields it carries must satisfy the canonical
 terminal-association rule. For the root driver, resume emits an exact-parent
 failed `tool.result` for every unmatched call of the interrupted provider
-batch, in batch order. Because batch calls run strictly one at a time, the
+batch, in batch order, when its persisted results show sequential execution;
+otherwise the earlier tail-only rule applies, and no root closure is emitted
+once the executing call has persisted execution events (`events.md`).
+Because batch calls run strictly one at a time, the
 first unmatched call keeps the possibly-executed (or permission-undecided)
 closure and every later call's closure says it never started
 (`docs/contracts/events.md`, `tool.result`). Resume also emits an exact-parent

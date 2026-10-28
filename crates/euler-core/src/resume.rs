@@ -1362,6 +1362,12 @@ fn interrupted_root_batch(events: &[EventEnvelope]) -> Option<InterruptedRootBat
     while is_pending_tool_window_event(events, tail) {
         tail = tail.checked_sub(1)?;
     }
+    let window = &events[tail + 1..];
+    // The batch's last call may be followed by its own exposure flag.
+    let trailing_exposure = is_call_exposure_flag(events, tail);
+    if trailing_exposure {
+        tail -= 1;
+    }
     let tail_event = &events[tail];
     let (anchor, last_result_call) = match tail_event.kind.as_str() {
         EventKind::TOOL_CALL => (tail, None),
@@ -1379,6 +1385,11 @@ fn interrupted_root_batch(events: &[EventEnvelope]) -> Option<InterruptedRootBat
         return None;
     }
     let batch = root_batch_call_indices(events, anchor);
+    // Plain resume of a single-call batch stays as before step 2 (ADR 0023
+    // regression rule), and that scan ends at a trailing exposure flag.
+    if trailing_exposure && batch.len() < 2 {
+        return None;
+    }
     let first_unmatched = batch
         .iter()
         .position(|&index| !tool_call_has_result(events, index))?;
@@ -1395,7 +1406,6 @@ fn interrupted_root_batch(events: &[EventEnvelope]) -> Option<InterruptedRootBat
         return None;
     }
     let executing_call = &events[batch[first_unmatched]];
-    let window = &events[tail + 1..];
     if !permission_suffix_belongs_to_call(executing_call, window) {
         return None;
     }
@@ -1418,12 +1428,8 @@ fn root_batch_call_indices(events: &[EventEnvelope], anchor: usize) -> Vec<usize
             && event.agent == anchor_call.agent
             && event.parent == anchor_call.parent
     };
-    let is_call_exposure = |index: usize| {
-        index > 0
-            && events[index].kind.as_str() == EventKind::SECRET_EXPOSURE_DETECTED
-            && events[index].parent.as_deref() == Some(events[index - 1].id.as_str())
-            && is_batch_call(&events[index - 1])
-    };
+    let is_call_exposure =
+        |index: usize| is_call_exposure_flag(events, index) && is_batch_call(&events[index - 1]);
     let mut start = anchor;
     while start > 0 {
         let previous = start - 1;
@@ -1447,6 +1453,15 @@ fn root_batch_call_indices(events: &[EventEnvelope], anchor: usize) -> Vec<usize
     (start..=end)
         .filter(|&index| is_batch_call(&events[index]))
         .collect()
+}
+
+/// Whether `events[index]` is the `secret.exposure.detected` flag of the
+/// `tool.call` directly before it (`record_tool_call` writes it there).
+fn is_call_exposure_flag(events: &[EventEnvelope], index: usize) -> bool {
+    index > 0
+        && events[index].kind.as_str() == EventKind::SECRET_EXPOSURE_DETECTED
+        && events[index - 1].kind.as_str() == EventKind::TOOL_CALL
+        && events[index].parent.as_deref() == Some(events[index - 1].id.as_str())
 }
 
 fn tool_call_has_result(events: &[EventEnvelope], call_index: usize) -> bool {

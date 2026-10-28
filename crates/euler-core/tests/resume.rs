@@ -1104,24 +1104,30 @@ fn permission_prompt(call: &EventEnvelope) -> EventEnvelope {
     )
 }
 
+/// The `secret.exposure.detected` flag `record_tool_call` writes right after
+/// a call whose input matched a secret shape.
+fn input_exposure(call: &EventEnvelope) -> EventEnvelope {
+    EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::SECRET_EXPOSURE_DETECTED,
+        object([
+            ("event", call.id.clone().into()),
+            ("field", "input".into()),
+            ("shapes", json!(["api-key"])),
+            ("count", 1.into()),
+        ]),
+    )
+}
+
 /// ADR 0023 step 2: a crash during the first call of a batch closes it as
 /// possibly executed and every later call as never started. A call's own
 /// `secret.exposure.detected` flag stays inside the batch.
 #[test]
 fn multi_call_batch_crash_during_an_earlier_call_closes_every_unmatched_call() {
     let first = tool_call(None, "call-read", "read_file");
-    let exposure = EventEnvelope::new(
-        "session",
-        "agent",
-        Some(first.id.clone()),
-        EventKind::SECRET_EXPOSURE_DETECTED,
-        object([
-            ("event", first.id.clone().into()),
-            ("field", "input".into()),
-            ("shapes", json!(["api-key"])),
-            ("count", 1.into()),
-        ]),
-    );
+    let exposure = input_exposure(&first);
     let second = tool_call(None, "call-edit", "edit_file");
     let third = tool_call(None, "call-shell", "run_shell");
 
@@ -1135,6 +1141,53 @@ fn multi_call_batch_crash_during_an_earlier_call_closes_every_unmatched_call() {
             (third.id, CLOSURE_EARLIER_CALL_UNFINISHED.to_owned()),
         ]
     );
+}
+
+/// The last call's own exposure flag ends the log, with and without a
+/// pending prompt for the first call after it.
+#[test]
+fn multi_call_batch_with_a_trailing_exposure_flag_closes_every_unmatched_call() {
+    let first = tool_call(None, "call-edit-a", "edit_file");
+    let second = tool_call(None, "call-edit-b", "edit_file");
+    let exposure = input_exposure(&second);
+
+    let crashed = resumed_tool_closures(&[first.clone(), second.clone(), exposure.clone()]);
+    assert_eq!(
+        crashed,
+        vec![
+            (first.id.clone(), CLOSURE_SIDE_EFFECTS.to_owned()),
+            (
+                second.id.clone(),
+                CLOSURE_EARLIER_CALL_UNFINISHED.to_owned()
+            ),
+        ]
+    );
+
+    let prompt = permission_prompt(&first);
+    let prompted = resumed_tool_closures(&[first.clone(), second.clone(), exposure, prompt]);
+    assert_eq!(
+        prompted,
+        vec![
+            (first.id, CLOSURE_PERMISSION_UNDECIDED.to_owned()),
+            (second.id, CLOSURE_EARLIER_CALL_UNFINISHED.to_owned()),
+        ]
+    );
+}
+
+/// ADR 0023 keeps plain resume of a single-call batch as before step 2. That
+/// scan stops at a trailing exposure flag, so no closure is appended, with or
+/// without a pending prompt after the flag.
+#[test]
+fn single_call_batch_with_a_trailing_exposure_flag_resumes_as_before_step_2() {
+    let call = tool_call(None, "call-edit", "edit_file");
+    let exposure = input_exposure(&call);
+    let prompt = permission_prompt(&call);
+
+    assert_eq!(
+        resumed_tool_closures(&[call.clone(), exposure.clone()]),
+        Vec::new()
+    );
+    assert_eq!(resumed_tool_closures(&[call, exposure, prompt]), Vec::new());
 }
 
 #[test]
