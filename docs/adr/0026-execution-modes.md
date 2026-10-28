@@ -12,18 +12,20 @@ owning contract.
 ## Context
 
 Euler has become too restrictive for a research agent. Its value should be
-pi's ease and flexibility plus what pi lacks: provenance, resume, redaction,
-and multi-agent workflows. The sandbox and prompts should be a choice, not
+the ease and flexibility of unrestricted local execution, like an unsandboxed
+local agent, plus what such agents lack: provenance, resume, redaction, and
+multi-agent workflows. The sandbox and prompts should be a choice, not
 the price of entry.
 
-An audit of 580 local pi sessions that used bash (regex classification,
-approximate) measured what the current default would block: 63% of sessions
-need network, 63% write outside the project (home, `/tmp`, `/usr/local`), 11%
-install something, and 75% hit at least one. Background or long-running jobs
-appear in 23%, `gh` in 28%, warehouse and cloud CLIs in 21%. In a live repro
-on a Linux VM, a sandboxed `curl` failed with "Could not resolve host" and the
-model told the user the machine had no internet; only the sandbox lacked
-network. Every command prompted, and one harmless probe was flagged dangerous.
+An audit of 580 local coding-agent session logs that used bash (regex
+classification, approximate) measured what the current default would block:
+63% of sessions need network, 63% write outside the project (home, `/tmp`,
+`/usr/local`), 11% install something, and 75% hit at least one. Background or
+long-running jobs appear in 23%, `gh` in 28%, warehouse and cloud CLIs in 21%.
+In a live repro on a Linux VM, a sandboxed `curl` failed with "Could not
+resolve host" and the model told the user the machine had no internet; only
+the sandbox lacked network. Every command prompted, and one harmless probe was
+flagged dangerous.
 
 ### Current facts (main at 6239829)
 
@@ -110,22 +112,22 @@ under `/permissions` Advanced.
 
 ### 1. Full access
 
-Pi parity. Commands run on the host with the user's authority and never ask,
-except for the always-on dangerous-command list, which keeps ADR 0021 row D's
-rule: it fires in every mode and never reaches the guardian. The always-on
-asks of every mode stay: the sensitive-basename ask for structured tools,
-privileged secret and config edits (`secrets.md`), and extension install and
-launch consent. Provenance, redaction, checkpoints,
+Unrestricted local execution. Commands run on the host with the user's
+authority and never ask, except for the always-on dangerous-command list,
+which keeps ADR 0021 row D's rule: it fires in every mode and never reaches
+the guardian. The always-on asks of every mode stay: the sensitive-basename
+ask for structured tools, privileged secret and config edits (`secrets.md`),
+and extension install and launch consent. Provenance, redaction, checkpoints,
 rollback, and resume stay on. `session.start` records `execution_mode:
-"full"`, `command_approvals: "off"`, and `sandbox_backend: "host"` as
-separate facts (row D). The environment passes through except Euler's own
-provider and auth credentials and row C's hard denylist, which apply
-unchanged; other secret-shaped variables reach commands and stay registered
-with the redactor (proposed, Q7). Redaction keeps those
-values out of tool results and provenance; it does not stop a command from
-sending them over the network. The dangerous-command list is a speed bump
-against common destructive commands, not a boundary: `python3 -c` deleting
-files is not on it, as in pi.
+"full"`, `command_approvals: "off"`, and `sandbox_backend: "host"` as separate
+facts (row D). The environment passes through except Euler's own provider and
+auth credentials and row C's hard denylist, which apply unchanged; other
+secret-shaped variables reach commands and stay registered with the redactor
+(proposed, Q7). Redaction keeps those values out of tool results and
+provenance; it does not stop a command from sending them over the network. The
+dangerous-command list is a speed bump against common destructive commands,
+not a boundary: `python3 -c` deleting files is not on it, as in any
+unsandboxed local agent.
 
 This reverses three ADR 0021 rules on purpose: row D's "no enforcement backend
 means never auto-allow", row P's "the prove-safe grammar governs the
@@ -140,7 +142,7 @@ Sandboxed, with the friction removed:
   profile gains outbound network and loopback bind. Row B's per-command
   network grants, its loopback restriction, its "retry with network" offer,
   and its veto on escalation under deny-read paths are dropped: network is a
-  mode property, sandboxed code reaches every local service as in pi, and an
+  mode property, sandboxed code reaches every local service, and an
   escalation is a human-approved host command.
 - **`/tmp`.** The host `/tmp` is writable and persistent (plus the host
   `TMPDIR` on macOS, where it lives under `/var/folders`). A per-session
@@ -319,9 +321,9 @@ contract (`capabilities.md`, `tools.md`, `events.md`, `ui.md`,
 
 ## Consequences
 
-- The interactive default matches pi: no sandbox, no routine prompts. Euler
-  keeps provenance, redaction, rollback, resume, and multi-agent work, and
-  records that approvals and the sandbox were off.
+- The interactive default is unrestricted local execution: no sandbox, no
+  routine prompts. Euler keeps provenance, redaction, rollback, resume, and
+  multi-agent work, and records that approvals and the sandbox were off.
 - Headless runs gain shell, writes, and network inside a sandbox by default,
   so CI on hosts without user namespaces (some hosted Linux runners) fails
   closed until it passes `--mode full`, the only mode that needs no backend.
@@ -350,7 +352,7 @@ contract (`capabilities.md`, `tools.md`, `events.md`, `ui.md`,
    not a boundary.
 4. Real host `/tmp` in Workspace rather than a per-session scratch as
    `TMPDIR`? **Proposed: real `/tmp`** (section 2). Cost: `/tmp` writes are
-   shared and outside workspace observation, as in pi.
+   shared and outside workspace observation, as without a sandbox.
 5. In Workspace, keep `HOME` private (persistent per session) and
    secret-shaped variables out, sending credentialed CLIs through
    escalation? **Proposed: yes.** With network on, credentials are what the
@@ -393,4 +395,4 @@ contract (`capabilities.md`, `tools.md`, `events.md`, `ui.md`,
 14. In Workspace, ask for a sandboxed command whose operands mention a
     sensitive path (`.env*`, keys, credentials)? **Proposed: yes.** Network
     is on, and this keeps shell parity with the structured-tool
-    sensitive-basename ask. Full access does not add it (pi parity).
+    sensitive-basename ask. Full access does not add it.
