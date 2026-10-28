@@ -440,8 +440,22 @@ extension error does not consume the later result.
   `file.change` events mean "not observed", never "no changes"; the same
   statement leads the agent-visible `output`. Omitted means the walk completed.
   Optional `recovery_closure: true` marks a resume-time canonical closure; it
-  records the resume observation, not the original tool outcome. The ordinary
-  root path closes only its interrupted tail call. In addition, for every
+  records the resume observation, not the original tool outcome. On the root
+  path, resume closes every unmatched call of the interrupted provider batch,
+  in batch order (ADR 0023): the contiguous same-parent root `tool.call` run
+  the accepted prefix ends inside, where only permission and companion-window
+  events of the first unmatched call follow the batch's last result. The root
+  driver runs a batch's calls strictly one at a time and persists each result
+  before the next call starts, so only the first unmatched call can have
+  started. Its closure says `interrupted before execution (permission
+  undecided); the tool did not run` when its permission ask is undecided, and
+  otherwise `execution and/or result persistence was interrupted, and side
+  effects may have occurred`. Every later unmatched call says `interrupted
+  before execution (an earlier call in the same batch had not finished); the
+  tool did not run`. Each text follows `accepted prefix ended without a
+  persisted result; `. A batch whose results are out of call order, or whose
+  pending window belongs to a later call, keeps the earlier rule: only an
+  unmatched tail call is closed. In addition, for every
   accepted `tool.call` authored by an incomplete child agent (an accepted
   `agent.spawn` with no `agent.result`), resume emits one failed result when no
   later same-agent result has that call event id as its exact semantic parent.

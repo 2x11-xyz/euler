@@ -1044,6 +1044,161 @@ fn permission_gated_tail_closure_says_tool_never_executed() {
     );
 }
 
+const CLOSURE_SIDE_EFFECTS: &str = "accepted prefix ended without a persisted result; \
+    execution and/or result persistence was interrupted, and side effects may have occurred";
+const CLOSURE_PERMISSION_UNDECIDED: &str = "accepted prefix ended without a persisted result; \
+    interrupted before execution (permission undecided); the tool did not run";
+const CLOSURE_EARLIER_CALL_UNFINISHED: &str = "accepted prefix ended without a persisted \
+    result; interrupted before execution (an earlier call in the same batch had not finished); \
+    the tool did not run";
+
+/// Resumes `events` and returns each appended tool closure as
+/// `(parent call event id, error)`, in append order. A second resume of the
+/// recovered log must append nothing.
+fn resumed_tool_closures(events: &[EventEnvelope]) -> Vec<(String, String)> {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    write_events(&log, events);
+    let resume = || {
+        resume_session(
+            fixture_config(temp.path()),
+            ProviderSet::single(ScriptedProvider::new(vec![])),
+            CountingDecider::default(),
+            &log,
+        )
+        .expect("resume")
+    };
+    let session = resume();
+    let closures = recovery_closures(session.events())
+        .into_iter()
+        .map(|closure| {
+            (
+                closure.parent.clone().expect("closure parent"),
+                payload_str(closure, "error")
+                    .expect("closure error")
+                    .to_owned(),
+            )
+        })
+        .collect();
+    let recovered_lines = line_count(&log);
+    drop(session);
+    drop(resume());
+    assert_eq!(
+        line_count(&log),
+        recovered_lines,
+        "a second resume appends no residual closure"
+    );
+    closures
+}
+
+fn permission_prompt(call: &EventEnvelope) -> EventEnvelope {
+    EventEnvelope::new(
+        "session",
+        "agent",
+        Some(call.id.clone()),
+        EventKind::PERMISSION_PROMPT,
+        object([
+            ("capability", "fs-write".into()),
+            ("reason", "tool edit_file".into()),
+        ]),
+    )
+}
+
+/// ADR 0023 step 2: a crash during the first call of a batch closes it as
+/// possibly executed and every later call as never started. A call's own
+/// `secret.exposure.detected` flag stays inside the batch.
+#[test]
+fn multi_call_batch_crash_during_an_earlier_call_closes_every_unmatched_call() {
+    let first = tool_call(None, "call-read", "read_file");
+    let exposure = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(first.id.clone()),
+        EventKind::SECRET_EXPOSURE_DETECTED,
+        object([
+            ("event", first.id.clone().into()),
+            ("field", "input".into()),
+            ("shapes", json!(["api-key"])),
+            ("count", 1.into()),
+        ]),
+    );
+    let second = tool_call(None, "call-edit", "edit_file");
+    let third = tool_call(None, "call-shell", "run_shell");
+
+    let closures = resumed_tool_closures(&[first.clone(), exposure, second.clone(), third.clone()]);
+
+    assert_eq!(
+        closures,
+        vec![
+            (first.id, CLOSURE_SIDE_EFFECTS.to_owned()),
+            (second.id, CLOSURE_EARLIER_CALL_UNFINISHED.to_owned()),
+            (third.id, CLOSURE_EARLIER_CALL_UNFINISHED.to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn multi_call_batch_crash_after_a_result_closes_the_later_calls() {
+    let first = tool_call(None, "call-read", "read_file");
+    let second = tool_call(None, "call-edit", "edit_file");
+    let third = tool_call(None, "call-shell", "run_shell");
+    let first_result = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(first.id.clone()),
+        EventKind::TOOL_RESULT,
+        object([
+            ("id", "call-read".into()),
+            ("name", "read_file".into()),
+            ("ok", true.into()),
+            ("output", "alpha".into()),
+        ]),
+    );
+
+    let closures = resumed_tool_closures(&[first, second.clone(), third.clone(), first_result]);
+
+    assert_eq!(
+        closures,
+        vec![
+            (second.id, CLOSURE_SIDE_EFFECTS.to_owned()),
+            (third.id, CLOSURE_EARLIER_CALL_UNFINISHED.to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn multi_call_batch_pending_prompt_on_an_earlier_call_closes_every_call() {
+    let first = tool_call(None, "call-edit-a", "edit_file");
+    let second = tool_call(None, "call-edit-b", "edit_file");
+    let prompt = permission_prompt(&first);
+
+    let closures = resumed_tool_closures(&[first.clone(), second.clone(), prompt]);
+
+    assert_eq!(
+        closures,
+        vec![
+            (first.id, CLOSURE_PERMISSION_UNDECIDED.to_owned()),
+            (second.id, CLOSURE_EARLIER_CALL_UNFINISHED.to_owned()),
+        ]
+    );
+}
+
+/// A prompt for a later call while an earlier call has no result does not
+/// show sequential execution, so resume keeps the tail-only closure.
+#[test]
+fn multi_call_batch_without_sequential_evidence_keeps_the_tail_only_closure() {
+    let first = tool_call(None, "call-edit-a", "edit_file");
+    let second = tool_call(None, "call-edit-b", "edit_file");
+    let prompt = permission_prompt(&second);
+
+    let closures = resumed_tool_closures(&[first, second.clone(), prompt]);
+
+    assert_eq!(
+        closures,
+        vec![(second.id, CLOSURE_PERMISSION_UNDECIDED.to_owned())]
+    );
+}
+
 #[test]
 fn guardian_interleaved_tail_still_appends_recovery_closure() {
     // Security-audit finding: guardian review (and extension agent fan-out)

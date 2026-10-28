@@ -38,6 +38,17 @@ pull requests that landed them; deeper design rationale lives in
   with neither field, is still ignored, and the warning now says how to fix
   it.
 
+### Per-call recovery closures (ADR 0023 step 2)
+
+- Resume now closes every unmatched call of an interrupted multi-call root
+  batch, not only the tail call. The first unmatched call keeps today's
+  closure (permission undecided, or side effects may have occurred); each
+  later call's closure says it never started because an earlier call in the
+  same batch had not finished. Previously a crash during an earlier call
+  closed only the last call (which never ran) as possibly executed, and a
+  crash after a result or during an earlier call's permission prompt closed
+  nothing. Nothing is re-run; single-call batches resume as before.
+
 ## 0.1.4 (2026-10-27)
 
 ### Subprocess sandboxing

@@ -984,9 +984,7 @@ fn recovery_closures(
             .into_iter()
             .map(|call| model_recovery_closure(call, open_drafts.get(call.id.as_str()).copied())),
     );
-    if let Some(closure) = tool_recovery_closure(events, &incomplete_child_agents) {
-        closures.push(closure);
-    }
+    closures.extend(tool_recovery_closures(events, &incomplete_child_agents));
     let linear_parent = closures
         .last()
         .map(|event| event.id.clone())
@@ -1264,26 +1262,72 @@ fn model_recovery_closure(
     closure
 }
 
-fn tool_recovery_closure(
+const TOOL_CLOSURE_PERMISSION_UNDECIDED: &str = "accepted prefix ended without a persisted \
+    result; interrupted before execution (permission undecided); the tool did not run";
+const TOOL_CLOSURE_SIDE_EFFECTS_UNKNOWN: &str = "accepted prefix ended without a persisted \
+    result; execution and/or result persistence was interrupted, and side effects may have \
+    occurred";
+const TOOL_CLOSURE_EARLIER_CALL_UNFINISHED: &str = "accepted prefix ended without a persisted \
+    result; interrupted before execution (an earlier call in the same batch had not finished); \
+    the tool did not run";
+
+/// Closures for the unmatched calls of the interrupted root batch (ADR 0023,
+/// rollout step 2). The root driver records the whole provider batch before
+/// it runs the first call, then runs the calls strictly one at a time: each
+/// call persists its `tool.result` before the next call starts
+/// (`finish_tool_round` in `session.rs`). So the first unmatched call is the
+/// only one that can have started, and every later call never ran. A batch
+/// whose results do not show that order keeps the tail-only closure.
+fn tool_recovery_closures(
     events: &[EventEnvelope],
     incomplete_child_agents: &BTreeSet<String>,
+) -> Vec<EventEnvelope> {
+    let Some(interrupted) = interrupted_root_batch(events) else {
+        return tail_unmatched_tool_call_index(events)
+            .and_then(|index| {
+                tool_recovery_closure(
+                    &events[index],
+                    executing_call_closure_message(&events[index + 1..]),
+                    incomplete_child_agents,
+                )
+            })
+            .into_iter()
+            .collect();
+    };
+    let executing = executing_call_closure_message(interrupted.window);
+    interrupted
+        .unmatched_calls
+        .iter()
+        .enumerate()
+        .filter_map(|(position, call)| {
+            let message = if position == 0 {
+                executing
+            } else {
+                TOOL_CLOSURE_EARLIER_CALL_UNFINISHED
+            };
+            tool_recovery_closure(call, message, incomplete_child_agents)
+        })
+        .collect()
+}
+
+fn executing_call_closure_message(window: &[EventEnvelope]) -> &'static str {
+    if permission_undecided_before_execution(window) {
+        TOOL_CLOSURE_PERMISSION_UNDECIDED
+    } else {
+        TOOL_CLOSURE_SIDE_EFFECTS_UNKNOWN
+    }
+}
+
+fn tool_recovery_closure(
+    call: &EventEnvelope,
+    message: &str,
+    incomplete_child_agents: &BTreeSet<String>,
 ) -> Option<EventEnvelope> {
-    let call_index = tail_unmatched_tool_call_index(events)?;
-    let call = &events[call_index];
     if incomplete_child_agents.contains(&call.agent) {
         return None;
     }
     let call_id = payload_str(call, "id")?;
     let name = payload_str(call, "name")?;
-    let permission_undecided = permission_undecided_before_execution(&events[call_index + 1..]);
-    let message = if permission_undecided {
-        "accepted prefix ended without a persisted result; interrupted before execution \
-         (permission undecided); the tool did not run"
-    } else {
-        "accepted prefix ended without a persisted result; execution and/or result persistence \
-         was interrupted, and side effects may have occurred"
-    };
-
     let mut closure = EventEnvelope::new(
         call.session.clone(),
         call.agent.clone(),
@@ -1299,6 +1343,120 @@ fn tool_recovery_closure(
     );
     closure.run.clone_from(&call.run);
     Some(closure)
+}
+
+struct InterruptedRootBatch<'a> {
+    /// Unmatched calls in batch order; the first is the executing call.
+    unmatched_calls: Vec<&'a EventEnvelope>,
+    /// Pending-window events after the batch's last persisted event.
+    window: &'a [EventEnvelope],
+}
+
+/// The root batch the accepted prefix ends inside, when its evidence matches
+/// strictly sequential execution: the matched calls form a prefix of the
+/// batch, the last persisted result belongs to the call just before the
+/// first unmatched one, and the trailing pending window belongs to that
+/// first unmatched call.
+fn interrupted_root_batch(events: &[EventEnvelope]) -> Option<InterruptedRootBatch<'_>> {
+    let mut tail = events.len().checked_sub(1)?;
+    while is_pending_tool_window_event(events, tail) {
+        tail = tail.checked_sub(1)?;
+    }
+    let tail_event = &events[tail];
+    let (anchor, last_result_call) = match tail_event.kind.as_str() {
+        EventKind::TOOL_CALL => (tail, None),
+        EventKind::TOOL_RESULT => {
+            let parent = tail_event.parent.as_deref()?;
+            let call_index = events[..tail]
+                .iter()
+                .rposition(|event| event.id == parent)?;
+            (call_index, Some(call_index))
+        }
+        _ => return None,
+    };
+    let anchor_call = &events[anchor];
+    if anchor_call.kind.as_str() != EventKind::TOOL_CALL || anchor_call.agent != tail_event.agent {
+        return None;
+    }
+    let batch = root_batch_call_indices(events, anchor);
+    let first_unmatched = batch
+        .iter()
+        .position(|&index| !tool_call_has_result(events, index))?;
+    if batch[first_unmatched..]
+        .iter()
+        .any(|&index| tool_call_has_result(events, index))
+    {
+        return None;
+    }
+    let previous_call = first_unmatched
+        .checked_sub(1)
+        .map(|position| batch[position]);
+    if last_result_call != previous_call {
+        return None;
+    }
+    let executing_call = &events[batch[first_unmatched]];
+    let window = &events[tail + 1..];
+    if !permission_suffix_belongs_to_call(executing_call, window) {
+        return None;
+    }
+    Some(InterruptedRootBatch {
+        unmatched_calls: batch[first_unmatched..]
+            .iter()
+            .map(|&index| &events[index])
+            .collect(),
+        window,
+    })
+}
+
+/// Indices of the provider batch containing the `tool.call` at `anchor`:
+/// the contiguous same-agent, same-parent calls recorded together, where a
+/// call's own `secret.exposure.detected` flag may follow it directly.
+fn root_batch_call_indices(events: &[EventEnvelope], anchor: usize) -> Vec<usize> {
+    let anchor_call = &events[anchor];
+    let is_batch_call = |event: &EventEnvelope| {
+        event.kind.as_str() == EventKind::TOOL_CALL
+            && event.agent == anchor_call.agent
+            && event.parent == anchor_call.parent
+    };
+    let is_call_exposure = |index: usize| {
+        index > 0
+            && events[index].kind.as_str() == EventKind::SECRET_EXPOSURE_DETECTED
+            && events[index].parent.as_deref() == Some(events[index - 1].id.as_str())
+            && is_batch_call(&events[index - 1])
+    };
+    let mut start = anchor;
+    while start > 0 {
+        let previous = start - 1;
+        if is_batch_call(&events[previous]) {
+            start = previous;
+        } else if is_call_exposure(previous) {
+            start = previous - 1;
+        } else {
+            break;
+        }
+    }
+    let mut end = anchor;
+    while end + 1 < events.len() {
+        let next = end + 1;
+        if is_batch_call(&events[next]) || is_call_exposure(next) {
+            end = next;
+        } else {
+            break;
+        }
+    }
+    (start..=end)
+        .filter(|&index| is_batch_call(&events[index]))
+        .collect()
+}
+
+fn tool_call_has_result(events: &[EventEnvelope], call_index: usize) -> bool {
+    let call = &events[call_index];
+    let call_id = payload_str(call, "id");
+    events[call_index + 1..].iter().any(|event| {
+        event.kind.as_str() == EventKind::TOOL_RESULT
+            && (event.parent.as_deref() == Some(call.id.as_str())
+                || (call_id.is_some() && payload_str(event, "id") == call_id))
+    })
 }
 
 fn tail_unmatched_tool_call_index(events: &[EventEnvelope]) -> Option<usize> {

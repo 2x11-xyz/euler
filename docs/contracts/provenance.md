@@ -328,8 +328,13 @@ closure must be an `error` with `source: "session"` and
 `recovery_closure: true`, its direct parent must name a still-open
 `model.call`, its session/agent/run origin must equal that call, and its
 purpose plus any provider/model fields it carries must satisfy the canonical
-terminal-association rule. Resume also emits an exact-parent failed
-`tool.result` for each unmatched accepted tool call belonging to an incomplete
+terminal-association rule. For the root driver, resume emits an exact-parent
+failed `tool.result` for every unmatched call of the interrupted provider
+batch, in batch order. Because batch calls run strictly one at a time, the
+first unmatched call keeps the possibly-executed (or permission-undecided)
+closure and every later call's closure says it never started
+(`docs/contracts/events.md`, `tool.result`). Resume also emits an exact-parent
+failed `tool.result` for each unmatched accepted tool call belonging to an incomplete
 child spawn, in call order, while preserving already-settled calls. This is a
 narrow restart closure for accepted work, not ordinary late tool execution;
 it never invents an `agent.result`, and the historical spawn remains
