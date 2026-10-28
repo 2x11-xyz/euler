@@ -52,6 +52,6 @@ rather than being backfilled or reused.
 | [0022](0022-code-swarm-as-ordinary-extension.md) | CodeSwarm as an ordinary extension | Accepted 2026-10-24 |
 | [0023](0023-resumable-work.md) | Resumable work: replay policy, durable subagent ownership, crash-loop parking | Accepted 2026-10-27 |
 | [0024](0024-materialized-projections.md) | Materialized projections next to the event log | Accepted 2026-10-27 |
-| [0025](0025-extension-provider-contributions.md) | Extension-contributed provider configuration | Proposed 2026-10-27 |
+| [0025](0025-gateway-provider-discovery.md) | Gateway provider discovery | Proposed 2026-10-27 |
 
 Next number: **0026**.
