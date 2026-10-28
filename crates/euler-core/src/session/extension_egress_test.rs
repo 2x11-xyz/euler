@@ -162,6 +162,17 @@ fn assert_child_request_and_spawn_record_are_redacted(batch: bool) {
         .find(|event| event.kind.as_str() == EventKind::AGENT_SPAWN)
         .expect("agent.spawn");
     assert_eq!(spawn.payload["egress_redacted"], json!(true));
+    assert_eq!(
+        spawn.payload["explicit_context_sha256"],
+        json!(crate::tools::hash_bytes(
+            b"explicit context [redacted-secret]"
+        )),
+        "the explicit-context digest covers the redacted egress bytes"
+    );
+    assert!(
+        spawn.payload.get("owner_event_id").is_none() && spawn.payload.get("spawn_key").is_none(),
+        "a spawn outside a model tool has no owning tool call"
+    );
     let recorded = Value::Object(spawn.payload.clone()).to_string();
     assert!(
         !recorded.contains(SECRET),

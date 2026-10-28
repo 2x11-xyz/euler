@@ -278,6 +278,27 @@ pub struct ModelToolDescriptor {
     /// 1..=`MAX_DECLARED_MODEL_TOOL_INPUT_BYTES`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_input_bytes: Option<usize>,
+    /// Whether re-running an interrupted call is safe (ADR 0023). Omitted
+    /// means `Unsafe`.
+    #[serde(default, skip_serializing_if = "ReplayPolicy::is_unsafe")]
+    pub replay: ReplayPolicy,
+}
+
+/// A tool's replay policy (ADR 0023). `Safe` is the declarer's promise that
+/// re-running an interrupted call is harmless; every undeclared tool is
+/// `Unsafe`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReplayPolicy {
+    Safe,
+    #[default]
+    Unsafe,
+}
+
+impl ReplayPolicy {
+    pub fn is_unsafe(&self) -> bool {
+        *self == Self::Unsafe
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]

@@ -8,6 +8,7 @@ license.workspace = true
 euler-event = { path = "../euler-event" }
 euler-sdk = { path = "../euler-sdk" }
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 ulid.workspace = true
 

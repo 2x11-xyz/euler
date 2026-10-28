@@ -171,6 +171,14 @@ Extensions gain the authority to run child agents through one SDK method:
   as the spawn event recorded them) so extensions can cite provenance
   without re-querying it. Provenance remains the record; this method
   removes the need to use it as the transport.
+- **Ownership recording (ADR 0023)**: when the command runs as a model tool,
+  each `agent.spawn` from `spawn_agent` or `spawn_agents` also records
+  `owner_event_id` (the owning `tool.call` event id) and `spawn_key` (the
+  spawn's ordinal within that execution, batch tasks in task order). Every
+  spawn whose task has explicit context records `explicit_context_sha256`.
+  These fields are recorded only: a historical incomplete spawn still cannot
+  be completed, and resume neither reattaches nor re-runs children (events
+  contract).
 - **Budgets**: the task's `AgentBudget` is recorded as today and enforced to
   the extent the child session loop enforces budgets; accounting/escrow
   remain future work. `max_tokens` bounds OUTPUT (completion) tokens only,

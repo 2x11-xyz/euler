@@ -16,6 +16,18 @@ pull requests that landed them; deeper design rationale lives in
   line instead of silently reading `~/.euler`, and the `USERPROFILE` fallback
   is gone (the Euler home requires `HOME` or `EULER_HOME`).
 
+### Replay declaration (ADR 0023 step 1, #259)
+
+- Root `tool.call` events record `replay: "safe"` when the tool's replay
+  policy is `safe`: the core read-only tools (`read_file`, `git_status`,
+  `git_diff`, `tool_result_get`, `skill_read`) and extension model tools whose
+  `ModelToolDescriptor` declares `replay: "safe"`. Everything else, including
+  every `run_shell` command, is `unsafe`.
+- An `agent.spawn` an extension requests while running as a model tool
+  records `owner_event_id` and an ordinal `spawn_key`, and every spawn with
+  explicit context records `explicit_context_sha256`.
+- Recording only: resume behavior is unchanged.
+
 ## 0.1.4 (2026-10-27)
 
 ### Subprocess sandboxing

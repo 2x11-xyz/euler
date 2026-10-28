@@ -11,7 +11,7 @@ use crate::{
 };
 use euler_event::{tool_result_succeeded, EventEnvelope, EventKind};
 use euler_provider::ToolDefinition;
-use euler_sdk::{CancellationToken, Capability};
+use euler_sdk::{CancellationToken, Capability, ReplayPolicy};
 use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -387,6 +387,18 @@ impl ToolRegistry {
             "edit_file" | "write_file" | "apply_patch" => Some(Capability::FsWrite),
             "run_shell" => Some(Capability::ShellExec),
             _ => None,
+        }
+    }
+
+    /// Core replay policy table (ADR 0023). Only the read-only tools are
+    /// `Safe`; writes and every `run_shell` command, statically safe ones
+    /// included, are `Unsafe`, as is any name core does not own.
+    pub fn replay_policy(&self, name: &str) -> ReplayPolicy {
+        match name {
+            "read_file" | "git_status" | "git_diff" | "tool_result_get" | "skill_read" => {
+                ReplayPolicy::Safe
+            }
+            _ => ReplayPolicy::Unsafe,
         }
     }
 

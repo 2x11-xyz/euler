@@ -578,6 +578,7 @@ fn standard_model_tool_descriptor() -> ModelToolDescriptor {
             "additionalProperties": false
         }),
         max_input_bytes: None,
+        replay: euler_sdk::ReplayPolicy::Unsafe,
     }
 }
 
@@ -604,6 +605,7 @@ fn large_model_tool_descriptor(name: &str) -> ModelToolDescriptor {
             "additionalProperties": false
         }),
         max_input_bytes: None,
+        replay: euler_sdk::ReplayPolicy::Unsafe,
     }
 }
 
@@ -2038,6 +2040,10 @@ fn model_tool_is_advertised_and_uses_canonical_attributed_braid() {
         assert_eq!(event.payload["extension_id"], json!("workflow-ext"));
         assert_eq!(event.payload["command"], json!("update"));
     }
+    assert!(
+        call.payload.get("replay").is_none(),
+        "an undeclared extension tool is unsafe to replay"
+    );
     assert_eq!(result.payload["ok"], json!(true));
     assert_eq!(
         serde_json::from_str::<Value>(result.payload["output"].as_str().expect("output"))
@@ -2051,6 +2057,39 @@ fn model_tool_is_advertised_and_uses_canonical_attributed_braid() {
             .model_tool_calls,
         1
     );
+}
+
+#[test]
+fn replay_safe_model_tool_records_replay_intent_on_its_tool_call() {
+    let temp = tempfile::tempdir().expect("temp");
+    let extension =
+        TestExtension::model_tool_only().with_model_tool_descriptor(ModelToolDescriptor {
+            replay: euler_sdk::ReplayPolicy::Safe,
+            ..standard_model_tool_descriptor()
+        });
+    let (mut session, _requests) = session_with_extension(
+        &temp,
+        extension,
+        vec![
+            FixtureResponse::ToolCalls(vec![ToolCall {
+                id: "call-update".to_owned(),
+                name: "update_workflow".to_owned(),
+                input: json!({"items": ["inspect"]}),
+            }]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ],
+        Vec::new(),
+    );
+
+    session.run_turn("do the work").expect("turn");
+
+    let call = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .expect("tool call");
+    assert_eq!(call.payload["replay"], json!("safe"));
+    assert_eq!(call.payload["extension_id"], json!("workflow-ext"));
 }
 
 #[test]
@@ -2674,6 +2713,7 @@ fn exact_integer_bound_rejects_adjacent_input_before_permission_or_execution() {
             "additionalProperties": false
         }),
         max_input_bytes: None,
+        replay: euler_sdk::ReplayPolicy::Unsafe,
     };
     let extension = TestExtension::model_tool_only()
         .with_capabilities(vec![Capability::FsWrite])

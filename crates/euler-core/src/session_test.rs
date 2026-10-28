@@ -3360,6 +3360,60 @@ fn request_time_resolved_provider_secret_registers_with_session_redactor() {
 }
 
 #[test]
+fn root_tool_calls_record_the_core_replay_policy() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join("a.txt"), "alpha").expect("a");
+    let call = |id: &str, name: &str, input: Value| euler_provider::ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        input,
+    };
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![
+            call("call-read", "read_file", json!({"path": "a.txt"})),
+            call("call-status", "git_status", json!({})),
+            call(
+                "call-write",
+                "write_file",
+                json!({"path": "b.txt", "content": "bravo"}),
+            ),
+            call("call-shell", "run_shell", json!({"command": "ls"})),
+            call("call-unknown", "no_such_tool", json!({})),
+        ]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("inspect and change").expect("turn");
+
+    let replay_by_call = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::TOOL_CALL)
+        .map(|event| {
+            (
+                event.payload["id"].as_str().expect("call id").to_owned(),
+                event.payload.get("replay").cloned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        replay_by_call,
+        vec![
+            ("call-read".to_owned(), Some(json!("safe"))),
+            ("call-status".to_owned(), Some(json!("safe"))),
+            ("call-write".to_owned(), None),
+            ("call-shell".to_owned(), None),
+            ("call-unknown".to_owned(), None),
+        ]
+    );
+}
+
+#[test]
 fn batched_tool_calls_replay_as_calls_then_outputs() {
     let temp = tempfile::tempdir().expect("temp dir");
     std::fs::write(temp.path().join("a.txt"), "alpha").expect("a");

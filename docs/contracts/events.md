@@ -391,7 +391,12 @@ extension error does not consume the later result.
   lifecycle reopen. Changed content at the same revision and identical content
    from a different extension remain distinct events. Legacy summary/content-
    only events remain renderable.
-- `tool.call`: `id`, `name`, `input` (structured JSON).
+- `tool.call`: `id`, `name`, `input` (structured JSON). A root-session call
+  adds optional `replay: "safe"` when the tool's replay policy resolved at
+  call time is `safe` (ADR 0023; tools contract, "Replay policy"). Absent
+  means `unsafe`, which is also how every call written before the field
+  existed reads. Resume does not consult it yet. Companion and child calls
+  never carry it.
 - `tool.result`: `id`, `name`, `ok`; `output` (+ optional `exit_code`) on
   success, `error` on failure (optional `output` and `exit_code` may
   accompany `error` when the tool produced output before failing; cancellation
@@ -1033,6 +1038,19 @@ extension error does not consume the later result.
   behalf (ADR 0022): its `task`, `persona`, `system_prompt`, and explicit
   context were redacted before the task was built, and its inherited parent canvas is
   redacted at request assembly. Absent means a core-authored spawn.
+  Optional `explicit_context_bytes` and `explicit_context_sha256` record the
+  byte length and lowercase hex SHA-256 of the explicit context the child
+  receives (redacted, for an extension-requested spawn) when the task has
+  one; the context itself is not recorded.
+  Optional `owner_event_id` and `spawn_key` record a spawn an extension
+  requested while running as a model tool (ADR 0023): `owner_event_id` is the
+  owning `tool.call` event id, and `spawn_key` is the spawn's decimal ordinal
+  within that tool execution (`"1"`, `"2"`, and so on, batch tasks in task
+  order). The host assigns the ordinal once the task (for a batch, every task
+  in it) passes its field checks, so a spawn that fails afterwards (an
+  unconfigured target, for example) still consumes it: keys may skip numbers
+  but never repeat within one execution. Other spawns carry neither field.
+  These fields are recorded only; resume does not read them yet.
 - `agent.message`: `from_agent_id`, `to_agent_id`, `spawn_event_id`,
   `queued_ts`, `payload`. This is a parent-drained child-to-parent report from
   a live current-process background child, not transcript content and not a

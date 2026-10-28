@@ -13,7 +13,7 @@ use crate::redaction::SecretRedactor;
 use crate::tools::{PatchEvents, ToolError, ToolExecution, ToolExecutionOutcome};
 use euler_event::{object, tool_result_succeeded, EventEnvelope, EventKind, JsonObject};
 use euler_provider::ToolCall;
-use euler_sdk::{CancellationToken, Capability};
+use euler_sdk::{CancellationToken, Capability, ReplayPolicy};
 use serde_json::Value;
 use std::time::Instant;
 
@@ -35,6 +35,11 @@ impl<D: PermissionDecider> Session<D> {
         if let Some((extension_id, command)) = self.extension_tool_attribution(&call.name) {
             payload.insert("extension_id".to_owned(), extension_id.into());
             payload.insert("command".to_owned(), command.into());
+        }
+        // Replay intent (ADR 0023): the policy resolved now is recorded with
+        // the call, before permission or execution. Absent means unsafe.
+        if self.tool_replay_policy(&call.name) == ReplayPolicy::Safe {
+            payload.insert("replay".to_owned(), "safe".into());
         }
         let tool_call_event_id = self.emit_with_parent(
             EventKind::TOOL_CALL,

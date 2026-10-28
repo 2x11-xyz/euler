@@ -107,6 +107,7 @@ impl ExtensionCommand for ConfigExtension {
                 "additionalProperties": false
             }),
             max_input_bytes: None,
+            replay: euler_sdk::ReplayPolicy::Unsafe,
         });
         CommandDescriptor {
             name: COMMAND.to_owned(),

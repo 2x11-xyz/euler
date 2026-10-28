@@ -692,6 +692,34 @@ fn interrupted_tool_tail_appends_one_side_effect_recovery_closure() {
     assert!(message.contains("side effects may have occurred"));
 }
 
+/// ADR 0023 step 1 records replay intent only: a `replay: "safe"` tail call
+/// resumes with exactly the closure a legacy call gets.
+#[test]
+fn replay_safe_tool_tail_resumes_with_the_legacy_recovery_closure() {
+    let closure_payload = |replay: Option<&str>| {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log = temp.path().join("events.jsonl");
+        let mut call = tool_call(None, "call-read", "read_file");
+        if let Some(replay) = replay {
+            call.payload.insert("replay".to_owned(), replay.into());
+        }
+        write_events(&log, std::slice::from_ref(&call));
+        let outcome = resume_session_with_outcome(
+            fixture_config(temp.path()),
+            ProviderSet::single(ScriptedProvider::new(vec![])),
+            CountingDecider::default(),
+            &log,
+        )
+        .expect("resume");
+        let closures = recovery_closures(outcome.session.events());
+        assert_eq!(closures.len(), 1);
+        assert_eq!(closures[0].parent.as_deref(), Some(call.id.as_str()));
+        closures[0].payload.clone()
+    };
+
+    assert_eq!(closure_payload(Some("safe")), closure_payload(None));
+}
+
 #[test]
 fn resume_closes_an_unterminated_shadow_model_call_behind_later_events() {
     let temp = tempfile::tempdir().expect("temp dir");
