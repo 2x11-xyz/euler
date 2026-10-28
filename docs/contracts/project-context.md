@@ -291,10 +291,38 @@ Cross-platform resume rejects, because a different host algorithm cannot be
 compared; false rejection is preferred to merging distinct roots. Within one
 host a path relocation or a different worktree is a recorded mismatch, resolved
 through the relocation-consent flow below rather than a silent merge. This
-identity detects location mismatch, not replacement of content at the same
-path, and is not workspace authentication. Legacy fallback applies only when
-both the project-context summary and snapshot are absent; a mixed shape with
-context events but no identity is invalid.
+identity detects location mismatch only and is not workspace authentication.
+Legacy fallback applies only when both the project-context summary and
+snapshot are absent; a mixed shape with context events but no identity is
+invalid.
+
+Replacement of the directory at the same path (a fresh clone, a restored
+backup, another directory renamed into place) is reported by the root object
+identity (issue #239), not by this digest. `session.start` and each
+`session.resumed` record the opened canonical root's `{ device, inode, birth }`
+in the optional `root_object_identity` field (`events.md`). The latest such
+record governs; a later accepted relocation supersedes it, and a record
+without the field resets it to unknown. Every resume records the root it runs
+in, whatever its verdict, once the resumed session first writes. Activity
+recorded after that marker ran in that directory, and the run the resume
+interrupted was already closed, so a later resume there verifies against it.
+Resume computes a verdict next to the path check above:
+
+- `Verified`: the live root is at the projected root path and is the same
+  directory object, birth time included.
+- `Relocated`: an accepted relocation moved the session after the root object
+  was last recorded, so there is nothing to compare.
+- `Unverified { reason }`: `NotRecorded` (the governing record predates the
+  field or could not read its root), `Malformed`, `Unreadable` (the live root
+  cannot be opened), `BirthUnreported` (either side lacks a birth time, so
+  inode reuse cannot be ruled out), or `Changed` (a different path, device,
+  inode, or birth time, including device numbers that drift after a remount).
+
+The verdict never blocks resume, prompts, resets grants, or shows a warning,
+and path-mismatch relocation is unchanged. It is read from the live
+filesystem when the session is folded and is not persisted. It is exposed on
+`FoldedSession` and `ResumeOutcome` for ADR 0023: anything but `Verified`
+disables automatic replay, and the session resumes with closures only.
 
 ## Resume relocation and consent
 

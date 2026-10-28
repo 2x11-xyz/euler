@@ -4,6 +4,7 @@ use crate::provenance::{
     event_advances_parent_frontier, nul_offset_in_line, numbered_accepted_prefix_lines,
     ProvenanceWriter,
 };
+use crate::root_identity::RootIdentityVerdict;
 use crate::runtime_identity::{
     runtime_identity_from_events, RecordedRuntimeIdentity, RuntimeIdentityError,
 };
@@ -39,6 +40,12 @@ pub struct FoldedSession {
     /// Exact originating runtime for current streams, or an explicit legacy
     /// unknown when `session.start` predates runtime provenance.
     pub runtime_identity: RecordedRuntimeIdentity,
+    /// Whether the live root is the directory object the session last
+    /// recorded (issue #239), read from the filesystem at fold time, so it is
+    /// meaningful only when folding to resume on the recording host.
+    /// Informational: it never blocks resume, and anything but `Verified`
+    /// disables automatic replay (ADR 0023).
+    pub root_identity: RootIdentityVerdict,
     /// Capabilities granted for the session scope in the historical prefix
     /// (PERMISSION_DECISION with scope == "session", root agent only). Old
     /// logs without the scope field are never folded (ADR D7/A13).
@@ -51,6 +58,7 @@ pub struct ResumeOutcome<D> {
     pub recovery_closure_appended: bool,
     pub events_folded: usize,
     pub active_target: ModelTarget,
+    pub root_identity: RootIdentityVerdict,
     pub warnings: Vec<ResumeWarning>,
 }
 
@@ -156,9 +164,8 @@ pub fn fold_session(
     config: &SessionConfig,
     events: Vec<EventEnvelope>,
 ) -> Result<FoldedSession, ResumeError> {
-    let runtime_identity = preflight_session(config, &events)?;
-    let initial = ModelTarget::new(config.provider.clone(), config.model.clone());
-    let mut target_at_event = initial;
+    let (runtime_identity, root_identity) = preflight_session(config, &events)?;
+    let mut target_at_event = ModelTarget::new(config.provider.clone(), config.model.clone());
     let mut reasoning_effort = config.reasoning_effort;
     let mut original_target = None;
     let mut latest_model_usage_used_tokens = None;
@@ -252,6 +259,7 @@ pub fn fold_session(
         context_limit_emitted,
         auto_compaction,
         runtime_identity,
+        root_identity,
         session_allowed_capabilities,
         warnings,
     })
@@ -260,10 +268,11 @@ pub fn fold_session(
 fn preflight_session(
     config: &SessionConfig,
     events: &[EventEnvelope],
-) -> Result<RecordedRuntimeIdentity, ResumeError> {
+) -> Result<(RecordedRuntimeIdentity, RootIdentityVerdict), ResumeError> {
     preflight_events(events)?;
     preflight_project_context(config, events)?;
-    Ok(runtime_identity_from_events(events)?)
+    let root_identity = crate::root_identity::root_identity_verdict(events, &config.root);
+    Ok((runtime_identity_from_events(events)?, root_identity))
 }
 
 /// Project-context resume preflight (ADR 0017): fail closed on a missing,
@@ -659,6 +668,7 @@ pub fn resume_session_from_folded_prefix<D>(
     let current_run_lifecycle = fold_run_lifecycle(&folded.events)?;
     let events_folded = folded.events.len();
     let active_target = folded.active_target.clone();
+    let root_identity = folded.root_identity;
     let reasoning_effort = folded.reasoning_effort;
     let session_allowed = std::mem::take(&mut folded.session_allowed_capabilities);
     let warnings = std::mem::take(&mut folded.warnings);
@@ -700,7 +710,7 @@ pub fn resume_session_from_folded_prefix<D>(
     //     causal chain stay identical to an uninterrupted run.
     // Built now because it needs the config ids and the accepted tail, before
     // `config` is moved into the session. Never carries user or model content.
-    let resume_marker = session_resumed_marker(
+    let mut resume_marker = session_resumed_marker(
         &config.session_id,
         &config.agent_id,
         &active_target,
@@ -714,6 +724,7 @@ pub fn resume_session_from_folded_prefix<D>(
             crate::SubprocessSandbox::Enforce(_) => crate::probe_workspace_sandbox(&config.root),
         },
     );
+    crate::root_identity::insert_root_object_identity(&mut resume_marker.payload, &config.root);
     writer
         .arm_resume_marker(resume_marker)
         .map_err(ResumeError::Append)?;
@@ -745,6 +756,7 @@ pub fn resume_session_from_folded_prefix<D>(
         recovery_closure_appended,
         events_folded,
         active_target,
+        root_identity,
         warnings,
     })
 }

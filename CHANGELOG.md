@@ -74,6 +74,17 @@ pull requests that landed them; deeper design rationale lives in
   so on a loaded machine one run could record Seatbelt and the other an
   unavailable sandbox. Production probing is unchanged.
 
+### Resume root identity (#239)
+
+- Sessions record the workspace root's directory identity (`device`, `inode`,
+  and birth time where reported) in an optional `root_object_identity` field
+  on `session.start` and `session.resumed`. Resume reports `Verified`,
+  `Relocated`, or `Unverified { reason }` on `FoldedSession` and
+  `ResumeOutcome`, so a directory replaced at the same path is no longer
+  indistinguishable from the original. The verdict never blocks, prompts, or
+  warns; it is the gate ADR 0023 replay will consume. Older Euler builds
+  resume these sessions unchanged.
+
 ### Shell command safety
 
 - Static shell approval now parses with `tree-sitter-bash` and uses the

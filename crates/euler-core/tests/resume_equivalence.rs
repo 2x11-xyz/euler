@@ -1303,6 +1303,15 @@ fn normalize_events(
                             Value::String("<root>".to_owned()),
                         );
                     }
+                    if payload.contains_key("root_object_identity") {
+                        // Each run's temporary root is a distinct directory.
+                        replace_allowed(
+                            payload,
+                            allowlist,
+                            "root_object_identity",
+                            Value::String("<root-object-identity>".to_owned()),
+                        );
+                    }
                     if let Some(runtime) = payload.get_mut("runtime").and_then(Value::as_object_mut)
                     {
                         // Equivalence cases deliberately create the two
@@ -1598,6 +1607,7 @@ fn nondeterministic_fields() -> BTreeSet<&'static str> {
         "file_change_id",
         "response_id",
         "root",
+        "root_object_identity",
         "attached_roots",
         "session_start_projection_sha256",
         "run",

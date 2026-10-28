@@ -26,6 +26,7 @@ pub mod provenance;
 mod provider_runtime;
 pub mod redaction;
 pub mod resume;
+mod root_identity;
 pub mod runtime_identity;
 pub mod sandbox;
 pub mod scrub;
@@ -118,6 +119,7 @@ pub use resume::{
     resume_session_from_prefix_with_outcome, resume_session_with_outcome, FoldedSession,
     RelocationRequired, ResumeError, ResumeOutcome, ResumeWarning,
 };
+pub use root_identity::{RootIdentityVerdict, RootUnverifiedReason};
 pub use runtime_identity::{
     runtime_identity_from_events, RecordedRuntimeIdentity, RuntimeIdentity, RuntimeIdentityError,
     RUNTIME_IDENTITY_SCHEMA_VERSION,

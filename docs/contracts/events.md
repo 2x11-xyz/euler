@@ -849,6 +849,16 @@ extension error does not consume the later result.
   malformed or unsupported object is incompatible rather than silently
   treated as legacy. More than one `session.start` is likewise invalid; a
   report or resume must not select one of several claimed identities.
+  Optional `root_object_identity` is `{ "device": <u64>, "inode": <u64>,
+  "birth": { "secs": <u64>, "nanos": <u32> } | null }`, the identity of the
+  opened canonical root directory (issue #239). `birth` is the directory
+  creation time where the filesystem reports one (statx `btime` on Linux,
+  `st_birthtime` on macOS). It is written before the projection digest is
+  computed, so the digest covers it and older readers accept it as an
+  ordinary non-runtime field. Omitted when the root cannot be read and in
+  streams written before this release. It feeds only the resume root identity
+  verdict (`project-context.md`); a malformed value yields `Unverified` and
+  never fails resume.
 - `session.resumed`: `provider`, `model`, `events_folded`, `sandbox_backend`,
   `sandbox_unavailable_reason`, optional
   `resumed_from_event_id`. The two sandbox fields carry the same values and
@@ -864,6 +874,10 @@ extension error does not consume the later result.
   LOG-LEAF: appended to the log but excluded from both that lifetime's and all
   later resumed lifetimes' in-memory buses, so it never becomes the parent of
   continued activity.
+  Optional `root_object_identity` has the `session.start` shape and records
+  the live root the session resumed in, so it governs later resume verdicts;
+  a marker without it (an older binary, or an unreadable root) resets the
+  governing identity to unknown.
 - `session.renamed`: `name`. Records the latest user-visible session name;
   sidecars and indexes are projections of this event, not naming authority.
   For sessions created by current new-Euler builds before this event existed,
