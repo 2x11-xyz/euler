@@ -130,7 +130,8 @@ Facts are never silently lost; only bulky result content is demoted.
 ## Custom providers (local models)
 
 Any OpenAI-compatible chat-completions endpoint can be registered as a
-provider in `~/.euler/providers.json`:
+provider in `providers.json` under the Euler home: `$EULER_HOME/providers.json`
+when `EULER_HOME` is set, otherwise `~/.euler/providers.json`:
 
 ```json
 {

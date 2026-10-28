@@ -4,6 +4,16 @@ All notable changes to Euler are documented here. Entries reference the
 pull requests that landed them; deeper design rationale lives in
 `docs/contracts/` and the GitHub issue ledger.
 
+## Unreleased
+
+- **`providers.json` now honors `EULER_HOME`.** Custom providers are read from
+  `$EULER_HOME/providers.json` when `EULER_HOME` is set, matching auth,
+  sessions, extensions, and skills. Previously the file was always read from
+  `~/.euler/providers.json`; if you set `EULER_HOME`, move the file there. An
+  unresolvable Euler home now prints a `warning: ignored provider config:`
+  line instead of silently reading `~/.euler`, and the `USERPROFILE` fallback
+  is gone (the Euler home requires `HOME` or `EULER_HOME`).
+
 ## 0.1.4 (2026-10-27)
 
 ### Subprocess sandboxing
