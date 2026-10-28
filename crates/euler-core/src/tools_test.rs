@@ -3222,3 +3222,160 @@ fn replay_policy_table_marks_only_read_only_core_tools_safe() {
         assert_eq!(registry.replay_policy(name), ReplayPolicy::Unsafe, "{name}");
     }
 }
+
+fn run_shell_description(registry: &ToolRegistry) -> String {
+    registry
+        .model_tools()
+        .into_iter()
+        .find(|definition| definition.name == "run_shell")
+        .expect("run_shell advertised")
+        .description
+}
+
+const CURL_DNS_FAILURE: &str = "echo 'curl: (6) Could not resolve host: example.com' >&2; exit 6";
+
+#[test]
+fn host_run_shell_states_host_execution_and_adds_no_network_note() {
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = ToolRegistry::new(temp.path());
+    let description = run_shell_description(&registry);
+    assert!(description.contains("Commands run directly on the host, outside Euler's sandbox."));
+    let child_description = registry
+        .child_model_tools()
+        .into_iter()
+        .find(|definition| definition.name == "run_shell")
+        .expect("run_shell advertised to children")
+        .description;
+    assert_eq!(child_description, description);
+
+    let result = registry
+        .execute("run_shell", &json!({"command": CURL_DNS_FAILURE}))
+        .expect("host shell runs");
+    assert_eq!(result.exit_code, Some(6));
+    assert!(
+        !result.output.contains(NETWORK_DENIAL_NOTE),
+        "{}",
+        result.output
+    );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn sandboxed_run_shell_states_its_boundary_and_notes_a_network_denial() {
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = ToolRegistry::with_subprocess_sandbox(
+        temp.path(),
+        SubprocessSandbox::Enforce(crate::SandboxProfile::WorkspaceNoNetwork),
+    );
+    let description = run_shell_description(&registry);
+    let SandboxStatus::Enforced(backend) = registry.sandbox_status() else {
+        assert!(
+            description.contains("Euler's sandbox could not start in this session"),
+            "{description}"
+        );
+        return;
+    };
+    assert!(
+        description.contains(&format!(
+            "Commands, including git, run in Euler's {} sandbox: network is disabled",
+            backend.as_str()
+        )),
+        "{description}"
+    );
+    assert!(
+        description.contains("services on the host's localhost are not reachable"),
+        "{description}"
+    );
+    assert!(
+        description.contains("only in the workspace"),
+        "{description}"
+    );
+    assert!(description.contains("report it as a sandbox limit"));
+    let tmp_fact = match backend {
+        SandboxBackend::Bwrap => "private and discarded after each command",
+        SandboxBackend::Seatbelt => "$TMPDIR and $HOME, which persist between commands",
+        SandboxBackend::Host => unreachable!("an enforced sandbox is never the host"),
+    };
+    assert!(description.contains(tmp_fact), "{description}");
+
+    let denied = registry
+        .execute("run_shell", &json!({"command": CURL_DNS_FAILURE}))
+        .expect("sandboxed shell runs");
+    assert_eq!(denied.exit_code, Some(6));
+    assert_eq!(
+        denied.output,
+        format!("exit 6\ncurl: (6) Could not resolve host: example.com\n{NETWORK_DENIAL_NOTE}")
+    );
+
+    for command in [
+        // A local service that is not listening is not a sandbox limit.
+        "echo 'curl: (7) Failed to connect to localhost port 9: Connection refused' >&2; exit 7",
+        // Success is never annotated, whatever the output says.
+        "echo 'Could not resolve host: example.com'",
+        "echo 'build failed' >&2; exit 1",
+    ] {
+        let result = registry
+            .execute("run_shell", &json!({"command": command}))
+            .expect("sandboxed shell runs");
+        assert!(
+            !result.output.contains(NETWORK_DENIAL_NOTE),
+            "{}",
+            result.output
+        );
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn unavailable_sandbox_run_shell_says_commands_are_refused() {
+    let temp = tempfile::tempdir().expect("temp");
+    let registry = ToolRegistry::with_subprocess_sandbox(
+        temp.path().join("missing-workspace"),
+        SubprocessSandbox::Enforce(crate::SandboxProfile::WorkspaceNoNetwork),
+    );
+    assert!(matches!(
+        registry.sandbox_status(),
+        SandboxStatus::Unavailable { .. }
+    ));
+    let description = run_shell_description(&registry);
+    assert!(
+        description.contains(
+            "Euler's sandbox could not start in this session, so commands are refused; \
+the user can run `euler --check-sandbox` to see why."
+        ),
+        "{description}"
+    );
+}
+
+#[test]
+fn network_denial_note_matches_resolver_and_unreachable_failures_only() {
+    for output in [
+        "fatal: unable to access 'https://example.com/': Could not resolve host: example.com\n",
+        "socket.gaierror: [Errno -3] Temporary failure in name resolution\n",
+        "socket.gaierror: [Errno 8] nodename nor servname provided, or not known\n",
+        "error: failed to lookup address information: Name or service not known\n",
+        "Error: getaddrinfo ENOTFOUND example.com\n",
+        "connect: Network is unreachable\n",
+        "curl: (7) Failed to connect to 93.184.215.14 port 80: Connection refused\n",
+        "ssh: connect to host 10.0.0.2 port 22: No route to host\n",
+        "Error: connect ECONNREFUSED 10.0.0.2:5432\n",
+        "curl: (7) Failed to connect to 93.184.215.14 port 80 after 0 ms: Couldn't connect to server\n",
+        "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com\n",
+        "Error: connect EPERM 1.1.1.1:80\n",
+        "dial tcp: lookup example.com: no such host\n",
+    ] {
+        let annotated = with_network_denial_note(output.to_owned());
+        assert_eq!(annotated, format!("{output}{NETWORK_DENIAL_NOTE}"));
+    }
+    for output in [
+        "curl: (7) Failed to connect to 127.0.0.1 port 9: Connection refused\n",
+        "Error: connect ECONNREFUSED 127.0.0.1:5432\n",
+        "curl: (7) Failed to connect to localhost port 9 after 0 ms: Couldn't connect to server\n",
+        "error connecting to 127.0.0.1:5432\n",
+        "touch: /etc/x: Operation not permitted\n",
+        "error[E0425]: cannot find value `x` in this scope\n",
+        "",
+    ] {
+        assert_eq!(with_network_denial_note(output.to_owned()), output);
+    }
+}

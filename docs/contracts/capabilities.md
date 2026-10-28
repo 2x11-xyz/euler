@@ -58,6 +58,9 @@ The backend is probed at session start, not assumed, and recorded on
 closed: no backend is ever silently downgraded to host execution.
 `euler --check-sandbox` reports
 the same result with an actionable diagnostic.
+The model reads the same boundary in the `run_shell` description, and a
+failed sandboxed command that looks like a network denial carries a host note
+saying network is disabled (tools contract, "Execution boundary").
 
 A probe that does not finish within its deadline is a timeout, not a refusal:
 it is reported with its own reason (`probe_timed_out`), its own message (the
