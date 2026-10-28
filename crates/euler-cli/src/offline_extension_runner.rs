@@ -1,7 +1,7 @@
 use crate::session_lifecycle::resolve_resume_target;
 use anyhow::{anyhow, Result};
 use euler_core::extensions::{ExtensionHost, ExtensionHostError, ExtensionInvocationOrigin};
-use euler_core::{read_resume_prefix, EulerHome, ProvenanceWriter};
+use euler_core::{read_resume_prefix, EulerHome, ExtensionExecutionError, ProvenanceWriter};
 use euler_event::EventEnvelope;
 use euler_sdk::{CommandDescriptor, Extension, ExtensionError};
 use std::path::PathBuf;
@@ -73,9 +73,10 @@ pub(super) fn execute_offline_extension_run(
             // The host already redacted and validated this extension text.
             ExtensionHostError::CommandFailed(_, ExtensionError::UserMessage(user_message)) => {
                 anyhow!(
-                    "{}.{} failed: extension command failed: {user_message}",
+                    "{}.{} failed: {}",
                     run.extension_id,
-                    run.command.name
+                    run.command.name,
+                    ExtensionExecutionError::CommandFailedWithUserMessage(user_message)
                 )
             }
             error => anyhow!(

@@ -43,7 +43,7 @@ in the failed model `tool.result` and in user command output, and as
 the fixed host text. The model-tool error projection below renders its newline
 and tab as visible escapes; the other surfaces keep them.
 An absent, non-string, or invalid message leaves the generic failure
-unchanged. No other extension error text is surfaced.
+unchanged. No other extension error text reaches the model or provenance.
 
 ## Bounded Event Feed v0
 
