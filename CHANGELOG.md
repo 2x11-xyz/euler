@@ -6,7 +6,7 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
-### Approval panel without grants says why
+### Approval panel without grants says why (#267)
 
 - A danger-flagged or once-only permission ask now shows only `y  Allow
   once` and `n/esc  Deny with instructions` plus a muted line with the

@@ -708,6 +708,31 @@ fn grantless_ask_scope_keys_type_instead_of_deciding() {
     }
 }
 
+/// Enter on a danger row once replied with an unscoped session scope and
+/// installed a shell-exec grant. Navigation now skips the hidden grant rows;
+/// should the selection land on one anyway, Enter still allows once.
+#[test]
+fn grantless_ask_enter_on_hidden_grant_row_allows_once() {
+    for request in [once_only_request(), danger_request()] {
+        for hidden in [
+            ApprovalOption::AllowSession,
+            ApprovalOption::AllowProject,
+            ApprovalOption::AllowUser,
+        ] {
+            let mut panel = grantless_panel(&request);
+            let (reply_tx, reply_rx) = mpsc::channel();
+            panel.reply_tx = reply_tx;
+            panel.approval_selection = hidden;
+            panel.handle_input(key(KeyCode::Enter));
+            assert_eq!(
+                reply_rx.try_recv().expect("Enter must reply"),
+                PermissionReply::AllowOnce,
+                "{hidden:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn user_rule_option_renders_and_replies_when_enabled() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
