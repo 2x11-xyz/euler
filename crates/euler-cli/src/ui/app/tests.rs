@@ -8025,6 +8025,27 @@ fn patch_approval_modal_renders_diff_and_prompt() {
 }
 
 #[test]
+fn once_only_patch_approval_modal_shows_reason_and_no_grant_rows() {
+    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
+    let mut core = core();
+    core.modal = Some(Modal::PatchApproval(PatchApprovalModal {
+        request: fs_write_request().with_once_only(),
+        preview: diff_preview("alpha\n", "beta\n"),
+    }));
+
+    terminal.draw(|frame| core.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("y  Allow once"), "contents: {contents}");
+    assert!(contents.contains("n/esc  Deny"), "contents: {contents}");
+    assert!(
+        contents.contains("Once-only request: an allow covers this request only."),
+        "contents: {contents}"
+    );
+    assert!(!contents.contains("a  Allow"), "contents: {contents}");
+    assert!(!contents.contains("p  Allow"), "contents: {contents}");
+}
+
+#[test]
 fn patch_approval_modal_has_blank_line_before_options_and_gold_selection() {
     let mut core = core();
     core.modal = Some(patch_modal(diff_preview("alpha\n", "beta\n")));

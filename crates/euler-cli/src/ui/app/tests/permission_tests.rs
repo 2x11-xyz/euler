@@ -602,68 +602,109 @@ fn scoped_shell_labels_and_replies_use_command_prefix() {
     );
 }
 
-#[test]
-fn once_only_ask_offers_only_allow_once() {
-    // The per-write project config ask from a model tool installs no grant
-    // (ADR 0022), so the panel must not offer a session or project scope.
-    let request = PermissionRequest::new(
+/// The per-write project config ask from a model tool installs no grant
+/// (ADR 0022), so its panel offers no session or project scope.
+fn once_only_request() -> PermissionRequest {
+    PermissionRequest::new(
         Capability::ConfigWrite,
         "extension config-ext.configure writes shared project config".to_owned(),
     )
-    .with_once_only();
-    let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");
-    let mut core = core();
-    core.modal = Some(Modal::Permission(request.clone()));
-
-    terminal.draw(|frame| core.render(frame)).expect("draw");
-    let contents = terminal.backend().screen_contents();
-    assert!(
-        !contents.contains("for this session"),
-        "contents: {contents}"
-    );
-    assert!(
-        !contents.contains("in this project"),
-        "contents: {contents}"
-    );
-    assert!(contents.contains("a  Allow once (this command always asks)"));
-
-    assert_grantless_rows_allow_once(&request);
+    .with_once_only()
 }
 
-#[test]
-fn danger_rows_allow_once_from_keys_and_enter() {
-    // Enter on a danger row used to reply with an unscoped session scope,
-    // installing a shell-exec grant that covered later safe commands.
+/// A simple shell command with a user store loaded would otherwise offer
+/// the durable `u` rule.
+fn once_only_shell_request() -> PermissionRequest {
+    PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
+        .with_command("cargo test -q")
+        .with_once_only()
+}
+
+fn danger_request() -> PermissionRequest {
     let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
         .with_command("rm -rf build");
     assert!(request.dangerous_command);
-
-    assert_grantless_rows_allow_once(&request);
+    request
 }
 
-/// Every way of choosing the session or project row on a panel that offers
-/// no grant (its key, or Enter on the selected row) allows once, which
-/// installs nothing.
-fn assert_grantless_rows_allow_once(request: &PermissionRequest) {
-    let choices = [
-        vec![key(KeyCode::Char('a'))],
-        vec![key(KeyCode::Char('p'))],
-        vec![key(KeyCode::Down), key(KeyCode::Enter)],
-        vec![key(KeyCode::Down), key(KeyCode::Down), key(KeyCode::Enter)],
-    ];
-    for (index, inputs) in choices.into_iter().enumerate() {
-        let mut core = core();
-        let (reply_tx, reply_rx) = mpsc::channel();
-        core.reply_tx = reply_tx;
-        core.modal = Some(Modal::Permission(request.clone()));
-        for input in inputs {
-            core.handle_input(input);
-        }
+fn grantless_panel(request: &PermissionRequest) -> AppCore {
+    let mut panel = core();
+    panel.user_rules_enabled = true;
+    panel.modal = Some(Modal::Permission(request.clone()));
+    panel
+}
+
+#[test]
+fn grantless_asks_render_allow_once_deny_and_reason() {
+    for (request, reason) in [
+        (
+            once_only_request(),
+            "Once-only request: an allow covers this request only.",
+        ),
+        (
+            danger_request(),
+            "Flagged dangerous by command safety: always asks, no grant offered.",
+        ),
+    ] {
+        let mut terminal = Terminal::new(VT100Backend::new(96, 24)).expect("terminal");
+        let mut panel = grantless_panel(&request);
+        terminal.draw(|frame| panel.render(frame)).expect("draw");
+        let contents = terminal.backend().screen_contents();
         assert_eq!(
-            reply_rx.recv().expect("reply"),
-            PermissionReply::AllowOnce,
-            "choice {index}"
+            contents.matches("Allow once").count(),
+            1,
+            "contents: {contents}"
         );
+        assert!(contents.contains("y  Allow once"), "contents: {contents}");
+        assert!(
+            contents.contains("n/esc  Deny with instructions"),
+            "contents: {contents}"
+        );
+        assert!(contents.contains(reason), "contents: {contents}");
+        for absent in ["a  Allow", "p  Allow", "u  Allow"] {
+            assert!(!contents.contains(absent), "{absent}: {contents}");
+        }
+    }
+}
+
+#[test]
+fn grantless_ask_arrows_move_between_allow_once_and_deny() {
+    for request in [
+        once_only_request(),
+        once_only_shell_request(),
+        danger_request(),
+    ] {
+        let mut panel = grantless_panel(&request);
+        let (reply_tx, reply_rx) = mpsc::channel();
+        panel.reply_tx = reply_tx;
+        panel.handle_input(key(KeyCode::Down));
+        assert_eq!(panel.approval_selection, ApprovalOption::Deny);
+        panel.handle_input(key(KeyCode::Down));
+        assert_eq!(panel.approval_selection, ApprovalOption::Deny);
+        panel.handle_input(key(KeyCode::Up));
+        assert_eq!(panel.approval_selection, ApprovalOption::AllowOnce);
+        panel.handle_input(key(KeyCode::Down));
+        panel.handle_input(key(KeyCode::Enter));
+        assert_eq!(reply_rx.recv().expect("reply"), PermissionReply::Deny);
+    }
+}
+
+#[test]
+fn grantless_ask_scope_keys_type_instead_of_deciding() {
+    for request in [
+        once_only_request(),
+        once_only_shell_request(),
+        danger_request(),
+    ] {
+        for letter in ['a', 'p', 'u'] {
+            let mut panel = grantless_panel(&request);
+            let (reply_tx, reply_rx) = mpsc::channel();
+            panel.reply_tx = reply_tx;
+            panel.handle_input(key(KeyCode::Char(letter)));
+            assert!(reply_rx.try_recv().is_err(), "{letter} must not decide");
+            assert!(panel.modal.is_some(), "{letter} must not close the panel");
+            assert_eq!(panel.bottom.composer().submit_text(), letter.to_string());
+        }
     }
 }
 

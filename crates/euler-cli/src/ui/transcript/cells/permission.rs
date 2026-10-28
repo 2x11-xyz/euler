@@ -92,9 +92,10 @@ pub(in crate::ui::transcript) struct PermissionAskView<'a> {
     /// `Some` only when the durable `u  Allow <prefix> * always` option is
     /// offerable (simple shell command + loaded user store).
     pub(in crate::ui::transcript) user_rule_prefix: Option<&'a str>,
-    /// False when the request is danger-flagged: no grant can cover it, so
-    /// the panel offers none.
-    pub(in crate::ui::transcript) grants_offerable: bool,
+    /// `Some` when the request offers no grant (danger-flagged or
+    /// once-only): the panel shows only allow-once and deny, plus this
+    /// reason as a muted line.
+    pub(in crate::ui::transcript) no_grant_reason: Option<&'static str>,
     pub(in crate::ui::transcript) prior_count: usize,
     pub(in crate::ui::transcript) selected_option: crate::ui::patch_approval::ApprovalOption,
     pub(in crate::ui::transcript) companion_name: Option<&'a str>,
@@ -195,7 +196,7 @@ pub(in crate::ui::transcript) fn render_permission_ask(
             ask.capability,
             ask.scope_prefix,
             ask.user_rule_prefix,
-            ask.grants_offerable,
+            ask.no_grant_reason.is_none(),
             ask.selected_option,
         )
         .into_iter()
@@ -207,6 +208,9 @@ pub(in crate::ui::transcript) fn render_permission_ask(
             }
         }),
     );
+    if let Some(reason) = ask.no_grant_reason {
+        rows.push(PermissionPanelRow::metadata(reason));
+    }
     push_bordered_permission_panel(lines, &rows, theme, width);
 }
 

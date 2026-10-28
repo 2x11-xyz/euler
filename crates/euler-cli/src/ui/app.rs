@@ -2850,23 +2850,21 @@ impl AppCore {
             KeyCode::Char('y') | KeyCode::Char('Y') if draft_empty => {
                 self.reply_to_modal(PermissionReply::AllowOnce)
             }
-            KeyCode::Char('a') | KeyCode::Char('A') if draft_empty => {
-                if !self.modal_offers_grants() {
-                    return self.reply_to_modal(PermissionReply::AllowOnce);
-                }
+            // `a`, `p`, and `u` decide only when the panel shows their row;
+            // otherwise they fall through and type into the composer like
+            // any other character.
+            KeyCode::Char('a') | KeyCode::Char('A')
+                if draft_empty && self.modal_offers_grants() =>
+            {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
             }
-            KeyCode::Char('p') | KeyCode::Char('P') if draft_empty && !self.modal_is_batch() => {
-                if !self.modal_offers_grants() {
-                    return self.reply_to_modal(PermissionReply::AllowOnce);
-                }
+            KeyCode::Char('p') | KeyCode::Char('P')
+                if draft_empty && !self.modal_is_batch() && self.modal_offers_grants() =>
+            {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
             }
-            // `u` decides only when the panel actually offers the durable
-            // user rule; otherwise it falls through and types into the
-            // composer like any other character.
             KeyCode::Char('u') | KeyCode::Char('U')
                 if draft_empty && self.modal_user_rule_prefix().is_some() =>
             {
@@ -2919,9 +2917,10 @@ impl AppCore {
             };
             return CoreEffect::Render;
         }
-        self.approval_selection = self
-            .approval_selection
-            .previous(self.modal_user_rule_prefix().is_some());
+        self.approval_selection = self.approval_selection.previous(
+            self.modal_user_rule_prefix().is_some(),
+            self.modal_offers_grants(),
+        );
         CoreEffect::Render
     }
 
@@ -2935,9 +2934,10 @@ impl AppCore {
             };
             return CoreEffect::Render;
         }
-        self.approval_selection = self
-            .approval_selection
-            .next(self.modal_user_rule_prefix().is_some());
+        self.approval_selection = self.approval_selection.next(
+            self.modal_user_rule_prefix().is_some(),
+            self.modal_offers_grants(),
+        );
         CoreEffect::Render
     }
 
@@ -2955,8 +2955,9 @@ impl AppCore {
         }
         match self.approval_selection {
             ApprovalOption::AllowOnce => self.reply_to_modal(PermissionReply::AllowOnce),
-            // Rows that offer no grant read "Allow once", so Enter on them
-            // allows once, exactly as their `a`/`p` keys do.
+            // A panel that offers no grant hides these rows and navigation
+            // skips them; should the selection still land here, allow once
+            // rather than install a grant the request does not offer.
             ApprovalOption::AllowSession
             | ApprovalOption::AllowProject
             | ApprovalOption::AllowUser
@@ -4605,7 +4606,7 @@ impl AppCore {
                     selected_option: self.approval_selection,
                     scope_prefix,
                     user_rule_prefix: self.modal_user_rule_prefix(),
-                    grants_offerable: request.offers_grants(),
+                    no_grant_reason: patch_approval::no_grant_reason(request),
                     companion_name: self.in_flight_companion_name.clone(),
                 })
             }
