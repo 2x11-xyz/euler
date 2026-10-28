@@ -14,6 +14,15 @@ impl SseParser {
         Self::default()
     }
 
+    /// A parser whose stream errors name `label` (for example a custom
+    /// provider label) instead of ChatGPT.
+    pub(crate) fn with_label(label: &str) -> Self {
+        Self {
+            response_events: ResponseEventParser::with_label(label),
+            ..Self::default()
+        }
+    }
+
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<Result<ModelStreamEvent, ProviderError>> {
         let mut events = Vec::new();
         for byte in chunk {
@@ -84,14 +93,34 @@ impl SseParser {
 /// Parses individual Responses API events for both SSE and WebSocket
 /// transports. Keeping the terminal/tool-call bookkeeping here prevents the
 /// two transports from drifting in their canonical event behavior.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ResponseEventParser {
+    /// Names the provider in stream errors.
+    label: String,
     saw_data: bool,
     terminal_event_seen: bool,
     saw_tool_call: bool,
 }
 
+impl Default for ResponseEventParser {
+    fn default() -> Self {
+        Self::with_label(CHATGPT_LABEL)
+    }
+}
+
+/// Stream error label of the built-in ChatGPT provider.
+pub(crate) const CHATGPT_LABEL: &str = "ChatGPT";
+
 impl ResponseEventParser {
+    pub(crate) fn with_label(label: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            saw_data: false,
+            terminal_event_seen: false,
+            saw_tool_call: false,
+        }
+    }
+
     pub(crate) fn push_json(
         &mut self,
         data: &str,
@@ -100,7 +129,7 @@ impl ResponseEventParser {
             return None;
         }
         self.saw_data = true;
-        let mut event = parse_payload(data)?;
+        let mut event = parse_payload(&self.label, data)?;
         if matches!(event, Ok(ModelStreamEvent::ToolCall(_))) {
             self.saw_tool_call = true;
         }
@@ -118,16 +147,17 @@ impl ResponseEventParser {
     pub(crate) fn finish(&mut self) -> Option<Result<ModelStreamEvent, ProviderError>> {
         if self.saw_data && !self.terminal_event_seen {
             self.terminal_event_seen = true;
-            Some(Err(ProviderError::stream_truncation(
-                "ChatGPT provider stream truncated before response.completed",
-            )))
+            Some(Err(ProviderError::stream_truncation(format!(
+                "{} provider stream truncated before response.completed",
+                self.label
+            ))))
         } else {
             None
         }
     }
 }
 
-fn parse_payload(data: &str) -> Option<Result<ModelStreamEvent, ProviderError>> {
+fn parse_payload(label: &str, data: &str) -> Option<Result<ModelStreamEvent, ProviderError>> {
     let value: Value = serde_json::from_str(data).ok()?;
     match value.get("type").and_then(Value::as_str)? {
         "response.output_text.delta" => {
@@ -155,7 +185,7 @@ fn parse_payload(data: &str) -> Option<Result<ModelStreamEvent, ProviderError>> 
                 usage: usage(&value),
             }))
         }
-        "response.failed" | "error" => Some(Err(response_failed_error(&value))),
+        "response.failed" | "error" => Some(Err(response_failed_error(label, &value))),
         _ => None,
     }
 }
@@ -218,7 +248,7 @@ fn usage(value: &Value) -> Option<Usage> {
     ))
 }
 
-fn response_failed_error(value: &Value) -> ProviderError {
+fn response_failed_error(label: &str, value: &Value) -> ProviderError {
     let code = value
         .get("response")
         .and_then(|response| response.get("error"))
@@ -227,10 +257,10 @@ fn response_failed_error(value: &Value) -> ProviderError {
         .and_then(Value::as_str);
     match code {
         Some("rate_limit_exceeded" | "rate_limit") => {
-            ProviderError::rate_limit("ChatGPT response failed: rate limit")
+            ProviderError::rate_limit(format!("{label} response failed: rate limit"))
         }
         Some("unauthorized" | "authentication_error" | "invalid_api_key") => {
-            ProviderError::auth("ChatGPT response failed: authentication failed")
+            ProviderError::auth(format!("{label} response failed: authentication failed"))
         }
         Some(
             "invalid_request"
@@ -240,8 +270,8 @@ fn response_failed_error(value: &Value) -> ProviderError {
             | "unsupported_value"
             | "usage_limit_reached"
             | "usage_not_included",
-        ) => ProviderError::rejected("ChatGPT response failed: request rejected"),
-        _ => ProviderError::transport("ChatGPT response failed"),
+        ) => ProviderError::rejected(format!("{label} response failed: request rejected")),
+        _ => ProviderError::transport(format!("{label} response failed")),
     }
 }
 
@@ -393,7 +423,7 @@ data: {"type":"response.completed"}
     #[test]
     fn reports_transient_throttle_codes_as_rate_limits() {
         for code in ["rate_limit", "rate_limit_exceeded"] {
-            let error = response_failed_error(&json!({"error": {"code": code}}));
+            let error = response_failed_error(CHATGPT_LABEL, &json!({"error": {"code": code}}));
             assert_eq!(
                 error,
                 ProviderError::rate_limit("ChatGPT response failed: rate limit")

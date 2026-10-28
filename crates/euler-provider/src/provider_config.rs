@@ -110,15 +110,21 @@ impl CustomProviderConfig {
 pub enum ApiFamily {
     OpenAiChatCompletions,
     AnthropicMessages,
+    OpenAiResponses,
 }
 
 impl ApiFamily {
-    const ALL: [Self; 2] = [Self::OpenAiChatCompletions, Self::AnthropicMessages];
+    const ALL: [Self; 3] = [
+        Self::OpenAiChatCompletions,
+        Self::AnthropicMessages,
+        Self::OpenAiResponses,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OpenAiChatCompletions => "openai_chat_completions",
             Self::AnthropicMessages => "anthropic_messages",
+            Self::OpenAiResponses => "openai_responses",
         }
     }
 
@@ -127,6 +133,7 @@ impl ApiFamily {
         match self {
             Self::OpenAiChatCompletions => "/chat/completions",
             Self::AnthropicMessages => "/messages",
+            Self::OpenAiResponses => "/responses",
         }
     }
 }
@@ -510,7 +517,7 @@ fn parse_model(
     }
     let compat = match api_family {
         ApiFamily::OpenAiChatCompletions => parse_compat(object.get("compat"), scope, warnings),
-        ApiFamily::AnthropicMessages => {
+        ApiFamily::AnthropicMessages | ApiFamily::OpenAiResponses => {
             if object.contains_key("compat") {
                 warnings.push(format!(
                     "ignored {scope} compat because it applies only to openai_chat_completions"

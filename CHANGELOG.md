@@ -6,6 +6,21 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Custom providers speak OpenAI Responses (#264)
+
+- **New `api_family: "openai_responses"`** for `providers.json`, per
+  provider or per model entry. It reuses the ChatGPT Responses adapter
+  against `<base_url>/responses` with the provider's auth, so a gateway's
+  Responses-native models (for example Codex models on a LiteLLM proxy) are
+  reached without a Chat Completions translation. A model entry that
+  declares `supports_reasoning: true` requests reasoning with streamed
+  summaries; recorded reasoning is not replayed, as on the built-in
+  `chatgpt` provider.
+- New load warnings: `compat` on a Responses model (Chat Completions only,
+  ignored), and a Responses provider or model under a full-endpoint
+  `base_url` of another family.
+- Responses stream errors name the custom provider instead of ChatGPT.
+
 ### Custom providers speak Anthropic Messages (#263)
 
 - **New `api_family: "anthropic_messages"`** for `providers.json`. It reuses
