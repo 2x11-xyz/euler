@@ -28,7 +28,7 @@ pull requests that landed them; deeper design rationale lives in
   explicit context records `explicit_context_sha256`.
 - Recording only: resume behavior is unchanged.
 
-### Custom providers without a models list
+### Custom providers without a models list (#261)
 
 - **`models` is optional when `default_model` is set.** A custom provider in
   `providers.json` may now name just a `default_model`; Euler treats it as one

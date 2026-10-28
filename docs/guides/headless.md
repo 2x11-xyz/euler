@@ -181,8 +181,9 @@ Rules, enforced at load with warnings for anything malformed:
   declare `context_window_tokens`, `max_output_tokens`, `supports_tools`, and
   `supports_reasoning`. `models` is optional when `default_model` is set: the
   provider then offers that one model with no declared metadata, the same as
-  passing an unlisted `--model`. A provider with neither, or with an empty
-  `models` array, is ignored with a warning.
+  passing an unlisted `--model`. A provider with neither field, or whose
+  `models` is present but empty or not an array (even with `default_model`
+  set), is ignored with a warning.
 
 ## Detached launches
 
