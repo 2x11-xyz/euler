@@ -5919,6 +5919,7 @@ fn session_start_payload(config: &SessionConfig, sandbox: SandboxStatus) -> Json
         ("root", session_root_for_event(&config.root).into()),
     ]);
     payload.extend(sandbox_start_fields(sandbox));
+    crate::root_identity::insert_root_object_identity(&mut payload, &config.root);
     if let Some(bootstrap) = &config.project_context {
         payload.insert(
             "project_context".to_owned(),

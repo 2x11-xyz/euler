@@ -805,6 +805,15 @@ advisory. Canonical name grammar, immutable snapshots, duplicate exclusion,
 containment, and permission behavior do not change. Description length is
 measured in Unicode scalar values after YAML decoding.
 
+### 2026-10-27 note: root object identity (#239)
+
+This note does not change the decision. The workspace identity above stays
+location-only. Replacement of the directory at the same path is reported
+separately by the root object identity recorded on `session.start` and
+`session.resumed`; resume computes a `Verified`, `Relocated`, or `Unverified`
+verdict next to the path check. The verdict never blocks resume or resets
+grants. Semantics are in `docs/contracts/project-context.md`.
+
 ## Consequences
 
 - Teams can commit one Euler-specific instruction hierarchy and cross-agent

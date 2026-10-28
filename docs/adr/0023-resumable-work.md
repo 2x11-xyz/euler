@@ -278,6 +278,11 @@ durable record can re-run it.
 
 Until #239 lands, replay stays off and continuation closes every call.
 
+Note (2026-10-27): the verdict this seam consumes exists.
+`RootIdentityVerdict` on `FoldedSession` and `ResumeOutcome` is `Verified`,
+`Relocated`, or `Unverified { reason }` (`docs/contracts/project-context.md`).
+Per Decision 5, rollout step 4 replays only on `Verified`.
+
 ## Compatibility
 
 - **Legacy logs.** No `replay` field means `unsafe`, no `owner_event_id`
