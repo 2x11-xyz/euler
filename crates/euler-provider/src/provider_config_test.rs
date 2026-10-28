@@ -1,4 +1,4 @@
-use crate::provider_config::{ApiFamily, ProviderConfigRegistry};
+use crate::provider_config::{ApiFamily, CustomModelConfig, ProviderConfigRegistry};
 
 #[test]
 fn parses_custom_provider_without_resolving_secret_references() {
@@ -561,4 +561,119 @@ fn reserved_qwen_chat_template_warns_without_echoing_value() {
         .expect("request_format warning");
     assert!(warning.contains("not supported"));
     assert!(!warning.contains("qwen_chat_template"));
+}
+
+#[test]
+fn default_model_without_models_becomes_the_only_model_with_no_metadata() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{
+          "providers": {
+            "local": {
+              "api_family": "openai_chat_completions",
+              "base_url": "http://localhost:11434/v1",
+              "default_model": "qwen3:32b"
+            }
+          }
+        }"#,
+    );
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let provider = registry.provider("local").expect("local provider");
+    assert_eq!(provider.default_model.as_deref(), Some("qwen3:32b"));
+    assert_eq!(provider.default_model_error, None);
+    let models = provider.models.values().collect::<Vec<_>>();
+    assert_eq!(
+        models,
+        [&CustomModelConfig {
+            id: "qwen3:32b".to_owned(),
+            display_name: "qwen3:32b".to_owned(),
+            context_window_tokens: None,
+            max_output_tokens: None,
+            supports_tools: None,
+            supports_reasoning: None,
+            compat: None,
+        }]
+    );
+}
+
+#[test]
+fn missing_empty_or_non_array_models_warn_with_the_fix() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{
+          "providers": {
+            "no_models": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://proxy.example.com/v1"
+            },
+            "non_string_default": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://proxy.example.com/v1",
+              "default_model": 42
+            },
+            "invalid_default": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://proxy.example.com/v1",
+              "default_model": " padded "
+            },
+            "empty_models": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://proxy.example.com/v1",
+              "default_model": "custom",
+              "models": []
+            },
+            "object_models": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://proxy.example.com/v1",
+              "default_model": "custom",
+              "models": {"custom": {}}
+            }
+          }
+        }"#,
+    );
+
+    assert_eq!(registry.providers().count(), 0);
+    for id in [
+        "no_models",
+        "non_string_default",
+        "invalid_default",
+        "empty_models",
+        "object_models",
+    ] {
+        let warning = warnings
+            .iter()
+            .find(|warning| warning.starts_with(&format!("ignored provider `{id}` because")))
+            .unwrap_or_else(|| panic!("warning for {id}: {warnings:?}"));
+        assert!(
+            warning.contains("list models as") && warning.contains("set \"default_model\""),
+            "{warning}"
+        );
+    }
+}
+
+#[test]
+fn headless_guide_custom_provider_example_parses_without_warnings() {
+    let guide = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../docs/guides/headless.md"
+    ))
+    .expect("headless guide");
+    let section = guide
+        .split("## Custom providers")
+        .nth(1)
+        .expect("custom providers section");
+    let example = section
+        .split("```json")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .expect("providers.json example");
+
+    let (registry, warnings) = ProviderConfigRegistry::with_json(example);
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let ids = registry.providers().map(|provider| provider.id.as_str());
+    assert_eq!(ids.collect::<Vec<_>>(), ["gateway", "local"]);
+    for provider in registry.providers() {
+        let default_model = provider.default_model.as_deref().expect("default model");
+        assert!(provider.models.contains_key(default_model));
+    }
 }

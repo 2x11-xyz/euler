@@ -179,7 +179,10 @@ fn parse_provider(
     let base_url = required_base_url(object, &scope, warnings)?;
     let auth_header = bool_field(object, "auth_header", &scope, warnings).unwrap_or(false);
     let headers = parse_headers(object.get("headers"), &scope, auth_header, warnings)?;
-    let models = parse_models(object.get("models"), &scope, warnings)?;
+    let models = match object.get("models") {
+        Some(models) => parse_models(models, &scope, warnings)?,
+        None => default_model_only(object.get("default_model"), &scope, warnings)?,
+    };
     let (default_model, default_model_error) =
         parse_default_model(object.get("default_model"), &id, &models, warnings);
     Some(CustomProviderConfig {
@@ -332,13 +335,13 @@ fn valid_header_name(name: &str) -> bool {
 }
 
 fn parse_models(
-    value: Option<&Value>,
+    value: &Value,
     scope: &str,
     warnings: &mut Vec<String>,
 ) -> Option<BTreeMap<String, CustomModelConfig>> {
-    let Some(models) = value.and_then(Value::as_array) else {
+    let Some(models) = value.as_array() else {
         warnings.push(format!(
-            "ignored {scope} because models is missing or not an array"
+            "ignored {scope} because models is not an array; {MODELS_FIX}"
         ));
         return None;
     };
@@ -355,10 +358,40 @@ fn parse_models(
         }
     }
     if parsed.is_empty() {
-        warnings.push(format!("ignored {scope} because it has no valid models"));
+        warnings.push(format!(
+            "ignored {scope} because it has no valid models; {MODELS_FIX}"
+        ));
         return None;
     }
     Some(parsed)
+}
+
+/// A provider that omits `models` offers only its `default_model`. The entry
+/// declares no metadata, so it behaves like an unlisted `--model`.
+fn default_model_only(
+    value: Option<&Value>,
+    scope: &str,
+    warnings: &mut Vec<String>,
+) -> Option<BTreeMap<String, CustomModelConfig>> {
+    let id = value
+        .and_then(Value::as_str)
+        .and_then(|id| valid_model_id(id, &format!("{scope} default_model"), warnings));
+    let Some(id) = id else {
+        warnings.push(format!(
+            "ignored {scope} because it has no models list and no valid string default_model; {MODELS_FIX}"
+        ));
+        return None;
+    };
+    let model = CustomModelConfig {
+        id: id.clone(),
+        display_name: id.clone(),
+        context_window_tokens: None,
+        max_output_tokens: None,
+        supports_tools: None,
+        supports_reasoning: None,
+        compat: None,
+    };
+    Some(BTreeMap::from([(id, model)]))
 }
 
 fn parse_model(
@@ -651,6 +684,8 @@ fn warn_unknown<'a>(
 }
 
 const API_FAMILIES: &[&str] = &["openai_chat_completions"];
+const MODELS_FIX: &str =
+    "list models as [{\"id\": \"<model id>\"}], or omit models and set \"default_model\": \"<model id>\"";
 const MAX_TOKEN_FIELDS: &[&str] = &["max_completion_tokens", "max_tokens"];
 const REASONING_FORMATS: &[&str] = &[
     "openai_reasoning_effort",
