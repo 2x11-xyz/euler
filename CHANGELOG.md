@@ -6,6 +6,8 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Custom provider config location (#258)
+
 - **`providers.json` now honors `EULER_HOME`.** Custom providers are read from
   `$EULER_HOME/providers.json` when `EULER_HOME` is set, matching auth,
   sessions, extensions, and skills. Previously the file was always read from

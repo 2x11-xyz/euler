@@ -1239,10 +1239,13 @@ fn models_command_warns_when_euler_home_cannot_hold_provider_config() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
-    assert!(
-        stderr.contains(
-            "warning: ignored provider config: EULER_HOME must be an absolute path: relative-euler-home"
-        ),
+    assert_eq!(
+        stderr
+            .matches(
+                "warning: ignored provider config: EULER_HOME must be an absolute path: relative-euler-home"
+            )
+            .count(),
+        1,
         "stderr: {stderr}"
     );
 }

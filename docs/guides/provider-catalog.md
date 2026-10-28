@@ -137,8 +137,9 @@ Euler assembles the model list in this order:
 3. the user's optional `~/.euler/models.json` additions and same-ID metadata
    overrides.
 
-Transport-bearing custom providers from `~/.euler/providers.json` are a
-separate configuration surface.
+Transport-bearing custom providers from `~/.euler/providers.json` (or
+`$EULER_HOME/providers.json` when `EULER_HOME` is set) are a separate
+configuration surface.
 
 ## Maintainer release sync
 
