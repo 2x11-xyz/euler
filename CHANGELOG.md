@@ -21,9 +21,7 @@ pull requests that landed them; deeper design rationale lives in
   `base_url` of another family.
 - Responses stream errors name the custom provider instead of ChatGPT.
 
-### `exec --resume --continue` continues an interrupted run (ADR 0023 step 3)
-
-### `exec --resume --continue` continues an interrupted run (#265)
+### `exec --resume --continue` continues an interrupted run (ADR 0023 step 3, #265)
 
 - **New `--continue` for `euler exec --resume <path-or-id>`.** Instead of
   closing the interrupted run and starting a new turn, resume keeps the run
