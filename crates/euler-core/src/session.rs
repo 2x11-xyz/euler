@@ -515,6 +515,11 @@ pub enum ExtensionExecutionError {
     /// persisted only as a sanitized host-generated extension error event.
     #[error("extension command failed")]
     CommandFailed,
+    /// The command failed with an extension-supplied user message that the
+    /// host already redacted and validated (ADR 0018 amendment). It is the
+    /// only extension-authored text this surface exposes.
+    #[error("extension command failed: {0}")]
+    CommandFailedWithUserMessage(String),
     /// The command panicked. Raw panic payloads are not returned or persisted.
     #[error("extension command panicked")]
     CommandPanicked,

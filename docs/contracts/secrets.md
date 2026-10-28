@@ -178,7 +178,10 @@ persisted to the ledger (and from there replays into model context):
   it all inherit the redacted text. Only the ERROR field: success output
   and reviewer findings stay faithful in `agent.result`;
 - `context.slot.updated` content (extension-injected text that replays
-  into every later round).
+  into every later round);
+- an extension user message on a command error (ADR 0018 amendment),
+  redacted once by the extension host before it reaches the extension `error`
+  event, the failed `tool.result`, or user command output.
 
 Model-authored text (`model.result` content, `model.reasoning`,
 `assistant.message`, agent result success output, reviewer findings, and

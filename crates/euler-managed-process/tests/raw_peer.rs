@@ -382,6 +382,67 @@ assert exit_message["method"] == "exit"
 }
 
 #[test]
+fn command_error_user_message_is_the_only_error_text_forwarded() {
+    require_python();
+    let temp = TempDir::new().expect("temp package");
+    write_script(
+        temp.path(),
+        "extension.py",
+        r#"import json
+import sys
+
+def read():
+    line = sys.stdin.buffer.readline()
+    if not line:
+        raise SystemExit(0)
+    return json.loads(line)
+
+def write(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+initialize = read()
+write({"jsonrpc": "2.0", "id": initialize["id"], "result": {"protocol_version": "euler-managed-process/1"}})
+read()
+command = read()
+write({"jsonrpc": "2.0", "id": command["id"], "error": command["params"]["input"]["error"]})
+shutdown = read()
+assert shutdown["method"] == "shutdown"
+write({"jsonrpc": "2.0", "id": shutdown["id"], "result": {}})
+exit_message = read()
+assert exit_message["method"] == "exit"
+"#,
+    );
+    let extension = extension(temp.path(), "exercise", Vec::new());
+    let run = |error: Value| {
+        execute_with_input(
+            &extension,
+            "exercise",
+            json!({"error": error}),
+            &FakeHost::default(),
+        )
+        .expect_err("command error")
+    };
+    let generic = ExtensionError::Message(ManagedProcessRuntimeError::CommandFailed.to_string());
+
+    assert_eq!(
+        run(json!({
+            "code": -32000,
+            "message": "PROCESS_SECRET_DO_NOT_RECORD",
+            "data": {"user_message": "population_size must be in range 1..=8"}
+        })),
+        ExtensionError::UserMessage("population_size must be in range 1..=8".to_owned())
+    );
+    for error in [
+        json!({"code": -32000, "message": "PROCESS_SECRET_DO_NOT_RECORD"}),
+        json!({"code": -32000, "message": "m", "data": "PROCESS_SECRET_DO_NOT_RECORD"}),
+        json!({"code": -32000, "message": "m", "data": {"user_message": 7}}),
+    ] {
+        assert_eq!(run(error.clone()), generic, "{error}");
+    }
+}
+
+#[test]
 fn peer_messages_queue_while_a_host_call_is_running() {
     require_python();
     let temp = TempDir::new().expect("temp package");

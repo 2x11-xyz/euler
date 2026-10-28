@@ -69,6 +69,8 @@ pub enum ExtensionHostError {
     RegistrationPanic(Option<String>),
     MissingCommand(String),
     ExtensionDisabled(String),
+    /// A command error. An `ExtensionError::UserMessage` source has already
+    /// passed `validated_user_message`; consumers surface it as is.
     CommandFailed(String, ExtensionError),
     CommandCancelled(String),
     CommandPanic(String, String),
@@ -517,8 +519,13 @@ impl ExtensionHost {
                 if let Some(error) = failure {
                     return Err(ExtensionHostError::Provenance(error));
                 }
-                self.record_command_failure(&extension_id, command, ExtensionFailureKind::Panic)
-                    .map_err(extension_provenance_error)?;
+                self.record_command_failure(
+                    &extension_id,
+                    command,
+                    ExtensionFailureKind::Panic,
+                    None,
+                )
+                .map_err(extension_provenance_error)?;
                 Err(ExtensionHostError::CommandPanic(
                     extension_id,
                     command.to_owned(),
@@ -530,10 +537,16 @@ impl ExtensionHost {
                 Err(ExtensionHostError::CommandCancelled(command.to_owned()))
             }
             (Ok(Err(source)), None) => {
+                let source = validated_user_message(source, &self.redactor);
+                let user_message = match &source {
+                    ExtensionError::UserMessage(user_message) => Some(user_message.as_str()),
+                    _ => None,
+                };
                 self.record_command_failure(
                     &extension_id,
                     command,
                     ExtensionFailureKind::CommandError,
+                    user_message,
                 )
                 .map_err(extension_provenance_error)?;
                 Err(ExtensionHostError::CommandFailed(
@@ -549,14 +562,24 @@ impl ExtensionHost {
         extension_id: &str,
         command: &str,
         failure: ExtensionFailureKind,
+        user_message: Option<&str>,
     ) -> io::Result<()> {
         let Some(recorder) = &self.artifact_recorder else {
             return Ok(());
         };
         let session_id = recorder.session_id.clone();
         let agent_id = recorder.agent_id.clone();
-        let extension_id = extension_id.to_owned();
-        let command = command.to_owned();
+        let mut payload = object([
+            ("source", "extension".into()),
+            ("message", failure.message().into()),
+            ("category", "internal".into()),
+            ("extension_id", extension_id.into()),
+            ("command", command.into()),
+            ("failure", failure.as_str().into()),
+        ]);
+        if let Some(user_message) = user_message {
+            payload.insert("user_message".to_owned(), user_message.into());
+        }
         recorder.record_parented_events(|parent| {
             let Some(parent) = parent else {
                 return Vec::new();
@@ -566,18 +589,35 @@ impl ExtensionHost {
                 agent_id,
                 Some(parent),
                 EventKind::ERROR,
-                object([
-                    ("source", "extension".into()),
-                    ("message", failure.message().into()),
-                    ("category", "internal".into()),
-                    ("extension_id", extension_id.into()),
-                    ("command", command.into()),
-                    ("failure", failure.as_str().into()),
-                ]),
+                payload,
             )]
         })?;
         Ok(())
     }
+}
+
+/// Keep an extension-supplied [`ExtensionError::UserMessage`] only after
+/// session redaction and only when it is nonblank, bounded, free of control
+/// characters other than newline and tab, and format-safe. Anything else
+/// becomes the generic host text, so the raw message never leaves the host.
+fn validated_user_message(
+    source: ExtensionError,
+    redactor: &crate::redaction::SecretRedactor,
+) -> ExtensionError {
+    let ExtensionError::UserMessage(user_message) = source else {
+        return source;
+    };
+    let user_message = redactor.redact(&user_message);
+    if user_message.trim().is_empty()
+        || user_message.len() > euler_sdk::MAX_EXTENSION_USER_MESSAGE_BYTES
+        || user_message
+            .chars()
+            .any(|character| character.is_control() && !matches!(character, '\n' | '\t'))
+        || !euler_sdk::extension_model_text_is_format_safe(&user_message)
+    {
+        return ExtensionError::Message(ExtensionFailureKind::CommandError.message().to_owned());
+    }
+    ExtensionError::UserMessage(user_message)
 }
 
 fn catch_extension_unwind<F, T>(work: F) -> std::thread::Result<T>

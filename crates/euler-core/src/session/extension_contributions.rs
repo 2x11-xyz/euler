@@ -1111,6 +1111,7 @@ fn safe_execution_error(error: &ExtensionExecutionError) -> String {
             "extension registration panicked".to_owned()
         }
         ExtensionExecutionError::CommandFailed => "extension command failed".to_owned(),
+        ExtensionExecutionError::CommandFailedWithUserMessage(_) => error.to_string(),
         ExtensionExecutionError::CommandPanicked => "extension command panicked".to_owned(),
         ExtensionExecutionError::Cancelled => "extension command cancelled".to_owned(),
         ExtensionExecutionError::Session(_) => "extension session bridge failed".to_owned(),
@@ -1124,7 +1125,8 @@ fn contribution_failure(error: &ExtensionExecutionError) -> &'static str {
         ExtensionExecutionError::InvalidInput(_) => "invalid-input",
         ExtensionExecutionError::RegistrationFailed => "registration",
         ExtensionExecutionError::RegistrationPanicked => "panic",
-        ExtensionExecutionError::CommandFailed => "command",
+        ExtensionExecutionError::CommandFailed
+        | ExtensionExecutionError::CommandFailedWithUserMessage(_) => "command",
         ExtensionExecutionError::CommandPanicked => "panic",
         ExtensionExecutionError::Cancelled => "cancelled",
         ExtensionExecutionError::Session(_) => "session",

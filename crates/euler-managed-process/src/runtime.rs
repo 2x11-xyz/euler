@@ -263,7 +263,7 @@ impl ExtensionCommand for ManagedProcessCommand {
         host: &dyn HostApi,
         cancellation: &CancellationToken,
     ) -> Result<Value, ExtensionError> {
-        execute_managed_process(
+        let response = execute_managed_process(
             ProcessInvocation {
                 package_dir: &self.package_dir,
                 entrypoint: &self.entrypoint,
@@ -276,7 +276,17 @@ impl ExtensionCommand for ManagedProcessCommand {
             host,
             cancellation,
         )
-        .map_err(ManagedProcessRuntimeError::into_extension_error)
+        .map_err(ManagedProcessRuntimeError::into_extension_error)?;
+        match response {
+            ResponseBody::Result(result) => Ok(result),
+            // The host validates this text before anyone sees it.
+            ResponseBody::Error {
+                user_message: Some(user_message),
+            } => Err(ExtensionError::UserMessage(user_message)),
+            ResponseBody::Error { user_message: None } => {
+                Err(ManagedProcessRuntimeError::CommandFailed.into_extension_error())
+            }
+        }
     }
 }
 
@@ -297,11 +307,13 @@ struct ProcessInvocation<'a> {
     limits: &'a ManagedProcessLimits,
 }
 
+/// Run one command to a clean shutdown and return its terminal response: an
+/// object result or a command error.
 fn execute_managed_process(
     invocation: ProcessInvocation<'_>,
     host: &dyn HostApi,
     cancellation: &CancellationToken,
-) -> Result<Value, ManagedProcessRuntimeError> {
+) -> Result<ResponseBody, ManagedProcessRuntimeError> {
     if cancellation.is_cancelled() {
         return Err(ManagedProcessRuntimeError::Cancelled);
     }
@@ -325,7 +337,7 @@ fn run_protocol(
     invocation: ProcessInvocation<'_>,
     host: &dyn HostApi,
     cancellation: &CancellationToken,
-) -> Result<Value, ManagedProcessRuntimeError> {
+) -> Result<ResponseBody, ManagedProcessRuntimeError> {
     if cancellation.is_cancelled() {
         return Err(ManagedProcessRuntimeError::Cancelled);
     }
@@ -366,17 +378,15 @@ fn run_protocol(
         host,
         cancellation,
     )?;
-    let result = match command_response {
-        ResponseBody::Result(result) if result.is_object() => Some(result),
-        ResponseBody::Result(_) => return Err(ManagedProcessRuntimeError::ProtocolViolation),
-        // A JSON-RPC error is a valid terminal command response. Finish the
-        // protocol cleanly so SDKs do not receive a cancel/EOF traceback for
-        // an error they deliberately reported.
-        ResponseBody::Error => None,
-    };
+    // A JSON-RPC error is a valid terminal command response. Finish the
+    // protocol cleanly so SDKs do not receive a cancel/EOF traceback for an
+    // error they deliberately reported.
+    if matches!(&command_response, ResponseBody::Result(result) if !result.is_object()) {
+        return Err(ManagedProcessRuntimeError::ProtocolViolation);
+    }
 
     shutdown_process(process, host, cancellation)?;
-    result.ok_or(ManagedProcessRuntimeError::CommandFailed)
+    Ok(command_response)
 }
 
 fn shutdown_process(
@@ -554,7 +564,7 @@ impl RunningProcess {
     ) -> Result<Value, ManagedProcessRuntimeError> {
         match self.await_response_body(expected_id, deadline, phase, host, cancellation)? {
             ResponseBody::Result(result) => Ok(result),
-            ResponseBody::Error => Err(ManagedProcessRuntimeError::CommandFailed),
+            ResponseBody::Error { .. } => Err(ManagedProcessRuntimeError::CommandFailed),
         }
     }
 

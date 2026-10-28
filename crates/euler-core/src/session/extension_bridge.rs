@@ -90,6 +90,9 @@ impl ExtensionExecutionError {
                 _,
                 euler_sdk::ExtensionError::CapabilityDenied { capability },
             ) => Self::CapabilityDenied { capability },
+            ExtensionHostError::CommandFailed(_, ExtensionError::UserMessage(user_message)) => {
+                Self::CommandFailedWithUserMessage(user_message)
+            }
             ExtensionHostError::CommandFailed(_, _) => Self::CommandFailed,
             ExtensionHostError::CommandCancelled(_) => Self::Cancelled,
             ExtensionHostError::CommandPanic(_, _) => Self::CommandPanicked,

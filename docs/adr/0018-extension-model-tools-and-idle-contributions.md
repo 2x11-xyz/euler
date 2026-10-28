@@ -150,3 +150,14 @@ Amendment (2026-10-27, ADR 0022): the CodeSwarm special path is removed.
 CodeSwarm is an ordinary extension that declares its review command as a
 model tool under this ADR, and core keeps no review-specific tool, config,
 or command.
+
+Amendment (2026-10-27, #163): a command error may carry one opt-in,
+extension-supplied user message: `ExtensionError::UserMessage` natively, or
+the string `error.data.user_message` on a managed-process command error. The
+host redacts it with the session redactor and keeps it only when it is
+nonblank, at most 1 KiB, free of control characters other than newline and
+tab, and format-safe. A kept message reaches the failed `tool.result` and
+user command output as `extension command failed: <message>`, and the
+canonical extension `error` event as `user_message` beside the fixed host
+`message`. An absent or invalid message keeps the generic host text. Every
+other extension error body stays host-sanitized.

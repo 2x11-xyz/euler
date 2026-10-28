@@ -1,9 +1,9 @@
 use crate::session_lifecycle::resolve_resume_target;
 use anyhow::{anyhow, Result};
-use euler_core::extensions::{ExtensionHost, ExtensionInvocationOrigin};
+use euler_core::extensions::{ExtensionHost, ExtensionHostError, ExtensionInvocationOrigin};
 use euler_core::{read_resume_prefix, EulerHome, ProvenanceWriter};
 use euler_event::EventEnvelope;
-use euler_sdk::{CommandDescriptor, Extension};
+use euler_sdk::{CommandDescriptor, Extension, ExtensionError};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -69,12 +69,20 @@ pub(super) fn execute_offline_extension_run(
     }
     let output = host
         .execute_command(&run.command.name, input)
-        .map_err(|error| {
-            anyhow!(
+        .map_err(|error| match error {
+            // The host already redacted and validated this extension text.
+            ExtensionHostError::CommandFailed(_, ExtensionError::UserMessage(user_message)) => {
+                anyhow!(
+                    "{}.{} failed: extension command failed: {user_message}",
+                    run.extension_id,
+                    run.command.name
+                )
+            }
+            error => anyhow!(
                 "{}.{} failed: {error:?}",
                 run.extension_id,
                 run.command.name
-            )
+            ),
         })?;
     if let Some(refresh) = target.refresh {
         if let Err(error) = refresh.refresh() {

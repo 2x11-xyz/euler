@@ -29,6 +29,22 @@ either append fails, the host returns an infrastructure failure, retains the
 writer's exact-append fence, and never substitutes the extension's ordinary
 result for the missing provenance.
 
+## Extension User Messages
+
+A command error may opt into one user- and model-visible message:
+`ExtensionError::UserMessage` for native extensions, or the string
+`error.data.user_message` on a managed-process command error (ADR 0018
+amendment). The host redacts it with the session redactor, then keeps it only
+when the redacted text is nonblank, at most `MAX_EXTENSION_USER_MESSAGE_BYTES`
+(1 KiB), free of control characters other than newline and tab, and
+format-safe. A kept message appears as `extension command failed: <message>`
+in the failed model `tool.result` and in user command output, and as
+`user_message` on the canonical extension `error` event, whose `message` stays
+the fixed host text. The model-tool error projection below renders its newline
+and tab as visible escapes; the other surfaces keep them.
+An absent, non-string, or invalid message leaves the generic failure
+unchanged. No other extension error text is surfaced.
+
 ## Bounded Event Feed v0
 
 `HostApi::query_provenance` is the v0 pull-based event feed for extensions.
@@ -425,10 +441,12 @@ capabilities.
   bounds that exact model-facing value. The canonical `tool.result` therefore
   remains valid JSON and active-canvas preview limits retain a
   `tool_result_get` recovery handle.
-- Failed model-tool results expose only host-generated error text through one
-  bounded projection. Controls and Unicode 17 `Cf`/`Zl`/`Zp` are rendered as
-  visible escapes before the error reaches provenance or model context; raw
-  extension error bodies remain unavailable.
+- Failed model-tool results expose only host-generated error text, plus a
+  validated extension user message when the command supplied one (Extension
+  User Messages above), through one bounded projection. Controls and
+  Unicode 17 `Cf`/`Zl`/`Zp` are rendered as visible escapes before the error
+  reaches provenance or model context; raw extension error bodies remain
+  unavailable.
 - Model-tool names must not collide with core tools or another enabled
   extension tool. Advertisement and execution both require the extension to be
   wired and enabled.
@@ -646,7 +664,9 @@ bytes, pending inbound/outbound queues, host request count, progress budget,
 invocation, shutdown, and stderr byte budget. Stderr is discarded without
 entering provenance or canvas; crossing its host byte limit aborts the
 invocation. Non-protocol stdout, malformed protocol messages, and process error
-bodies similarly become safe generic extension failures. Structured progress is
+bodies similarly become safe generic extension failures. The one exception is
+a string `error.data.user_message` on the terminal command error, which the
+host validates as an extension user message. Structured progress is
 validated and bounded, but is not implicitly admitted to the model canvas or
 transcript. Default ceilings are 1 MiB per JSON payload, 4 MiB/512 messages of
 total peer output, 64 host requests, 128 progress messages, and 64 KiB stderr.

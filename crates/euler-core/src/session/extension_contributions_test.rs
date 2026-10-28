@@ -3436,3 +3436,252 @@ fn second_enabled_idle_owner_is_rejected_at_wiring() {
     assert!(matches!(error, ExtensionExecutionError::InvalidInput(_)));
     assert!(error.to_string().contains("multiple enabled extensions"));
 }
+
+/// A model tool whose command always fails: with an opt-in
+/// `ExtensionError::UserMessage` when one is set, otherwise with raw
+/// extension error text that must stay unexposed.
+struct FailingModelToolExtension {
+    user_message: Option<String>,
+}
+
+const RAW_EXTENSION_ERROR_DETAIL: &str = "RAW_EXTENSION_ERROR_DETAIL";
+
+impl Extension for FailingModelToolExtension {
+    fn manifest(&self) -> ExtensionManifest {
+        ExtensionManifest {
+            id: "failing-ext".to_owned(),
+            version: "0.1.0".to_owned(),
+            display_name: "Failing model tool".to_owned(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn register(&self, registrar: &mut dyn CommandRegistrar) -> Result<(), ExtensionError> {
+        registrar.register_command(
+            "update",
+            Box::new(FailingModelToolCommand {
+                user_message: self.user_message.clone(),
+            }),
+        );
+        Ok(())
+    }
+}
+
+struct FailingModelToolCommand {
+    user_message: Option<String>,
+}
+
+impl ExtensionCommand for FailingModelToolCommand {
+    fn descriptor(&self) -> euler_sdk::CommandDescriptor {
+        euler_sdk::CommandDescriptor {
+            name: "update".to_owned(),
+            display_name: "update".to_owned(),
+            summary: "test command".to_owned(),
+            required_capabilities: Vec::new(),
+            args: Vec::new(),
+            accepts_session_id: false,
+            invocation: Invocation::AgentOnly,
+            model_tool: Some(standard_model_tool_descriptor()),
+        }
+    }
+
+    fn execute(
+        &self,
+        _context: CommandContext,
+        _host: &dyn HostApi,
+    ) -> Result<Value, ExtensionError> {
+        Err(match &self.user_message {
+            Some(user_message) => ExtensionError::UserMessage(user_message.clone()),
+            None => ExtensionError::Message(RAW_EXTENSION_ERROR_DETAIL.to_owned()),
+        })
+    }
+}
+
+fn session_with_failing_model_tool(
+    temp: &tempfile::TempDir,
+    user_message: Option<&str>,
+    secret: Option<&str>,
+) -> (Session<ScriptedDecider>, Arc<Mutex<Vec<ModelRequest>>>) {
+    let (provider, requests) = CapturingProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-update".to_owned(),
+            name: "update_workflow".to_owned(),
+            input: json!({"items": ["validate"]}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut config = super::super::SessionConfig::new(temp.path());
+    config.extensions_enabled.insert("failing-ext".to_owned());
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()))
+        .with_provenance(ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer"));
+    if let Some(secret) = secret {
+        session.add_redacted_secret(secret);
+    }
+    session
+        .wire_extension(Arc::new(FailingModelToolExtension {
+            user_message: user_message.map(str::to_owned),
+        }))
+        .expect("wire extension");
+    (session, requests)
+}
+
+/// Run one failing model-tool call and return the failed `tool.result`
+/// payload and the host's extension `error` event payload.
+fn failed_model_tool_events(
+    user_message: Option<&str>,
+    secret: Option<&str>,
+) -> (JsonObject, JsonObject) {
+    let temp = tempfile::tempdir().expect("temp");
+    let (mut session, _requests) = session_with_failing_model_tool(&temp, user_message, secret);
+
+    session.run_turn("validate it").expect("turn");
+
+    let result = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::TOOL_RESULT)
+        .expect("tool result")
+        .payload
+        .clone();
+    let error = session
+        .events()
+        .iter()
+        .find(|event| {
+            event.kind.as_str() == EventKind::ERROR && event.payload["source"] == json!("extension")
+        })
+        .expect("extension error event")
+        .payload
+        .clone();
+    assert_eq!(result["ok"], json!(false));
+    assert_eq!(result["extension_id"], json!("failing-ext"));
+    assert_eq!(error["message"], json!("extension command failed"));
+    assert_eq!(error["extension_id"], json!("failing-ext"));
+    assert_eq!(error["failure"], json!("command_error"));
+    (result, error)
+}
+
+#[test]
+fn extension_user_message_reaches_the_failed_model_tool_result_and_provenance() {
+    let (result, error) =
+        failed_model_tool_events(Some("population_size must be in range 1..=8"), None);
+
+    assert_eq!(
+        result["error"],
+        json!("extension command failed: population_size must be in range 1..=8")
+    );
+    assert_eq!(
+        error["user_message"],
+        json!("population_size must be in range 1..=8")
+    );
+}
+
+#[test]
+fn extension_user_message_reaches_the_next_model_request() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (mut session, requests) = session_with_failing_model_tool(
+        &temp,
+        Some("population_size must be in range 1..=8"),
+        None,
+    );
+
+    session.run_turn("validate it").expect("turn");
+
+    let requests = requests.lock().unwrap_or_else(PoisonError::into_inner);
+    assert!(requests[1].input.iter().any(|item| matches!(
+        item,
+        ModelInputItem::ToolOutput { ok: false, error: Some(error), .. }
+            if error == "extension command failed: population_size must be in range 1..=8"
+    )));
+}
+
+#[test]
+fn extension_user_message_is_redacted_before_it_surfaces() {
+    const SECRET: &str = "synthetic-user-message-secret-0123456789";
+    let (result, error) =
+        failed_model_tool_events(Some(&format!("token {SECRET} was rejected")), Some(SECRET));
+
+    assert_eq!(
+        result["error"],
+        json!("extension command failed: token [redacted-secret] was rejected")
+    );
+    assert_eq!(
+        error["user_message"],
+        json!("token [redacted-secret] was rejected")
+    );
+}
+
+#[test]
+fn invalid_extension_user_messages_fall_back_to_the_generic_failure() {
+    let oversize = "x".repeat(euler_sdk::MAX_EXTENSION_USER_MESSAGE_BYTES + 1);
+    for user_message in [
+        oversize.as_str(),
+        "bad \u{1b}[31mred",
+        "bad \u{202E}reversed",
+        " \n\t ",
+    ] {
+        let (result, error) = failed_model_tool_events(Some(user_message), None);
+
+        assert_eq!(
+            result["error"],
+            json!("extension command failed"),
+            "{user_message:?}"
+        );
+        assert!(!error.contains_key("user_message"), "{user_message:?}");
+    }
+}
+
+#[test]
+fn extension_user_message_at_the_byte_bound_is_kept() {
+    let bounded = "x".repeat(euler_sdk::MAX_EXTENSION_USER_MESSAGE_BYTES);
+    let (result, error) = failed_model_tool_events(Some(&bounded), None);
+
+    assert_eq!(
+        result["error"],
+        json!(format!("extension command failed: {bounded}"))
+    );
+    assert_eq!(error["user_message"], json!(bounded));
+}
+
+#[test]
+fn extension_user_message_keeps_newline_and_tab_escaped_only_for_the_model() {
+    let (result, error) = failed_model_tool_events(Some("line one\n\tline two"), None);
+
+    assert_eq!(
+        result["error"],
+        json!(r"extension command failed: line one\n\tline two")
+    );
+    assert_eq!(error["user_message"], json!("line one\n\tline two"));
+}
+
+#[test]
+fn command_error_without_a_user_message_keeps_the_generic_failure() {
+    let (result, error) = failed_model_tool_events(None, None);
+
+    assert_eq!(result["error"], json!("extension command failed"));
+    assert!(!error.contains_key("user_message"));
+    assert!(!serde_json::to_string(&result)
+        .expect("result JSON")
+        .contains(RAW_EXTENSION_ERROR_DETAIL));
+}
+
+#[test]
+fn extension_user_message_reaches_user_command_output() {
+    let temp = tempfile::tempdir().expect("temp");
+    let (mut session, _requests) = session_with_failing_model_tool(
+        &temp,
+        Some("population_size must be in range 1..=8"),
+        None,
+    );
+    let extension = FailingModelToolExtension {
+        user_message: Some("population_size must be in range 1..=8".to_owned()),
+    };
+
+    let error = session
+        .execute_extension_command(&extension, "update", json!({}), [])
+        .expect_err("command error");
+
+    assert_eq!(
+        error.to_string(),
+        "extension command failed: population_size must be in range 1..=8"
+    );
+}
