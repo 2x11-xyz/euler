@@ -1177,6 +1177,80 @@ fn models_command_prints_merged_catalog_with_isolated_home() {
 }
 
 #[test]
+fn models_command_reads_provider_config_from_euler_home() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let euler_home = tempfile::tempdir().expect("euler home");
+    fs::write(
+        euler_home.path().join("providers.json"),
+        r#"{
+          "version": 1,
+          "providers": {
+            "euler-home-gateway": {
+              "api_family": "openai_chat_completions",
+              "base_url": "http://localhost:11434/v1",
+              "models": [{ "id": "gateway-model" }]
+            }
+          }
+        }"#,
+    )
+    .expect("write provider config");
+
+    let output = command_with_home(exe, &home)
+        .env("EULER_HOME", euler_home.path())
+        .arg("models")
+        .output()
+        .expect("run models");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let catalog: serde_json::Value = serde_json::from_slice(&output.stdout).expect("catalog json");
+    let gateway = catalog["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["id"] == "euler-home-gateway")
+        .expect("provider from $EULER_HOME/providers.json");
+    assert_eq!(gateway["models"][0]["id"], "gateway-model");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        !stderr.contains("ignored provider config"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn models_command_warns_when_euler_home_cannot_hold_provider_config() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+
+    let output = command_with_home(exe, &home)
+        .env("EULER_HOME", "relative-euler-home")
+        .arg("models")
+        .output()
+        .expect("run models");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert_eq!(
+        stderr
+            .matches(
+                "warning: ignored provider config: EULER_HOME must be an absolute path: relative-euler-home"
+            )
+            .count(),
+        1,
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn headless_exec_and_offline_listing_do_not_start_catalog_refresh() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();

@@ -86,7 +86,10 @@ pub(crate) fn run() -> Result<()> {
         Command::CheckSandbox => crate::sandbox_check::check_sandbox(io::stdout(), io::stderr()),
         Command::Models(ModelsCommand::List) => model_catalog::print_model_catalog(
             model_catalog::default_model_catalog_path().as_deref(),
-            provider_config_runtime::default_provider_config_path().as_deref(),
+            // Argument parsing already warned about an unresolvable Euler home.
+            provider_config_runtime::resolve_provider_config_path()
+                .ok()
+                .as_deref(),
             io::stdout(),
             io::stderr(),
         ),

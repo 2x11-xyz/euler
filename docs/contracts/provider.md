@@ -183,3 +183,14 @@ The canonical `model.call` plus its ordinary `model.result` or terminal
 carry `provider_attempt_id` and `timeout_stage`; those fields support
 postmortems without introducing high-volume heartbeat events. Ordinary raw
 transport observations are never persisted.
+
+## User provider configuration
+
+User-owned custom provider transport is read from `providers.json` in the
+Euler home: `$EULER_HOME/providers.json` when `EULER_HOME` is set, otherwise
+`$HOME/.euler/providers.json`. The path resolves through the same Euler home
+resolution as auth, sessions, extensions, and skills. A missing file means no
+custom providers. When the Euler home cannot be resolved (for example a
+relative `EULER_HOME`), no custom providers load and line-oriented commands
+print the resolution error as a `warning: ignored provider config:` line on
+stderr.

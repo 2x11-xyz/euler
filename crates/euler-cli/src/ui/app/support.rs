@@ -406,8 +406,12 @@ pub(super) fn command_context(
 ) -> CommandContext {
     // This is called when the bottom surface is rebuilt for session lifecycle
     // transitions, not during frame rendering or palette filtering.
+    // No stderr warning here: the TUI owns the terminal, and argument
+    // parsing already warned about an unresolvable Euler home before launch.
     let provider_config = provider_config_runtime::load_provider_config(
-        provider_config_runtime::default_provider_config_path().as_deref(),
+        provider_config_runtime::resolve_provider_config_path()
+            .ok()
+            .as_deref(),
     );
     let model_choices = model_choices(model_catalog, &provider_config.registry, provider, model);
     // The model-targets picker must not offer a target that will burn a

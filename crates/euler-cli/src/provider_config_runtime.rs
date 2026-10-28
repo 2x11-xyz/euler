@@ -1,3 +1,4 @@
+use euler_core::{EulerHome, EulerHomeError};
 use euler_provider::provider_config::ProviderConfigRegistry;
 use std::ffi::OsString;
 use std::fs;
@@ -10,17 +11,26 @@ pub(crate) struct ProviderConfigLoad {
     pub(crate) warnings: Vec<String>,
 }
 
-pub(crate) fn default_provider_config_path() -> Option<PathBuf> {
-    provider_config_path_from_home_vars(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))
+/// `providers.json` lives in the Euler home, so `EULER_HOME` relocates it with
+/// the rest of the user state.
+pub(crate) fn resolve_provider_config_path() -> Result<PathBuf, EulerHomeError> {
+    provider_config_path_from_env(std::env::var_os("HOME"), std::env::var_os("EULER_HOME"))
 }
 
-fn provider_config_path_from_home_vars(
+/// Line-oriented CLI entry: an unresolvable Euler home loads no custom
+/// providers and says why on stderr, so a later "unknown provider" error is
+/// not the only signal.
+pub(crate) fn default_provider_config_path() -> Option<PathBuf> {
+    resolve_provider_config_path()
+        .map_err(|error| eprintln!("warning: ignored provider config: {error}"))
+        .ok()
+}
+
+fn provider_config_path_from_env(
     home: Option<OsString>,
-    user_profile: Option<OsString>,
-) -> Option<PathBuf> {
-    home.or(user_profile)
-        .map(PathBuf::from)
-        .map(|home| home.join(".euler").join(PROVIDER_CONFIG_FILE))
+    euler_home: Option<OsString>,
+) -> Result<PathBuf, EulerHomeError> {
+    EulerHome::resolve_from_env(home, euler_home).map(|home| home.root().join(PROVIDER_CONFIG_FILE))
 }
 
 pub(crate) fn load_provider_config(path: Option<&Path>) -> ProviderConfigLoad {
@@ -63,6 +73,49 @@ mod tests {
 
         assert!(load.registry.providers.is_empty());
         assert!(load.warnings.is_empty());
+    }
+
+    #[test]
+    fn provider_config_path_uses_euler_home_when_set() {
+        let home = tempfile::tempdir().expect("home dir");
+        let euler_home = tempfile::tempdir().expect("euler home dir");
+
+        let path =
+            provider_config_path_from_env(Some(home.path().into()), Some(euler_home.path().into()));
+
+        let canonical_euler_home = fs::canonicalize(euler_home.path()).expect("canonical");
+        assert_eq!(
+            path.expect("resolved path"),
+            canonical_euler_home.join("providers.json")
+        );
+    }
+
+    #[test]
+    fn provider_config_path_defaults_to_dot_euler_under_home() {
+        let home = tempfile::tempdir().expect("home dir");
+
+        let path = provider_config_path_from_env(Some(home.path().into()), None);
+
+        let canonical_home = fs::canonicalize(home.path()).expect("canonical");
+        assert_eq!(
+            path.expect("resolved path"),
+            canonical_home.join(".euler").join("providers.json")
+        );
+    }
+
+    #[test]
+    fn provider_config_path_reports_relative_euler_home() {
+        let home = tempfile::tempdir().expect("home dir");
+
+        let path = provider_config_path_from_env(
+            Some(home.path().into()),
+            Some("relative-euler-home".into()),
+        );
+
+        let error = path.expect_err("relative EULER_HOME must not resolve");
+        assert!(error
+            .to_string()
+            .contains("EULER_HOME must be an absolute path"));
     }
 
     #[test]
