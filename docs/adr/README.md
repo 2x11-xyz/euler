@@ -53,6 +53,6 @@ rather than being backfilled or reused.
 | [0023](0023-resumable-work.md) | Resumable work: replay policy, durable subagent ownership, crash-loop parking | Accepted 2026-10-27 |
 | [0024](0024-materialized-projections.md) | Materialized projections next to the event log | Accepted 2026-10-27 |
 | 0025 | Gateway provider discovery | Reserved by draft PR #260 |
-| [0026](0026-execution-modes.md) | Execution modes: Full access, Workspace, Locked | Proposed 2026-10-28 |
+| [0026](0026-execution-profiles.md) | Execution profiles: full, workspace, locked | Proposed 2026-10-28 |
 
 Next number: **0027**.
