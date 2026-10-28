@@ -194,3 +194,11 @@ custom providers. When the Euler home cannot be resolved (for example a
 relative `EULER_HOME`), no custom providers load and line-oriented commands
 print the resolution error as a `warning: ignored provider config:` line on
 stderr.
+
+Each provider lists its models in a non-empty `models` array of objects with
+an `id`. A provider may omit `models` when it sets `default_model`; the parser
+then records one model with that id and no declared metadata (context window,
+output limit, tool and reasoning support, compat), which is how an unlisted
+`--model` is treated. A provider whose `models` is empty, is not an array, or
+holds no valid entries, or that omits `models` without a valid string
+`default_model`, is ignored with a warning that names both fixes.

@@ -28,6 +28,16 @@ pull requests that landed them; deeper design rationale lives in
   explicit context records `explicit_context_sha256`.
 - Recording only: resume behavior is unchanged.
 
+### Custom providers without a models list (#261)
+
+- **`models` is optional when `default_model` is set.** A custom provider in
+  `providers.json` may now name just a `default_model`; Euler treats it as one
+  model with no declared metadata, like an unlisted `--model`. Previously such
+  a provider, including the `local` example in the headless guide, was
+  ignored with a warning. An empty or malformed `models` value, or a provider
+  with neither field, is still ignored, and the warning now says how to fix
+  it.
+
 ## 0.1.4 (2026-10-27)
 
 ### Subprocess sandboxing

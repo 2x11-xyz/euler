@@ -146,7 +146,12 @@ when `EULER_HOME` is set, otherwise `~/.euler/providers.json`:
       "api_family": "openai_chat_completions",
       "base_url": "https://llm.example.com/v1",
       "auth_header": true,
-      "api_key": "$GATEWAY_API_KEY"
+      "api_key": "$GATEWAY_API_KEY",
+      "default_model": "large-model",
+      "models": [
+        { "id": "large-model", "context_window_tokens": 200000, "supports_tools": true },
+        { "id": "small-model" }
+      ]
     }
   }
 }
@@ -172,9 +177,13 @@ Rules, enforced at load with warnings for anything malformed:
   from logs and provenance by construction.
 - Built-in provider ids (`chatgpt`, `anthropic`, `openai`, `openrouter`,
   `xai`, `fixture`) are reserved and cannot be overridden.
-- Optional per-model entries under `"models"` can declare
-  `context_window_tokens`, `max_output_tokens`, `supports_tools`, and
-  `supports_reasoning`.
+- `models` lists the provider's models; each entry needs an `id` and can
+  declare `context_window_tokens`, `max_output_tokens`, `supports_tools`, and
+  `supports_reasoning`. `models` is optional when `default_model` is set: the
+  provider then offers that one model with no declared metadata, the same as
+  passing an unlisted `--model`. A provider with neither field, or whose
+  `models` is present but empty or not an array (even with `default_model`
+  set), is ignored with a warning.
 
 ## Detached launches
 
