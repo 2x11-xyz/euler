@@ -6,7 +6,7 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
-### Custom providers speak OpenAI Responses
+### Custom providers speak OpenAI Responses (#264)
 
 - **New `api_family: "openai_responses"`** for `providers.json`, per
   provider or per model entry. It reuses the ChatGPT Responses adapter
@@ -17,8 +17,8 @@ pull requests that landed them; deeper design rationale lives in
   summaries; recorded reasoning is not replayed, as on the built-in
   `chatgpt` provider.
 - New load warnings: `compat` on a Responses model (Chat Completions only,
-  ignored), and a Responses model under a full-endpoint `base_url` of
-  another family.
+  ignored), and a Responses provider or model under a full-endpoint
+  `base_url` of another family.
 - Responses stream errors name the custom provider instead of ChatGPT.
 
 ### Custom providers speak Anthropic Messages (#263)

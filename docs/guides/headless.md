@@ -236,9 +236,15 @@ the requested `--reasoning-effort`, the same mapping as the built-in
 `max_output_tokens` when that is lower, so declare that field for a model
 with a lower output limit. On a Responses model, `supports_reasoning: true`
 requests reasoning (with streamed summaries) at the requested
-`--reasoning-effort`; without it no reasoning field is sent. Recorded
-reasoning is not replayed on Responses models, as on the built-in `chatgpt`
-provider. `compat` applies only to Chat Completions models. For
+`--reasoning-effort`; without it no reasoning field is sent, so list a
+reasoning model with `supports_reasoning: true`. Otherwise
+`--reasoning-effort` is ignored and no reasoning summaries stream. Euler does
+not check the effort on a Responses model. It sends `xsmall` as `minimal` and
+`max` as `max`, and a level the upstream model does not support (often `max`,
+sometimes `minimal`) fails as a rejected request, so pick one it accepts
+(typically `small` to `xlarge`).
+Recorded reasoning is not replayed on Responses models, as on the built-in
+`chatgpt` provider. `compat` applies only to Chat Completions models. For
 Anthropic's own API, which expects `x-api-key` rather than a bearer token, use
 `"headers": { "x-api-key": "$ANTHROPIC_API_KEY" }` instead of `auth_header`.
 
