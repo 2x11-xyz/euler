@@ -21,6 +21,22 @@ pull requests that landed them; deeper design rationale lives in
   `base_url` of another family.
 - Responses stream errors name the custom provider instead of ChatGPT.
 
+### `exec --resume --continue` continues an interrupted run (ADR 0023 step 3)
+
+- **New `--continue` for `euler exec --resume <path-or-id>`.** Instead of
+  closing the interrupted run and starting a new turn, resume keeps the run
+  open, records a new `run.continued` event, and starts a new model round in
+  the same run. Cut-off calls get the same closures as a plain resume;
+  nothing is re-run yet.
+  `--continue` takes no prompt and never reads stdin, and it refuses, appending
+  nothing, when the run was not cleanly started, had already reached an
+  outcome, or shows no work that was cut off.
+- **Crash-loop parking.** A run continued 5 times without progress is parked.
+  `--continue` then exits nonzero, says why, and prints the exact
+  `--continue --retry` command, which starts the count again at one.
+- **Rollback.** Older Euler rejects `run.continued` during resume, so a
+  continued log fails closed on an older binary.
+
 ### Custom providers speak Anthropic Messages (#263)
 
 - **New `api_family: "anthropic_messages"`** for `providers.json`. It reuses

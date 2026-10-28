@@ -173,6 +173,93 @@ fn exec_parse_accepts_resume_path() {
 }
 
 #[test]
+fn exec_parse_accepts_continue_and_retry_with_resume() {
+    let exec = unwrap_exec(parse_args_without_env([
+        "exec",
+        "--resume",
+        "events.jsonl",
+        "--continue",
+        "--retry",
+    ]));
+
+    assert!(exec.continue_run);
+    assert!(exec.retry);
+    assert_eq!(exec.prompt, None);
+}
+
+#[test]
+fn exec_continue_usage_errors_name_the_fix() {
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["exec", "--resume", "events.jsonl", "--continue", "go", "on"],
+            "--continue takes no prompt: it continues the interrupted run. Drop the prompt, or \
+             drop --continue to start a new turn",
+        ),
+        (
+            &["exec", "--continue"],
+            "--continue needs a session: euler exec --resume <path-or-id> --continue",
+        ),
+        (
+            &["exec", "--resume", "events.jsonl", "--retry"],
+            "--retry only works with --continue: euler exec --resume <path-or-id> --continue \
+             --retry",
+        ),
+        (
+            &["--resume", "events.jsonl", "--continue"],
+            "--continue is only supported with exec",
+        ),
+    ];
+
+    for (args, expected) in cases {
+        let mut args = args.iter().copied().map(str::to_owned);
+        let error = match Args::parse_with_env(&mut args, EnvArgs::default()) {
+            Ok(_) => panic!("expected usage error for {args:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), *expected);
+    }
+}
+
+#[test]
+fn shell_word_quotes_what_a_shell_would_reinterpret() {
+    assert_eq!(shell_word("sessions/run-1.jsonl"), "sessions/run-1.jsonl");
+    assert_eq!(shell_word("my log.jsonl"), "'my log.jsonl'");
+    assert_eq!(shell_word("it's.jsonl"), "'it'\\''s.jsonl'");
+    assert_eq!(shell_word("~old/events.jsonl"), "'~old/events.jsonl'");
+    assert_eq!(shell_word("-events.jsonl"), "'-events.jsonl'");
+    assert_eq!(shell_word(""), "''");
+}
+
+#[test]
+fn continuation_refusals_name_the_next_command() {
+    let parked = euler_core::ContinuationRefusal::Parked {
+        run_id: "r1".to_owned(),
+        restart_count: 5,
+    };
+    let message = continuation_refusal_message(&parked, "log.jsonl");
+    assert!(message.contains("is parked (restart_limit)"), "{message}");
+    assert!(
+        message.contains("euler exec --resume log.jsonl --continue --retry"),
+        "{message}"
+    );
+    assert!(
+        message.contains("euler exec --resume log.jsonl \"<next prompt>\""),
+        "{message}"
+    );
+
+    let not_parked = euler_core::ContinuationRefusal::RetryNotParked {
+        run_id: "r1".to_owned(),
+        restart_count: 2,
+    };
+    let message = continuation_refusal_message(&not_parked, "log.jsonl");
+    assert!(message.contains("2 of 5 restarts used"), "{message}");
+    assert!(
+        message.ends_with("euler exec --resume log.jsonl --continue"),
+        "{message}"
+    );
+}
+
+#[test]
 fn exec_prompt_validation_strips_trailing_newlines_only() {
     assert_eq!(
         non_empty_exec_prompt("inspect repo\n\n".to_owned()).expect("prompt"),

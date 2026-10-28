@@ -49,6 +49,11 @@ parent chains.
   byte length only; ordinary events parent the frontier, and batched events
   parent their predecessor in the same batch.
 
+Note (2026-10-27): ADR 0023 adds an eighth lifecycle kind, `run.continued`.
+`RunLifecycleProjection` folds it as keeping an open run open and derives the
+run's restart count from it, so the fold stays the single owner of run state
+(`docs/contracts/events.md`).
+
 ## Consequences
 
 - Session listing validates the lifecycle before selecting status. An open

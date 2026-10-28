@@ -20,7 +20,8 @@ pub(crate) use model_resolution::{resolve_live_options, LiveOptions};
 pub(crate) use scrub::parse_values as parse_scrub_values;
 #[cfg(test)]
 pub(crate) use session::{
-    apply_interactive_tui_linefeed_default, non_empty_exec_prompt, validate_resume_live_target,
+    apply_interactive_tui_linefeed_default, continuation_refusal_message, non_empty_exec_prompt,
+    shell_word, validate_resume_live_target,
 };
 #[cfg(test)]
 pub(crate) use terminal::{decide_interactive_launch, InteractiveLaunch, TuiLaunchIntent};

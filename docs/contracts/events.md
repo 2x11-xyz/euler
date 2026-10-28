@@ -84,6 +84,7 @@ authority.
 - `session.summary`
 - `run.started`
 - `run.terminal`
+- `run.continued`
 - `queue.enqueued`
 - `queue.replaced`
 - `queue.cancelled`
@@ -123,6 +124,18 @@ envelope `v` per `docs/contracts/persistence.md`.
   prefix of one or more terminal `queue.cancelled` rows is inert until the
   matching `run.terminal` completes the batch. A complete retry supersedes
   such a physical prefix and commits once as a logical terminal transaction.
+- `run.continued`: optional `retry` (only `true` is valid). Its envelope `run`
+  names an open run, owned by the same `session` and `agent` as the run's other
+  lifecycle events. Resume appends it when `exec --resume --continue` continues
+  that run (ADR 0023; `docs/contracts/provenance.md`). It keeps the run open,
+  adds one to the run's restart count, and a `retry: true` event starts the
+  count again at one. A run may be continued more than once. The continuation
+  transaction is `queue.cancelled` (reason `run_interrupted`) for every pending
+  steer of the run, then `run.continued`; no steering may still be pending when
+  it folds. As with terminal batches, a crash-prefix of those `queue.cancelled`
+  rows is inert until the `run.continued` completes the transaction. Older
+  Euler rejects the kind during resume preflight, so a continued log fails
+  closed on an older binary.
 - `queue.enqueued`: `queue_id`, `mode` (`steering` | `follow_up`), `position`
   (`front` | `back`), and `content`. Its envelope `run` is the open target run
   for steering or the preallocated not-yet-started run for a follow-up. The
@@ -1236,7 +1249,8 @@ Cardinality and ordering invariants:
   while its `BackgroundAgent` handle exists. Queue acceptance is volatile; only
   drained `agent.message` events are durable and queryable after resume.
 - the lifecycle projection accepts exactly one completed `run.started`
-  admission and at most one `run.terminal` for each run id. A crash-prefix
+  admission and at most one `run.terminal` for each run id, plus any number of
+  `run.continued` events while the run is open. A crash-prefix
   `run.started` is inert and a later complete retry may therefore leave an
   additional physical start fragment in the stream without becoming a second
   logical start. Every accepted root model/tool/error event produced while
@@ -1275,7 +1289,7 @@ on honest parents.
   not prompt content.
 - `file.diff` is excluded from model-canvas projection in v0.
 - `agent.message` is excluded from transcript/model-canvas projection in v0.
-- `run.started`, `run.terminal`, and every `queue.*` event are excluded from
+- `run.started`, `run.terminal`, `run.continued`, and every `queue.*` event are excluded from
   transcript/model-canvas projection. A delivered queue row appears through
   its canonical `user.message`, never by projecting private pending content.
 - Extensions observe events through the SDK, subject to capabilities and result bounds.

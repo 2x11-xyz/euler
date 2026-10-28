@@ -3,6 +3,7 @@
 //! it (`RawArgsParser` in `main.rs` and `extension_cli.rs`).
 
 use anyhow::{anyhow, Result};
+use euler_core::RUN_RESTART_LIMIT;
 
 /// Options shared by `run`, `tui`, and `exec` (consumed by `RawArgsParser`
 /// and applied through `build_run_args`).
@@ -150,14 +151,24 @@ fn exec_help() -> String {
 Usage: euler exec [OPTIONS] [PROMPT]...
        euler exec [OPTIONS] -- <PROMPT>...
        euler exec --resume <path-or-id> [OPTIONS] [PROMPT]...
+       euler exec --resume <path-or-id> --continue [--retry] [OPTIONS]
 
 Non-flag arguments are joined into the prompt; after `--` every argument
 is a prompt word, even if it starts with `-`. With no prompt arguments
 the prompt is read from piped stdin.
 
+A plain resume closes an interrupted run and starts a new turn. With
+--continue, exec instead continues the interrupted run: calls cut off by
+the crash are closed (nothing is re-run) and the model picks up from there.
+It takes no prompt and never reads stdin. A run continued {RUN_RESTART_LIMIT} times without
+progress is parked to stop a crash loop; --retry continues it with a fresh
+count.
+
 Options:
 {SESSION_OPTIONS}  \
---auto-approve <tier>      read-only or trusted-local (default: read-only)
+--continue                 Continue the session's interrupted run
+  --retry                    With --continue, retry a parked run
+  --auto-approve <tier>      read-only or trusted-local (default: read-only)
   --reasoning-effort <e>     xsmall, small, medium, large, xlarge, or max
   --max-output-tokens <n>    Cap output tokens per model response
   --max-tool-rounds <n>      Cap tool rounds per turn (default: unlimited)

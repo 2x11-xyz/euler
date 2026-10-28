@@ -80,6 +80,10 @@ impl EventKind {
     /// `status` payload distinguishes completion, failure, cancellation, and
     /// interruption without multiplying lifecycle event kinds.
     pub const RUN_TERMINAL: &'static str = "run.terminal";
+    /// Continues an open run after a restart instead of closing it (ADR
+    /// 0023). Keeps the run open; an optional `retry: true` records an
+    /// explicit retry of a parked run.
+    pub const RUN_CONTINUED: &'static str = "run.continued";
     pub const QUEUE_ENQUEUED: &'static str = "queue.enqueued";
     pub const QUEUE_REPLACED: &'static str = "queue.replaced";
     pub const QUEUE_CANCELLED: &'static str = "queue.cancelled";
@@ -147,6 +151,7 @@ impl EventKind {
         Self::SESSION_SUMMARY,
         Self::RUN_STARTED,
         Self::RUN_TERMINAL,
+        Self::RUN_CONTINUED,
         Self::QUEUE_ENQUEUED,
         Self::QUEUE_REPLACED,
         Self::QUEUE_CANCELLED,
@@ -538,6 +543,7 @@ mod tests {
             EventKind::RUN_TERMINAL,
             object([("status", "completed".into())]),
         );
+        assert_round_trip(EventKind::RUN_CONTINUED, object([("retry", true.into())]));
         assert_round_trip(
             EventKind::QUEUE_ENQUEUED,
             object([
@@ -647,6 +653,7 @@ mod tests {
             EventKind::SESSION_SUMMARY,
             EventKind::RUN_STARTED,
             EventKind::RUN_TERMINAL,
+            EventKind::RUN_CONTINUED,
             EventKind::QUEUE_ENQUEUED,
             EventKind::QUEUE_REPLACED,
             EventKind::QUEUE_CANCELLED,
@@ -974,6 +981,7 @@ mod tests {
             base(EventKind::SESSION_SUMMARY, json!({"summary": "done"})),
             base(EventKind::RUN_STARTED, json!({"trigger": "direct"})),
             base(EventKind::RUN_TERMINAL, json!({"status": "completed"})),
+            base(EventKind::RUN_CONTINUED, json!({})),
             base(
                 EventKind::QUEUE_ENQUEUED,
                 json!({"queue_id": "queue-1", "mode": "follow_up", "position": "back", "content": "continue"}),

@@ -114,10 +114,11 @@ pub use provider_runtime::{
     ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope, ProviderRuntimeTarget,
 };
 pub use resume::{
-    fold_session, plan_relocation, read_resume_prefix, resume_session,
-    resume_session_from_folded_prefix, resume_session_from_prefix,
-    resume_session_from_prefix_with_outcome, resume_session_with_outcome, FoldedSession,
-    RelocationRequired, ResumeError, ResumeOutcome, ResumeWarning,
+    check_run_continuation, fold_session, plan_relocation, read_resume_prefix, resume_session,
+    resume_session_continuing_run, resume_session_from_folded_prefix, resume_session_from_prefix,
+    resume_session_from_prefix_with_outcome, resume_session_with_outcome, ContinuationRefusal,
+    DecidedRunOutcome, FoldedSession, RelocationRequired, ResumeError, ResumeOutcome,
+    ResumeWarning, RunContinuation, RUN_RESTART_LIMIT,
 };
 pub use root_identity::{RootIdentityVerdict, RootUnverifiedReason};
 pub use runtime_identity::{

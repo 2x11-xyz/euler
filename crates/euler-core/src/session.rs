@@ -102,7 +102,7 @@ const COMPACTION_SYSTEM_INSTRUCTIONS: &str = concat!(
 );
 const CONTEXT_LIMIT_MESSAGE: &str =
     "Session stopped because the context limit threshold was reached.";
-const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
+pub(crate) const TOOL_ROUNDS_LIMIT_MESSAGE: &str =
     "Exploration limit reached; here is what I found so far. Send a follow-up to continue from this point.";
 const SKILL_COMMAND_PREFIX: &str = "/skill:";
 const SKILL_ACTIVATION_SCHEMA_VERSION: u64 = 1;
@@ -348,6 +348,8 @@ pub enum SessionError {
     },
     #[error("turn cancelled")]
     Cancelled,
+    #[error("no continued run to drive; resume the session with run continuation first")]
+    NoRunToContinue,
     #[error("invalid model switch: {0}")]
     InvalidModelSwitch(String),
     #[error("invalid model switch event: {0}")]
@@ -3575,6 +3577,58 @@ impl<D: PermissionDecider> Session<D> {
             on_event(event);
         }
         result
+    }
+
+    /// Drive the open run a continuation resume kept open (ADR 0023,
+    /// Decision 1): start a new model round in that run, with no new user
+    /// message, and end it with its single `run.terminal`.
+    pub fn continue_run_with_sink<F>(
+        &mut self,
+        cancel_flag: Arc<AtomicBool>,
+        mut on_event: F,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        let cancellation = CancellationSource::from_shared_flag(cancel_flag).token();
+        let result = self.continue_run_open(cancellation, &mut on_event);
+        let terminal_start = self.bus.events().len();
+        let result = self.finish_run_result(result);
+        for event in &self.bus.events()[terminal_start..] {
+            on_event(event);
+        }
+        result
+    }
+
+    fn continue_run_open<F>(
+        &mut self,
+        cancellation: CancellationToken,
+        mut on_event: F,
+    ) -> Result<Vec<EventEnvelope>, SessionError>
+    where
+        F: FnMut(&EventEnvelope),
+    {
+        self.ensure_terminalization_intact()?;
+        self.ensure_no_pending_admission()?;
+        let run_id = self
+            .run_lifecycle
+            .open_runs()
+            .next()
+            .map(|(run_id, _, _)| run_id.to_owned())
+            .filter(|_| {
+                self.active_run.is_none()
+                    && self.pending_run_terminal.is_none()
+                    && self.deferred_run_terminal.is_none()
+            })
+            .ok_or(SessionError::NoRunToContinue)?;
+        if let Some(queue) = &self.steering {
+            queue.activate_turn(&run_id);
+        }
+        self.active_run = Some(run_id);
+        let start = self.bus.events().len();
+        crate::diagnostics::turn_start(&self.config.session_id);
+        let mut sink = EventSink::new(start, &mut on_event);
+        self.run_model_rounds(start, cancellation, &mut sink)
     }
 
     /// Continue the active run after an ambiguous mid-turn steering append.

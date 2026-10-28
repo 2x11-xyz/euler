@@ -41,6 +41,8 @@ impl RawArgsParser {
                 tui: false,
                 exec: false,
                 exec_prompt: Vec::new(),
+                continue_run: false,
+                retry: false,
                 auto_approve: None,
                 max_output_tokens: None,
                 max_tool_rounds: None,
@@ -115,6 +117,8 @@ impl RawArgsParser {
             EXPERIMENTAL_TUI_LINEFEED_HISTORY_FLAG => self.parse_linefeed_history(true, &arg),
             NO_TUI_LINEFEED_HISTORY_FLAG => self.parse_linefeed_history(false, &arg),
             "--auto-approve" => self.parse_auto_approve(args),
+            "--continue" => self.parse_exec_flag(&arg, |parsed| &mut parsed.continue_run),
+            "--retry" => self.parse_exec_flag(&arg, |parsed| &mut parsed.retry),
             "--max-output-tokens" => self.parse_max_output_tokens(args),
             "--max-tool-rounds" => self.parse_max_tool_rounds(args),
             "--auto-compaction" => self.parse_auto_compaction(args),
@@ -322,6 +326,18 @@ impl RawArgsParser {
 
     fn parse_linefeed_history(&mut self, enabled: bool, arg: &str) -> Result<ArgParseFlow> {
         accept_linefeed_history_option(&mut self.parsed.linefeed_history_insert, enabled, arg)?;
+        Ok(ArgParseFlow::Continue)
+    }
+
+    fn parse_exec_flag(
+        &mut self,
+        flag: &str,
+        field: impl FnOnce(&mut RawArgs) -> &mut bool,
+    ) -> Result<ArgParseFlow> {
+        if !self.parsed.exec {
+            return Err(anyhow!("{flag} is only supported with exec"));
+        }
+        *field(&mut self.parsed) = true;
         Ok(ArgParseFlow::Continue)
     }
 

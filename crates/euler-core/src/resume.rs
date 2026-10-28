@@ -26,6 +26,13 @@ use std::io;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+mod continuation;
+
+pub use continuation::{
+    check_run_continuation, ContinuationRefusal, DecidedRunOutcome, RunContinuation,
+    RUN_RESTART_LIMIT,
+};
+
 pub const SUPPORTED_ENVELOPE_VERSION: u16 = 1;
 
 #[derive(Clone, Debug)]
@@ -56,6 +63,8 @@ pub struct FoldedSession {
 pub struct ResumeOutcome<D> {
     pub session: Session<D>,
     pub recovery_closure_appended: bool,
+    /// The open run this resume continued instead of closing (ADR 0023).
+    pub continued_run: Option<RunContinuation>,
     pub events_folded: usize,
     pub active_target: ModelTarget,
     pub root_identity: RootIdentityVerdict,
@@ -147,6 +156,8 @@ pub enum ResumeError {
     AssistantResponse(#[from] crate::assistant_response::AssistantResponseProtocolError),
     #[error(transparent)]
     RunLifecycle(Box<crate::session::RunLifecycleError>),
+    #[error("cannot continue: {0}")]
+    ContinuationRefused(#[from] ContinuationRefusal),
 }
 
 impl From<crate::session::RunLifecycleError> for ResumeError {
@@ -645,7 +656,40 @@ pub fn resume_session_from_folded_prefix<D>(
     providers: ProviderSet,
     decider: D,
     writer: ProvenanceWriter,
+    folded: FoldedSession,
+) -> Result<ResumeOutcome<D>, ResumeError> {
+    resume_from_folded_prefix(config, providers, decider, writer, folded, None)
+}
+
+/// Resume and continue the session's open run instead of closing it (ADR
+/// 0023, Decision 1). Every call that will not replay gets today's closure,
+/// pending steering is cancelled, and `run.continued` keeps the run open;
+/// drive it with [`Session::continue_run_with_sink`]. A refusal appends
+/// nothing and returns [`ResumeError::ContinuationRefused`].
+///
+/// The folded events MUST come from `read_resume_prefix` for the same log path
+/// so envelope preflight and blob hash verification have already run.
+#[doc(hidden)]
+pub fn resume_session_continuing_run<D>(
+    config: SessionConfig,
+    providers: ProviderSet,
+    decider: D,
+    writer: ProvenanceWriter,
+    folded: FoldedSession,
+    retry: bool,
+) -> Result<ResumeOutcome<D>, ResumeError> {
+    resume_from_folded_prefix(config, providers, decider, writer, folded, Some(retry))
+}
+
+/// `continue_retry` is `None` for a plain resume, which closes every open
+/// run, and `Some(retry)` to continue the open run.
+fn resume_from_folded_prefix<D>(
+    config: SessionConfig,
+    providers: ProviderSet,
+    decider: D,
+    writer: ProvenanceWriter,
     mut folded: FoldedSession,
+    continue_retry: Option<bool>,
 ) -> Result<ResumeOutcome<D>, ResumeError> {
     // This is the mutation boundary: even doc-hidden callers that bypass
     // `fold_session` cannot append recovery events from caller-modified
@@ -680,7 +724,8 @@ pub fn resume_session_from_folded_prefix<D>(
     // accepted tail after folding. Rebuild before deciding whether recovery
     // writes are necessary, otherwise stale "open run" state can append a
     // duplicate terminal before the final fold notices the disagreement.
-    let recovery_closures = recovery_closures(&folded.events, &current_run_lifecycle)?;
+    let (continued_run, recovery_closures) =
+        plan_resume_appends(&folded.events, &current_run_lifecycle, continue_retry)?;
     let run_lifecycle = if recovery_closures.is_empty() {
         current_run_lifecycle
     } else {
@@ -691,7 +736,7 @@ pub fn resume_session_from_folded_prefix<D>(
         // unmatched even though its run already terminated; attributing a
         // synthesized model/tool terminal to that inactive run would corrupt
         // an otherwise readable prefix and only fail at the later fold.
-        let recovered = preflight_recovery_candidate(&config, &candidate)?;
+        let recovered = preflight_resume_candidate(&config, &candidate, continued_run.as_ref())?;
         writer
             .append(&recovery_closures)
             .map_err(ResumeError::Append)?;
@@ -754,6 +799,7 @@ pub fn resume_session_from_folded_prefix<D>(
     Ok(ResumeOutcome {
         session,
         recovery_closure_appended,
+        continued_run,
         events_folded,
         active_target,
         root_identity,
@@ -767,6 +813,39 @@ fn preflight_recovery_candidate(
 ) -> Result<RunLifecycleProjection, ResumeError> {
     let lifecycle = preflight_recovery_lifecycle(config, events)?;
     if recovery_closures(events, &lifecycle)?.is_empty() {
+        Ok(lifecycle)
+    } else {
+        Err(ResumeError::IncompleteRecoveryCandidate)
+    }
+}
+
+/// The events resume appends: closures that close every open run, or, when
+/// `continue_retry` is `Some(retry)`, the continuation of the open run.
+fn plan_resume_appends(
+    events: &[EventEnvelope],
+    lifecycle: &RunLifecycleProjection,
+    continue_retry: Option<bool>,
+) -> Result<(Option<RunContinuation>, Vec<EventEnvelope>), ResumeError> {
+    match continue_retry {
+        None => Ok((None, recovery_closures(events, lifecycle)?)),
+        Some(retry) => {
+            let (continuation, appended) =
+                continuation::plan_run_continuation(events, lifecycle, retry)?;
+            Ok((Some(continuation), appended))
+        }
+    }
+}
+
+fn preflight_resume_candidate(
+    config: &SessionConfig,
+    events: &[EventEnvelope],
+    continued_run: Option<&RunContinuation>,
+) -> Result<RunLifecycleProjection, ResumeError> {
+    let Some(continuation) = continued_run else {
+        return preflight_recovery_candidate(config, events);
+    };
+    let lifecycle = preflight_recovery_lifecycle(config, events)?;
+    if continuation::continuation_is_settled(events, &lifecycle, &continuation.run_id)? {
         Ok(lifecycle)
     } else {
         Err(ResumeError::IncompleteRecoveryCandidate)
@@ -790,6 +869,7 @@ fn preflight_resume_identity(
                     event.kind.as_str(),
                     EventKind::RUN_STARTED
                         | EventKind::RUN_TERMINAL
+                        | EventKind::RUN_CONTINUED
                         | EventKind::QUEUE_ENQUEUED
                         | EventKind::QUEUE_REPLACED
                         | EventKind::QUEUE_CANCELLED
@@ -975,6 +1055,18 @@ fn recovery_closures(
     events: &[EventEnvelope],
     lifecycle: &RunLifecycleProjection,
 ) -> Result<Vec<EventEnvelope>, ResumeError> {
+    let mut closures = call_recovery_closures(events)?;
+    let linear_parent = closures
+        .last()
+        .map(|event| event.id.clone())
+        .or_else(|| logical_parent_frontier(events));
+    closures.extend(run_recovery_closures(lifecycle, linear_parent));
+    Ok(closures)
+}
+
+/// Closures for unresolved work: incomplete children's tool calls, every
+/// open model call, then the root's unmatched tool calls.
+fn call_recovery_closures(events: &[EventEnvelope]) -> Result<Vec<EventEnvelope>, ResumeError> {
     let incomplete_child_agents = incomplete_child_agents(events);
     let open_drafts = open_response_draft_bytes(events)?;
     let calls = unresolved_model_calls(events)?;
@@ -985,11 +1077,6 @@ fn recovery_closures(
             .map(|call| model_recovery_closure(call, open_drafts.get(call.id.as_str()).copied())),
     );
     closures.extend(tool_recovery_closures(events, &incomplete_child_agents));
-    let linear_parent = closures
-        .last()
-        .map(|event| event.id.clone())
-        .or_else(|| logical_parent_frontier(events));
-    closures.extend(run_recovery_closures(lifecycle, linear_parent));
     Ok(closures)
 }
 
