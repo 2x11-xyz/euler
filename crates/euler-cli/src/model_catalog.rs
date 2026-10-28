@@ -1,7 +1,7 @@
 use anyhow::Result;
 use euler_provider::catalog::{MergedModelCatalog, ModelDescriptor};
 use euler_provider::provider_config::{
-    ApiFamily, CustomModelConfig, CustomProviderConfig, ProviderConfigRegistry,
+    CustomModelConfig, CustomProviderConfig, ProviderConfigRegistry,
 };
 use serde_json::{json, Map, Value};
 use std::ffi::OsString;
@@ -222,10 +222,7 @@ fn custom_provider_json(provider: &CustomProviderConfig) -> Value {
     object.insert("id".to_owned(), json!(provider.id.as_str()));
     object.insert("display_name".to_owned(), json!(provider.id.as_str()));
     object.insert("source".to_owned(), json!("custom"));
-    object.insert(
-        "api_family".to_owned(),
-        json!(api_family(provider.api_family)),
-    );
+    object.insert("api_family".to_owned(), json!(provider.api_family.as_str()));
     object.insert("default_model".to_owned(), json!(default_model));
     if let Some(error) = &provider.default_model_error {
         object.insert("default_model_error".to_owned(), json!(error));
@@ -277,6 +274,7 @@ fn custom_model_json(model: &CustomModelConfig, is_default: bool) -> Value {
         json!(model.display_name.as_str()),
     );
     object.insert("source".to_owned(), json!("custom"));
+    object.insert("api_family".to_owned(), json!(model.api_family.as_str()));
     object.insert("default".to_owned(), json!(is_default));
     if let Some(value) = model.context_window_tokens {
         object.insert("context_window_tokens".to_owned(), json!(value));
@@ -325,12 +323,6 @@ fn optional_secret_status(value: Option<&str>) -> &'static str {
     match value {
         None => "missing",
         Some(value) => secret_status(value),
-    }
-}
-
-fn api_family(api_family: ApiFamily) -> &'static str {
-    match api_family {
-        ApiFamily::OpenAiChatCompletions => "openai_chat_completions",
     }
 }
 
@@ -620,7 +612,8 @@ mod tests {
                   "models": [
                     {
                       "id": "z-model",
-                      "display_name": "Z Model"
+                      "display_name": "Z Model",
+                      "api_family": "anthropic_messages"
                     },
                     {
                       "id": "b-model",
@@ -704,8 +697,13 @@ mod tests {
         assert_eq!(local_b["models"][0]["supports_reasoning"], true);
         assert_eq!(local_b["models"][0]["context_window_tokens"], 4096);
         assert_eq!(local_b["models"][0]["max_output_tokens"], 1024);
+        assert_eq!(
+            local_b["models"][0]["api_family"],
+            "openai_chat_completions"
+        );
         assert_eq!(local_b["models"][1]["id"], "z-model");
         assert_eq!(local_b["models"][1]["default"], false);
+        assert_eq!(local_b["models"][1]["api_family"], "anthropic_messages");
     }
 
     #[test]

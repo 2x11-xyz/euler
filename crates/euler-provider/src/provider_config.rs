@@ -96,15 +96,46 @@ impl fmt::Debug for CustomProviderConfig {
     }
 }
 
+impl CustomProviderConfig {
+    /// The wire family for `model`: its entry's family when listed, otherwise
+    /// the provider's (an unlisted `--model`).
+    pub fn model_api_family(&self, model: &str) -> ApiFamily {
+        self.models
+            .get(model)
+            .map_or(self.api_family, |model| model.api_family)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApiFamily {
     OpenAiChatCompletions,
+    AnthropicMessages,
+}
+
+impl ApiFamily {
+    const ALL: [Self; 2] = [Self::OpenAiChatCompletions, Self::AnthropicMessages];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAiChatCompletions => "openai_chat_completions",
+            Self::AnthropicMessages => "anthropic_messages",
+        }
+    }
+
+    /// The endpoint path a `base_url` may already end with for this family.
+    pub(crate) fn endpoint_suffix(self) -> &'static str {
+        match self {
+            Self::OpenAiChatCompletions => "/chat/completions",
+            Self::AnthropicMessages => "/messages",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CustomModelConfig {
     pub id: String,
     pub display_name: String,
+    pub api_family: ApiFamily,
     pub context_window_tokens: Option<u64>,
     pub max_output_tokens: Option<u64>,
     pub supports_tools: Option<bool>,
@@ -174,14 +205,25 @@ fn parse_provider(
         warnings.push(format!("ignored {scope} because api_family is missing"));
         return None;
     }
-    choice_field(object, "api_family", &scope, API_FAMILIES, warnings)?;
-    let api_family = ApiFamily::OpenAiChatCompletions;
+    let api_family = api_family_field(object, &scope, warnings)?;
     let base_url = required_base_url(object, &scope, warnings)?;
+    // The provider's family also serves `default_model_only` and any unlisted
+    // `--model`, so its base_url must serve that family.
+    if !base_url_serves(&base_url, api_family) {
+        warnings.push(format!(
+            "ignored {scope} because base_url is a full endpoint for another api_family; set api_family to the family it serves, or use the API root as base_url"
+        ));
+        return None;
+    }
+    let route = ProviderRoute {
+        api_family,
+        base_url: &base_url,
+    };
     let auth_header = bool_field(object, "auth_header", &scope, warnings).unwrap_or(false);
     let headers = parse_headers(object.get("headers"), &scope, auth_header, warnings)?;
     let models = match object.get("models") {
-        Some(models) => parse_models(models, &scope, warnings)?,
-        None => default_model_only(object.get("default_model"), &scope, warnings)?,
+        Some(models) => parse_models(models, &scope, &route, warnings)?,
+        None => default_model_only(object.get("default_model"), &scope, api_family, warnings)?,
     };
     let (default_model, default_model_error) =
         parse_default_model(object.get("default_model"), &id, &models, warnings);
@@ -230,6 +272,37 @@ fn required_base_url(
             None
         }
     }
+}
+
+fn api_family_field(
+    object: &Map<String, Value>,
+    scope: &str,
+    warnings: &mut Vec<String>,
+) -> Option<ApiFamily> {
+    let names = ApiFamily::ALL.map(ApiFamily::as_str);
+    let value = choice_field(object, "api_family", scope, &names, warnings)?;
+    ApiFamily::ALL
+        .into_iter()
+        .find(|family| family.as_str() == value)
+}
+
+/// A `base_url` is either an API root, which every family joins its own path
+/// onto, or a full endpoint, which serves only the family it names.
+fn base_url_serves(base_url: &str, api_family: ApiFamily) -> bool {
+    let Ok(url) = Url::parse(base_url) else {
+        return false;
+    };
+    let path = url.path().trim_end_matches('/');
+    ApiFamily::ALL
+        .into_iter()
+        .filter(|family| *family != api_family)
+        .all(|family| !path.ends_with(family.endpoint_suffix()))
+}
+
+/// The provider-level transport a model entry inherits.
+struct ProviderRoute<'a> {
+    api_family: ApiFamily,
+    base_url: &'a str,
 }
 
 fn valid_base_url(url: &str) -> Result<(), &'static str> {
@@ -288,7 +361,7 @@ fn parse_headers(
         }
         if adapter_owned_header(&lower) {
             warnings.push(format!(
-                "ignored {scope} because header `{name}` is owned by the OpenAI Chat Completions adapter"
+                "ignored {scope} because header `{name}` is owned by the provider adapter"
             ));
             return None;
         }
@@ -337,6 +410,7 @@ fn valid_header_name(name: &str) -> bool {
 fn parse_models(
     value: &Value,
     scope: &str,
+    route: &ProviderRoute<'_>,
     warnings: &mut Vec<String>,
 ) -> Option<BTreeMap<String, CustomModelConfig>> {
     let Some(models) = value.as_array() else {
@@ -347,7 +421,8 @@ fn parse_models(
     };
     let mut parsed = BTreeMap::new();
     for (index, value) in models.iter().enumerate() {
-        if let Some(model) = parse_model(value, &format!("{scope} model #{index}"), warnings) {
+        if let Some(model) = parse_model(value, &format!("{scope} model #{index}"), route, warnings)
+        {
             let model_id = model.id.clone();
             if parsed.insert(model_id.clone(), model).is_some() {
                 warnings.push(format!(
@@ -371,6 +446,7 @@ fn parse_models(
 fn default_model_only(
     value: Option<&Value>,
     scope: &str,
+    api_family: ApiFamily,
     warnings: &mut Vec<String>,
 ) -> Option<BTreeMap<String, CustomModelConfig>> {
     let id = value
@@ -385,6 +461,7 @@ fn default_model_only(
     let model = CustomModelConfig {
         id: id.clone(),
         display_name: id.clone(),
+        api_family,
         context_window_tokens: None,
         max_output_tokens: None,
         supports_tools: None,
@@ -397,6 +474,7 @@ fn default_model_only(
 fn parse_model(
     value: &Value,
     scope: &str,
+    route: &ProviderRoute<'_>,
     warnings: &mut Vec<String>,
 ) -> Option<CustomModelConfig> {
     let object = object_value(value, scope, warnings)?;
@@ -405,6 +483,7 @@ fn parse_model(
         &[
             "id",
             "display_name",
+            "api_family",
             "context_window_tokens",
             "max_output_tokens",
             "supports_tools",
@@ -419,15 +498,37 @@ fn parse_model(
         scope,
         warnings,
     )?;
+    let api_family = match object.get("api_family") {
+        None => route.api_family,
+        Some(_) => api_family_field(object, scope, warnings)?,
+    };
+    if !base_url_serves(route.base_url, api_family) {
+        warnings.push(format!(
+            "ignored {scope} because the provider base_url is a full endpoint for another api_family"
+        ));
+        return None;
+    }
+    let compat = match api_family {
+        ApiFamily::OpenAiChatCompletions => parse_compat(object.get("compat"), scope, warnings),
+        ApiFamily::AnthropicMessages => {
+            if object.contains_key("compat") {
+                warnings.push(format!(
+                    "ignored {scope} compat because it applies only to openai_chat_completions"
+                ));
+            }
+            None
+        }
+    };
     Some(CustomModelConfig {
         display_name: string_field(object, "display_name", scope, warnings)
             .unwrap_or(&id)
             .to_owned(),
+        api_family,
         context_window_tokens: positive_u64(object, "context_window_tokens", scope, warnings),
         max_output_tokens: positive_u64(object, "max_output_tokens", scope, warnings),
         supports_tools: bool_field(object, "supports_tools", scope, warnings),
         supports_reasoning: bool_field(object, "supports_reasoning", scope, warnings),
-        compat: parse_compat(object.get("compat"), scope, warnings),
+        compat,
         id,
     })
 }
@@ -683,7 +784,6 @@ fn warn_unknown<'a>(
     }
 }
 
-const API_FAMILIES: &[&str] = &["openai_chat_completions"];
 const MODELS_FIX: &str =
     "list models as [{\"id\": \"<model id>\"}], or omit models and set \"default_model\": \"<model id>\"";
 const MAX_TOKEN_FIELDS: &[&str] = &["max_completion_tokens", "max_tokens"];

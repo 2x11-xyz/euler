@@ -303,6 +303,97 @@ fn request_drops_reasoning_not_owned_by_same_anthropic_model() {
 }
 
 #[test]
+fn request_drops_unsigned_anthropic_reasoning() {
+    let request = ModelRequest {
+        model: DEFAULT_MODEL.to_owned(),
+        instructions: String::new(),
+        input: vec![
+            ModelInputItem::Message {
+                role: ModelRole::User,
+                content: "lookup".to_owned(),
+            },
+            anthropic_reasoning("unsigned", None),
+            anthropic_reasoning("signed", Some("opaque-signature")),
+        ],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Medium,
+        max_output_tokens: None,
+    };
+
+    let body = request_body(&request);
+
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!([{"type": "thinking", "thinking": "signed", "signature": "opaque-signature"}])
+    );
+}
+
+#[test]
+fn custom_route_replays_its_own_signed_thinking_and_drops_unsigned_thinking() {
+    let reasoning =
+        |provider: &str, content: &str, artifact: Option<&str>| ModelInputItem::Reasoning {
+            provider: provider.to_owned(),
+            model: "gateway-model".to_owned(),
+            fidelity: ReasoningFidelity::Raw,
+            content: content.to_owned(),
+            artifact: artifact.map(str::to_owned),
+        };
+    let request = ModelRequest {
+        model: "gateway-model".to_owned(),
+        instructions: String::new(),
+        input: vec![
+            ModelInputItem::Message {
+                role: ModelRole::User,
+                content: "lookup".to_owned(),
+            },
+            reasoning("gateway", "unsigned", None),
+            // Chat Completions records `reasoning_details` as a JSON array.
+            reasoning(
+                "gateway",
+                "chat-details",
+                Some(r#"[{"type":"reasoning.text","text":"chat-details"}]"#),
+            ),
+            ModelInputItem::Reasoning {
+                provider: "gateway".to_owned(),
+                model: "gateway-model".to_owned(),
+                fidelity: ReasoningFidelity::Opaque,
+                content: String::new(),
+                artifact: Some(r#"[{"type":"reasoning.encrypted","data":"enc"}]"#.to_owned()),
+            },
+            reasoning("gateway", "signed", Some("gateway-signature")),
+            reasoning("anthropic", "native", Some("native-signature")),
+            ModelInputItem::ToolCall {
+                call_id: "toolu_123".to_owned(),
+                name: "tiny_lookup".to_owned(),
+                arguments: json!({"key": "k"}),
+            },
+        ],
+        tools: Vec::new(),
+        reasoning_effort: crate::ReasoningEffort::Large,
+        max_output_tokens: None,
+    };
+
+    let body = messages_request_body(
+        &request,
+        &MessagesRoute {
+            provider: "gateway",
+            adaptive_thinking: true,
+            default_max_tokens: 8192,
+        },
+    );
+
+    assert_eq!(
+        body["messages"][1]["content"],
+        json!([
+            {"type": "thinking", "thinking": "signed", "signature": "gateway-signature"},
+            {"type": "tool_use", "id": "toolu_123", "name": "tiny_lookup", "input": {"key": "k"}},
+        ])
+    );
+    assert_eq!(body["output_config"]["effort"], "xhigh");
+    assert_eq!(body["max_tokens"], 8192);
+}
+
+#[test]
 fn same_model_tool_loop_request_matches_probe_shape() {
     let request = ModelRequest {
         model: DEFAULT_MODEL.to_owned(),

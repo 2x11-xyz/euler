@@ -613,16 +613,182 @@ fn custom_provider_debug_redacts_unresolved_secret_values() {
 #[test]
 fn custom_provider_endpoint_appends_chat_completions_once() {
     assert_eq!(
-        endpoint_for_test("https://proxy.example.test/v1").expect("endpoint"),
+        endpoint_for_test(
+            "https://proxy.example.test/v1",
+            ApiFamily::OpenAiChatCompletions
+        )
+        .expect("endpoint"),
         "https://proxy.example.test/v1/chat/completions"
     );
     assert_eq!(
-        endpoint_for_test("https://proxy.example.test/v1/").expect("endpoint"),
+        endpoint_for_test(
+            "https://proxy.example.test/v1/",
+            ApiFamily::OpenAiChatCompletions
+        )
+        .expect("endpoint"),
         "https://proxy.example.test/v1/chat/completions"
     );
     assert_eq!(
-        endpoint_for_test("https://proxy.example.test/v1/chat/completions").expect("endpoint"),
+        endpoint_for_test(
+            "https://proxy.example.test/v1/chat/completions",
+            ApiFamily::OpenAiChatCompletions
+        )
+        .expect("endpoint"),
         "https://proxy.example.test/v1/chat/completions"
+    );
+}
+
+#[test]
+fn custom_provider_messages_endpoint_accepts_host_root_or_v1_root() {
+    let messages =
+        |base_url| endpoint_for_test(base_url, ApiFamily::AnthropicMessages).expect("endpoint");
+    assert_eq!(
+        messages("https://proxy.example.test"),
+        "https://proxy.example.test/v1/messages"
+    );
+    assert_eq!(
+        messages("https://proxy.example.test/v1/"),
+        "https://proxy.example.test/v1/messages"
+    );
+    assert_eq!(
+        messages("https://proxy.example.test/gateway"),
+        "https://proxy.example.test/gateway/v1/messages"
+    );
+    assert_eq!(
+        messages("https://proxy.example.test/v1/messages"),
+        "https://proxy.example.test/v1/messages"
+    );
+}
+
+#[test]
+fn custom_provider_routes_messages_model_and_replays_signed_thinking() {
+    let (base_url, request_rx) = spawn_sse_server_with_sse(concat!(
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    ));
+    let provider = CustomOpenAiProvider::from_config(messages_model_config(&base_url))
+        .expect("custom provider");
+    let mut request = model_request("messages-model");
+    request.input.extend([
+        ModelInputItem::Reasoning {
+            provider: "local-openai".to_owned(),
+            model: "messages-model".to_owned(),
+            fidelity: crate::ReasoningFidelity::Raw,
+            content: "Need the tool.".to_owned(),
+            artifact: Some("thinking-signature".to_owned()),
+        },
+        ModelInputItem::ToolCall {
+            call_id: "toolu_1".to_owned(),
+            name: "read_file".to_owned(),
+            arguments: json!({"path": "a.txt"}),
+        },
+        ModelInputItem::ToolOutput {
+            call_id: "toolu_1".to_owned(),
+            name: "read_file".to_owned(),
+            ok: true,
+            output: Some("contents".to_owned()),
+            error: None,
+            exit_code: None,
+        },
+    ]);
+
+    let events = provider
+        .invoke(request)
+        .expect("invoke")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stream");
+
+    assert_eq!(events[0], ModelStreamEvent::TextDelta("ok".to_owned()));
+    let request = request_rx.recv().expect("server request");
+    assert!(request.starts_with("POST /v1/messages "), "{request}");
+    let lowercase = request.to_ascii_lowercase();
+    assert!(lowercase.contains("authorization: bearer literal-secret"));
+    assert!(lowercase.contains("anthropic-version: 2023-06-01"));
+    let body = request_json(&request);
+    assert_eq!(body["thinking"]["type"], "adaptive");
+    assert_eq!(body["output_config"]["effort"], "high");
+    assert_eq!(body["max_tokens"], 32_000);
+    assert_eq!(
+        body["messages"][1]["content"][0],
+        json!({
+            "type": "thinking",
+            "thinking": "Need the tool.",
+            "signature": "thinking-signature",
+        })
+    );
+    assert_eq!(body["messages"][1]["content"][1]["type"], "tool_use");
+}
+
+#[test]
+fn custom_provider_messages_model_without_declared_reasoning_omits_thinking() {
+    let (base_url, request_rx) =
+        spawn_sse_server_with_sse("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+    let mut config = messages_model_config(&base_url);
+    config.headers = BTreeMap::from([("Anthropic-Version".to_owned(), "2099-01-01".to_owned())]);
+    if let Some(model) = config.models.get_mut("messages-model") {
+        model.supports_reasoning = None;
+    }
+    let provider = CustomOpenAiProvider::from_config(config).expect("custom provider");
+
+    let _ = provider
+        .invoke(model_request("messages-model"))
+        .expect("invoke")
+        .collect::<Vec<_>>();
+
+    let request = request_rx.recv().expect("server request");
+    let lowercase = request.to_ascii_lowercase();
+    assert!(lowercase.contains("anthropic-version: 2099-01-01"));
+    assert!(!lowercase.contains("anthropic-version: 2023-06-01"));
+    let body = request_json(&request);
+    assert_eq!(body.get("thinking"), None);
+    assert_eq!(body.get("output_config"), None);
+}
+
+#[test]
+fn custom_provider_messages_model_caps_default_max_tokens_at_declared_limit() {
+    for (declared, expected) in [(8192, 8192), (64_000, 32_000)] {
+        let (base_url, request_rx) =
+            spawn_sse_server_with_sse("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        let mut config = messages_model_config(&base_url);
+        if let Some(model) = config.models.get_mut("messages-model") {
+            model.max_output_tokens = Some(declared);
+        }
+        let provider = CustomOpenAiProvider::from_config(config).expect("custom provider");
+
+        let _ = provider
+            .invoke(model_request("messages-model"))
+            .expect("invoke")
+            .collect::<Vec<_>>();
+
+        let body = request_json(&request_rx.recv().expect("server request"));
+        assert_eq!(body["max_tokens"], expected, "declared {declared}");
+    }
+}
+
+#[test]
+fn custom_provider_messages_stream_errors_include_custom_label() {
+    let (base_url, _request_rx) = spawn_sse_server_with_sse("data: not-json\n\n");
+    let provider = CustomOpenAiProvider::from_config(messages_model_config(&base_url))
+        .expect("custom provider");
+
+    let error = provider
+        .invoke(model_request("messages-model"))
+        .expect("invoke")
+        .find_map(Result::err)
+        .expect("malformed stream");
+
+    assert!(
+        error
+            .message()
+            .contains("custom provider `local-openai` provider emitted malformed stream JSON"),
+        "{}",
+        error.message()
     );
 }
 
@@ -846,6 +1012,7 @@ fn custom_config_with_compat<'a>(
             CustomModelConfig {
                 id: "custom-model".to_owned(),
                 display_name: "Custom Model".to_owned(),
+                api_family: ApiFamily::OpenAiChatCompletions,
                 context_window_tokens: None,
                 max_output_tokens: None,
                 supports_tools: Some(true),
@@ -854,6 +1021,31 @@ fn custom_config_with_compat<'a>(
             },
         )]),
     }
+}
+
+/// A Chat Completions provider whose `messages-model` entry overrides its
+/// family to Anthropic Messages.
+fn messages_model_config(base_url: &str) -> CustomProviderConfig {
+    let mut config = custom_config(base_url, Some("literal-secret"), []);
+    config.models.insert(
+        "messages-model".to_owned(),
+        CustomModelConfig {
+            id: "messages-model".to_owned(),
+            display_name: "messages-model".to_owned(),
+            api_family: ApiFamily::AnthropicMessages,
+            context_window_tokens: None,
+            max_output_tokens: None,
+            supports_tools: Some(true),
+            supports_reasoning: Some(true),
+            compat: None,
+        },
+    );
+    config
+}
+
+fn request_json(request: &str) -> Value {
+    let (_, body) = request.split_once("\r\n\r\n").expect("request body");
+    serde_json::from_str(body).expect("request json")
 }
 
 fn model_request(model: &str) -> ModelRequest {

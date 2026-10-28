@@ -281,7 +281,7 @@ fn rejects_invalid_headers_and_authorization_conflict() {
         .any(|warning| warning.contains("conflicts with auth_header")));
     assert!(warnings
         .iter()
-        .any(|warning| warning.contains("owned by the OpenAI Chat Completions adapter")));
+        .any(|warning| warning.contains("owned by the provider adapter")));
 }
 
 #[test]
@@ -314,7 +314,7 @@ fn rejects_unsupported_api_family_and_empty_models() {
         r#"{
           "providers": {
             "bad_family": {
-              "api_family": "anthropic_messages",
+              "api_family": "openai_responses",
               "base_url": "https://proxy.example.com/v1",
               "models": [{"id": "custom"}]
             },
@@ -333,7 +333,7 @@ fn rejects_unsupported_api_family_and_empty_models() {
         .any(|warning| warning.contains("api_family") && warning.contains("not supported")));
     assert!(warnings
         .iter()
-        .any(|warning| warning.contains("anthropic_messages")));
+        .any(|warning| warning.contains("openai_responses")));
     assert!(warnings
         .iter()
         .any(|warning| warning.contains("no valid models")));
@@ -587,6 +587,7 @@ fn default_model_without_models_becomes_the_only_model_with_no_metadata() {
         [&CustomModelConfig {
             id: "qwen3:32b".to_owned(),
             display_name: "qwen3:32b".to_owned(),
+            api_family: ApiFamily::OpenAiChatCompletions,
             context_window_tokens: None,
             max_output_tokens: None,
             supports_tools: None,
@@ -651,7 +652,7 @@ fn missing_empty_or_non_array_models_warn_with_the_fix() {
 }
 
 #[test]
-fn headless_guide_custom_provider_example_parses_without_warnings() {
+fn headless_guide_custom_provider_examples_parse_without_warnings() {
     let guide = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../docs/guides/headless.md"
@@ -660,20 +661,175 @@ fn headless_guide_custom_provider_example_parses_without_warnings() {
     let section = guide
         .split("## Custom providers")
         .nth(1)
+        .and_then(|rest| rest.split("\n## ").next())
         .expect("custom providers section");
-    let example = section
+    let examples = section
         .split("```json")
-        .nth(1)
-        .and_then(|rest| rest.split("```").next())
-        .expect("providers.json example");
+        .skip(1)
+        .filter_map(|rest| rest.split("```").next())
+        .collect::<Vec<_>>();
+    assert_eq!(examples.len(), 2, "providers.json examples");
 
-    let (registry, warnings) = ProviderConfigRegistry::with_json(example);
+    let mut ids = Vec::new();
+    let mut messages_models = 0;
+    for example in examples {
+        let (registry, warnings) = ProviderConfigRegistry::with_json(example);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        for provider in registry.providers() {
+            ids.push(provider.id.clone());
+            let default_model = provider.default_model.as_deref().expect("default model");
+            assert!(provider.models.contains_key(default_model));
+            messages_models += provider
+                .models
+                .values()
+                .filter(|model| model.api_family == ApiFamily::AnthropicMessages)
+                .count();
+        }
+    }
+    assert_eq!(ids.len(), 3);
+    assert!(ids.contains(&"gateway".to_owned()) && ids.contains(&"local".to_owned()));
+    assert_eq!(messages_models, 1);
+}
+
+#[test]
+fn model_api_family_overrides_the_provider_family() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{
+          "providers": {
+            "gateway": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://gateway.example.com/v1",
+              "models": [
+                { "id": "chat-model" },
+                { "id": "messages-model", "api_family": "anthropic_messages" }
+              ]
+            },
+            "messages_only": {
+              "api_family": "anthropic_messages",
+              "base_url": "https://gateway.example.com",
+              "headers": {
+                "x-api-key": "$ANTHROPIC_API_KEY",
+                "anthropic-version": "2023-06-01"
+              },
+              "default_model": "messages-default"
+            }
+          }
+        }"#,
+    );
 
     assert!(warnings.is_empty(), "{warnings:?}");
-    let ids = registry.providers().map(|provider| provider.id.as_str());
-    assert_eq!(ids.collect::<Vec<_>>(), ["gateway", "local"]);
-    for provider in registry.providers() {
-        let default_model = provider.default_model.as_deref().expect("default model");
-        assert!(provider.models.contains_key(default_model));
+    let gateway = registry.provider("gateway").expect("gateway provider");
+    assert_eq!(
+        gateway.model_api_family("chat-model"),
+        ApiFamily::OpenAiChatCompletions
+    );
+    assert_eq!(
+        gateway.model_api_family("messages-model"),
+        ApiFamily::AnthropicMessages
+    );
+    assert_eq!(
+        gateway.model_api_family("unlisted-model"),
+        ApiFamily::OpenAiChatCompletions
+    );
+    let messages_only = registry
+        .provider("messages_only")
+        .expect("messages provider");
+    assert_eq!(messages_only.api_family, ApiFamily::AnthropicMessages);
+    assert_eq!(
+        messages_only.headers.keys().collect::<Vec<_>>(),
+        ["anthropic-version", "x-api-key"]
+    );
+    assert_eq!(
+        messages_only.model_api_family("messages-default"),
+        ApiFamily::AnthropicMessages
+    );
+}
+
+#[test]
+fn provider_whose_full_endpoint_base_url_serves_another_family_is_ignored() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{
+          "providers": {
+            "messages_on_chat_endpoint": {
+              "api_family": "anthropic_messages",
+              "base_url": "https://gateway.example.com/v1/chat/completions",
+              "default_model": "messages-model"
+            },
+            "chat_on_messages_endpoint": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://gateway.example.com/v1/messages",
+              "models": [{ "id": "messages-model", "api_family": "anthropic_messages" }]
+            },
+            "messages_on_messages_endpoint": {
+              "api_family": "anthropic_messages",
+              "base_url": "https://gateway.example.com/v1/messages",
+              "default_model": "messages-model"
+            }
+          }
+        }"#,
+    );
+
+    assert!(registry.provider("messages_on_messages_endpoint").is_some());
+    assert!(registry.provider("messages_on_chat_endpoint").is_none());
+    assert!(registry.provider("chat_on_messages_endpoint").is_none());
+    for provider in ["messages_on_chat_endpoint", "chat_on_messages_endpoint"] {
+        let expected = format!(
+            "ignored provider `{provider}` because base_url is a full endpoint for another api_family"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains(&expected)),
+            "missing `{expected}` in {warnings:?}"
+        );
+    }
+}
+
+#[test]
+fn model_api_family_entries_that_cannot_be_routed_are_ignored_with_warnings() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{
+          "providers": {
+            "gateway": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://gateway.example.com/v1/chat/completions",
+              "models": [
+                { "id": "chat-model" },
+                { "id": "full-endpoint-mismatch", "api_family": "anthropic_messages" },
+                { "id": "unknown-family", "api_family": "openai_responses" }
+              ]
+            },
+            "messages_compat": {
+              "api_family": "anthropic_messages",
+              "base_url": "https://gateway.example.com",
+              "models": [
+                { "id": "messages-model", "compat": { "supports_developer_role": false } }
+              ]
+            }
+          }
+        }"#,
+    );
+
+    let gateway = registry.provider("gateway").expect("gateway provider");
+    assert_eq!(
+        gateway
+            .models
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["chat-model"]
+    );
+    let compat_model = &registry
+        .provider("messages_compat")
+        .expect("messages provider")
+        .models["messages-model"];
+    assert_eq!(compat_model.compat, None);
+    for expected in [
+        "model #1 because the provider base_url is a full endpoint for another api_family",
+        "model #2 api_family `openai_responses` because it is not supported",
+        "compat because it applies only to openai_chat_completions",
+    ] {
+        assert!(
+            warnings.iter().any(|warning| warning.contains(expected)),
+            "missing `{expected}` in {warnings:?}"
+        );
     }
 }

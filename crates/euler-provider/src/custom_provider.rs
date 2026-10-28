@@ -3,8 +3,8 @@
 use crate::auth::SecretString;
 use crate::provider_config::{ApiFamily, CustomProviderConfig};
 use crate::{
-    ModelProvider, ModelRequest, ProviderError, ProviderStream, ProviderTransportObserver,
-    ResolvedSecretSink,
+    observed_http_agent, ModelProvider, ModelRequest, ProviderError, ProviderStream,
+    ProviderTransportObserver, ResolvedSecretSink, TransportReader,
 };
 use std::collections::BTreeMap;
 use std::fmt;
@@ -12,10 +12,11 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
+/// A `providers.json` provider. Each request is sent in its model's
+/// `api_family` to that family's endpoint under the shared `base_url`.
 #[derive(Clone)]
 pub struct CustomOpenAiProvider {
     config: CustomProviderConfig,
-    endpoint: String,
     label: String,
     /// Host observer for request-time secret resolution: every resolved
     /// api_key / header value is reported so the host can secret-taint it
@@ -27,18 +28,13 @@ pub struct CustomOpenAiProvider {
 
 impl CustomOpenAiProvider {
     pub fn from_config(config: CustomProviderConfig) -> Result<Self, ProviderError> {
-        match config.api_family {
-            ApiFamily::OpenAiChatCompletions => {
-                let endpoint = chat_completions_endpoint(&config.base_url)?;
-                let label = format!("custom provider `{}`", config.id);
-                Ok(Self {
-                    config,
-                    endpoint,
-                    label,
-                    secret_sink: Arc::new(Mutex::new(None)),
-                })
-            }
-        }
+        family_endpoint(&config.base_url, config.api_family)?;
+        let label = format!("custom provider `{}`", config.id);
+        Ok(Self {
+            config,
+            label,
+            secret_sink: Arc::new(Mutex::new(None)),
+        })
     }
 
     fn report_resolved_secret(&self, value: &SecretString) {
@@ -58,7 +54,6 @@ impl fmt::Debug for CustomOpenAiProvider {
         formatter
             .debug_struct("CustomOpenAiProvider")
             .field("config", &self.config)
-            .field("endpoint", &self.endpoint)
             .field("label", &self.label)
             .finish()
     }
@@ -109,6 +104,21 @@ impl CustomOpenAiProvider {
         observer: Option<ProviderTransportObserver>,
     ) -> Result<ProviderStream, ProviderError> {
         let resolved = self.resolve_headers()?;
+        match self.config.model_api_family(&request.model) {
+            ApiFamily::OpenAiChatCompletions => {
+                self.send_chat_completions(request, resolved, observer)
+            }
+            ApiFamily::AnthropicMessages => self.send_messages(request, resolved, observer),
+        }
+    }
+
+    fn send_chat_completions(
+        &self,
+        request: ModelRequest,
+        resolved: ResolvedHeaders,
+        observer: Option<ProviderTransportObserver>,
+    ) -> Result<ProviderStream, ProviderError> {
+        let endpoint = family_endpoint(&self.config.base_url, ApiFamily::OpenAiChatCompletions)?;
         let options = self.chat_completions_options(&request.model);
         let body = crate::chat_completions::request_body_with_options(&request, &options);
         // Shares the ureq request + error skeleton with the built-in providers
@@ -120,7 +130,7 @@ impl CustomOpenAiProvider {
             .map(|(name, value)| (name.as_str(), value.expose()));
         use crate::chat_completions_provider::{ChatCompletionsCall, SendFailure};
         crate::chat_completions_provider::send_chat_completions(
-            &self.endpoint,
+            &endpoint,
             headers,
             ChatCompletionsCall {
                 body,
@@ -137,6 +147,61 @@ impl CustomOpenAiProvider {
                 )),
             },
         )
+    }
+
+    fn send_messages(
+        &self,
+        request: ModelRequest,
+        resolved: ResolvedHeaders,
+        observer: Option<ProviderTransportObserver>,
+    ) -> Result<ProviderStream, ProviderError> {
+        let model = self.config.models.get(&request.model);
+        let adaptive_thinking = model.and_then(|model| model.supports_reasoning) == Some(true);
+        // A declared output limit caps the default, since the API rejects a
+        // `max_tokens` above the model's limit.
+        let default_max_tokens = model
+            .and_then(|model| model.max_output_tokens)
+            .map_or(crate::anthropic::DEFAULT_MAX_TOKENS, |limit| {
+                limit.min(crate::anthropic::DEFAULT_MAX_TOKENS)
+            });
+        let body = crate::anthropic::messages_request_body(
+            &request,
+            &crate::anthropic::MessagesRoute {
+                provider: &self.config.id,
+                adaptive_thinking,
+                default_max_tokens,
+            },
+        );
+        let endpoint = family_endpoint(&self.config.base_url, ApiFamily::AnthropicMessages)?;
+        let agent = observed_http_agent(observer.as_ref());
+        let mut call = agent
+            .post(&endpoint)
+            .set("Content-Type", "application/json")
+            .set("Accept", "text/event-stream");
+        // A configured `anthropic-version` header replaces the default.
+        if !resolved
+            .headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("anthropic-version"))
+        {
+            call = call.set("anthropic-version", crate::anthropic::ANTHROPIC_VERSION);
+        }
+        for (name, value) in &resolved.headers {
+            call = call.set(name, value.expose());
+        }
+        match call.send_json(body) {
+            Ok(response) => Ok(crate::anthropic::messages_stream(
+                &self.label,
+                TransportReader::new(response.into_reader(), observer),
+            )),
+            // As on the Chat Completions path, the rejection body is dropped
+            // unread.
+            Err(ureq::Error::Status(status, _)) => Err(classify_http_error(&self.label, status)),
+            Err(error) => Err(ProviderError::transport(scrub_secrets(
+                format!("{} request failed: {error}", self.label),
+                &resolved.secrets,
+            ))),
+        }
     }
 }
 
@@ -185,17 +250,23 @@ struct ResolvedHeaders {
     secrets: Vec<SecretString>,
 }
 
-fn chat_completions_endpoint(base_url: &str) -> Result<String, ProviderError> {
+/// Joins a family's endpoint path onto `base_url`. A `base_url` that already
+/// ends with the family's path is used as is. Chat Completions appends
+/// `/chat/completions` (the root conventionally ends in `/v1`). Messages
+/// appends `/messages` to a root ending in `/v1` and `/v1/messages` to any
+/// other root, so one `/v1` root serves both families and a bare host root
+/// also works for Messages.
+fn family_endpoint(base_url: &str, api_family: ApiFamily) -> Result<String, ProviderError> {
     let mut url = Url::parse(base_url)
         .map_err(|_| ProviderError::transport("custom provider base_url is invalid"))?;
-    let path = url.path().trim_end_matches('/');
-    if path.ends_with("/chat/completions") || path == "chat/completions" {
+    let path = url.path().trim_end_matches('/').to_owned();
+    let suffix = api_family.endpoint_suffix();
+    if path.ends_with(suffix) {
         return Ok(url.to_string());
     }
-    let next_path = if path.is_empty() {
-        "/chat/completions".to_owned()
-    } else {
-        format!("{path}/chat/completions")
+    let next_path = match api_family {
+        ApiFamily::AnthropicMessages if !path.ends_with("/v1") => format!("{path}/v1{suffix}"),
+        _ => format!("{path}{suffix}"),
     };
     url.set_path(&next_path);
     Ok(url.to_string())
@@ -337,6 +408,9 @@ fn scrub_secrets(message: String, secrets: &[SecretString]) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn endpoint_for_test(base_url: &str) -> Result<String, ProviderError> {
-    chat_completions_endpoint(base_url)
+pub(crate) fn endpoint_for_test(
+    base_url: &str,
+    api_family: ApiFamily,
+) -> Result<String, ProviderError> {
+    family_endpoint(base_url, api_family)
 }
