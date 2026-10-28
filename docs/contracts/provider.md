@@ -220,8 +220,9 @@ derives its endpoint from `base_url`:
 
 A `base_url` that already ends with a family's path is that family's full
 endpoint and is used as is. A full endpoint serves only its own family: a
-model entry that overrides the provider's family to one the full endpoint
-cannot serve is ignored with a warning. So one `/v1` root serves both
+provider whose own `api_family` the full endpoint cannot serve is ignored
+with a warning, and so is a model entry that overrides the provider's family
+to one the full endpoint cannot serve. So one `/v1` root serves both
 families, and a bare host root also serves Messages.
 
 `anthropic_messages` requests use the built-in Anthropic Messages adapter
@@ -231,10 +232,13 @@ an `x-api-key` entry in `headers` sends the key the way Anthropic's own API
 expects. A configured `anthropic-version` header replaces the default. A
 model that declares `supports_reasoning: true` requests adaptive thinking
 with the same effort mapping as the built-in `anthropic` provider; any other
-model requests no thinking. Recorded thinking blocks are replayed with their
-signatures only to the same provider and model; reasoning recorded without a
-signature (for example by a Chat Completions route) is not replayed. The same
-rule applies to the built-in `anthropic` provider. `compat`
+model requests no thinking. When a request sets no `max_output_tokens`,
+`max_tokens` is 32000, capped at the model entry's declared
+`max_output_tokens`. Errors read from the stream name the custom provider.
+Recorded thinking blocks are replayed with their signatures only to the same
+provider and model; reasoning recorded without a signature, or with a Chat
+Completions `reasoning_details` array in place of one, is not replayed. The
+same rule applies to the built-in `anthropic` provider. `compat`
 applies only to `openai_chat_completions`; on a Messages model it is ignored
 with a warning. As on the Chat Completions path, an HTTP rejection is
 classified by status and its body is not read.

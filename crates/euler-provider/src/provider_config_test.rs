@@ -746,6 +746,44 @@ fn model_api_family_overrides_the_provider_family() {
 }
 
 #[test]
+fn provider_whose_full_endpoint_base_url_serves_another_family_is_ignored() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{
+          "providers": {
+            "messages_on_chat_endpoint": {
+              "api_family": "anthropic_messages",
+              "base_url": "https://gateway.example.com/v1/chat/completions",
+              "default_model": "messages-model"
+            },
+            "chat_on_messages_endpoint": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://gateway.example.com/v1/messages",
+              "models": [{ "id": "messages-model", "api_family": "anthropic_messages" }]
+            },
+            "messages_on_messages_endpoint": {
+              "api_family": "anthropic_messages",
+              "base_url": "https://gateway.example.com/v1/messages",
+              "default_model": "messages-model"
+            }
+          }
+        }"#,
+    );
+
+    assert!(registry.provider("messages_on_messages_endpoint").is_some());
+    assert!(registry.provider("messages_on_chat_endpoint").is_none());
+    assert!(registry.provider("chat_on_messages_endpoint").is_none());
+    for provider in ["messages_on_chat_endpoint", "chat_on_messages_endpoint"] {
+        let expected = format!(
+            "ignored provider `{provider}` because base_url is a full endpoint for another api_family"
+        );
+        assert!(
+            warnings.iter().any(|warning| warning.contains(&expected)),
+            "missing `{expected}` in {warnings:?}"
+        );
+    }
+}
+
+#[test]
 fn model_api_family_entries_that_cannot_be_routed_are_ignored_with_warnings() {
     let (registry, warnings) = ProviderConfigRegistry::with_json(
         r#"{

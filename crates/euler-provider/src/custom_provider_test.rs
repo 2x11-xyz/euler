@@ -713,6 +713,7 @@ fn custom_provider_routes_messages_model_and_replays_signed_thinking() {
     let body = request_json(&request);
     assert_eq!(body["thinking"]["type"], "adaptive");
     assert_eq!(body["output_config"]["effort"], "high");
+    assert_eq!(body["max_tokens"], 32_000);
     assert_eq!(
         body["messages"][1]["content"][0],
         json!({
@@ -747,6 +748,48 @@ fn custom_provider_messages_model_without_declared_reasoning_omits_thinking() {
     let body = request_json(&request);
     assert_eq!(body.get("thinking"), None);
     assert_eq!(body.get("output_config"), None);
+}
+
+#[test]
+fn custom_provider_messages_model_caps_default_max_tokens_at_declared_limit() {
+    for (declared, expected) in [(8192, 8192), (64_000, 32_000)] {
+        let (base_url, request_rx) =
+            spawn_sse_server_with_sse("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        let mut config = messages_model_config(&base_url);
+        if let Some(model) = config.models.get_mut("messages-model") {
+            model.max_output_tokens = Some(declared);
+        }
+        let provider = CustomOpenAiProvider::from_config(config).expect("custom provider");
+
+        let _ = provider
+            .invoke(model_request("messages-model"))
+            .expect("invoke")
+            .collect::<Vec<_>>();
+
+        let body = request_json(&request_rx.recv().expect("server request"));
+        assert_eq!(body["max_tokens"], expected, "declared {declared}");
+    }
+}
+
+#[test]
+fn custom_provider_messages_stream_errors_include_custom_label() {
+    let (base_url, _request_rx) = spawn_sse_server_with_sse("data: not-json\n\n");
+    let provider = CustomOpenAiProvider::from_config(messages_model_config(&base_url))
+        .expect("custom provider");
+
+    let error = provider
+        .invoke(model_request("messages-model"))
+        .expect("invoke")
+        .find_map(Result::err)
+        .expect("malformed stream");
+
+    assert!(
+        error
+            .message()
+            .contains("custom provider `local-openai` provider emitted malformed stream JSON"),
+        "{}",
+        error.message()
+    );
 }
 
 #[test]

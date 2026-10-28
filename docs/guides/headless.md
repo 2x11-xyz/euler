@@ -224,7 +224,10 @@ family, so a model that overrides the family needs a root `base_url`.
 
 On a Messages model, `supports_reasoning: true` turns on adaptive thinking at
 the requested `--reasoning-effort`, the same mapping as the built-in
-`anthropic` provider. `compat` applies only to Chat Completions models. For
+`anthropic` provider. Messages requires `max_tokens`. Without
+`--max-output-tokens`, Euler sends 32000, or the model entry's
+`max_output_tokens` when that is lower, so declare that field for a model
+with a lower output limit. `compat` applies only to Chat Completions models. For
 Anthropic's own API, which expects `x-api-key` rather than a bearer token, use
 `"headers": { "x-api-key": "$ANTHROPIC_API_KEY" }` instead of `auth_header`.
 

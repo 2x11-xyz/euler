@@ -17,7 +17,9 @@ pub(crate) const ANTHROPIC_VERSION: &str = "2023-06-01";
 // 4096 starved adaptive-thinking models: a single deep reasoning pass
 // consumed the whole budget and truncated rounds with zero content.
 // All current Anthropic models accept far larger output ceilings.
-const DEFAULT_MAX_TOKENS: u64 = 32_000;
+pub(crate) const DEFAULT_MAX_TOKENS: u64 = 32_000;
+/// Stream error label of the built-in provider.
+const ANTHROPIC_LABEL: &str = "Anthropic";
 
 #[derive(Clone, Debug)]
 pub struct AnthropicProvider {
@@ -97,10 +99,10 @@ impl AnthropicProvider {
             }
         };
 
-        Ok(Box::new(AnthropicStream::new(TransportReader::new(
-            response.into_reader(),
-            observer,
-        ))))
+        Ok(messages_stream(
+            ANTHROPIC_LABEL,
+            TransportReader::new(response.into_reader(), observer),
+        ))
     }
 }
 
@@ -141,6 +143,7 @@ fn request_body(request: &ModelRequest) -> Value {
         &MessagesRoute {
             provider: "anthropic",
             adaptive_thinking: model_supports_adaptive_thinking(&request.model),
+            default_max_tokens: DEFAULT_MAX_TOKENS,
         },
     )
 }
@@ -152,12 +155,15 @@ pub(crate) struct MessagesRoute<'a> {
     pub(crate) provider: &'a str,
     /// Whether the model accepts adaptive thinking and an effort level.
     pub(crate) adaptive_thinking: bool,
+    /// `max_tokens` when the request sets no `max_output_tokens`. The API
+    /// requires the field and rejects values above the model's limit.
+    pub(crate) default_max_tokens: u64,
 }
 
 pub(crate) fn messages_request_body(request: &ModelRequest, route: &MessagesRoute<'_>) -> Value {
     let mut body = json!({
         "model": request.model,
-        "max_tokens": request.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        "max_tokens": request.max_output_tokens.unwrap_or(route.default_max_tokens),
         "stream": true,
         "messages": anthropic_messages(route.provider, &request.model, &request.input),
     });
@@ -335,10 +341,14 @@ fn reasoning_content_block(
     artifact: Option<&str>,
 ) -> Option<(AnthropicRole, Value)> {
     // The API rejects a thinking block without its signature and a redacted
-    // block without its data. Unsigned reasoning (for example recorded by a
-    // Chat Completions route before the model moved to Messages) cannot be
+    // block without its data. Reasoning recorded by a Chat Completions route
+    // before the model moved to Messages is unsigned, or carries a JSON array
+    // of `reasoning_details` that is no Messages signature. Neither can be
     // replayed, so drop it.
     let artifact = artifact?;
+    if matches!(serde_json::from_str::<Value>(artifact), Ok(Value::Array(_))) {
+        return None;
+    }
     let mut block = reasoning_block_value(fidelity, content, artifact);
     if !matches!(fidelity, ReasoningFidelity::Opaque) {
         block["signature"] = Value::String(artifact.to_owned());
@@ -459,16 +469,17 @@ struct AnthropicStream {
     done: bool,
 }
 
-/// Wraps a Messages API SSE response body as a model event stream.
-pub(crate) fn messages_stream(reader: impl Read + Send + 'static) -> ProviderStream {
-    Box::new(AnthropicStream::new(reader))
+/// Wraps a Messages API SSE response body as a model event stream whose
+/// errors name `label` (for example "Anthropic" or a custom provider label).
+pub(crate) fn messages_stream(label: &str, reader: impl Read + Send + 'static) -> ProviderStream {
+    Box::new(AnthropicStream::new(label, reader))
 }
 
 impl AnthropicStream {
-    fn new(reader: impl Read + Send + 'static) -> Self {
+    fn new(label: &str, reader: impl Read + Send + 'static) -> Self {
         Self {
             reader: Box::new(reader),
-            parser: AnthropicSseParser::new(),
+            parser: AnthropicSseParser::with_label(label),
             queued: Vec::new().into_iter(),
             done: false,
         }
@@ -498,17 +509,19 @@ impl Iterator for AnthropicStream {
                 }
                 Err(_) => {
                     self.done = true;
-                    return Some(Err(ProviderError::transport(
-                        "Anthropic provider stream read failed",
-                    )));
+                    return Some(Err(ProviderError::transport(format!(
+                        "{} provider stream read failed",
+                        self.parser.label
+                    ))));
                 }
             }
         }
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct AnthropicSseParser {
+    label: String,
     line_buffer: Vec<u8>,
     data_lines: Vec<String>,
     saw_data: bool,
@@ -518,8 +531,21 @@ struct AnthropicSseParser {
 }
 
 impl AnthropicSseParser {
+    #[cfg(test)]
     fn new() -> Self {
-        Self::default()
+        Self::with_label(ANTHROPIC_LABEL)
+    }
+
+    fn with_label(label: &str) -> Self {
+        Self {
+            label: label.to_owned(),
+            line_buffer: Vec::new(),
+            data_lines: Vec::new(),
+            saw_data: false,
+            terminal_event_seen: false,
+            blocks: Vec::new(),
+            usage: PartialUsage::default(),
+        }
     }
 
     fn feed(&mut self, chunk: &[u8]) -> Vec<Result<ModelStreamEvent, ProviderError>> {
@@ -555,9 +581,10 @@ impl AnthropicSseParser {
             self.flush_event(&mut events);
         }
         if self.saw_data && !self.terminal_event_seen {
-            events.push(Err(ProviderError::stream_truncation(
-                "Anthropic provider stream truncated before message_delta",
-            )));
+            events.push(Err(ProviderError::stream_truncation(format!(
+                "{} provider stream truncated before message_delta",
+                self.label
+            ))));
         }
         events
     }
@@ -590,9 +617,10 @@ impl AnthropicSseParser {
             Ok(value) => value,
             Err(_) => {
                 self.terminal_event_seen = true;
-                events.push(Err(ProviderError::transport(
-                    "Anthropic provider emitted malformed stream JSON",
-                )));
+                events.push(Err(ProviderError::transport(format!(
+                    "{} provider emitted malformed stream JSON",
+                    self.label
+                ))));
                 return;
             }
         };
@@ -622,7 +650,7 @@ impl AnthropicSseParser {
                 stop_reason: stop_reason(value),
                 usage: self.usage.finish(),
             })),
-            "error" => Some(Err(stream_error(value))),
+            "error" => Some(Err(stream_error(&self.label, value))),
             _ => None,
         }
     }
@@ -722,7 +750,7 @@ impl AnthropicSseParser {
                 input_prefix,
                 input_json,
             } => {
-                let input = match tool_input(input_prefix, &input_json) {
+                let input = match tool_input(&self.label, input_prefix, &input_json) {
                     Ok(input) => input,
                     Err(error) => return Some(Err(error)),
                 };
@@ -873,17 +901,18 @@ fn ensure_block_slot(blocks: &mut Vec<Option<StreamBlock>>, index: usize) {
     }
 }
 
-fn tool_input(input_prefix: Value, input_json: &str) -> Result<Value, ProviderError> {
+fn tool_input(label: &str, input_prefix: Value, input_json: &str) -> Result<Value, ProviderError> {
     if input_json.trim().is_empty() {
         return Ok(input_prefix);
     }
     if !empty_tool_input_prefix(&input_prefix) {
-        return Err(ProviderError::transport(
-            "Anthropic provider emitted mixed tool input prefix and deltas",
-        ));
+        return Err(ProviderError::transport(format!(
+            "{label} provider emitted mixed tool input prefix and deltas"
+        )));
     }
-    serde_json::from_str(input_json)
-        .map_err(|_| ProviderError::transport("Anthropic provider emitted invalid tool input JSON"))
+    serde_json::from_str(input_json).map_err(|_| {
+        ProviderError::transport(format!("{label} provider emitted invalid tool input JSON"))
+    })
 }
 
 fn empty_tool_input_prefix(value: &Value) -> bool {
@@ -910,20 +939,20 @@ fn stop_reason(value: &Value) -> StopReason {
     }
 }
 
-fn stream_error(value: &Value) -> ProviderError {
+fn stream_error(label: &str, value: &Value) -> ProviderError {
     let error_type = value
         .get("error")
         .and_then(|error| error.get("type"))
         .and_then(Value::as_str);
     match error_type {
-        Some("authentication_error") => ProviderError::auth("Anthropic stream failed: auth"),
+        Some("authentication_error") => ProviderError::auth(format!("{label} stream failed: auth")),
         Some("rate_limit_error" | "overloaded_error") => {
-            ProviderError::rate_limit("Anthropic stream failed: rate limit")
+            ProviderError::rate_limit(format!("{label} stream failed: rate limit"))
         }
         Some("invalid_request_error") => {
-            ProviderError::rejected("Anthropic stream failed: rejected")
+            ProviderError::rejected(format!("{label} stream failed: rejected"))
         }
-        _ => ProviderError::transport("Anthropic stream failed"),
+        _ => ProviderError::transport(format!("{label} stream failed")),
     }
 }
 

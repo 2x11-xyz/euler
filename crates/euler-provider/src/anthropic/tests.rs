@@ -347,6 +347,19 @@ fn custom_route_replays_its_own_signed_thinking_and_drops_unsigned_thinking() {
                 content: "lookup".to_owned(),
             },
             reasoning("gateway", "unsigned", None),
+            // Chat Completions records `reasoning_details` as a JSON array.
+            reasoning(
+                "gateway",
+                "chat-details",
+                Some(r#"[{"type":"reasoning.text","text":"chat-details"}]"#),
+            ),
+            ModelInputItem::Reasoning {
+                provider: "gateway".to_owned(),
+                model: "gateway-model".to_owned(),
+                fidelity: ReasoningFidelity::Opaque,
+                content: String::new(),
+                artifact: Some(r#"[{"type":"reasoning.encrypted","data":"enc"}]"#.to_owned()),
+            },
             reasoning("gateway", "signed", Some("gateway-signature")),
             reasoning("anthropic", "native", Some("native-signature")),
             ModelInputItem::ToolCall {
@@ -365,6 +378,7 @@ fn custom_route_replays_its_own_signed_thinking_and_drops_unsigned_thinking() {
         &MessagesRoute {
             provider: "gateway",
             adaptive_thinking: true,
+            default_max_tokens: 8192,
         },
     );
 
@@ -376,6 +390,7 @@ fn custom_route_replays_its_own_signed_thinking_and_drops_unsigned_thinking() {
         ])
     );
     assert_eq!(body["output_config"]["effort"], "xhigh");
+    assert_eq!(body["max_tokens"], 8192);
 }
 
 #[test]

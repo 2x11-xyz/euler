@@ -155,17 +155,21 @@ impl CustomOpenAiProvider {
         resolved: ResolvedHeaders,
         observer: Option<ProviderTransportObserver>,
     ) -> Result<ProviderStream, ProviderError> {
-        let adaptive_thinking = self
-            .config
-            .models
-            .get(&request.model)
-            .and_then(|model| model.supports_reasoning)
-            == Some(true);
+        let model = self.config.models.get(&request.model);
+        let adaptive_thinking = model.and_then(|model| model.supports_reasoning) == Some(true);
+        // A declared output limit caps the default, since the API rejects a
+        // `max_tokens` above the model's limit.
+        let default_max_tokens = model
+            .and_then(|model| model.max_output_tokens)
+            .map_or(crate::anthropic::DEFAULT_MAX_TOKENS, |limit| {
+                limit.min(crate::anthropic::DEFAULT_MAX_TOKENS)
+            });
         let body = crate::anthropic::messages_request_body(
             &request,
             &crate::anthropic::MessagesRoute {
                 provider: &self.config.id,
                 adaptive_thinking,
+                default_max_tokens,
             },
         );
         let endpoint = family_endpoint(&self.config.base_url, ApiFamily::AnthropicMessages)?;
@@ -186,10 +190,10 @@ impl CustomOpenAiProvider {
             call = call.set(name, value.expose());
         }
         match call.send_json(body) {
-            Ok(response) => Ok(crate::anthropic::messages_stream(TransportReader::new(
-                response.into_reader(),
-                observer,
-            ))),
+            Ok(response) => Ok(crate::anthropic::messages_stream(
+                &self.label,
+                TransportReader::new(response.into_reader(), observer),
+            )),
             // As on the Chat Completions path, the rejection body is dropped
             // unread.
             Err(ureq::Error::Status(status, _)) => Err(classify_http_error(&self.label, status)),

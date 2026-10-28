@@ -207,6 +207,14 @@ fn parse_provider(
     }
     let api_family = api_family_field(object, &scope, warnings)?;
     let base_url = required_base_url(object, &scope, warnings)?;
+    // The provider's family also serves `default_model_only` and any unlisted
+    // `--model`, so its base_url must serve that family.
+    if !base_url_serves(&base_url, api_family) {
+        warnings.push(format!(
+            "ignored {scope} because base_url is a full endpoint for another api_family; set api_family to the family it serves, or use the API root as base_url"
+        ));
+        return None;
+    }
     let route = ProviderRoute {
         api_family,
         base_url: &base_url,

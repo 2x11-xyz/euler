@@ -6,7 +6,7 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
-### Custom providers speak Anthropic Messages
+### Custom providers speak Anthropic Messages (#263)
 
 - **New `api_family: "anthropic_messages"`** for `providers.json`. It reuses
   the native Anthropic adapter, so signed thinking blocks are replayed on
@@ -18,12 +18,15 @@ pull requests that landed them; deeper design rationale lives in
   over Chat Completions. Both families share the provider's `base_url`: a
   `/v1` root serves `/v1/chat/completions` and `/v1/messages`, and a bare
   host root also works for Messages.
-- New load warnings: a model with an unknown `api_family`, a model family that
-  a full-endpoint `base_url` cannot serve, and `compat` on a Messages model
-  (Chat Completions only, ignored).
-- Reasoning recorded without a signature is no longer replayed over Messages,
-  including on the built-in `anthropic` provider. The API rejects unsigned
-  thinking blocks, so such a request previously failed.
+- New load warnings: a model with an unknown `api_family`, a provider or
+  model family that a full-endpoint `base_url` cannot serve, and `compat` on
+  a Messages model (Chat Completions only, ignored).
+- A Messages model's declared `max_output_tokens` caps the default
+  `max_tokens` (32000), and stream errors name the custom provider.
+- Reasoning recorded without a signature, or with a Chat Completions
+  `reasoning_details` array, is no longer replayed over Messages, including
+  on the built-in `anthropic` provider. The API rejects such thinking blocks,
+  so such a request previously failed.
 
 ### Custom provider config location (#258)
 
