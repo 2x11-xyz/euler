@@ -146,7 +146,8 @@ pub enum TranscriptItem {
         /// Prefix for the durable `u  Allow <prefix> * always` option;
         /// `None` hides the row (unscoped/compound ask or no user store).
         user_rule_prefix: Option<String>,
-        grants_offerable: bool,
+        /// Why no grant is offered; `None` when grants are offered.
+        no_grant_reason: Option<&'static str>,
         /// Prior allowed decisions for this capability / scope in the session.
         prior_count: usize,
         /// Currently highlighted approval option; defaults to allow-once.

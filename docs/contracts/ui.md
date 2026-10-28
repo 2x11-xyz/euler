@@ -697,6 +697,13 @@ ledger. Scoped grants and project persistence are defined in
 `docs/contracts/capabilities.md` (when extended); the UI must not claim a
 scope the gate did not grant.
 
+A request that offers no grant (danger-flagged by the command-safety walk, or
+marked once-only) renders only `y  Allow once` and `n/esc  Deny with
+instructions`, followed by one muted line naming why: flagged dangerous by
+command safety, or a once-only request. Arrow navigation moves between those
+two rows. The `a`, `p`, and `u` keys decide nothing on such a panel; with an
+empty draft they type into the composer like any other character.
+
 An extension command with several uncovered static capabilities renders one
 operation panel that names the command and lists every requested capability.
 Its choices are allow once, allow every listed capability for this session, or

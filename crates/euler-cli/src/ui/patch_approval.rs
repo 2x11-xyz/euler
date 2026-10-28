@@ -49,7 +49,12 @@ pub(crate) enum ApprovalOption {
 }
 
 impl ApprovalOption {
-    pub(crate) fn previous(self, user_available: bool) -> Self {
+    /// `grants_offered` false means the panel shows only allow-once and
+    /// deny, so navigation moves between those two rows.
+    pub(crate) fn previous(self, user_available: bool, grants_offered: bool) -> Self {
+        if !grants_offered {
+            return Self::AllowOnce;
+        }
         match self {
             Self::AllowOnce => Self::AllowOnce,
             Self::AllowSession => Self::AllowOnce,
@@ -60,7 +65,10 @@ impl ApprovalOption {
         }
     }
 
-    pub(crate) fn next(self, user_available: bool) -> Self {
+    pub(crate) fn next(self, user_available: bool, grants_offered: bool) -> Self {
+        if !grants_offered {
+            return Self::Deny;
+        }
         match self {
             Self::AllowOnce => Self::AllowSession,
             Self::AllowSession => Self::AllowProject,
@@ -224,6 +232,9 @@ pub(crate) fn panel_lines(
         .into_iter()
         .map(panel_row_for_option),
     );
+    if let Some(reason) = no_grant_reason(&modal.request) {
+        content.push(PanelRow::metadata(reason));
+    }
     bordered_panel(content, panel_width, theme)
 }
 
@@ -316,11 +327,12 @@ pub(crate) fn derive_shell_prefix(command: &str, workspace_root: Option<&Path>) 
 pub(crate) fn derive_user_rule_prefix(request: &PermissionRequest) -> Option<String> {
     if request.capability != Capability::ShellExec
         || request.command_truncated
-        || request.dangerous_command
+        || !request.offers_grants()
     {
-        // A truncated command may hide metacharacters past the bound, and a
-        // danger-flagged one is covered by no grant at all: never offer a
-        // durable rule the gate would refuse to honor.
+        // A truncated command may hide metacharacters past the bound, a
+        // danger-flagged one is covered by no grant at all, and a once-only
+        // one installs none: never offer a durable rule the gate would not
+        // install or honor.
         return None;
     }
     let command = request.command.as_deref()?;
@@ -349,6 +361,19 @@ pub(crate) fn derive_edit_prefix(path: &Path) -> Option<String> {
     Some(first)
 }
 
+/// Why a request offers no session or project grant, shown as a muted line
+/// under its options. `None` exactly when [`PermissionRequest::offers_grants`]
+/// is true.
+pub(crate) fn no_grant_reason(request: &PermissionRequest) -> Option<&'static str> {
+    if request.offers_grants() {
+        None
+    } else if request.dangerous_command {
+        Some("Flagged dangerous by command safety: always asks, no grant offered.")
+    } else {
+        Some("Once-only request: an allow covers this request only.")
+    }
+}
+
 /// Honest option labels: never show a prefix the gate will not grant.
 /// `user_rule_prefix` is `Some` only when a durable user rule is offerable
 /// (simple shell command with a derivable prefix AND a loaded user store) —
@@ -360,35 +385,35 @@ pub(crate) fn approval_option_lines(
     offers_grants: bool,
     selected: ApprovalOption,
 ) -> Vec<ApprovalOptionLine> {
-    // A danger-flagged command is covered by no grant in any mode, so the
-    // panel must not offer one — not even the broad "all shell commands"
-    // fallback. The rows stay in place (selection navigation is positional)
-    // and say what they now do: allow this once.
-    let (session_label, project_label) = if !offers_grants {
-        (
-            "a  Allow once (this command always asks)".to_owned(),
-            "p  Allow once (this command always asks)".to_owned(),
-        )
-    } else {
-        match scope_prefix.filter(|p| !p.is_empty()) {
-            Some(prefix) => (
-                format!("a  Allow {prefix} * for this session"),
-                format!("p  Allow {prefix} * in this project"),
-            ),
-            None if capability == "shell-exec" => (
-                "a  Allow all shell commands for this session".to_owned(),
-                "p  Allow all shell commands in this project".to_owned(),
-            ),
-            None => (
-                format!("a  Allow {capability} for this session"),
-                format!("p  Allow {capability} in this project"),
-            ),
-        }
+    // v2.1 (§7b): the selection bar (the `›` marker plus gold-on-select
+    // styling) marks the default now, with no "(default selection)" text.
+    let allow_once = approval_option_line("y  Allow once", selected, ApprovalOption::AllowOnce);
+    let deny = approval_option_line(
+        "n/esc  Deny with instructions",
+        selected,
+        ApprovalOption::Deny,
+    );
+    // A request that offers no grant (danger-flagged or once-only) shows
+    // only allow-once and deny; the caller adds the reason line.
+    if !offers_grants {
+        return vec![allow_once, deny];
+    }
+    let (session_label, project_label) = match scope_prefix.filter(|p| !p.is_empty()) {
+        Some(prefix) => (
+            format!("a  Allow {prefix} * for this session"),
+            format!("p  Allow {prefix} * in this project"),
+        ),
+        None if capability == "shell-exec" => (
+            "a  Allow all shell commands for this session".to_owned(),
+            "p  Allow all shell commands in this project".to_owned(),
+        ),
+        None => (
+            format!("a  Allow {capability} for this session"),
+            format!("p  Allow {capability} in this project"),
+        ),
     };
     let mut lines = vec![
-        // v2.1 (§7b): the selection bar (the `›` marker plus gold-on-select
-        // styling) marks the default now — no "(default selection)" text.
-        approval_option_line("y  Allow once", selected, ApprovalOption::AllowOnce),
+        allow_once,
         approval_option_line(&session_label, selected, ApprovalOption::AllowSession),
         approval_option_line(&project_label, selected, ApprovalOption::AllowProject),
     ];
@@ -399,11 +424,7 @@ pub(crate) fn approval_option_lines(
             ApprovalOption::AllowUser,
         ));
     }
-    lines.push(approval_option_line(
-        "n/esc  Deny with instructions",
-        selected,
-        ApprovalOption::Deny,
-    ));
+    lines.push(deny);
     lines
 }
 

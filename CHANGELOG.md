@@ -4,6 +4,15 @@ All notable changes to Euler are documented here. Entries reference the
 pull requests that landed them; deeper design rationale lives in
 `docs/contracts/` and the GitHub issue ledger.
 
+## Unreleased
+
+### Approval panel without grants says why (#267)
+
+- A danger-flagged or once-only permission ask now shows only `y  Allow
+  once` and `n/esc  Deny with instructions` plus a muted line with the
+  reason, instead of three identical "Allow once" rows. Arrow navigation
+  skips the absent rows, and `a`/`p`/`u` no longer silently allow once.
+
 ## 0.1.5 (2026-10-28)
 
 ### Custom providers speak OpenAI Responses (#264)
