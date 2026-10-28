@@ -137,7 +137,9 @@ terminal is invalid (`provenance.md`). So:
   nothing, when the run's root events after its admission show a decided
   outcome: any `cancelled: true` model error or tool result, a provider model
   error (transport retries persist nothing, so a persisted one ended the
-  run), the guardian turn-interrupt error, the tool-rounds-limit message, or
+  run), the guardian turn-interrupt error, the tool-rounds-limit message, a
+  root session error that is not a recovery closure (added 2026-10-28, #265:
+  the live session had already failed the run), or
   a `model.result` that requests no tools with no later steering
   `user.message`. It also refuses, failing closed, unless the root work is
   visibly in flight: an unresolved `model.call`, an unmatched `tool.call`, or

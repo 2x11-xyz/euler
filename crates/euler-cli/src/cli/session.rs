@@ -10,13 +10,17 @@ use super::terminal::{
 };
 use anyhow::{anyhow, Result};
 use euler_core::{
-    fold_session, read_resume_prefix, resume_session_from_folded_prefix, CompactionTier,
-    ModelTarget, PermissionDecider, ProvenanceWriter, ReasoningEffort, Session, SessionConfig,
-    SessionKind,
+    check_run_continuation, fold_session, read_resume_prefix, resume_session_continuing_run,
+    resume_session_from_folded_prefix, CompactionTier, ContinuationRefusal, FoldedSession,
+    ModelTarget, PermissionDecider, ProvenanceWriter, ReasoningEffort, ResumeError, ResumeOutcome,
+    RunContinuation, Session, SessionConfig, SessionKind, RUN_RESTART_LIMIT,
 };
+use euler_event::EventEnvelope;
 use euler_provider::ProviderSet;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use crate::auth_validation::validate_provider_auth;
 use crate::companion_run::execute_headless_companion_run;
@@ -329,13 +333,27 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
 /// stdout is the human-facing progress view. Each event renders standalone, so
 /// the stream is strictly append-only (no retroactive coalescing to unprint).
 fn run_turn_streaming<D: PermissionDecider>(session: &mut Session<D>, prompt: &str) -> Result<()> {
+    stream_run_to_stdout(session, |session, cancel, sink| {
+        session.run_turn_with_sink(prompt, cancel, sink)
+    })
+}
+
+/// Drive one run, streaming each event to stdout as it is produced.
+fn stream_run_to_stdout<D: PermissionDecider>(
+    session: &mut Session<D>,
+    drive: impl FnOnce(
+        &mut Session<D>,
+        Arc<AtomicBool>,
+        &mut dyn FnMut(&EventEnvelope),
+    ) -> Result<Vec<EventEnvelope>, euler_core::SessionError>,
+) -> Result<()> {
     let mut stdout = io::stdout();
-    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
     // Capture the FIRST stdout write/flush failure rather than silently
     // dropping it: a disk-full redirect must not exit 0 with lost output. Once
     // a write fails, stop trying (later writes would just re-fail).
     let mut write_error: Option<io::Error> = None;
-    session.run_turn_with_sink(prompt, cancel, |event| {
+    drive(session, cancel, &mut |event| {
         if write_error.is_some() {
             return;
         }
@@ -361,6 +379,10 @@ fn run_turn_streaming<D: PermissionDecider>(session: &mut Session<D>, prompt: &s
 
 pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
     if let Some(path) = exec.resume_path {
+        if exec.continue_run {
+            // `--continue` takes no prompt and never reads stdin.
+            return run_exec_continue(path, exec.run, exec.auto_approve, exec.retry);
+        }
         let prompt = read_exec_prompt(exec.prompt)?;
         return run_exec_resume(
             resolve_resume_target(path)?,
@@ -445,6 +467,7 @@ fn run_exec_resume(
         run,
         SubagentDecider::new(auto_approve),
         RelocationConsent::Headless,
+        ResumeIntent::CloseOpenRun,
         |config| {
             apply_exec_config(config, overrides);
         },
@@ -457,6 +480,101 @@ fn run_exec_resume(
         }
     }
     turn_result
+}
+
+/// `exec --resume <path-or-id> --continue [--retry]` (ADR 0023): continue the
+/// interrupted run from its log instead of starting a new turn.
+fn run_exec_continue(
+    path: PathBuf,
+    run: RunArgs,
+    auto_approve: AutoApproveTier,
+    retry: bool,
+) -> Result<()> {
+    let session_arg = shell_word(&path.to_string_lossy());
+    let overrides = ExecConfigOverrides::from_run(&run);
+    let mut outcome = resume_cli_session(
+        resolve_resume_target(path)?,
+        run,
+        SubagentDecider::new(auto_approve),
+        RelocationConsent::Headless,
+        ResumeIntent::ContinueRun { retry },
+        |config| {
+            apply_exec_config(config, overrides);
+        },
+    )
+    .map_err(|error| explain_continuation_refusal(error, &session_arg))?;
+    if let Some(continued) = &outcome.continued_run {
+        eprintln!(
+            "Continuing run {} (restart {} of {RUN_RESTART_LIMIT}).",
+            continued.run_id, continued.restart_count
+        );
+    }
+    SubagentDecider::apply_tier(auto_approve, &mut outcome.session);
+    let turn_result = stream_run_to_stdout(&mut outcome.session, |session, cancel, sink| {
+        session.continue_run_with_sink(cancel, sink)
+    });
+    if let Some(refresh) = outcome.refresh.as_ref() {
+        if let Err(error) = refresh.refresh() {
+            eprintln!("warning: failed to refresh session metadata: {error}");
+        }
+    }
+    turn_result
+}
+
+/// Turn a continuation refusal into a plain reason plus the exact command
+/// that moves the user forward. Other errors pass through unchanged.
+fn explain_continuation_refusal(error: anyhow::Error, session_arg: &str) -> anyhow::Error {
+    let Some(ResumeError::ContinuationRefused(refusal)) = error.downcast_ref::<ResumeError>()
+    else {
+        return error;
+    };
+    anyhow!(continuation_refusal_message(refusal, session_arg))
+}
+
+pub(crate) fn continuation_refusal_message(
+    refusal: &ContinuationRefusal,
+    session_arg: &str,
+) -> String {
+    let close = format!("euler exec --resume {session_arg} \"<next prompt>\"");
+    match refusal {
+        ContinuationRefusal::Parked { .. } => format!(
+            "Can't continue: {refusal}. Nothing was changed.\n\
+             Retry it:\n  euler exec --resume {session_arg} --continue --retry\n\
+             Or close the run as interrupted and start a new turn:\n  {close}"
+        ),
+        ContinuationRefusal::RetryNotParked { .. } => format!(
+            "Can't retry: {refusal}. Nothing was changed.\n\
+             Continue it without --retry:\n  euler exec --resume {session_arg} --continue"
+        ),
+        ContinuationRefusal::NoOpenRun => format!(
+            "Can't continue: {refusal}. Nothing was changed.\n\
+             Start a new turn instead:\n  {close}"
+        ),
+        ContinuationRefusal::IncompleteAdmission { .. }
+        | ContinuationRefusal::PartialTerminalBatch { .. }
+        | ContinuationRefusal::DecidedOutcome { .. }
+        | ContinuationRefusal::NotInFlight { .. }
+        | ContinuationRefusal::UnclosedToolCall { .. } => format!(
+            "Can't continue: {refusal}. Nothing was changed.\n\
+             Close the run as interrupted and start a new turn:\n  {close}"
+        ),
+    }
+}
+
+/// Quote `word` for a POSIX shell when it contains anything but plain path
+/// characters, or starts with `~` or `-`, so a printed command can be pasted
+/// as is.
+pub(crate) fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && !word.starts_with(['~', '-'])
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./~:@+=,".contains(c));
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', "'\\''"))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -564,7 +682,14 @@ pub(super) fn resume_interactive_entry(
 }
 
 fn resume_line_oriented(target: ResumeTarget, run: RunArgs) -> Result<()> {
-    let mut outcome = resume_cli_session(target, run, CliDecider, RelocationConsent::Line, |_| {})?;
+    let mut outcome = resume_cli_session(
+        target,
+        run,
+        CliDecider,
+        RelocationConsent::Line,
+        ResumeIntent::CloseOpenRun,
+        |_| {},
+    )?;
     eprintln!(
         "resumed session {}: folded {} events, target {}/{}, recovery closure {}",
         outcome
@@ -601,6 +726,7 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
         run,
         decider,
         RelocationConsent::Card(theme_choice),
+        ResumeIntent::CloseOpenRun,
         |_| {},
     )?;
     let show_timestamp_gutter =
@@ -656,9 +782,48 @@ struct ResumeCliOutcome<D: PermissionDecider> {
     events_folded: usize,
     active_target: ModelTarget,
     recovery_closure_appended: bool,
+    continued_run: Option<RunContinuation>,
     warning_count: usize,
     display_label: Option<String>,
     session_name: Option<String>,
+}
+
+/// Whether resume closes the open run, as every resume did before ADR 0023,
+/// or continues it.
+#[derive(Clone, Copy)]
+enum ResumeIntent {
+    CloseOpenRun,
+    ContinueRun { retry: bool },
+}
+
+impl ResumeIntent {
+    /// Read the accepted prefix, refusing a continuation before resume
+    /// records anything, not even a relocation.
+    fn read_prefix(self, log_path: &Path) -> Result<Vec<EventEnvelope>, ResumeError> {
+        let prefix = read_resume_prefix(log_path)?;
+        if let Self::ContinueRun { retry } = self {
+            check_run_continuation(&prefix, retry)?;
+        }
+        Ok(prefix)
+    }
+
+    fn resume<D: PermissionDecider>(
+        self,
+        config: SessionConfig,
+        providers: ProviderSet,
+        decider: D,
+        writer: ProvenanceWriter,
+        folded: FoldedSession,
+    ) -> Result<ResumeOutcome<D>, ResumeError> {
+        match self {
+            Self::CloseOpenRun => {
+                resume_session_from_folded_prefix(config, providers, decider, writer, folded)
+            }
+            Self::ContinueRun { retry } => {
+                resume_session_continuing_run(config, providers, decider, writer, folded, retry)
+            }
+        }
+    }
 }
 
 /// How a resume workspace relocation is consented to when the live folder does
@@ -747,6 +912,7 @@ fn resume_cli_session<D>(
     run: RunArgs,
     decider: D,
     relocation: RelocationConsent,
+    intent: ResumeIntent,
     configure: impl FnOnce(&mut SessionConfig),
 ) -> Result<ResumeCliOutcome<D>>
 where
@@ -760,7 +926,7 @@ where
     } = target;
     bind_diagnostics_for_log(&log_path);
     let writer = ProvenanceWriter::new(log_path.clone())?;
-    let mut prefix = read_resume_prefix(&log_path)?;
+    let mut prefix = intent.read_prefix(&log_path)?;
     let session_id = session_id_from_events(&prefix)
         .unwrap_or(SESSION_ID)
         .to_owned();
@@ -814,7 +980,7 @@ where
     config.model = folded.active_target.model.clone();
     apply_catalog_context_limit(&mut config, &run.model_catalog);
 
-    let outcome = resume_session_from_folded_prefix(config, providers, decider, writer, folded)?;
+    let outcome = intent.resume(config, providers, decider, writer, folded)?;
     let warning_count = outcome.warnings.len();
     let mut session = outcome.session;
     crate::session_lifecycle::seed_secret_redaction(&mut session, run.auth_file.as_deref());
@@ -829,6 +995,7 @@ where
         events_folded: outcome.events_folded,
         active_target: outcome.active_target,
         recovery_closure_appended: outcome.recovery_closure_appended,
+        continued_run: outcome.continued_run,
         warning_count,
         display_label,
         session_name,

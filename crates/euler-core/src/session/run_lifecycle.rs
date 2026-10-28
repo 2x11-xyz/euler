@@ -155,6 +155,9 @@ impl PendingQueueInput {
 pub struct RecoverableQueueInput {
     input: PendingQueueInput,
     reason: QueueCancellationReason,
+    /// Cancelled by a `run.continued` transaction rather than the run's
+    /// terminal, so its reason does not have to match that later terminal.
+    by_continuation: bool,
 }
 
 impl RecoverableQueueInput {
@@ -196,6 +199,9 @@ struct RunRecord {
     session_id: String,
     agent_id: String,
     terminal: Option<(String, RunTerminalStatus)>,
+    /// `run.continued` events since the run's latest progress; a retry
+    /// restarts the count at one (ADR 0023, Decision 4).
+    restart_count: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -229,7 +235,7 @@ impl RunLifecycleProjection {
     pub(crate) fn terminal_recovery_status(&self, run_id: &str) -> Option<RunTerminalStatus> {
         self.recoverable
             .iter()
-            .find(|item| item.run_id() == run_id)
+            .find(|item| item.run_id() == run_id && !item.by_continuation)
             .and_then(|item| item.reason().terminal_status())
     }
 
@@ -241,6 +247,16 @@ impl RunLifecycleProjection {
                 record.agent_id.as_str(),
             ))
         })
+    }
+
+    pub(crate) fn has_run(&self, run_id: &str) -> bool {
+        self.runs.contains_key(run_id)
+    }
+
+    pub(crate) fn restart_count(&self, run_id: &str) -> u32 {
+        self.runs
+            .get(run_id)
+            .map_or(0, |record| record.restart_count)
     }
 
     pub(crate) fn is_open(&self, run_id: &str) -> bool {
@@ -296,6 +312,24 @@ pub enum RunLifecycleError {
     DirectRunHasQueueId { event_id: String },
     #[error("run {run_id} terminates before it starts (at {event_id})")]
     TerminalWithoutStart { run_id: String, event_id: String },
+    #[error("run continuation {event_id} names run {run_id}, which is not open")]
+    ContinuationWithoutOpenRun { run_id: String, event_id: String },
+    #[error("run {run_id} continues at {event_id} with pending steering queue id {queue_id}")]
+    ContinuationWithPendingSteering {
+        run_id: String,
+        queue_id: String,
+        event_id: String,
+    },
+    #[error("run continuation {event_id} has invalid retry {retry}; only true is valid")]
+    InvalidContinuationRetry { event_id: String, retry: String },
+    #[error(
+        "run continuation cancels queue id {queue_id} with reason {reason} at {event_id}; only run_interrupted is valid"
+    )]
+    InvalidContinuationCancellationReason {
+        queue_id: String,
+        reason: String,
+        event_id: String,
+    },
     #[error("run {run_id} has more than one terminal event (again at {event_id})")]
     DuplicateRunTerminal { run_id: String, event_id: String },
     #[error("run terminal event {event_id} has invalid status {status}")]
@@ -584,6 +618,7 @@ pub(crate) fn fold_run_lifecycle(
                 continue;
             }
             EventKind::RUN_TERMINAL => fold_run_terminal(&mut projection, event)?,
+            EventKind::RUN_CONTINUED => fold_run_continued(&mut projection, event)?,
             EventKind::QUEUE_ENQUEUED => {
                 fold_queue_enqueued(&mut projection, &mut seen_queue_ids, event)?;
             }
@@ -612,13 +647,16 @@ pub(crate) fn fold_run_lifecycle(
                 )?;
                 continue;
             }
-            _ => validate_non_lifecycle_event(
-                &projection,
-                event,
-                &events[..index],
-                owner,
-                &mut async_lanes,
-            )?,
+            _ => {
+                validate_non_lifecycle_event(
+                    &projection,
+                    event,
+                    &events[..index],
+                    owner,
+                    &mut async_lanes,
+                )?;
+                record_run_progress(&mut projection, event, owner);
+            }
         }
         index += 1;
     }
@@ -729,12 +767,53 @@ fn root_lifecycle_kind(kind: &str) -> bool {
         kind,
         EventKind::RUN_STARTED
             | EventKind::RUN_TERMINAL
+            | EventKind::RUN_CONTINUED
             | EventKind::QUEUE_ENQUEUED
             | EventKind::QUEUE_REPLACED
             | EventKind::QUEUE_CANCELLED
             | EventKind::QUEUE_DELIVERED
             | EventKind::QUEUE_RECOVERED
     )
+}
+
+/// Progress resets a run's restart count (ADR 0023, Decision 4): a tool
+/// result that is not a recovery closure, an agent result, or a root driver
+/// `model.result` that requests no tools. A `model.result` that requests
+/// tools is not progress, so a call that crashes on every continuation still
+/// parks the run.
+fn record_run_progress(
+    projection: &mut RunLifecycleProjection,
+    event: &EventEnvelope,
+    owner: LifecycleOwner<'_>,
+) {
+    let Some(run_id) = event.run.as_deref() else {
+        return;
+    };
+    let progress = match event.kind.as_str() {
+        EventKind::TOOL_RESULT => {
+            event
+                .payload
+                .get("recovery_closure")
+                .and_then(Value::as_bool)
+                != Some(true)
+        }
+        EventKind::AGENT_RESULT => true,
+        EventKind::MODEL_RESULT => {
+            owner.root_agent_id == Some(event.agent.as_str())
+                && !event.payload.contains_key("purpose")
+                && event
+                    .payload
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+        }
+        _ => false,
+    };
+    if progress {
+        if let Some(record) = projection.runs.get_mut(run_id) {
+            record.restart_count = 0;
+        }
+    }
 }
 
 fn validate_non_lifecycle_event(
@@ -1138,16 +1217,53 @@ fn fold_terminal_admission(
         consumed += 1;
     }
 
-    let Some(terminal) = events.get(consumed) else {
+    let Some(closer) = events.get(consumed) else {
         return Ok(consumed);
     };
-    if terminal.kind.as_str() != EventKind::RUN_TERMINAL || event_run(terminal)? != run_id {
+    let closes_run = matches!(
+        closer.kind.as_str(),
+        EventKind::RUN_TERMINAL | EventKind::RUN_CONTINUED
+    );
+    if !closes_run || event_run(closer)? != run_id {
         return Ok(consumed);
     }
     validate_transaction_chain(&events[attempt_start..=consumed])?;
-    fold_run_terminal(&mut candidate, terminal)?;
+    if closer.kind.as_str() == EventKind::RUN_TERMINAL {
+        fold_run_terminal(&mut candidate, closer)?;
+    } else {
+        mark_continuation_cancellations(&mut candidate, &events[attempt_start..consumed])?;
+        fold_run_continued(&mut candidate, closer)?;
+    }
     *projection = candidate;
     Ok(consumed + 1)
+}
+
+/// A continuation cancels the run's pending steering as an interrupted run
+/// would (ADR 0023, resolved question 4); the rows stay recoverable.
+fn mark_continuation_cancellations(
+    projection: &mut RunLifecycleProjection,
+    cancellations: &[EventEnvelope],
+) -> Result<(), RunLifecycleError> {
+    for event in cancellations {
+        let queue_id = required_queue_field(event, "queue_id")?;
+        let reason = queue_cancellation_reason(event)?;
+        if reason != QueueCancellationReason::RunInterrupted {
+            return Err(RunLifecycleError::InvalidContinuationCancellationReason {
+                queue_id: queue_id.to_owned(),
+                reason: reason.as_str().to_owned(),
+                event_id: event.id.clone(),
+            });
+        }
+        if let Some(item) = projection
+            .recoverable
+            .iter_mut()
+            .rev()
+            .find(|item| item.queue_id() == queue_id)
+        {
+            item.by_continuation = true;
+        }
+    }
+    Ok(())
 }
 
 /// Fold one direct/follow-up admission as a transaction.
@@ -1339,6 +1455,7 @@ fn fold_run_started(
             session_id: event.session.clone(),
             agent_id: event.agent.clone(),
             terminal: None,
+            restart_count: 0,
         },
     );
     Ok(())
@@ -1461,11 +1578,11 @@ fn fold_run_terminal(
             event_id: event.id.clone(),
         });
     }
-    if let Some(item) = projection
-        .recoverable
-        .iter()
-        .find(|item| item.run_id() == run_id && item.reason().terminal_status() != Some(status))
-    {
+    if let Some(item) = projection.recoverable.iter().find(|item| {
+        item.run_id() == run_id
+            && !item.by_continuation
+            && item.reason().terminal_status() != Some(status)
+    }) {
         return Err(RunLifecycleError::QueueCancellationTerminalMismatch {
             queue_id: item.queue_id().to_owned(),
             reason: item.reason().as_str().to_owned(),
@@ -1476,6 +1593,51 @@ fn fold_run_terminal(
     }
     record.terminal = Some((event.id.clone(), status));
     projection.latest_terminal = Some(status);
+    Ok(())
+}
+
+/// Keep an open run open after a restart and count the restart. A
+/// `retry: true` continuation starts the count again at one.
+fn fold_run_continued(
+    projection: &mut RunLifecycleProjection,
+    event: &EventEnvelope,
+) -> Result<(), RunLifecycleError> {
+    let run_id = event_run(event)?;
+    let retry = match event.payload.get("retry") {
+        None => false,
+        Some(Value::Bool(true)) => true,
+        Some(other) => {
+            return Err(RunLifecycleError::InvalidContinuationRetry {
+                event_id: event.id.clone(),
+                retry: other.to_string(),
+            });
+        }
+    };
+    let record = projection
+        .runs
+        .get_mut(run_id)
+        .filter(|record| record.terminal.is_none())
+        .ok_or_else(|| RunLifecycleError::ContinuationWithoutOpenRun {
+            run_id: run_id.to_owned(),
+            event_id: event.id.clone(),
+        })?;
+    require_ownership(event, run_id, &record.session_id, &record.agent_id)?;
+    if let Some(item) = projection
+        .pending
+        .iter()
+        .find(|item| item.run_id == run_id && item.mode == QueueMode::Steering)
+    {
+        return Err(RunLifecycleError::ContinuationWithPendingSteering {
+            run_id: run_id.to_owned(),
+            queue_id: item.queue_id.clone(),
+            event_id: event.id.clone(),
+        });
+    }
+    record.restart_count = if retry {
+        1
+    } else {
+        record.restart_count.saturating_add(1)
+    };
     Ok(())
 }
 
@@ -1620,6 +1782,7 @@ fn fold_queue_settled(
             }
             if let Some(existing) = projection.recoverable.iter().find(|existing| {
                 existing.run_id() == run_id
+                    && !existing.by_continuation
                     && existing.reason().terminal_status() != reason.terminal_status()
             }) {
                 return Err(RunLifecycleError::ConflictingTerminalCancellationReason {
@@ -1633,6 +1796,7 @@ fn fold_queue_settled(
             projection.recoverable.push(RecoverableQueueInput {
                 input: item,
                 reason,
+                by_continuation: false,
             });
         }
     }
@@ -1968,6 +2132,19 @@ fn queue_mode(event: &EventEnvelope) -> Result<QueueMode, RunLifecycleError> {
         event_id: event.id.clone(),
         mode: raw.to_owned(),
     })
+}
+
+/// Whether `event` is a `queue.cancelled` row that belongs to a run's
+/// terminal (or continuation) transaction rather than a user cancellation.
+pub(crate) fn is_run_transaction_cancellation(event: &EventEnvelope) -> bool {
+    event.kind.as_str() == EventKind::QUEUE_CANCELLED
+        && event
+            .payload
+            .get("reason")
+            .and_then(Value::as_str)
+            .and_then(QueueCancellationReason::parse)
+            .and_then(QueueCancellationReason::terminal_status)
+            .is_some()
 }
 
 fn queue_cancellation_reason(

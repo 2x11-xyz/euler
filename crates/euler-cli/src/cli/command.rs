@@ -113,6 +113,10 @@ pub(crate) struct ExecArgs {
     pub(crate) auto_approve: AutoApproveTier,
     pub(crate) prompt: Option<String>,
     pub(crate) resume_path: Option<PathBuf>,
+    /// Continue the interrupted run instead of starting a new turn.
+    pub(crate) continue_run: bool,
+    /// Continue a run parked by the restart limit.
+    pub(crate) retry: bool,
 }
 impl Args {
     pub(super) fn parse(mut args: impl Iterator<Item = String>) -> Result<Self> {
@@ -450,11 +454,29 @@ fn build_exec_args(
     catalog: &MergedModelCatalog,
     custom_providers: &ProviderConfigRegistry,
 ) -> Result<ExecArgs> {
+    if parsed.continue_run && parsed.resume_path.is_none() {
+        return Err(anyhow!(
+            "--continue needs a session: euler exec --resume <path-or-id> --continue"
+        ));
+    }
+    if parsed.continue_run && !parsed.exec_prompt.is_empty() {
+        return Err(anyhow!(
+            "--continue takes no prompt: it continues the interrupted run. Drop the prompt, or \
+             drop --continue to start a new turn"
+        ));
+    }
+    if parsed.retry && !parsed.continue_run {
+        return Err(anyhow!(
+            "--retry only works with --continue: euler exec --resume <path-or-id> --continue --retry"
+        ));
+    }
     Ok(ExecArgs {
         run: build_run_args(parsed, preference, catalog, custom_providers)?,
         auto_approve: parsed.auto_approve.unwrap_or(AutoApproveTier::DEFAULT),
         prompt: (!parsed.exec_prompt.is_empty()).then(|| parsed.exec_prompt.join(" ")),
         resume_path: parsed.resume_path.clone(),
+        continue_run: parsed.continue_run,
+        retry: parsed.retry,
     })
 }
 

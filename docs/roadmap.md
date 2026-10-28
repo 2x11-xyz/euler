@@ -23,6 +23,10 @@ from intent to shipped; details in `CHANGELOG.md`.
 
 - **Headless session resume.** `exec --resume`: continue an interrupted run
   from its provenance log instead of re-exploring from scratch.
+  `exec --resume <path-or-id> --continue` now continues the interrupted run,
+  with crash-loop parking; cut-off calls are still closed rather than re-run.
+  Replaying calls whose tools declare `replay: "safe"` follows (ADR 0023,
+  rollout steps 4 and 5).
 - **Honest cap summaries.** When a session hits its round limit, report what
   was done and where it stopped, not a canned line.
 - **Causal-DAG redesign.** The extension is paused for a behavior-first

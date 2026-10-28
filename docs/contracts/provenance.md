@@ -184,8 +184,9 @@ applicable, then `user.message`). Run termination owns one exact atomic batch
 terminal batch remains outside the accepted live bus even if its complete bytes
 are visible on disk, and becomes live exactly once only after exact retry
 confirms durability. Replay likewise leaves every crash-prefix `run_*`
-`queue.cancelled` row inert until a matching `run.terminal` completes the
-logical batch; a later complete retry supersedes those physical fragments.
+`queue.cancelled` row inert until a matching `run.terminal` or
+`run.continued` completes the logical batch; a later complete retry supersedes
+those physical fragments.
 The terminal cutoff closes steering and samples the already-classified enqueue
 generation under the queue lock. Earlier generations settle first; the
 terminal batch then owns the writer before any later follow-up enqueue. The
@@ -341,7 +342,9 @@ failed `tool.result` for each unmatched accepted tool call belonging to an incom
 child spawn, in call order, while preserving already-settled calls. This is a
 narrow restart closure for accepted work, not ordinary late tool execution;
 it never invents an `agent.result`, and the historical spawn remains
-incomplete. Ordinary late model or tool work remains invalid.
+incomplete. Ordinary late model or tool work remains invalid, except inside a
+run that resume continued (below): that run stays open, so its new model rounds
+are ordinary run work.
 Before resume appends any recovery mutation, it preflights the exact candidate
 prefix -- durable events plus every proposed closure -- through full session,
 run-lifecycle, and model-terminal validation, then verifies that another
@@ -354,6 +357,41 @@ that run's pending steering, followed by one `run.terminal` with status
 `interrupted`; pending follow-ups are preserved. Refolding the recovered prefix
 must yield no open run, must preserve follow-up FIFO, and must make a second
 recovery pass idempotent.
+
+`euler exec --resume <path-or-id> --continue` continues the open run instead
+(ADR 0023). It takes no prompt and never reads stdin. The run must be cleanly
+admitted, must have no partial terminal batch, must show no outcome the live
+session had already decided (a `cancelled: true` model error or tool result, a
+provider model error, a root `source: "session"` error that is not a resume
+`recovery_closure`, the guardian turn interrupt, the tool-rounds-limit
+message, or a `model.result` requesting no tools without a later steering
+`user.message`), and its root work must be visibly in flight (an unresolved
+`model.call`, an unmatched `tool.call`, or a settled tool batch, steering
+`user.message`, or earlier `run.continued` not yet followed by a `model.call`).
+In one writer append resume appends the same call closures as a plain resume
+(nothing is re-run in this release), `queue.cancelled` with reason
+`run_interrupted` for the run's pending steering, then `run.continued`; it
+appends no `run.terminal`. If that append is cut short, the call closures stand
+on their own as in a plain resume, and the `queue.cancelled` rows stay inert
+until a `run.continued` completes them (`events.md`). Those rows cannot be told
+apart from a partial terminal batch, so a later `--continue` refuses and a
+plain resume closes the run. The candidate prefix passes the same preflight, and
+refolding it must leave the run open with no pending steering and no residual
+closure. The live session then starts a new model round in the same run, which
+ends with the run's single `run.terminal`. Steering cancelled by a continuation
+stays recoverable and does not have to match that later terminal's status.
+
+A run's restart count is the number of `run.continued` events since its latest
+progress, derived by the run fold and never stored. Progress is a `tool.result`
+without `recovery_closure`, an `agent.result`, or a root driver `model.result`
+that requests no tools. A run whose count is 5 is parked: `--continue` refuses
+with reason `restart_limit`, the count, and the exact retry and plain-resume
+commands. `--continue --retry` is accepted only for a parked run; it appends
+`run.continued` with `retry: true`, which starts the count again at one. Every
+refusal (no open run, crash-partial admission, partial terminal batch, decided
+outcome, work not in flight, parked, retry of a run that is not parked) happens
+before the resume marker is armed or a relocation is recorded, exits nonzero,
+and appends nothing.
 
 Resume's mutation boundary re-reads the accepted prefix from the locked
 writer, requires it to match the supplied event vector byte-for-byte in parsed

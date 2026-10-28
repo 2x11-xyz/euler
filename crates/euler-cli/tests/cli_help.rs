@@ -65,6 +65,10 @@ fn exec_help_lists_verified_flags_and_defaults() {
     assert!(text.contains("default: 640000"));
     assert!(text.contains("default: unlimited"));
     assert!(text.contains("exec --resume"));
+    assert!(text.contains("--continue"));
+    assert!(text.contains("--retry"));
+    assert!(text.contains("never reads stdin"));
+    assert!(text.contains("continued 5 times without"));
 }
 
 #[test]

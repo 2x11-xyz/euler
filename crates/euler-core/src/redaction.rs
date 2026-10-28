@@ -213,6 +213,7 @@ fn take_lifecycle_protocol_fields(
     let fields = match event.kind.as_str() {
         EventKind::RUN_STARTED => vec![("trigger", false), ("queue_id", false)],
         EventKind::RUN_TERMINAL => vec![("status", false), ("recovery_closure", false)],
+        EventKind::RUN_CONTINUED => vec![("retry", false)],
         EventKind::QUEUE_ENQUEUED => vec![
             ("queue_id", false),
             ("mode", false),
@@ -854,6 +855,7 @@ mod tests {
             "reason",
             "run_failed",
             "recovery_closure",
+            "retry",
             "content",
             private,
         ]
@@ -870,6 +872,7 @@ mod tests {
                     ("recovery_closure", true.into()),
                 ]),
             ),
+            (EventKind::RUN_CONTINUED, object([("retry", true.into())])),
             (
                 EventKind::QUEUE_ENQUEUED,
                 object([

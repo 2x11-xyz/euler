@@ -189,6 +189,10 @@ pub(crate) struct RawArgs {
     pub(crate) tui: bool,
     pub(crate) exec: bool,
     pub(crate) exec_prompt: Vec<String>,
+    /// `exec --resume --continue`: continue the interrupted run (ADR 0023).
+    pub(crate) continue_run: bool,
+    /// `--continue --retry`: continue a run parked by the restart limit.
+    pub(crate) retry: bool,
     pub(crate) auto_approve: Option<AutoApproveTier>,
     pub(crate) max_output_tokens: Option<u64>,
     pub(crate) max_tool_rounds: Option<usize>,
