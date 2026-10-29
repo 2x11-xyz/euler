@@ -1143,9 +1143,11 @@ fn non_apply_patch_shell_commands_still_execute_normally() {
 }
 
 /// ADR 0026 resolved question 7: an escalated command gets the environment a
-/// `full` host command gets. Secret-shaped variables that are not Euler's own
-/// (`GH_TOKEN`, cloud keys) pass through for credentialed CLIs; Euler's own
-/// credentials and parent controls do not.
+/// `full` host command gets. A secret-shaped variable that is not Euler's own
+/// (here `EULER_ESCALATION_TOKEN`, as `GH_TOKEN` would be) passes through for
+/// credentialed CLIs; Euler's own credentials (the built-in
+/// `ANTHROPIC_API_KEY`, a variable `providers.json` names) and parent
+/// controls do not.
 #[test]
 fn an_escalated_run_shell_gets_the_full_host_environment() {
     let _guard = ENV_LOCK.lock().expect("env lock");

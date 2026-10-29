@@ -1967,8 +1967,9 @@ impl<D> Session<D> {
             return Err(SessionError::ProfileChangeDuringRun);
         }
         self.persist_new_events()?;
-        // Jobs started under a sandboxed profile end before the boundary
-        // changes; host jobs keep running (ADR 0026 resolved question 12).
+        // Jobs started under a sandboxed profile, escalated ones included,
+        // end before the boundary changes; jobs started with the sandbox off
+        // keep running (ADR 0026 resolved question 12).
         self.tools.end_sandboxed_jobs();
         self.config.set_execution_profile(profile);
         self.tools.set_subprocess_sandbox(

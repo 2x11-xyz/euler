@@ -1440,60 +1440,35 @@ see them.\n"
         args: &[&str],
         env: &[(OsString, OsString)],
     ) -> Result<AgentSubprocess, ToolError> {
-        let sandboxed = self.workspace_sandbox.is_some();
-        let mut child = match &self.workspace_sandbox {
-            Some(sandbox) => sandbox
-                .command(program, args, env)
-                .map_err(sandbox_unavailable)?,
-            None => {
-                let mut command = Command::new(program);
-                command
-                    .args(args)
-                    .current_dir(&self.root)
-                    .envs(env.to_vec());
-                command
-            }
+        let Some(sandbox) = &self.workspace_sandbox else {
+            return self.host_subprocess(program, args, env);
         };
+        let mut child = sandbox
+            .command(program, args, env)
+            .map_err(sandbox_unavailable)?;
         // Defense in depth: both launchers clear this environment too. A
-        // sandbox under `credentials: "pass"` passes secrets on purpose; host
-        // execution passes the environment through except Euler's own
-        // credentials (ADR 0026 resolved question 7).
-        match &self.workspace_sandbox {
-            Some(sandbox) => scrub_agent_subprocess_env(&mut child, sandbox.passes_credentials()),
-            None => withhold_euler_credentials(&mut child, &self.euler_credentials),
-        }
-        if !sandboxed {
-            child.env("EULER_HOME", self.agent_euler_home()?);
-        }
+        // sandbox under `credentials: "pass"` passes secrets on purpose.
+        scrub_agent_subprocess_env(&mut child, sandbox.passes_credentials());
         Ok(AgentSubprocess {
             command: child,
-            sandboxed,
-            backend: self
-                .workspace_sandbox
-                .as_ref()
-                .map_or(SandboxBackend::Host, WorkspaceSandbox::backend),
+            sandboxed: true,
+            backend: sandbox.backend(),
         })
     }
 
-    /// `sh -c <command>` in the boundary, or on the host when `escalated`.
-    fn shell_subprocess(
+    /// The child process for a command run on the host: under a sandbox-off
+    /// profile, on an unsupported platform, or for an approved escalation.
+    /// The environment passes through except Euler's own credentials (ADR
+    /// 0026 resolved question 7), and `EULER_HOME` points at a private
+    /// directory.
+    fn host_subprocess(
         &self,
-        command: &str,
-        escalated: bool,
+        program: &str,
+        args: &[&str],
+        env: &[(OsString, OsString)],
     ) -> Result<AgentSubprocess, ToolError> {
-        if escalated {
-            self.escalated_subprocess(command)
-        } else {
-            self.agent_subprocess("sh", &["-c", command], &[])
-        }
-    }
-
-    /// `sh -c <command>` on the host for an approved escalation (ADR 0026
-    /// section 3), with the user's own `HOME` and the environment a `full`
-    /// host command gets (resolved question 7).
-    fn escalated_subprocess(&self, command: &str) -> Result<AgentSubprocess, ToolError> {
-        let mut child = Command::new("sh");
-        child.args(["-c", command]).current_dir(&self.root);
+        let mut child = Command::new(program);
+        child.args(args).current_dir(&self.root).envs(env.to_vec());
         withhold_euler_credentials(&mut child, &self.euler_credentials);
         child.env("EULER_HOME", self.agent_euler_home()?);
         Ok(AgentSubprocess {
@@ -1501,6 +1476,21 @@ see them.\n"
             sandboxed: false,
             backend: SandboxBackend::Host,
         })
+    }
+
+    /// `sh -c <command>` in the boundary, or on the host with the user's own
+    /// `HOME` and the environment a `full` host command gets when
+    /// `escalated` (ADR 0026 section 3).
+    fn shell_subprocess(
+        &self,
+        command: &str,
+        escalated: bool,
+    ) -> Result<AgentSubprocess, ToolError> {
+        if escalated {
+            self.host_subprocess("sh", &["-c", command], &[])
+        } else {
+            self.agent_subprocess("sh", &["-c", command], &[])
+        }
     }
 
     /// Walk the workspace under the configured observation bound.

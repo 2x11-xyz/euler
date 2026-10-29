@@ -383,8 +383,9 @@ is not tracked.
   the session between turns: it rebuilds the subprocess boundary and the
   structured-write scope, applies the new profile's approval override and
   escalation setting, clears escalation grants, and records
-  `session.profile_changed`. Jobs started under a sandboxed profile
-  are ended first; host background jobs keep running.
+  `session.profile_changed`. Jobs started under a sandboxed profile,
+  escalated ones included, are ended first; jobs started with the sandbox
+  off keep running.
   `/profile default <name>` writes `defaults.interactive` for new sessions.
 - **Project overlay.** A repository may hold `.euler/profile-overlay.json`
   with any profile field except `reviewer` and `extends`. It applies to
