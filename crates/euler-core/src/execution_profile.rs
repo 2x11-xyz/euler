@@ -21,6 +21,7 @@ use crate::guardian::PermissionReviewer;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -199,8 +200,40 @@ impl ProfileFields {
         None
     }
 
+    /// Each field that differs from `self` in `other`, as
+    /// `field old -> new`, in sorted field order.
+    fn changes_to(&self, other: &Self) -> Vec<String> {
+        let (Value::Object(before), Value::Object(after)) = (
+            serde_json::to_value(self).expect("profile fields serialize"),
+            serde_json::to_value(other).expect("profile fields serialize"),
+        ) else {
+            unreachable!("profile fields serialize as a JSON object");
+        };
+        let text = |value: &Value| match value {
+            Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        let before: BTreeMap<String, Value> = before.into_iter().collect();
+        before
+            .iter()
+            .filter(|(field, value)| after.get(field.as_str()) != Some(value))
+            .map(|(field, value)| {
+                let new = after.get(field.as_str()).map(text).unwrap_or_default();
+                format!("{field} {} -> {new}", text(value))
+            })
+            .collect()
+    }
+
+    /// SHA-256 over the compact JSON of the fields with keys sorted, so a
+    /// reader can recompute it from the logged `fields` object whatever key
+    /// order the log kept.
     fn sha256(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("profile fields serialize");
+        let Value::Object(fields) = serde_json::to_value(self).expect("profile fields serialize")
+        else {
+            unreachable!("profile fields serialize as a JSON object");
+        };
+        let sorted: BTreeMap<String, Value> = fields.into_iter().collect();
+        let bytes = serde_json::to_vec(&sorted).expect("profile fields serialize");
         format!("{:x}", Sha256::digest(bytes))
     }
 }
@@ -389,6 +422,10 @@ impl ResumeProfile {
     /// recorded one or the log recorded none. `None` when nothing changed.
     pub fn summary(&self) -> Option<String> {
         let applied = &self.profile.name;
+        let changes = self.recorded.as_ref().map_or_else(Vec::new, |recorded| {
+            recorded.fields.changes_to(&self.profile.fields)
+        });
+        let changes = changes.join(", ");
         match (&self.basis, &self.recorded) {
             (ResumeProfileBasis::NotRecorded, _) => Some(format!(
                 "execution profile: {applied} (this session recorded no profile)"
@@ -399,14 +436,28 @@ impl ResumeProfile {
                     looser_field,
                 },
                 _,
-            ) => Some(format!(
-                "execution profile: kept the recorded profile {applied}; {resolved_name} is \
-                 looser on {looser_field}. Pass --profile to change it"
-            )),
-            (_, Some(recorded)) if recorded != &self.profile => Some(format!(
-                "execution profile: {applied} (recorded: {})",
-                recorded.name
-            )),
+            ) => {
+                let changes = if changes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (changed {changes})")
+                };
+                Some(format!(
+                    "execution profile: kept the recorded profile {applied}{changes}; \
+                     {resolved_name} is looser on {looser_field}. Pass --profile to change it"
+                ))
+            }
+            (_, Some(recorded)) if recorded != &self.profile => {
+                let changes = if changes.is_empty() {
+                    String::new()
+                } else {
+                    format!("; changed {changes}")
+                };
+                Some(format!(
+                    "execution profile: {applied} (recorded: {}{changes})",
+                    recorded.name
+                ))
+            }
             _ => None,
         }
     }

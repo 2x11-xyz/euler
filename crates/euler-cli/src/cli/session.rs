@@ -25,7 +25,7 @@ use std::sync::Arc;
 use crate::auth_validation::validate_provider_auth;
 use crate::companion_run::execute_headless_companion_run;
 use crate::execution_profile_runtime::{
-    install_resume_profile, launch_profile, print_notices, ProfileRequest,
+    launch_profile, print_notices, resolve_resume_profile, ProfileRequest, ResolvedResumeProfile,
 };
 use crate::extension_cli::resolve_round_observer;
 use crate::extension_enablement::resolve_session_extensions;
@@ -926,6 +926,21 @@ fn apply_resume_relocation(
     Ok(())
 }
 
+/// Resolve the resume's profile before relocation appends to the log, so a
+/// profile error fails resume with the log untouched.
+fn resolve_profile_then_relocate(
+    prefix: &mut Vec<euler_event::EventEnvelope>,
+    live_root: &Path,
+    run: &RunArgs,
+    relocation: RelocationConsent,
+    writer: &ProvenanceWriter,
+) -> Result<ResolvedResumeProfile> {
+    let request = run_profile_request(run, relocation.profile_context());
+    let resume_profile = resolve_resume_profile(request, live_root)?;
+    apply_resume_relocation(prefix, live_root, run.accept_relocation, relocation, writer)?;
+    Ok(resume_profile)
+}
+
 fn resume_cli_session<D>(
     target: ResumeTarget,
     run: RunArgs,
@@ -960,15 +975,10 @@ where
             config.extensions_enabled.insert(id.clone());
         }
     }
-    apply_resume_relocation(
-        &mut prefix,
-        &config.root,
-        run.accept_relocation,
-        relocation,
-        &writer,
-    )?;
+    let resume_profile =
+        resolve_profile_then_relocate(&mut prefix, &config.root, &run, relocation, &writer)?;
     let folded = fold_session(&config, prefix)?;
-    install_cli_resume_profile(&mut config, &folded.events, &run, relocation)?;
+    print_notices(&resume_profile.install(&mut config, &folded.events)?);
     let providers = (if let Some(original) = &folded.original_target {
         if invocation_target(&run) != *original {
             eprintln!(
@@ -1019,18 +1029,6 @@ where
         display_label,
         session_name,
     })
-}
-
-/// ADR 0026 section 9 for `--resume`: stderr shows the startup summary.
-fn install_cli_resume_profile(
-    config: &mut SessionConfig,
-    events: &[EventEnvelope],
-    run: &RunArgs,
-    relocation: RelocationConsent,
-) -> Result<()> {
-    let request = run_profile_request(run, relocation.profile_context());
-    print_notices(&install_resume_profile(config, events, request)?);
-    Ok(())
 }
 
 fn run_profile_request(run: &RunArgs, context: ProfileContext) -> ProfileRequest<'_> {

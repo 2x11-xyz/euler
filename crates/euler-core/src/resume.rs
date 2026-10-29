@@ -1044,9 +1044,9 @@ fn verify_and_rehydrate_blobs(
 }
 
 /// Build the durable `session.resumed` marker for a resume boundary (issue
-/// #6). Payload is audit metadata only — provider/model, the count of folded
+/// #6). Payload is audit metadata only (provider/model, the count of folded
 /// events, the tail event id continued from, and the execution boundary and
-/// profile this resume got — never user or model content.
+/// profile this resume got), never user or model content.
 fn session_resumed_marker(
     config: &SessionConfig,
     target: &ModelTarget,

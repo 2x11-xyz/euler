@@ -402,7 +402,10 @@ fn resume_keeps_the_recorded_profile_when_the_resolved_one_is_looser() {
     assert_eq!(explicit.basis, ResumeProfileBasis::Explicit);
     assert_eq!(
         explicit.summary().as_deref(),
-        Some("execution profile: locked (recorded: net)")
+        Some(
+            "execution profile: locked (recorded: net; changed approvals escalation-only -> \
+             always, caches writable -> private, network on -> off, tmp host -> private)"
+        )
     );
 
     // A tighter resolution applies as resolved.
@@ -412,12 +415,55 @@ fn resume_keeps_the_recorded_profile_when_the_resolved_one_is_looser() {
     assert_eq!(tighter.basis, ResumeProfileBasis::Resolved);
     assert_eq!(
         tighter.summary().as_deref(),
-        Some("execution profile: locked (recorded: net)")
+        Some(
+            "execution profile: locked (recorded: net; changed approvals escalation-only -> \
+             always, caches writable -> private, network on -> off, tmp host -> private)"
+        )
     );
 
     let unchanged = ResumeProfile::choose(Some(recorded.clone()), recorded.clone(), false, None)
         .expect("choose");
     assert_eq!(unchanged.summary(), None);
+}
+
+/// `reviewer` has no order, so it never keeps the recorded profile, but a
+/// change to it under the same name is named in the summary.
+#[test]
+fn resume_summary_names_the_fields_that_changed() {
+    let recorded = ExecutionProfile {
+        fields: ProfileFields {
+            reviewer: PermissionReviewer::Guardian,
+            ..locked::fields()
+        },
+        ..ExecutionProfile::default()
+    };
+    let resolved = ExecutionProfile::default();
+    let choice = ResumeProfile::choose(Some(recorded), resolved, false, None).expect("choose");
+    assert_eq!(choice.basis, ResumeProfileBasis::Resolved);
+    assert_eq!(
+        choice.summary().as_deref(),
+        Some("execution profile: locked (recorded: locked; changed reviewer guardian -> user)")
+    );
+
+    // A kept recorded profile names the reviewer the flag changed on it.
+    let mut kept = ResumeProfile::choose(
+        Some(ExecutionProfile::default()),
+        ExecutionProfile {
+            name: "net".to_owned(),
+            fields: networked_fields(),
+        },
+        false,
+        None,
+    )
+    .expect("choose");
+    kept.profile.fields.reviewer = PermissionReviewer::Guardian;
+    assert_eq!(
+        kept.summary().as_deref(),
+        Some(
+            "execution profile: kept the recorded profile locked (changed reviewer user -> \
+             guardian); net is looser on network. Pass --profile to change it"
+        )
+    );
 }
 
 /// A kept recorded profile still gets the project overlay, and one this

@@ -71,7 +71,11 @@ impl AppCore {
                 if effect == CoreEffect::ReplayHistoryWithScrollbackPurge
                     && !profile_notices.is_empty()
                 {
-                    self.notice = Some(profile_notices.join("; "));
+                    let profile_notice = profile_notices.join("; ");
+                    self.notice = Some(match self.notice.take() {
+                        Some(existing) => format!("{existing}; {profile_notice}"),
+                        None => profile_notice,
+                    });
                 }
                 effect
             }
@@ -164,7 +168,8 @@ impl AppCore {
         config.provider = folded.active_target.provider.clone();
         config.model = folded.active_target.model.clone();
         crate::session_lifecycle::apply_catalog_context_limit(&mut config, &self.model_catalog);
-        let profile_notices = install_in_app_resume_profile(&mut config, &folded.events)?;
+        let profile_notices =
+            install_in_app_resume_profile(&mut config, &folded.events, &extension_home)?;
         let providers = crate::cli::providers::resume_provider_set(
             folded
                 .original_target

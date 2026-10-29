@@ -844,12 +844,14 @@ extension error does not consume the later result.
   `tmp`, `caches`, `credentials`, `approvals`, `escalation`,
   `background_jobs`, `reviewer`, the values of the capabilities contract,
   "Execution profiles"); `reviewer` is the reviewer the session uses, so it
-  matches `permission_reviewer`. `fields_sha256` is SHA-256 over the JSON of
-  `fields`. Current writers always emit it; streams written before this
-  release omit it, which means not recorded: resume resolves such a session
-  as a new one and infers nothing. Resume compares against it (the resume
-  rule in the capabilities contract); a record with unknown keys or values,
-  or a digest that does not match, fails resume closed.
+  matches `permission_reviewer`. `fields_sha256` is SHA-256 over the
+  compact JSON of `fields` with keys sorted (no whitespace), so a reader
+  recomputes it from the logged object. Current writers always emit it;
+  streams written before this release omit it, which means not recorded:
+  resume resolves such a session as a new one and infers nothing. Resume
+  compares against it (the resume rule in the capabilities contract); a
+  record with unknown keys or values, or a digest that does not match,
+  fails resume closed.
   Optional `context_limit` is either `null` (unknown/legacy window) or an
   object `{ "limit_tokens": <u64>, "source": "catalog" }` recording the
   catalog-derived context window used for token-threshold compaction and

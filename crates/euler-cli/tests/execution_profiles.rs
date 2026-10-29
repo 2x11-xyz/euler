@@ -1,6 +1,7 @@
 //! Execution profile selection, validation, and recording through the CLI
 //! (ADR 0026 rollout step 3: profile plumbing and the `locked` preset).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -46,12 +47,16 @@ fn write_overlay(workspace: &Workspace, text: &str) {
 }
 
 fn exec(workspace: &Workspace, args: &[&str]) -> Output {
+    exec_in(workspace, &workspace.root, args)
+}
+
+fn exec_in(workspace: &Workspace, root: &Path, args: &[&str]) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_euler"))
         .env("HOME", &workspace.home)
         .env_remove("EULER_HOME")
         .env_remove("EULER_PROVIDER")
         .env_remove("EULER_MODEL")
-        .current_dir(&workspace.root)
+        .current_dir(root)
         .arg("exec")
         .args(["--provider", "fixture"])
         .args(args)
@@ -109,6 +114,21 @@ fn built_in_default_records_the_locked_preset() {
     assert_eq!(profiles[0]["fields"]["approvals"], "always");
     assert_eq!(profiles[0]["fields"]["reviewer"], "user");
     assert!(profiles[0]["fields_sha256"].is_string());
+}
+
+#[test]
+fn recorded_fields_digest_recomputes_from_the_logged_fields() {
+    let workspace = workspace();
+    let output = exec_new(&workspace, &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // The events contract: SHA-256 over the compact JSON of `fields` with
+    // keys sorted.
+    let profiles = recorded_profiles(&workspace.log, "session.start");
+    let fields: BTreeMap<String, serde_json::Value> =
+        serde_json::from_value(profiles[0]["fields"].clone()).expect("fields object");
+    let digest = Sha256::digest(serde_json::to_vec(&fields).expect("serialize"));
+    assert_eq!(profiles[0]["fields_sha256"], format!("{digest:x}"));
 }
 
 #[test]
@@ -259,6 +279,69 @@ fn resume_records_the_profile_it_runs_under_and_shows_a_change() {
     let resumed = recorded_profiles(&workspace.log, "session.resumed");
     assert_eq!(resumed.len(), 1);
     assert_eq!(resumed[0]["name"], "locked");
+}
+
+/// `--permission-reviewer` applies before the resume rule compares, so the
+/// same flag on start and resume shows no change, and dropping it names the
+/// reviewer change.
+#[test]
+fn resume_with_the_same_reviewer_flag_shows_no_profile_change() {
+    let workspace = workspace();
+    let guardian = ["--permission-reviewer", "guardian"];
+    let output = exec_new(&workspace, &guardian);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let output = exec_resume(&workspace, &guardian);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("execution profile:"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = exec_resume(&workspace, &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "execution profile: locked (recorded: locked; changed reviewer guardian -> user)"
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Profile errors fail a resume before the relocation it accepted is
+/// appended to the log.
+#[test]
+fn resume_profile_errors_fail_before_relocation_is_recorded() {
+    let workspace = workspace();
+    let output = exec_new(&workspace, &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let moved = workspace.root.with_file_name("moved");
+    fs::create_dir_all(moved.join(".git")).expect("second repository");
+    write_profiles(
+        &workspace,
+        r#"{"profiles": {"ci": {"extends": "locked", "bogus": 1}}}"#,
+    );
+    let before = fs::read_to_string(&workspace.log).expect("read log");
+
+    let log = workspace.log.to_str().expect("utf8 log");
+    let output = exec_in(
+        &workspace,
+        &moved,
+        &["--resume", log, "--accept-relocation", "again"],
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("profiles.json"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(&workspace.log).expect("read log"),
+        before,
+        "nothing is appended"
+    );
 }
 
 #[test]
