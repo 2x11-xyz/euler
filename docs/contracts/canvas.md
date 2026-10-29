@@ -174,6 +174,27 @@ disable/re-enable cycle around crash recovery.
 Stops, malformed outputs, failures, cancelled outputs, and continuations
 superseded by pending user input remain provenance-only.
 
+## Execution Profile Notes
+
+A `session.profile_changed` carrying `model_note` projects that exact text as
+a user-role item before the next turn's input (`user.message`,
+`extension.contribution`, or `model.call`), so the model learns the new
+boundary instead of guessing why commands behave differently (ADR 0026
+section 6). `/profile` changes are refused during a run, so several changes
+before one turn project one note, for the latest; none projects when the
+profile ends equal to the one the model last saw (the `session.start` record
+or the last change a turn followed). A resumed lifetime under a profile other
+than the chain's latest records its own `session.profile_changed` (events
+contract, `session.resumed`), so a resume takes part in the same comparison.
+A change before the session's first turn boundary (the first `user.message`,
+`extension.contribution`, or `model.call` in the chain, across lifetimes)
+projects nothing: no command ran under an earlier profile, and the
+`run_shell` description states the current boundary. The note stays in later
+canvases as history. A change before the active `canvas.swap` frontier
+projects nothing after the swap. Child and parallel-reviewer canvases drop
+these notes: a child may run under a tighter profile, and its own `run_shell`
+description states its boundary.
+
 ## Pinned Project Context
 
 An admitted `project.context.snapshot` (ADR 0017,

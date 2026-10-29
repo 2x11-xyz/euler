@@ -638,6 +638,193 @@ fn resumed_session_records_its_execution_profile_on_session_resumed() {
     );
 }
 
+fn preset_profile(name: &str) -> euler_core::ExecutionProfile {
+    euler_core::ProfilesConfig::default()
+        .resolve(Some(name), euler_core::ProfileContext::Interactive, None)
+        .expect("preset resolves")
+}
+
+fn profile_config(root: &std::path::Path, profile: &str) -> SessionConfig {
+    let mut config = fixture_config(root);
+    config.execution_profile = preset_profile(profile);
+    config
+}
+
+fn execution_profile_notes(request: &ModelRequest) -> Vec<String> {
+    request
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            euler_provider::ModelInputItem::Message { content, .. }
+                if content.starts_with("[host note]") =>
+            {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Runs one lifetime under `profile`: a turn, then the given `/profile`
+/// changes with no turn after them.
+fn first_lifetime(log: &std::path::Path, root: &std::path::Path, profile: &str, changes: &[&str]) {
+    let mut session = Session::new(
+        profile_config(root, profile),
+        ScriptedProvider::new(vec![FixtureResponse::Assistant("one".to_owned())]),
+        CountingDecider::default(),
+    )
+    .with_provenance(ProvenanceWriter::new(log).expect("writer"));
+    session.run_turn("first").expect("first turn");
+    for change in changes {
+        session
+            .change_execution_profile(preset_profile(change))
+            .expect("profile change");
+    }
+}
+
+/// A change with no turn after it, then a resume under another profile: the
+/// note names the profile commands run under now (ADR 0026 sections 6 and
+/// 9), never the superseded pending one.
+#[test]
+fn resume_under_another_profile_notes_the_resumed_profile() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    first_lifetime(&log, temp.path(), "full", &["locked"]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+
+    let mut session = resume_session(
+        profile_config(temp.path(), "workspace"),
+        ProviderSet::single(CapturingStaticProvider::new(
+            vec![completed_stream("two")],
+            Arc::clone(&requests),
+        )),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+    session.run_turn("second").expect("resumed turn");
+
+    let requests = requests.lock().expect("requests");
+    let notes = execution_profile_notes(&requests[0]);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("[host note] Execution profile changed to workspace;"));
+    let changes = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::SESSION_PROFILE_CHANGED)
+        .collect::<Vec<_>>();
+    assert_eq!(changes.len(), 2);
+    assert_eq!(
+        changes[1].payload.get("execution_profile"),
+        Some(&preset_profile("workspace").record())
+    );
+}
+
+/// After a resume under another profile, a change back to the start profile
+/// is noted, because the model's last turn ran under the resumed one.
+#[test]
+fn profile_change_after_a_resume_under_another_profile_is_noted() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    first_lifetime(&log, temp.path(), "full", &[]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+
+    let mut session = resume_session(
+        profile_config(temp.path(), "locked"),
+        ProviderSet::single(CapturingStaticProvider::new(
+            vec![completed_stream("two"), completed_stream("three")],
+            Arc::clone(&requests),
+        )),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+    session.run_turn("second").expect("resumed turn");
+    session
+        .change_execution_profile(preset_profile("full"))
+        .expect("profile change");
+    session.run_turn("third").expect("turn after the change");
+
+    let requests = requests.lock().expect("requests");
+    let notes = execution_profile_notes(&requests[1]);
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert!(notes[0].starts_with("[host note] Execution profile changed to locked;"));
+    assert!(notes[1].starts_with("[host note] Execution profile changed to full;"));
+}
+
+/// A `/profile` change as a resumed lifetime's first activity follows the
+/// resume-time change; the next turn gets one note, for the latest.
+#[test]
+fn profile_change_right_after_a_resume_records_both_and_notes_the_latest() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    first_lifetime(&log, temp.path(), "full", &[]);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+
+    let mut session = resume_session(
+        profile_config(temp.path(), "locked"),
+        ProviderSet::single(CapturingStaticProvider::new(
+            vec![completed_stream("two")],
+            Arc::clone(&requests),
+        )),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+    session
+        .change_execution_profile(preset_profile("workspace"))
+        .expect("profile change");
+    session.run_turn("second").expect("turn after the change");
+
+    let recorded = session
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::SESSION_PROFILE_CHANGED)
+        .map(|event| event.payload["execution_profile"]["name"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(recorded, [json!("locked"), json!("workspace")]);
+    let requests = requests.lock().expect("requests");
+    let notes = execution_profile_notes(&requests[0]);
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].starts_with("[host note] Execution profile changed to workspace;"));
+}
+
+/// The resume-time change waits for durable activity like `session.resumed`:
+/// an open-and-inspect resume appends nothing, and a resume under the
+/// recorded profile records no change.
+#[test]
+fn resume_profile_change_waits_for_activity_and_needs_a_difference() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    first_lifetime(&log, temp.path(), "full", &[]);
+    let lines = line_count(&log);
+
+    let inspected = resume_session(
+        profile_config(temp.path(), "locked"),
+        ProviderSet::single(ScriptedProvider::new(vec![])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("inspect resume");
+    drop(inspected);
+    assert_eq!(line_count(&log), lines);
+
+    let mut session = resume_session(
+        profile_config(temp.path(), "full"),
+        ProviderSet::single(ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "two".to_owned(),
+        )])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+    session.run_turn("second").expect("resumed turn");
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::SESSION_PROFILE_CHANGED));
+}
+
 #[test]
 fn fold_replays_compaction_policy_changes_and_legacy_tier_off() {
     let temp = tempfile::tempdir().expect("temp dir");

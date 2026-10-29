@@ -958,6 +958,7 @@ fn preserves_message_and_selected_tool_result_interleaving() {
                 CanvasItem::Projection { .. } => "projection",
                 CanvasItem::Slot { .. } => "slot",
                 CanvasItem::ExtensionContribution { .. } => "extension.contribution",
+                CanvasItem::ExecutionProfileNote { .. } => "execution.profile.note",
                 CanvasItem::Reasoning { .. } => "reasoning",
                 CanvasItem::ToolCall { .. } => "tool.call",
                 CanvasItem::ToolOutput { .. } => "tool.output",
@@ -1181,6 +1182,160 @@ fn excludes_model_switched_from_canvas_and_prompt_text() {
     assert!(!prompt.contains("model.switched"));
     assert!(!prompt.contains("chatgpt"));
     assert!(!prompt.contains("gpt-5.5"));
+}
+
+fn profile_event(kind: &'static str, profile: &str, model_note: Option<&str>) -> EventEnvelope {
+    let mut payload = object([("execution_profile", serde_json::json!({ "name": profile }))]);
+    if let Some(note) = model_note {
+        payload.insert("model_note".to_owned(), note.into());
+    }
+    EventEnvelope::new("s", "a", None, kind, payload)
+}
+
+fn user_event(content: &str) -> EventEnvelope {
+    EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::USER_MESSAGE,
+        object([("content", content.into())]),
+    )
+}
+
+/// A change recorded without `model_note` (an older binary) yields no note;
+/// a recorded note lands before the next turn's input.
+#[test]
+fn execution_profile_note_projects_only_recorded_text_before_the_next_turn() {
+    let events = vec![
+        profile_event(EventKind::SESSION_START, "locked", None),
+        user_event("one"),
+        profile_event(EventKind::SESSION_PROFILE_CHANGED, "full", None),
+        user_event("two"),
+        profile_event(
+            EventKind::SESSION_PROFILE_CHANGED,
+            "workspace",
+            Some("note"),
+        ),
+        user_event("three"),
+    ];
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+
+    assert_eq!(
+        canvas.iter().map(CanvasItem::event_id).collect::<Vec<_>>(),
+        [1, 3, 4, 5].map(|index| events[index].id.as_str())
+    );
+    assert_eq!(
+        canvas[2],
+        CanvasItem::ExecutionProfileNote {
+            event_id: events[4].id.clone(),
+            content: "note".to_owned(),
+        }
+    );
+}
+
+/// A change before the active compaction frontier was summarized with the
+/// canvas it ended, so it is not repeated after the swap.
+#[test]
+fn execution_profile_note_before_the_compaction_frontier_is_not_repeated() {
+    let start = profile_event(EventKind::SESSION_START, "locked", None);
+    let change = profile_event(EventKind::SESSION_PROFILE_CHANGED, "full", Some("note"));
+    let frontier = user_event("new request");
+    let swap = EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::CANVAS_SWAP,
+        object([
+            ("snapshot_start_id", start.id.clone().into()),
+            ("snapshot_end_id", change.id.clone().into()),
+            ("frontier_start_id", frontier.id.clone().into()),
+            ("policy_version", COMPACTION_POLICY_VERSION.into()),
+            (
+                "projection_schema_version",
+                PROJECTION_SCHEMA_VERSION.into(),
+            ),
+            ("projection_blob", "old compacted".into()),
+            ("validation_result", "pass".into()),
+        ]),
+    );
+    let events = vec![start, user_event("old request"), change, frontier, swap];
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+
+    assert_eq!(
+        canvas.iter().map(CanvasItem::event_id).collect::<Vec<_>>(),
+        [4, 3].map(|index| events[index].id.as_str())
+    );
+}
+
+/// A continuation assembles its request before its `model.call` is recorded,
+/// so the note lands at the tail; once the `model.call` is recorded, later
+/// assemblies keep it at the same position (prompt-cache stable).
+#[test]
+fn execution_profile_note_for_a_continuation_keeps_its_position() {
+    let mut events = vec![
+        profile_event(EventKind::SESSION_START, "locked", None),
+        user_event("one"),
+        profile_event(EventKind::SESSION_PROFILE_CHANGED, "full", Some("note")),
+    ];
+    let note = CanvasItem::ExecutionProfileNote {
+        event_id: events[2].id.clone(),
+        content: "note".to_owned(),
+    };
+
+    let before_call = assemble_canvas(&events, &AutoCompactionPolicy::default());
+    events.push(EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::MODEL_CALL,
+        object([("provider", "fixture".into()), ("model", "fixture".into())]),
+    ));
+    let after_call = assemble_canvas(&events, &AutoCompactionPolicy::default());
+
+    assert_eq!(before_call.len(), 2);
+    assert_eq!(before_call[1], note);
+    assert_eq!(after_call, before_call);
+}
+
+/// An accepted idle contribution starts the next turn, so the note precedes it.
+#[test]
+fn execution_profile_note_precedes_an_accepted_contribution() {
+    let events = vec![
+        profile_event(EventKind::SESSION_START, "locked", None),
+        user_event("one"),
+        profile_event(EventKind::SESSION_PROFILE_CHANGED, "full", Some("note")),
+        accepted_driver_continuation("s", "a"),
+    ];
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+
+    assert_eq!(
+        canvas.iter().map(CanvasItem::event_id).collect::<Vec<_>>(),
+        [1, 2, 3].map(|index| events[index].id.as_str())
+    );
+    assert!(matches!(canvas[1], CanvasItem::ExecutionProfileNote { .. }));
+}
+
+/// Before the first turn no command ran, and the `run_shell` description
+/// already states the boundary, so a change then yields no note.
+#[test]
+fn execution_profile_change_before_the_first_turn_adds_no_note() {
+    let events = vec![
+        profile_event(EventKind::SESSION_START, "locked", None),
+        profile_event(EventKind::SESSION_PROFILE_CHANGED, "full", Some("note")),
+        user_event("one"),
+        profile_event(EventKind::SESSION_PROFILE_CHANGED, "locked", Some("back")),
+        user_event("two"),
+    ];
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+
+    assert_eq!(
+        canvas.iter().map(CanvasItem::event_id).collect::<Vec<_>>(),
+        [2, 3, 4].map(|index| events[index].id.as_str())
+    );
 }
 
 #[test]

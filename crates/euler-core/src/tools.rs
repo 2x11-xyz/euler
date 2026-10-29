@@ -675,7 +675,7 @@ impl ToolRegistry {
     /// The execution boundary the `run_shell` description states. It lives in
     /// the tool description, not the system instructions, so it stays stable
     /// for a session's prompt cache and follows the registry's real backend.
-    fn model_execution_boundary(&self) -> String {
+    pub(crate) fn model_execution_boundary(&self) -> String {
         match &self.workspace_sandbox {
             Some(sandbox) => sandbox.model_boundary(self.escalation_allowed),
             None if self.writes_outside_workspace => {

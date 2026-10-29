@@ -355,7 +355,9 @@ the workspace that cannot be rolled back. An
 unavailable sandbox says commands are refused and points at
 `euler --check-sandbox`. The facts live in the tool description rather than
 the system instructions, so `SYSTEM_INSTRUCTIONS_VERSION` is unchanged and the
-description is stable for a session's prompt cache.
+description is stable for a session's prompt cache. After a profile change the
+next turn also carries a host note naming the new profile and repeating this
+boundary text (canvas contract, "Execution Profile Notes").
 
 ### Escalation
 

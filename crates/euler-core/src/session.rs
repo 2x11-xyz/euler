@@ -707,6 +707,11 @@ pub struct Session<D> {
     /// (issue #100). In-memory only — NEVER persisted — so a bare `/scrub`
     /// knows what to remove after the warning. Holds the values, not labels.
     scrub_candidates: Vec<String>,
+    /// This resumed lifetime runs under a profile other than the latest one
+    /// the event chain records. Its `session.profile_changed` is appended
+    /// before the lifetime's first accepted event, so an open-and-inspect
+    /// resume appends nothing and the model's next turn gets the note.
+    resumed_profile_change_pending: bool,
 }
 
 struct ShadowCompaction {
@@ -1437,6 +1442,7 @@ impl<D> Session<D> {
             compaction_request: None,
             shadow_compaction: None,
             scrub_candidates: Vec::new(),
+            resumed_profile_change_pending: false,
         };
         session.install_provider_secret_sink();
         session
@@ -1967,6 +1973,7 @@ impl<D> Session<D> {
             return Err(SessionError::ProfileChangeDuringRun);
         }
         self.persist_new_events()?;
+        self.record_resumed_profile_change()?;
         // Jobs started under a sandboxed profile, escalated ones included,
         // end before the boundary changes; jobs started with the sandbox off
         // keep running (ADR 0026 resolved question 12).
@@ -1985,16 +1992,49 @@ impl<D> Session<D> {
             self.config.execution_profile.fields.clone(),
             matches!(self.tools.sandbox_status(), SandboxStatus::Enforced(_)),
         );
+        let event = self.execution_profile_change_event();
+        self.accept_control_event(event)
+    }
+
+    /// The `session.profile_changed` record for the session's current
+    /// profile and boundary.
+    fn execution_profile_change_event(&self) -> EventEnvelope {
         let mut payload = sandbox_start_fields(self.tools.sandbox_status());
         payload.extend(execution_profile_fields(&self.config));
-        let event = EventEnvelope::new(
+        // The model's next turn sees this note (ADR 0026 section 6), so it
+        // does not guess why commands behave differently.
+        payload.insert(
+            "model_note".to_owned(),
+            format!(
+                "[host note] Execution profile changed to {}; earlier commands ran under the \
+previous profile. {}",
+                self.config.execution_profile.name,
+                self.tools.model_execution_boundary()
+            )
+            .into(),
+        );
+        EventEnvelope::new(
             self.config.session_id.clone(),
             self.config.agent_id.clone(),
             self.previous_persisted_event_id(),
             EventKind::SESSION_PROFILE_CHANGED,
             payload,
-        );
-        self.accept_control_event(event)
+        )
+    }
+
+    /// Append the pending resume-time profile change (ADR 0026 sections 6
+    /// and 9) ahead of this lifetime's first accepted event. Cleared first,
+    /// so the append it makes does not re-enter; a failed append leaves it
+    /// pending for the next accepted event. It inherits the open run of a
+    /// continued run, which a root event during that run must carry.
+    fn record_resumed_profile_change(&mut self) -> Result<(), SessionError> {
+        if !std::mem::take(&mut self.resumed_profile_change_pending) {
+            return Ok(());
+        }
+        let event = self.execution_profile_change_event();
+        let result = self.accept_control_event(event);
+        self.resumed_profile_change_pending = result.is_err();
+        result
     }
 
     /// Background jobs started with the sandbox off that are still running,
@@ -2353,6 +2393,7 @@ impl<D> Session<D> {
         events: &mut [EventEnvelope],
         inherit_active_run: bool,
     ) -> Result<(), SessionError> {
+        self.record_resumed_profile_change()?;
         self.ensure_no_pending_admission()?;
         self.accept_ordered_batch_after_admission_check(events, inherit_active_run)
     }
@@ -2429,6 +2470,7 @@ impl<D> Session<D> {
             (false, Some(QueueMode::Steering)) => UserAdmissionKind::Steering,
             _ => return Err(SessionError::InvalidQueuedInput),
         };
+        self.record_resumed_profile_change()?;
         let run_id = self.prepare_user_admission(content, input, kind)?;
         let id = self.append_pending_user_admission()?;
         if matches!(
@@ -3102,6 +3144,11 @@ impl<D> Session<D> {
             .into_iter()
             .filter(|event| event.kind.as_str() != EventKind::SESSION_RESUMED)
             .collect::<Vec<_>>();
+        // Compared with the chain's records, not `session.resumed`, because
+        // the canvas folds only the chain. A log that predates profiles
+        // records none, so no profile is inferred and none is noted.
+        let resumed_profile_change_pending = latest_chain_execution_profile_record(&events)
+            .is_some_and(|record| *record != config.execution_profile_record());
         let mut tools = profile_tool_registry(&config);
         if let Ok(fold) = crate::project_context::fold_project_context(&events) {
             if let Some(pinned) = fold.admitted() {
@@ -3153,6 +3200,7 @@ impl<D> Session<D> {
             compaction_request: None,
             shadow_compaction: None,
             scrub_candidates: Vec::new(),
+            resumed_profile_change_pending,
         };
         session.install_provider_secret_sink();
         session
@@ -5690,6 +5738,7 @@ impl<D: PermissionDecider> Session<D> {
         writer_ordered_parent: bool,
         inherit_active_run: bool,
     ) -> Result<String, SessionError> {
+        self.record_resumed_profile_change()?;
         if inherit_active_run && event.run.is_none() {
             event.run.clone_from(&self.active_run);
         }
@@ -6188,6 +6237,21 @@ fn profile_tool_registry(config: &SessionConfig) -> ToolRegistry {
     tools
 }
 
+/// The latest `execution_profile` record on the event chain: `session.start`
+/// or a `session.profile_changed`. `session.resumed` is a log leaf, not chain.
+fn latest_chain_execution_profile_record(events: &[EventEnvelope]) -> Option<&Value> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                EventKind::SESSION_START | EventKind::SESSION_PROFILE_CHANGED
+            )
+        })
+        .find_map(|event| event.payload.get("execution_profile"))
+}
+
 /// `execution_profile` and `command_approvals`, recorded on `session.start`
 /// and `session.profile_changed`. `command_approvals` is `off` when commands
 /// inside the profile's boundary never ask, `on` otherwise: a fact separate
@@ -6265,9 +6329,16 @@ fn push_session_bootstrap(
 /// Enforce the root/child data-flow boundary on an inherited request canvas.
 /// Accepted terminal-idle contributions are committed one-shot inputs for the
 /// root driver only; inheriting children must not observe, select, or spend
-/// their context budget on them.
+/// their context budget on them. Execution-profile notes describe the root's
+/// boundary; a child may run under a tighter profile, and its own `run_shell`
+/// description states its boundary.
 fn child_canvas_boundary(mut canvas: Vec<CanvasItem>) -> Vec<CanvasItem> {
-    canvas.retain(|item| !matches!(item, CanvasItem::ExtensionContribution { .. }));
+    canvas.retain(|item| {
+        !matches!(
+            item,
+            CanvasItem::ExtensionContribution { .. } | CanvasItem::ExecutionProfileNote { .. }
+        )
+    });
     canvas
 }
 
@@ -6286,7 +6357,8 @@ fn redact_child_canvas_for_egress(
         CanvasItem::Message { content, .. }
         | CanvasItem::Projection { content, .. }
         | CanvasItem::Slot { content, .. }
-        | CanvasItem::ExtensionContribution { content, .. } => {
+        | CanvasItem::ExtensionContribution { content, .. }
+        | CanvasItem::ExecutionProfileNote { content, .. } => {
             *content = redactor.redact(content);
             true
         }
@@ -6415,11 +6487,9 @@ fn model_input_item(item: &CanvasItem) -> ModelInputItem {
             },
             content: content.clone(),
         },
-        CanvasItem::SkillActivation { content, .. } => ModelInputItem::Message {
-            role: ModelRole::User,
-            content: content.clone(),
-        },
-        CanvasItem::Projection { content, .. } => ModelInputItem::Message {
+        CanvasItem::SkillActivation { content, .. }
+        | CanvasItem::Projection { content, .. }
+        | CanvasItem::ExecutionProfileNote { content, .. } => ModelInputItem::Message {
             role: ModelRole::User,
             content: content.clone(),
         },
