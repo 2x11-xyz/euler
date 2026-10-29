@@ -17,10 +17,10 @@ const SESSION_OPTIONS: &str = "  \
                              (default: extension-defined)
   --permission-reviewer <r>  user or guardian: who reviews permission asks
                              (default: the profile's reviewer, else user)
-  --profile <name>           Execution profile: full, locked, or a profile in
-                             profiles.json (default: the defaults entry for
-                             interactive or exec, else full interactive and
-                             locked for exec)
+  --profile <name>           Execution profile: full, workspace, locked, or a
+                             profile in profiles.json (default: the defaults
+                             entry for interactive or exec, else full
+                             interactive and workspace for exec)
   --project-context <p>      auto, on, or off: load this project's EULER.md
                              guidance (default: auto)
   --accept-relocation        On resume, move the session to the current folder
@@ -172,7 +172,9 @@ Options:
 {SESSION_OPTIONS}  \
 --continue                 Continue the session's interrupted run
   --retry                    With --continue, retry a parked run
-  --auto-approve <tier>      read-only or trusted-local (default: read-only)
+  --auto-approve <tier>      read-only or trusted-local (default: read-only);
+                             a no-op under a profile that already runs
+                             commands and writes, such as workspace
   --reasoning-effort <e>     xsmall, small, medium, large, xlarge, or max
   --max-output-tokens <n>    Cap output tokens per model response
   --max-tool-rounds <n>      Cap tool rounds per turn (default: unlimited)

@@ -46,7 +46,7 @@ fn unenforced_fields() -> ProfileFields {
 }
 
 #[test]
-fn built_in_defaults_are_full_interactive_and_locked_headless() {
+fn built_in_defaults_are_full_interactive_and_workspace_headless() {
     let config = ProfilesConfig::default();
     let interactive = config
         .resolve(None, ProfileContext::Interactive, None)
@@ -56,8 +56,8 @@ fn built_in_defaults_are_full_interactive_and_locked_headless() {
     let headless = config
         .resolve(None, ProfileContext::Headless, None)
         .expect("resolves");
-    assert_eq!(headless, ExecutionProfile::default());
-    assert_eq!(headless.name, "locked");
+    assert_eq!(headless.name, "workspace");
+    assert_eq!(headless.fields, workspace::fields());
 }
 
 #[test]
@@ -438,7 +438,7 @@ fn project_overlay_tightens_and_never_loosens() {
         r#"{"approvals": "always", "writable_paths": []}"#,
     );
     let profile = config
-        .resolve(None, ProfileContext::Headless, Some(&same))
+        .resolve(Some("locked"), ProfileContext::Headless, Some(&same))
         .expect("an equal value is at least as tight");
     assert_eq!(profile, ExecutionProfile::default());
 

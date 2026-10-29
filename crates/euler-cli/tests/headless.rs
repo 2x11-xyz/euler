@@ -169,6 +169,8 @@ fn agent_shell_applies_backend_environment_and_home_isolation() {
             "none",
             "--project-context",
             "off",
+            "--profile",
+            "locked",
             "--auto-approve",
             "trusted-local",
             "--provenance",
