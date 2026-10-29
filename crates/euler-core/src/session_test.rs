@@ -7228,6 +7228,63 @@ fn sensitive_basename_read_asks_instead_of_riding_session_allow() {
         .contains("plain-canary-value"));
 }
 
+/// ADR 0026 row P: under the `workspace` profile a command and a
+/// structured write run without a prompt, and a command naming a sensitive
+/// path still asks (resolved question 14), so `cat .env` is denied by a
+/// decider that denies every ask.
+#[test]
+fn the_workspace_profile_asks_only_for_a_command_naming_a_sensitive_path() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join(".env"), "API_KEY=workspace-canary").expect(".env");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![
+            euler_provider::ToolCall {
+                id: "call-shell".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": "printf ok > out.txt"}),
+            },
+            euler_provider::ToolCall {
+                id: "call-write".to_owned(),
+                name: "write_file".to_owned(),
+                input: json!({"path": "notes.txt", "content": "x"}),
+            },
+            euler_provider::ToolCall {
+                id: "call-secret".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": "cat .env"}),
+            },
+        ]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut config = SessionConfig::new(temp.path());
+    config.set_execution_profile(
+        crate::ProfilesConfig::default()
+            .resolve(Some("workspace"), crate::ProfileContext::Headless, None)
+            .expect("workspace ships"),
+    );
+    // The approvals rule is under test, not the backend this host has.
+    config.subprocess_sandbox = SubprocessSandbox::Host;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
+
+    session.run_turn("work").expect("turn");
+
+    let results = events_of_kind(session.events(), EventKind::TOOL_RESULT);
+    let ok = |id: &str| {
+        results
+            .iter()
+            .find(|result| result.payload["id"] == json!(id))
+            .map(|result| result.payload["ok"].clone())
+    };
+    assert_eq!(ok("call-shell"), Some(json!(true)));
+    assert_eq!(ok("call-write"), Some(json!(true)));
+    assert_eq!(ok("call-secret"), Some(json!(false)));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("out.txt")).expect("shell ran"),
+        "ok"
+    );
+    assert!(temp.path().join("notes.txt").is_file());
+}
+
 #[test]
 fn sensitive_basename_read_denial_blocks_the_tool() {
     let temp = tempfile::tempdir().expect("temp dir");

@@ -195,9 +195,14 @@ pub struct SessionConfig {
     pub reasoning_effort: ReasoningEffort,
     pub root: PathBuf,
     /// Whether agent-controlled subprocesses must use a core sandbox profile.
-    /// Disabled is the default until a user-facing mode can promise real
-    /// enforcement on the current host.
+    /// [`Self::set_execution_profile`] sets it from the profile.
     pub subprocess_sandbox: SubprocessSandbox,
+    /// The session store's sessions directory, when the session has a
+    /// store. A sandbox profile with a private per-session `HOME` (ADR 0026
+    /// `workspace`) keeps it at `<dir>/<session id>/home`; with `None` it
+    /// uses a fresh directory under `<euler home>/state/homes` that is
+    /// removed when the session ends.
+    pub session_store_dir: Option<PathBuf>,
     /// The resolved execution profile (ADR 0026), recorded on `session.start`
     /// and `session.resumed`. Default: the `locked` preset, today's boundary.
     /// Its `reviewer` is recorded from [`Self::permission_reviewer`], which
@@ -270,10 +275,37 @@ pub struct SessionConfig {
 
 impl SessionConfig {
     /// Install a resolved execution profile. Its reviewer becomes the
-    /// session's reviewer, the one the gate consults.
+    /// session's reviewer, the one the gate consults, and its boundary
+    /// becomes the subprocess sandbox. A profile this build cannot enforce
+    /// is refused before it reaches here, so the sandbox keeps its value
+    /// only for a profile resolution already rejected.
     pub fn set_execution_profile(&mut self, profile: ExecutionProfile) {
         self.permission_reviewer = profile.fields.reviewer;
+        if let Ok(sandbox) = profile.subprocess_sandbox() {
+            self.subprocess_sandbox = sandbox;
+        }
         self.execution_profile = profile;
+    }
+
+    /// The private per-session `HOME` for a sandbox profile that keeps one.
+    fn sandbox_home(&self) -> Option<PathBuf> {
+        self.session_store_dir
+            .as_ref()
+            .map(|dir| dir.join(&self.session_id).join("home"))
+    }
+
+    /// Probe the boundary this configuration's subprocess sandbox would
+    /// get on this host.
+    pub(crate) fn probe_subprocess_sandbox(&self) -> crate::SandboxStatus {
+        match &self.subprocess_sandbox {
+            SubprocessSandbox::Host => crate::SandboxStatus::Host,
+            SubprocessSandbox::Enforce(profile) => crate::sandbox::WorkspaceSandbox::new(
+                &self.root,
+                profile.clone(),
+                self.sandbox_home(),
+            )
+            .status(),
+        }
     }
 
     /// The `execution_profile` provenance object, with the reviewer the
@@ -293,6 +325,7 @@ impl SessionConfig {
             reasoning_effort: ReasoningEffort::Medium,
             root: root.into(),
             subprocess_sandbox: SubprocessSandbox::default(),
+            session_store_dir: None,
             execution_profile: ExecutionProfile::default(),
             max_tool_rounds: None,
             provider_transport_retries: 2,
@@ -1334,8 +1367,11 @@ impl<D> Session<D> {
     }
 
     pub fn new_with_providers(config: SessionConfig, providers: ProviderSet, decider: D) -> Self {
-        let mut tools =
-            ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
+        let mut tools = ToolRegistry::with_sandbox_home(
+            config.root.clone(),
+            config.subprocess_sandbox.clone(),
+            config.sandbox_home(),
+        );
         if let Some(project_context) = config.project_context.as_ref() {
             tools.set_frozen_skills(project_context.frozen_skills());
         }
@@ -1355,6 +1391,7 @@ impl<D> Session<D> {
             .map(|bootstrap| bootstrap.redactor().clone())
             .unwrap_or_else(SecretRedactor::from_env);
         let mut permissions = PermissionGate::new(decider);
+        permissions.set_execution_profile(config.execution_profile.fields.clone());
         // Project grants are best-effort at open: missing file is empty; corrupt
         // files leave the store unloaded so project writes fail closed.
         let _ = permissions
@@ -2823,6 +2860,21 @@ impl<D> Session<D> {
         self.permissions.set_mode(capability, mode);
     }
 
+    /// Whether the execution profile runs `fs-write` and `shell-exec`
+    /// requests that would ask without a prompt (ADR 0026 row P), so an
+    /// `--auto-approve` tier leaves them to the profile.
+    pub fn profile_lifts_command_approvals(&self) -> bool {
+        [Capability::FsWrite, Capability::ShellExec]
+            .into_iter()
+            .all(|capability| {
+                crate::execution_profile::profile_mode_override(
+                    &self.config.execution_profile.fields,
+                    &crate::permissions::PermissionRequest::new(capability, String::new()),
+                    ApprovalMode::Ask,
+                ) == Some(ApprovalMode::SessionAllow)
+            })
+    }
+
     /// Who resolves uncovered `ask` permission decisions (ADR 0011).
     pub fn permission_reviewer(&self) -> PermissionReviewer {
         self.config.permission_reviewer
@@ -2961,8 +3013,11 @@ impl<D> Session<D> {
             .into_iter()
             .filter(|event| event.kind.as_str() != EventKind::SESSION_RESUMED)
             .collect::<Vec<_>>();
-        let mut tools =
-            ToolRegistry::with_subprocess_sandbox(config.root.clone(), config.subprocess_sandbox);
+        let mut tools = ToolRegistry::with_sandbox_home(
+            config.root.clone(),
+            config.subprocess_sandbox.clone(),
+            config.sandbox_home(),
+        );
         if let Ok(fold) = crate::project_context::fold_project_context(&events) {
             if let Some(pinned) = fold.admitted() {
                 tools.set_frozen_skills(pinned.frozen_skills());
@@ -2970,6 +3025,7 @@ impl<D> Session<D> {
         }
         let persisted_events = events.len();
         let mut permissions = PermissionGate::new(decider);
+        permissions.set_execution_profile(config.execution_profile.fields.clone());
         let _ = permissions
             .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
         let _ = permissions.load_user_grants(config.user_grant_dir.as_deref());

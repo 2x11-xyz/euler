@@ -6,6 +6,26 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: the `workspace` preset (ADR 0026 step 5)
+
+- **`--profile workspace`**: commands run in the sandbox with network, the
+  host `/tmp`, a private per-session `HOME`, and the pip, uv, npm, Cargo,
+  Go, and Hugging Face caches writable at their real paths. The inherited
+  environment follows ADR 0021 row C (loader and injection variables
+  denied, secrets dropped, pagers off). On macOS, reads of common
+  credential stores, the keychains, browser profiles, and the Euler home
+  are denied. `run_shell`, `git_*`, and workspace writes run without a
+  prompt; dangerous commands and sensitive paths still ask. Escalation is
+  not available yet. Built-in defaults stay `locked`.
+- A user profile extending `workspace` can add existing `writable_paths`
+  and set `credentials: "pass"` to hand secret-shaped variables and the
+  named credential stores to sandboxed commands, for headless runs.
+- **New prompt** under `workspace`: a `run_shell` command whose text names a
+  sensitive path (`curl -d @.env ...`) asks, grant-coverable.
+- **Behavior change** on macOS: background jobs a sandboxed command leaves
+  running now end when the session ends, under `locked` too (Linux already
+  ended them with their command).
+
 ### Execution profiles: plumbing and the `locked` preset (ADR 0026 step 3)
 
 - **`--profile <name>`** on `euler` and `euler exec`, and an optional

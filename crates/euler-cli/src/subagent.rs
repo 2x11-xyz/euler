@@ -67,7 +67,14 @@ impl SubagentDecider {
         // deny (headless fail-closed). This overrides the tier for those
         // two capabilities in both directions: read-only's always-deny and
         // trusted-local's session-allow.
-        if session.permission_reviewer() == euler_core::PermissionReviewer::Guardian {
+        //
+        // A profile that already runs commands and writes inside its
+        // boundary (ADR 0026 row P) wins over the tier for the same two:
+        // they return to `ask`, which the profile lifts, and dangerous or
+        // sensitive-path requests still ask.
+        if session.permission_reviewer() == euler_core::PermissionReviewer::Guardian
+            || session.profile_lifts_command_approvals()
+        {
             session.set_permission_mode(Capability::FsWrite, ApprovalMode::Ask);
             session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
         }

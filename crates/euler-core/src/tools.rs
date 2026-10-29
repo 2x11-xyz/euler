@@ -2,6 +2,7 @@ use crate::git_neutralization::{
     cached_fsmonitor_daemon_support, fsmonitor_override, parse_executable_config, GitNeutralization,
 };
 use crate::sandbox::WorkspaceSandbox;
+use crate::sandboxed_jobs::{exit_code_without_reaping, SandboxedJobs};
 use crate::structured_file;
 use crate::{
     apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
@@ -234,6 +235,9 @@ impl ReteachTracker {
 pub struct ToolRegistry {
     root: PathBuf,
     workspace_sandbox: Option<WorkspaceSandbox>,
+    /// Background jobs sandboxed commands left running, ended when the
+    /// registry, and so the session, ends.
+    sandboxed_jobs: SandboxedJobs,
     agent_euler_home: OnceLock<tempfile::TempDir>,
     skills: BTreeMap<String, FrozenSkill>,
     observation_bound: usize,
@@ -285,14 +289,28 @@ impl ToolRegistry {
         root: impl Into<PathBuf>,
         subprocess_sandbox: SubprocessSandbox,
     ) -> Self {
+        Self::with_sandbox_home(root, subprocess_sandbox, None)
+    }
+
+    /// As [`Self::with_subprocess_sandbox`], with the private per-session
+    /// `HOME` a `workspace` boundary uses
+    /// (`<session dir>/home`; see [`crate::SessionConfig::session_store_dir`]).
+    pub fn with_sandbox_home(
+        root: impl Into<PathBuf>,
+        subprocess_sandbox: SubprocessSandbox,
+        sandbox_home: Option<PathBuf>,
+    ) -> Self {
         let root = root.into();
         let workspace_sandbox = match subprocess_sandbox {
             SubprocessSandbox::Host => None,
-            SubprocessSandbox::Enforce(profile) => Some(WorkspaceSandbox::new(&root, profile)),
+            SubprocessSandbox::Enforce(profile) => {
+                Some(WorkspaceSandbox::new(&root, profile, sandbox_home))
+            }
         };
         Self {
             root,
             workspace_sandbox,
+            sandboxed_jobs: SandboxedJobs::default(),
             agent_euler_home: OnceLock::new(),
             skills: BTreeMap::new(),
             observation_bound: MAX_WORKSPACE_SNAPSHOT_FILES,
@@ -306,6 +324,13 @@ impl ToolRegistry {
     pub fn with_observation_bound(mut self, bound: usize) -> Self {
         self.observation_bound = bound.max(1);
         self
+    }
+
+    /// End the background jobs sandboxed commands left running (ADR 0026
+    /// resolved questions 6 and 12). Dropping the registry does this too; a
+    /// profile change calls it before the boundary is rebuilt.
+    pub fn end_sandboxed_jobs(&self) {
+        self.sandboxed_jobs.end_all();
     }
 
     /// The execution boundary that agent subprocesses actually get, as
@@ -929,7 +954,8 @@ impl ToolRegistry {
         let child = self.agent_subprocess("sh", &["-c", command], &[])?;
         let sandboxed = child.sandboxed;
         let sandbox_backend = child.backend;
-        let outcome = run_process(child.command, Some(timeout_ms), cancellation)
+        let jobs = sandboxed.then_some(&self.sandboxed_jobs);
+        let outcome = run_process(child.command, Some(timeout_ms), cancellation, jobs)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         let text = collected_agent_output(
             outcome.stdout,
@@ -1004,7 +1030,7 @@ impl ToolRegistry {
         let sandbox_backend = child.backend;
         let mut command = child.command;
         neutralization.strip_inherited_redirects(&mut command);
-        let outcome = run_process(command, None, cancellation)
+        let outcome = run_process(command, None, cancellation, None)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         let cancelled = outcome.termination == ProcessTermination::Cancelled;
         let text = collected_agent_output(outcome.stdout, outcome.stderr, sandboxed, cancelled)?;
@@ -1105,7 +1131,7 @@ see them.\n"
         let sandboxed = child.sandboxed;
         let mut command = child.command;
         neutralization.strip_inherited_redirects(&mut command);
-        let outcome = run_process(command, Some(GIT_PROBE_TIMEOUT_MS), cancellation)
+        let outcome = run_process(command, Some(GIT_PROBE_TIMEOUT_MS), cancellation, None)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         match outcome.termination {
             ProcessTermination::Exited(0) => {}
@@ -1155,7 +1181,12 @@ see them.\n"
         };
         // Defense in depth: both launchers clear this environment too, while
         // ordinary host execution needs an explicit child-process boundary.
-        scrub_agent_subprocess_env(&mut child);
+        // A sandbox under `credentials: "pass"` passes secrets on purpose.
+        let pass_secrets = self
+            .workspace_sandbox
+            .as_ref()
+            .is_some_and(WorkspaceSandbox::passes_credentials);
+        scrub_agent_subprocess_env(&mut child, pass_secrets);
         if !sandboxed {
             child.env("EULER_HOME", self.agent_euler_home()?);
         }
@@ -1436,9 +1467,10 @@ pub(crate) fn display_path(path: &str) -> String {
 /// agent-controlled shell would change what `run_shell` sees on the host
 /// backend, and that is ADR 0021 row C's decision to make. Euler's own git
 /// invocations strip it themselves.
-fn scrub_agent_subprocess_env(command: &mut Command) {
+fn scrub_agent_subprocess_env(command: &mut Command, pass_secrets: bool) {
     for (name, _) in std::env::vars_os() {
-        if crate::redaction::is_secret_env_name(&name) || is_parent_control_env_name(&name) {
+        let secret = !pass_secrets && crate::redaction::is_secret_env_name(&name);
+        if secret || is_parent_control_env_name(&name) {
             command.env_remove(name);
         }
     }
@@ -1450,7 +1482,7 @@ fn scrub_agent_subprocess_env(command: &mut Command) {
 /// `EULER_AUTH_FILE` lives here rather than in the secret-name classifier:
 /// its value is a path (the credentials live in the file), so the subprocess
 /// must not see it, but the path itself is not a redaction known-value.
-fn is_parent_control_env_name(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn is_parent_control_env_name(name: &std::ffi::OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
@@ -1691,10 +1723,15 @@ fn spawn_supervised_process(mut child: Command) -> Result<SupervisedProcess, Too
 /// the leader and ordinary descendants that remain in the group; a descendant
 /// that deliberately moves itself into another process group is outside this
 /// ownership guarantee.
+///
+/// With `jobs`, a leader that exits while background jobs of its group
+/// still run is handed to `jobs` unreaped instead of reaped, so the session
+/// can end those jobs later without signalling a reused group.
 fn run_process(
     child: Command,
     timeout_ms: Option<u64>,
     cancellation: &CancellationToken,
+    jobs: Option<&SandboxedJobs>,
 ) -> Result<ShellOutcome, ToolError> {
     use std::time::{Duration, Instant};
 
@@ -1707,8 +1744,7 @@ fn run_process(
         mut stdout,
         mut stderr,
     } = spawn_supervised_process(child)?;
-    let mut stdout_open = true;
-    let mut stderr_open = true;
+    let (mut stdout_open, mut stderr_open) = (true, true);
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
 
@@ -1764,10 +1800,8 @@ fn run_process(
         // pipe. Keeping the leader unreaped pins its pid/process-group id, so
         // a later cancellation cannot signal an unrelated reused group.
         if !stdout_open && !stderr_open {
-            match handle.try_wait() {
-                Ok(Some(status)) => {
-                    break ProcessTermination::Exited(status.code().unwrap_or(-1));
-                }
+            match leader_exit_code(&mut handle, jobs.is_some()) {
+                Ok(Some(code)) => break ProcessTermination::Exited(code),
                 Ok(None) => {}
                 Err(error) => {
                     kill_process_group(pid);
@@ -1778,11 +1812,25 @@ fn run_process(
         }
         std::thread::sleep(Duration::from_millis(25));
     };
+    if let (Some(jobs), ProcessTermination::Exited(_)) = (jobs, &termination) {
+        jobs.keep_or_reap(handle);
+    }
     Ok(ShellOutcome {
         termination,
         stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
     })
+}
+
+/// The exit code of a leader whose pipes have closed, once it has exited.
+/// With `pin`, the leader stays unreaped so its process-group id stays
+/// reserved for [`SandboxedJobs`]; otherwise it is reaped.
+fn leader_exit_code(handle: &mut std::process::Child, pin: bool) -> std::io::Result<Option<i32>> {
+    if pin {
+        exit_code_without_reaping(handle)
+    } else {
+        Ok(handle.try_wait()?.map(|status| status.code().unwrap_or(-1)))
+    }
 }
 
 const PROCESS_PIPE_DRAIN_BUDGET: usize = 256 * 1024;

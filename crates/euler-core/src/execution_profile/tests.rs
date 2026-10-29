@@ -19,8 +19,8 @@ fn overlay(root: &Path, text: &str) -> ProjectOverlay {
         .expect("overlay present")
 }
 
-/// Fields of a profile looser than `locked` on network, built by hand
-/// because no looser preset has shipped.
+/// Fields of a profile looser than `locked` on network: the `workspace`
+/// preset, built by hand so the tests state each field.
 fn networked_fields() -> ProfileFields {
     ProfileFields {
         network: NetworkSetting::On,
@@ -28,6 +28,14 @@ fn networked_fields() -> ProfileFields {
         caches: CachesSetting::Writable,
         approvals: ApprovalsSetting::EscalationOnly,
         ..locked::fields()
+    }
+}
+
+/// A networked profile this build cannot enforce: escalation ships later.
+fn escalating_fields() -> ProfileFields {
+    ProfileFields {
+        escalation: EscalationSetting::Allowed,
+        ..networked_fields()
     }
 }
 
@@ -54,23 +62,61 @@ fn missing_profiles_file_is_the_built_in_configuration() {
 #[test]
 fn presets_not_shipped_yet_are_refused_never_substituted() {
     let config = ProfilesConfig::default();
-    for preset in ["full", "workspace"] {
-        let message = error_text(config.resolve(Some(preset), ProfileContext::Headless, None));
-        assert!(
-            message.contains(&format!("the {preset} preset is not available")),
-            "{message}"
-        );
-    }
+    let message = error_text(config.resolve(Some("full"), ProfileContext::Headless, None));
+    assert!(
+        message.contains("the full preset is not available"),
+        "{message}"
+    );
 
     // A profile extending an unshipped preset loads, and is refused only
     // when selected.
-    let config =
-        parse(r#"{"profiles": {"data": {"extends": "workspace", "writable_paths": ["~/data"]}}}"#)
-            .expect("loads");
-    let message = error_text(config.resolve(Some("data"), ProfileContext::Interactive, None));
+    let config = parse(r#"{"profiles": {"mine": {"extends": "full", "reviewer": "guardian"}}}"#)
+        .expect("loads");
+    let message = error_text(config.resolve(Some("mine"), ProfileContext::Interactive, None));
     assert!(
-        message.contains("profile \"data\" extends the workspace preset"),
+        message.contains("profile \"mine\" extends the full preset"),
         "{message}"
+    );
+}
+
+#[test]
+fn the_workspace_preset_resolves_to_its_boundary() {
+    let profile = ProfilesConfig::default()
+        .resolve(Some("workspace"), ProfileContext::Headless, None)
+        .expect("workspace ships");
+    assert_eq!(profile.name, "workspace");
+    assert_eq!(profile.fields, networked_fields());
+    assert_eq!(profile.fields.escalation, EscalationSetting::NotAllowed);
+    assert_eq!(profile.fields.credentials, CredentialsSetting::Private);
+    assert!(matches!(
+        profile.subprocess_sandbox(),
+        Ok(SubprocessSandbox::Enforce(
+            crate::sandbox::SandboxProfile::WorkspaceNetwork(access)
+        )) if access == crate::sandbox::WorkspaceNetworkAccess::default()
+    ));
+
+    // A user profile extending it adds writable paths and passes
+    // credentials.
+    let temp = tempfile::tempdir().expect("temp");
+    let data = temp.path().canonicalize().expect("canonical");
+    let text = format!(
+        r#"{{"profiles": {{"agents": {{"extends": "workspace", "credentials": "pass", "writable_paths": ["{}"]}}}}}}"#,
+        data.display()
+    );
+    let profile = parse(&text)
+        .expect("loads")
+        .resolve(Some("agents"), ProfileContext::Headless, None)
+        .expect("resolves");
+    assert_eq!(
+        profile.subprocess_sandbox(),
+        Ok(SubprocessSandbox::Enforce(
+            crate::sandbox::SandboxProfile::WorkspaceNetwork(
+                crate::sandbox::WorkspaceNetworkAccess {
+                    writable_paths: vec![data],
+                    pass_credentials: true,
+                }
+            )
+        ))
     );
 }
 
@@ -224,29 +270,41 @@ fn contradictory_combinations_are_load_errors() {
     }
 }
 
+/// Only the `locked` and `workspace` boundaries are enforced; a profile
+/// mixing their fields, or setting one that ships later, is refused naming
+/// the field.
 #[test]
-fn a_user_profile_the_locked_boundary_cannot_deliver_is_refused() {
+fn a_user_profile_no_enforced_boundary_delivers_is_refused() {
     let config = parse(
         r#"{"profiles": {
             "net": {"extends": "locked", "network": "on"},
-            "data": {"extends": "locked", "writable_paths": ["~/data"]}
+            "data": {"extends": "locked", "writable_paths": ["~/data"]},
+            "keys": {"extends": "locked", "credentials": "pass"},
+            "offline": {"extends": "workspace", "network": "off"},
+            "missing": {"extends": "workspace", "writable_paths": ["/nonexistent/euler-data"]},
+            "escalate": {"extends": "workspace", "escalation": "allowed"},
+            "quiet": {"extends": "workspace", "approvals": "never"}
         }}"#,
     )
     .expect("loads");
-    assert_eq!(
-        config.resolve(Some("net"), ProfileContext::Headless, None),
-        Err(ProfileError::Unenforced {
-            profile: "net".to_owned(),
-            field: "network",
-        })
-    );
-    assert_eq!(
-        config.resolve(Some("data"), ProfileContext::Headless, None),
-        Err(ProfileError::Unenforced {
-            profile: "data".to_owned(),
-            field: "writable_paths",
-        })
-    );
+    for (name, field) in [
+        ("net", "tmp"),
+        ("data", "writable_paths"),
+        ("keys", "credentials"),
+        ("offline", "tmp"),
+        ("missing", "writable_paths"),
+        ("escalate", "escalation"),
+        ("quiet", "approvals"),
+    ] {
+        assert_eq!(
+            config.resolve(Some(name), ProfileContext::Headless, None),
+            Err(ProfileError::Unenforced {
+                profile: name.to_owned(),
+                field,
+            }),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -389,11 +447,23 @@ fn resume_keeps_the_recorded_profile_when_the_resolved_one_is_looser() {
 
     // --profile applies the resolved profile even when it is looser, but
     // only one this host can enforce.
+    let explicit_looser =
+        ResumeProfile::choose(Some(recorded.clone()), resolved.clone(), true, None)
+            .expect("choose");
+    assert_eq!(explicit_looser.profile, resolved);
     assert_eq!(
-        ResumeProfile::choose(Some(recorded.clone()), resolved.clone(), true, None),
+        ResumeProfile::choose(
+            Some(recorded.clone()),
+            ExecutionProfile {
+                name: "escalate".to_owned(),
+                fields: escalating_fields(),
+            },
+            true,
+            None
+        ),
         Err(ProfileError::Unenforced {
-            profile: "net".to_owned(),
-            field: "network",
+            profile: "escalate".to_owned(),
+            field: "escalation",
         })
     );
     let explicit = ResumeProfile::choose(Some(resolved.clone()), recorded.clone(), true, None)
@@ -472,22 +542,22 @@ fn resume_summary_names_the_fields_that_changed() {
 #[test]
 fn a_kept_recorded_profile_is_overlaid_and_must_be_enforceable() {
     let recorded = ExecutionProfile {
-        name: "net".to_owned(),
-        fields: networked_fields(),
+        name: "escalate".to_owned(),
+        fields: escalating_fields(),
     };
     let resolved = ExecutionProfile {
         name: "host".to_owned(),
         fields: ProfileFields {
             sandbox: SandboxSetting::Off,
-            ..networked_fields()
+            ..escalating_fields()
         },
     };
 
     assert_eq!(
         ResumeProfile::choose(Some(recorded.clone()), resolved.clone(), false, None),
         Err(ProfileError::RecordedUnenforced {
-            profile: "net".to_owned(),
-            field: "network",
+            profile: "escalate".to_owned(),
+            field: "escalation",
         })
     );
 

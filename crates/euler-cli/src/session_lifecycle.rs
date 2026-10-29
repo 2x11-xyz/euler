@@ -19,6 +19,11 @@ pub(crate) struct HomeSessionRefresh {
 }
 
 impl HomeSessionRefresh {
+    /// The store's sessions directory, where each session keeps its state.
+    pub(crate) fn sessions_dir(&self) -> PathBuf {
+        self.store.home().sessions_dir()
+    }
+
     pub(crate) fn session_store(&self) -> SessionStore {
         self.store.clone()
     }
@@ -98,7 +103,8 @@ pub(crate) fn live_session_config(
             let home = EulerHome::resolve()?;
             let store = SessionStore::new(home)?;
             let record = store.create_session()?;
-            let config = session_config(root, provider, model, record.id().to_owned());
+            let mut config = session_config(root, provider, model, record.id().to_owned());
+            config.session_store_dir = Some(store.home().sessions_dir());
             Ok(LiveSession {
                 config,
                 log_path: record.events_path().to_path_buf(),

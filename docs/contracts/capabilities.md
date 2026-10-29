@@ -76,17 +76,95 @@ of an approval mode, and no `/permissions` posture changes the sandbox.
 ## Execution profiles
 
 The execution boundary and the default approval policy are a named profile
-(ADR 0026). This release enforces only the `locked` preset, which is the
-boundary described above, unchanged: the no-network sandbox, a private `/tmp`
-and `HOME`, and every command not statically safe or grant-covered asks.
-Its fields are `sandbox: on`, `network: off`, `writable_paths: []`,
-`tmp: private`, `caches: private`, `credentials: private`,
-`approvals: always`, `escalation: not-allowed`, `background_jobs:
-end-with-command` on Linux and `outlive` elsewhere, and `reviewer: user`.
+(ADR 0026). This release enforces the `locked` and `workspace` presets.
+
+`locked` is the boundary described above, unchanged: the no-network
+sandbox, a private `/tmp` and `HOME`, and every command not statically safe
+or grant-covered asks. Its fields are `sandbox: on`, `network: off`,
+`writable_paths: []`, `tmp: private`, `caches: private`,
+`credentials: private`, `approvals: always`, `escalation: not-allowed`,
+`background_jobs: end-with-command` on Linux and `outlive` elsewhere, and
+`reviewer: user`.
+
+`workspace` is sandboxed with the friction removed. Its fields are
+`locked`'s except `network: on`, `tmp: host`, `caches: writable`, and
+`approvals: escalation-only`; `escalation` stays `not-allowed` until
+escalation ships.
+
+- **Network.** Bubblewrap shares the host network namespace; the Seatbelt
+  profile allows outbound connections and binding and accepting on
+  loopback.
+- **`/tmp`.** The host `/tmp` is writable and persistent (a bind on Linux;
+  `/private/tmp` and the host `TMPDIR` on macOS, where `TMPDIR` is the
+  host's), so a path the model reports exists outside the sandbox. On macOS
+  writes into another session's `euler-seatbelt-*` scratch tree there are
+  denied.
+- **`HOME`.** A private per-session directory, `<session dir>/home` for a
+  session in the store; a session with no store (`--provenance <path>`)
+  gets a fresh directory under `<euler home>/state/homes`, removed when the
+  session ends. It is bound at its real path on Linux and allowed on
+  macOS, persists between commands, and is never under `/tmp` or `TMPDIR`
+  by construction. `XDG_CACHE_HOME` is `$HOME/.cache`; inherited
+  `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME` are dropped so
+  their defaults follow `HOME`.
+- **Caches.** The pip, uv, and npm caches, Cargo's `registry` and `git`,
+  `GOMODCACHE`, and the Hugging Face hub cache are writable at their real
+  paths when they exist on the host (a variable the user set wins over the
+  default location), and their variable (`PIP_CACHE_DIR`, `UV_CACHE_DIR`,
+  `npm_config_cache`, `GOMODCACHE`, `HF_HUB_CACHE`) points the toolchain
+  there. A cache root is never bound, and a missing cache is created in the
+  private `HOME`.
+- **Environment (ADR 0021 row C).** The parent environment is inherited,
+  minus row C's hard denylist (`LD_PRELOAD`, `LD_AUDIT`, `LD_LIBRARY_PATH`,
+  `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, `ENV`, `GIT_CONFIG_COUNT`,
+  `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`, `GIT_CONFIG_GLOBAL`, and
+  `GIT_SSH_COMMAND`, which only Euler sets), Euler's parent-control
+  variables, and secret-shaped variables. `HOME`, `TMPDIR`, `PATH`, the
+  toolchain and cache variables, and `PAGER=cat GIT_PAGER=cat TERM=dumb
+  NO_COLOR=1` are set.
+- **Credential reads on macOS.** Seatbelt denies reads of `~/.ssh`,
+  `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`,
+  `~/.config/op`, `~/.kube`, `~/.docker/config.json`, `~/.netrc`,
+  `~/.git-credentials`, `~/.npmrc`, `~/.pypirc`,
+  `~/.cargo/credentials.toml`, `~/.terraform.d`, the keychains, browser
+  profiles, and the Euler home (except the session's private `HOME`).
+  Linux never mounts the real home.
+- **`writable_paths`.** Each listed path must exist; it is bound writable at
+  its real path on Linux and allowed on macOS. A missing path is a startup
+  error naming the field.
+- **`credentials: "pass"`.** For a user profile extending `workspace`:
+  secret-shaped variables pass except Euler's own provider keys
+  (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
+  `XAI_API_KEY`) and parent-control variables; row C's denylist still
+  applies. Each listed credential store that exists, except the keychains,
+  browser profiles, and the Euler home, plus `~/.gitconfig` and
+  `~/.config/git`, appears at the same path under the private `HOME`: a
+  read-only bind on Linux (writable when `writable_paths` covers its real
+  path), and on macOS a symlink to the real path with its read deny lifted.
+  Cargo's credential mask is lifted too. The macOS keychain is never
+  passed.
+- **Approvals (row P).** Inside the sandbox, an `ask` for `fs-write` or
+  `shell-exec` becomes `session-allow`, so `run_shell`, the `git_*` tools,
+  and workspace-confined structured writes run without a prompt. Dangerous
+  commands, sensitive-path requests (structured tools, and `run_shell`
+  commands whose text names a sensitive path), `agent-spawn`, the asks every
+  profile keeps, and a configured `always-deny` (the Read only posture)
+  are unchanged. Under `euler exec` the profile wins over the
+  `--auto-approve` tier for `fs-write` and `shell-exec`.
+- **Background jobs.** As `locked`: on Linux they end with their command;
+  on macOS a job that redirects its output outlives its command. Under any
+  sandboxed profile Euler ends the jobs its commands left running when the
+  session ends, without signalling a reused process group.
+
+Only these two boundaries are enforced: a profile with `network: on` must
+keep `workspace`'s `tmp`, `caches`, `escalation`, and `background_jobs`, and
+one with `network: off` must keep all of `locked`'s, with no
+`writable_paths` and private credentials. `approvals: never` belongs to the
+`full` preset and is refused with the sandbox on.
 
 - **Presets.** `full`, `workspace`, and `locked` are reserved names. Naming
-  `full` or `workspace`, directly or through `extends`, is a startup error
-  saying the preset is not available yet; it is never substituted.
+  `full`, directly or through `extends`, is a startup error saying the
+  preset is not available yet; it is never substituted.
 - **`<euler home>/profiles.json`.** Optional. `defaults` holds `interactive`
   (`euler`, `euler tui`), `headless` (`euler exec`), and `subagent`
   (`inherit` or a profile name); each must name a preset or a defined
@@ -105,9 +183,9 @@ end-with-command` on Linux and `outlive` elsewhere, and `reviewer: user`.
   context default in `profiles.json`, then the built-in default, `locked`
   for both contexts. An unknown name is a startup error listing the defined
   profiles. `--permission-reviewer` overrides the profile's `reviewer`.
-  Child agents run inside the parent session's boundary; `defaults.subagent`
-  is validated, and since `locked` is the only enforced boundary a child can
-  never run looser than its parent.
+  Child agents run inside the parent session's boundary and approvals;
+  `defaults.subagent` is validated but not applied yet, so a child never
+  runs looser than its parent.
 - **Project overlay.** A repository may hold `.euler/profile-overlay.json`
   with any profile field except `reviewer` and `extends`. It applies to
   whichever profile resolves, including one named by `--profile`, and each
@@ -119,12 +197,11 @@ end-with-command` on Linux and `outlive` elsewhere, and `reviewer: user`.
   never < escalation-only < always; `escalation` allowed < not-allowed;
   `background_jobs` outlive < end-with-command. Tightening needs no trust
   acknowledgment; stderr names the overlay at startup.
-- **Enforcement.** A resolved profile whose fields the `locked` boundary
-  cannot deliver (any field other than `reviewer` differing from `locked`,
-  or a `sandbox` backend name other than this host's) is a startup error
-  naming the profile and field. On a host whose sandbox backend is missing,
-  `locked` keeps the behavior above (sandbox-requiring tools fail closed);
-  the headless startup failure of ADR 0026 section 5 is not implemented yet.
+- **Enforcement.** A resolved profile neither enforced boundary delivers
+  (see above, or a `sandbox` backend name other than this host's) is a
+  startup error naming the profile and field. On a host whose sandbox
+  backend is missing, sandbox-requiring tools fail closed; the headless
+  startup failure of ADR 0026 section 5 is not implemented yet.
 - **Resume.** Resume resolves the profile as a new launch does, then
   compares it with the latest profile the log recorded (`session.start` or a
   later `session.resumed`). If the resolved profile is looser on any field,
@@ -441,8 +518,8 @@ distinct nodes.
   `rg` at all, since `rg` recurses by default. A tree walk reads files the
   per-operand sensitive check never saw — `grep -r PASSWORD .` printed
   `.env`, and `rg PASSWORD` reads `deploy.pem`, `id_rsa`, and
-  `credentials.json`. Under ADR 0021 row P the sandbox auto-allows these
-  later; until then they prompt. `uniq` accepts at most one operand, because the
+  `credentials.json`. Under the `workspace` profile (row P) the sandbox runs
+  them without a prompt; under `locked` they prompt. `uniq` accepts at most one operand, because the
   second operand is an output file it truncates. Binaries outside the set
   are never provable — `sort` (`-o` writes a file), `tee`, and every
   interpreter included.
@@ -451,7 +528,8 @@ distinct nodes.
   `diff.external`, `core.fsmonitor`, `core.pager`, and clean and smudge
   filters, all selected by `.git/config` — the very file audit F34 showed a
   "read-only" command could write. Proving `git` safe needs the sandbox,
-  not a parser; it returns in Unit 2 (ADR 0021 row P).
+  not a parser: under the `workspace` profile (row P) the `git_*` tools run
+  without a prompt inside the sandbox.
 - **`cd` is not in the set**: it moves the directory later commands resolve
   against while confinement keeps checking the root the command started in.
 - **Wrappers.** `[sh|bash|zsh] -c|-lc <script>` is provable only by
@@ -682,7 +760,9 @@ Root-session `artifact-write` also defaults to `session-allow`: the host
 writes the bytes content-addressed into the calling extension's
 session-private artifact directory, records an attributed `extension.artifact`
 event, and grants the extension no filesystem authority.
-`fs-write`, `shell-exec`, and root-session `agent-spawn` default to `ask`.
+`fs-write`, `shell-exec`, and root-session `agent-spawn` default to `ask`;
+the `workspace` profile runs an unflagged `fs-write` or `shell-exec` ask
+without a prompt ("Execution profiles", row P).
 Unconfigured capabilities remain `always-deny`; child-agent gates start
 deny-all and inherit only their explicit attenuated envelope. Headless
 auto-approve tiers override these root defaults with the explicit mapping
@@ -710,3 +790,12 @@ permission gates — root session and companion loop — apply the same
 escalation. In headless auto-approve tiers the escalated ask reaches the
 fail-closed headless decider and is therefore denied unless a durable grant
 covers it.
+
+**Sensitive-path shell ask.** A `run_shell` request also carries the
+sensitive-path flag when its command text names a path on the same list,
+anywhere (operands, nested scripts, redirections, here-documents), with `@`
+read as a separator so `curl -d @.env` counts. Under `approvals:
+escalation-only` (`workspace`) the flag asks like the structured-tool
+escalation above, grant-coverable and guardian-routable; under `approvals:
+always` (`locked`) it leaves the capability's mode alone, as before
+profiles.

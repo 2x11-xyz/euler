@@ -966,6 +966,7 @@ where
         .to_owned();
     let root = std::env::current_dir()?;
     let mut config = session_config(root, run.provider_id.clone(), run.model.clone(), session_id);
+    config.session_store_dir = refresh.as_ref().map(HomeSessionRefresh::sessions_dir);
     config.extensions_enabled = resolve_session_extensions(&config.root, &run.extensions)?;
     configure(&mut config);
     let observer = resolve_round_observer(&run.observe)?;
