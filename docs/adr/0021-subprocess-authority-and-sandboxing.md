@@ -9,6 +9,10 @@ backend portions of Unit 2 have shipped. Network and environment policy, host
 mode, approval shape, and the final shipped-state record remain staged in the
 units listed under Consequences.
 
+Amended by ADR 0026 (2026-10-28): execution profiles amend rows B, C, D, and P
+and reverse the note that Full Access does not disable the sandbox; rows A, A′,
+E, and G stand.
+
 ## Context
 
 PR #217 made agent subprocess execution Bubblewrap-only. Bubblewrap needs
