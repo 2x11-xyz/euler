@@ -1269,6 +1269,75 @@ fn execution_profile_note_before_the_compaction_frontier_is_not_repeated() {
     );
 }
 
+/// A continuation assembles its request before its `model.call` is recorded,
+/// so the note lands at the tail; once the `model.call` is recorded, later
+/// assemblies keep it at the same position (prompt-cache stable).
+#[test]
+fn execution_profile_note_for_a_continuation_keeps_its_position() {
+    let mut events = vec![
+        profile_event(EventKind::SESSION_START, "locked", None),
+        user_event("one"),
+        profile_event(EventKind::SESSION_PROFILE_CHANGED, "full", Some("note")),
+    ];
+    let note = CanvasItem::ExecutionProfileNote {
+        event_id: events[2].id.clone(),
+        content: "note".to_owned(),
+    };
+
+    let before_call = assemble_canvas(&events, &AutoCompactionPolicy::default());
+    events.push(EventEnvelope::new(
+        "s",
+        "a",
+        None,
+        EventKind::MODEL_CALL,
+        object([("provider", "fixture".into()), ("model", "fixture".into())]),
+    ));
+    let after_call = assemble_canvas(&events, &AutoCompactionPolicy::default());
+
+    assert_eq!(before_call.len(), 2);
+    assert_eq!(before_call[1], note);
+    assert_eq!(after_call, before_call);
+}
+
+/// An accepted idle contribution starts the next turn, so the note precedes it.
+#[test]
+fn execution_profile_note_precedes_an_accepted_contribution() {
+    let events = vec![
+        profile_event(EventKind::SESSION_START, "locked", None),
+        user_event("one"),
+        profile_event(EventKind::SESSION_PROFILE_CHANGED, "full", Some("note")),
+        accepted_driver_continuation("s", "a"),
+    ];
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+
+    assert_eq!(
+        canvas.iter().map(CanvasItem::event_id).collect::<Vec<_>>(),
+        [1, 2, 3].map(|index| events[index].id.as_str())
+    );
+    assert!(matches!(canvas[1], CanvasItem::ExecutionProfileNote { .. }));
+}
+
+/// Before the first turn no command ran, and the `run_shell` description
+/// already states the boundary, so a change then yields no note.
+#[test]
+fn execution_profile_change_before_the_first_turn_adds_no_note() {
+    let events = vec![
+        profile_event(EventKind::SESSION_START, "locked", None),
+        profile_event(EventKind::SESSION_PROFILE_CHANGED, "full", Some("note")),
+        user_event("one"),
+        profile_event(EventKind::SESSION_PROFILE_CHANGED, "locked", Some("back")),
+        user_event("two"),
+    ];
+
+    let canvas = assemble_canvas(&events, &AutoCompactionPolicy::default());
+
+    assert_eq!(
+        canvas.iter().map(CanvasItem::event_id).collect::<Vec<_>>(),
+        [2, 3, 4].map(|index| events[index].id.as_str())
+    );
+}
+
 #[test]
 fn canvas_swap_replaces_snapshot_range_with_projection_and_keeps_frontier() {
     let old = EventEnvelope::new(

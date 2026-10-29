@@ -942,13 +942,21 @@ extension error does not consume the later result.
   `execution_profile` has the `session.start` shape and records the profile
   the resumed lifetime runs under; the latest one recorded (on
   `session.start`, `session.resumed`, or `session.profile_changed`) governs
-  the next resume's comparison. Markers from older binaries omit it.
+  the next resume's comparison. Markers from older binaries omit it. When
+  that profile differs from the latest one on the chain (`session.start` or
+  `session.profile_changed`), the lifetime also records an in-chain
+  `session.profile_changed`, appended before its first accepted event (a
+  `/profile` change as that first activity follows it directly), so the
+  canvas, which never sees this leaf, notes the change. An open-and-inspect
+  resume appends neither event.
 - `session.profile_changed`: `execution_profile` (the `session.start`
   shape), `command_approvals`, `sandbox_backend`,
   `sandbox_unavailable_reason`, and `model_note`. Records a `/profile` switch
-  between turns (ADR 0026 section 5); the latest recorded profile governs the
-  next resume's comparison. `model_note` is the exact host note the model
-  sees at the next turn, unless the profile ends where the model last saw it:
+  between turns (ADR 0026 section 5), or a resumed lifetime running under a
+  profile other than the chain's latest (above); the latest recorded profile
+  governs the next resume's comparison. `model_note` is the exact host note
+  the model sees at the next turn, unless the profile ends where the model
+  last saw it or the session (all lifetimes) has had no turn yet:
   `[host note] Execution profile changed to <name>;
   earlier commands ran under the previous profile.` followed by the boundary
   the new `run_shell` description states (canvas contract, "Execution

@@ -41,8 +41,11 @@ pull requests that landed them; deeper design rationale lives in
   host note naming the new profile and its boundary (the text the
   `run_shell` description states), so the model no longer guesses why
   network or writes behave differently. Several changes before one turn
-  yield one note for the latest; none when the profile ends where it was.
-  `session.profile_changed` records the note as `model_note`.
+  yield one note for the latest; none when the profile ends where it was,
+  or when no turn has run yet. A resume under a different profile records
+  its own `session.profile_changed` with the first activity after the
+  resume, so the model is told then too. `session.profile_changed` records
+  the note as `model_note`.
 
 ### Execution profiles: headless default (ADR 0026 step 7)
 

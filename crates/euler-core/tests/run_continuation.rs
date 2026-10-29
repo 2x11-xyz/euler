@@ -176,6 +176,53 @@ fn continuation_closes_the_cut_off_call_and_finishes_the_same_run() {
     assert_eq!(fs::read(&log).expect("read log"), lines);
 }
 
+/// A continuation under another profile records the resume-time profile
+/// change inside the open run, before its first `model.call`, so the run's
+/// lifecycle stays valid and the next request carries the note.
+#[test]
+fn continuation_under_another_profile_records_the_change_in_the_open_run() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = crashed_during_tool(temp.path());
+    let run_id = of_kind(&events(&log), EventKind::RUN_STARTED)[0]
+        .run
+        .clone()
+        .expect("run id");
+    let mut config = SessionConfig::new(temp.path());
+    config.execution_profile = euler_core::ProfilesConfig::default()
+        .resolve(Some("full"), euler_core::ProfileContext::Interactive, None)
+        .expect("preset resolves");
+    let folded = fold_session(&config, events(&log)).expect("fold");
+
+    let mut outcome = resume_session_continuing_run(
+        config,
+        providers(vec![answer("resumed")]),
+        ScriptedDecider::new(vec![]),
+        ProvenanceWriter::new(log.clone()).expect("writer"),
+        folded,
+        false,
+    )
+    .expect("continue");
+    outcome
+        .session
+        .continue_run_with_sink(Arc::new(AtomicBool::new(false)), |_| {})
+        .expect("continued run");
+    drop(outcome);
+
+    let logged = events(&log);
+    let change = of_kind(&logged, EventKind::SESSION_PROFILE_CHANGED);
+    assert_eq!(change.len(), 1);
+    assert_eq!(change[0].run.as_deref(), Some(run_id.as_str()));
+    let position = |id: &str| logged.iter().position(|event| event.id == id);
+    let resumed_call = of_kind(&logged, EventKind::MODEL_CALL)
+        .last()
+        .map(|call| call.id.clone())
+        .expect("resumed model call");
+    assert!(position(&change[0].id) < position(&resumed_call));
+    let terminals = of_kind(&logged, EventKind::RUN_TERMINAL);
+    assert_eq!(terminals.len(), 1);
+    assert_eq!(terminals[0].payload["status"], "completed");
+}
+
 #[test]
 fn continuation_refuses_a_crash_partial_admission() {
     let temp = tempfile::tempdir().expect("temp dir");

@@ -410,12 +410,18 @@ fn collect_canvas_items(
 }
 
 /// Folds `session.start` and `session.profile_changed` records into the
-/// execution-profile notes the model sees. Changes are refused during a run,
-/// so the changes before a turn coalesce: the turn gets one note, for the
-/// latest change, and none when the profile ends where the model last saw
-/// it. A record without `model_note` (an older binary) yields no note.
+/// execution-profile notes the model sees. `/profile` changes are refused
+/// during a run, so the changes before a turn coalesce: the turn gets one
+/// note, for the latest change, and none when the profile ends where the
+/// model last saw it. A change before the session's first turn yields none:
+/// no command ran under an earlier profile, and the `run_shell` description
+/// already states the boundary. A record without `model_note` (an older
+/// binary) yields no note.
 struct ExecutionProfileNotes {
     frontier_start_index: Option<usize>,
+    /// Set by the first turn boundary in the chain, so `next_turn` must run
+    /// at every boundary, pending change or not.
+    turn_started: bool,
     /// The `execution_profile` record the model last saw: the start, or the
     /// last change a turn followed.
     seen: Option<Value>,
@@ -434,6 +440,7 @@ impl ExecutionProfileNotes {
             frontier_start_index: active_swap
                 .and_then(|swap| swap.projection.as_ref())
                 .map(|(frontier_start_index, _, _)| *frontier_start_index),
+            turn_started: false,
             seen: None,
             pending: None,
         }
@@ -480,12 +487,15 @@ impl ExecutionProfileNotes {
     /// The note for a turn boundary. A change before the active compaction
     /// frontier was already summarized, so it yields none.
     fn next_turn(&mut self) -> Option<CanvasItem> {
+        let first_turn = !std::mem::replace(&mut self.turn_started, true);
         let pending = self.pending.take()?;
         if self.seen.as_ref() == Some(&pending.record) {
             return None;
         }
         self.seen = Some(pending.record);
-        pending.note.filter(|_| !pending.before_frontier)
+        pending
+            .note
+            .filter(|_| !pending.before_frontier && !first_turn)
     }
 }
 
