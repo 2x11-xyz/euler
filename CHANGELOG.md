@@ -23,7 +23,8 @@ pull requests that landed them; deeper design rationale lives in
   runs the command and drops the text. It shows
   `/quit takes no arguments; remove the text after it` and keeps the draft.
   Commands that take arguments are unchanged.
-- A command error from the slash palette (usage, unavailable, unknown) now
+- A command error from the slash palette (usage, unavailable skill, unknown
+  command) now
   keeps the palette open with what was typed, instead of closing it and
   discarding the input.
 

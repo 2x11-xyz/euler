@@ -3480,6 +3480,35 @@ fn pasted_no_argument_command_with_trailing_text_keeps_draft() {
     assert_eq!(bare.handle_input(key(KeyCode::Enter)), CoreEffect::Quit);
 }
 
+/// Typed text after a no-argument command is a usage error: the command
+/// does not run and the palette stays open with what was typed (#276).
+#[test]
+fn typed_no_argument_command_with_trailing_text_keeps_palette_open() {
+    let mut typed_core = core();
+
+    type_text(&mut typed_core, "/quit now");
+    assert_eq!(
+        typed_core.handle_input(key(KeyCode::Enter)),
+        CoreEffect::Render
+    );
+
+    assert_eq!(user_message_count(&typed_core), 0);
+    assert_eq!(
+        typed_core.visual_canvas.finalized_items().last(),
+        Some(&TranscriptItem::Notice(
+            "/quit takes no arguments; remove the text after it".to_owned()
+        ))
+    );
+    let BottomOwner::Palette(palette) = typed_core.bottom.owner() else {
+        panic!("palette should stay open after a command error");
+    };
+    assert_eq!(palette.input(), "/quit now");
+
+    let mut bare = core();
+    type_text(&mut bare, "/quit");
+    assert_eq!(bare.handle_input(key(KeyCode::Enter)), CoreEffect::Quit);
+}
+
 /// A slash command that arrives as a bracketed paste runs like a typed one
 /// instead of going to the model as a chat message.
 #[test]

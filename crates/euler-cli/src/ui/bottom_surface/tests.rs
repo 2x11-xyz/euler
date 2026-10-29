@@ -181,6 +181,7 @@ fn palette_confirm_on_disabled_extension_returns_muted_notice_every_time() {
     surface.open_palette();
     surface.palette_insert("review-brief");
     assert_eq!(surface.confirm(), expected);
+    assert!(!matches!(surface.owner(), BottomOwner::Palette(_)));
 
     // Invoke the same disabled command again: still teaches, not silenced.
     surface.open_palette();

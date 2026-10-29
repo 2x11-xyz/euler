@@ -353,9 +353,10 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   `/quit takes no arguments; remove the text after it`. Commands that take
   arguments are unchanged.
 - Palette command errors: when a palette confirmation that is not an
-  extension row returns an error (usage, unavailable, unknown command), the
-  notice is shown and the palette stays open with its input intact, so the
-  user can fix what they typed. A command that runs closes the palette.
+  extension row returns an error message (usage, unavailable skill, unknown
+  command), the notice is shown and the palette stays open with its input
+  intact, so the user can fix what they typed. A command that runs closes the
+  palette, and so does a disabled-extension notice.
 - Footer: **one** line below the composer — two hard-edged clusters:
   contextual hints then `cwd (branch)` flush-left; `model · ctx N%` with an
   optional `· $N.NNN` (plus the session name once named) flush-right. The cost
