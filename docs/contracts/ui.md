@@ -827,14 +827,30 @@ recorded as `session.profile_changed`, and the notice names the new
 profile and its boundary. `/profile default <name>` writes
 `defaults.interactive` so new sessions start with it.
 
-The first interactive launch without `--profile` and without
-`defaults.interactive` asks once, as plain lines on stderr before the
-session starts, which preset to use: `full` (preselected; Enter picks it)
-or `locked`, each with a one-line boundary, saved to `defaults.interactive`.
-It needs a terminal on stdin and stderr; otherwise nothing is asked. At
-exit, `euler`, `euler tui`, and `euler exec` list on stderr the background
-jobs Euler started with the sandbox off that are still running, after the
-TUI restores the terminal.
+The first TUI launch or resume without `--profile` and without
+`defaults.interactive` opens the first-run profile picker inside the app,
+under the banner: the header `Welcome to Euler. How should it run
+commands?` and `You can change this any time with /profile.`, then the
+presets `full` (preselected, marked `(recommended)`), `workspace`, and
+`locked`, each with the same one-line boundary `/profile` shows, the
+session's profile marked `●`. While it is open, typing, pasting, and submit
+do nothing, no turn starts (queued input included), and the status bar
+reads `choose a profile to start`; a command-context rebuild leaves it
+open. Enter switches the session to the choice, saves it to
+`defaults.interactive`, and shows `execution profile set to <name> and
+saved as your default · change it with /profile`; if the default cannot be
+written, the profile still applies to this session and the error says it
+was not saved. Esc saves nothing and keeps the session's profile, so the
+picker returns next launch: on a fresh start that is `full` (footer `esc
+use full for now`); on a resume it is the profile the resume rule chose
+(footer `esc keep <name> for now`), so Esc never loosens a resumed
+session. Either way the notice reads `using <name> for this session (not
+saved) · you'll be asked again next time, or use /profile`. The
+line-oriented `euler run` asks the same question as plain lines on stderr
+before the session starts, only when stdin and stderr are terminals.
+`euler exec` never asks. At exit, `euler`, `euler tui`, and `euler exec`
+list on stderr the background jobs Euler started with the sandbox off that
+are still running, after the TUI restores the terminal.
 
 Runs that did not prompt render their provenance as a dim tag on the tool
 header instead of a standalone decision record: `· session grant` /

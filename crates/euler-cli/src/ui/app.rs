@@ -8,6 +8,7 @@ use self::queue_mutations::{
 };
 #[cfg(test)]
 use self::resume::TuiResume;
+use self::session_commands::first_run_profile_picker;
 #[cfg(test)]
 use super::app_layout::{layout, string_lines};
 use super::bottom_surface::{BottomOwner, BottomSurface, SurfaceEvent};
@@ -109,6 +110,9 @@ const QUEUE_RECOVERY_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const TURN_STARTING_NOTICE: &str =
     "turn is starting · input kept in the composer; submit again when steering is ready";
 const QUEUE_MUTATION_SAVING_NOTICE: &str = "queue change is being saved";
+/// The status bar, and the notice for a blocked submit, while the first-run
+/// profile picker is open.
+const FIRST_RUN_PROFILE_STATUS: &str = "choose a profile to start";
 const DENY_INSTRUCTION_SAVING_NOTICE: &str =
     "deny instruction is still being saved · approval stays open";
 
@@ -249,6 +253,22 @@ pub struct AppOptions {
     /// defaulting to the standard auth file would silently drop the
     /// override's values from redaction (secrets contract).
     pub auth_file: Option<PathBuf>,
+    /// Set when an interactive launch or resume named no `--profile`: the
+    /// app opens the first-run profile picker when the file holds no
+    /// `defaults.interactive`.
+    pub first_run_profile: Option<FirstRunProfile>,
+}
+
+/// The first-run profile picker (ADR 0026 section 5), shown in the app
+/// before the first turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FirstRunProfile {
+    /// The user's `profiles.json`: the picker opens when it has no
+    /// `defaults.interactive`, and Enter saves the choice there.
+    pub profiles_file: PathBuf,
+    /// A resumed session keeps the profile the resume rule chose on Esc
+    /// instead of `full`, so declining never loosens a session.
+    pub resumed: bool,
 }
 
 pub struct ResumedAppState {
@@ -1118,7 +1138,8 @@ struct AppCoreBootstrap {
     theme: Theme,
     status: StatusSnapshot,
     initial_token_usage: TokenUsageSnapshot,
-    initial_context: super::commands::CommandContext,
+    /// The composer, or the first-run profile picker when it applies.
+    bottom: BottomSurface,
     authenticated_providers: BTreeSet<String>,
 }
 
@@ -1132,6 +1153,22 @@ pub(super) fn permission_envelope_for(session: &Session<TuiDecider>) -> String {
             || crate::ui::commands::CUSTOM_PERMISSION_ENVELOPE.to_owned(),
             |posture| posture.envelope().to_owned(),
         )
+}
+
+/// The app's startup state, with the first-run profile picker open when it
+/// applies.
+fn bootstrap_with_first_run_profile(
+    session: &Session<TuiDecider>,
+    mut options: AppOptions,
+) -> Result<AppCoreBootstrap> {
+    let first_run_profile = options.first_run_profile.take();
+    let mut boot = bootstrap_app_core(session, options);
+    if let Some(first_run_profile) = first_run_profile {
+        if let Some(picker) = first_run_profile_picker(session, &first_run_profile)? {
+            boot.bottom.open_picker(picker);
+        }
+    }
+    Ok(boot)
 }
 
 fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> AppCoreBootstrap {
@@ -1219,7 +1256,7 @@ fn bootstrap_app_core(session: &Session<TuiDecider>, options: AppOptions) -> App
         theme,
         status,
         initial_token_usage,
-        initial_context,
+        bottom: BottomSurface::new(initial_context),
         authenticated_providers,
     }
 }
@@ -1282,8 +1319,8 @@ impl AppCore {
         channels: PermissionChannels,
         options: AppOptions,
     ) -> Result<Self> {
-        let boot = bootstrap_app_core(&session, options);
-        let skill_commands = boot.initial_context.skill_commands.clone();
+        let boot = bootstrap_with_first_run_profile(&session, options)?;
+        let skill_commands = boot.bottom.context().skill_commands.clone();
         let initial_queue = bind_initial_queue(&mut session)?;
         Ok(Self {
             state: AppState::Idle {
@@ -1296,7 +1333,7 @@ impl AppCore {
             active_permission_cancellation: None,
             permission_generation: 0,
             permission_run_id: None,
-            bottom: BottomSurface::new(boot.initial_context),
+            bottom: boot.bottom,
             status: boot.status,
             authenticated_providers: boot.authenticated_providers,
             skill_commands,
@@ -3137,6 +3174,9 @@ impl AppCore {
     }
 
     fn handle_submit(&mut self) -> CoreEffect {
+        if self.first_run_profile_blocks_turn() {
+            return CoreEffect::Render;
+        }
         // Mention segments submit as workspace-relative paths (file references
         // in the user.message content). A dedicated context.slot.updated path
         // is deferred until core exposes a non-extension slot writer — do not
@@ -3335,6 +3375,9 @@ impl AppCore {
     }
 
     fn start_expected_queued_turn(&mut self, queue_id: String) -> CoreEffect {
+        if self.first_run_profile_blocks_turn() {
+            return CoreEffect::Render;
+        }
         let AppState::Idle { session } = &self.state else {
             return CoreEffect::None;
         };
@@ -3583,6 +3626,11 @@ impl AppCore {
             CommandAction::OpenProfilePicker => self.open_profile_picker(),
             CommandAction::SetExecutionProfile { name } => self.set_execution_profile(name),
             CommandAction::SetDefaultProfile { name } => self.set_default_profile(name),
+            CommandAction::ChooseFirstRunProfile {
+                name,
+                profiles_file,
+            } => self.choose_first_run_profile(name, profiles_file),
+            CommandAction::DeferFirstRunProfile => self.defer_first_run_profile(),
             CommandAction::OpenPermissions => self.open_permissions_picker(),
             CommandAction::OpenPermissionsAdvanced => self.open_permissions_advanced_picker(),
             CommandAction::RevokeGrant {

@@ -393,13 +393,18 @@ is not tracked.
   A `defaults.subagent` this host cannot enforce is a startup error naming
   the setting. `agent.spawn` records the child's `execution_profile`.
 - **First run.** An interactive launch without `--profile` whose
-  `profiles.json` has no `defaults.interactive` asks once, on a terminal
-  (stdin and stderr both terminals), which preset to use: `full`
-  (preselected), `workspace`, or `locked`, each with a one-line boundary.
-  The choice is written to `defaults.interactive`, keeping the rest of the
-  file, and never asked again. Without a terminal nothing is asked or
-  written and the built-in default applies. End of input at the prompt
-  quits without starting a session.
+  `profiles.json` has no `defaults.interactive` asks which preset to use:
+  `full` (preselected), `workspace`, or `locked`, each with a one-line
+  boundary. The TUI asks inside the app before the first turn, on a fresh
+  launch and when resuming into the TUI (see the UI contract); the line-oriented
+  `euler run` asks on stderr before the session starts, only when stdin and
+  stderr are terminals, and end of input there quits without starting a
+  session. The choice is written to `defaults.interactive`, keeping the rest
+  of the file, and never asked again. Declining in the TUI (Esc) writes
+  nothing and keeps the session's profile (`full` on a fresh launch, the
+  resume rule's choice on a resume), so it asks again next launch. Without
+  a terminal nothing is asked or written and the built-in default applies.
+  `euler exec` never asks.
 - **`--auto-approve`** is accepted under every profile. Under
   `approvals: always` its tiers configure the gate as before. Under any
   other profile commands and writes inside the boundary already run, so the

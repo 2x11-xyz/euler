@@ -1,6 +1,6 @@
 use super::*;
 use crate::execution_profile_runtime::{profile_boundary, ProfileSources};
-use euler_core::execution_profile::write_interactive_default;
+use euler_core::execution_profile::{write_interactive_default, Preset};
 
 impl AppCore {
     pub(super) fn show_session_diff(&mut self) -> CoreEffect {
@@ -582,6 +582,72 @@ impl AppCore {
         }
     }
 
+    /// While the first-run picker is open no turn starts; the notice says
+    /// why.
+    pub(super) fn first_run_profile_blocks_turn(&mut self) -> bool {
+        if !self.bottom.is_first_run_profile_picker() {
+            return false;
+        }
+        self.notice = Some(FIRST_RUN_PROFILE_STATUS.to_owned());
+        true
+    }
+
+    /// First-run picker Enter: switch this session to `name`, then save it
+    /// as `defaults.interactive` (what the line prompt saves). A failure says
+    /// which profile the session runs.
+    pub(super) fn choose_first_run_profile(
+        &mut self,
+        name: String,
+        profiles_file: PathBuf,
+    ) -> CoreEffect {
+        let AppState::Idle { session } = &mut self.state else {
+            return CoreEffect::None;
+        };
+        let current = session.execution_profile().name.clone();
+        let sources = match ProfileSources::load_file(profiles_file, session.workspace_root()) {
+            Ok(sources) => sources,
+            Err(error) => {
+                return self.error_item(format!(
+                    "execution profile not changed: {error} · using {current} for this session"
+                ))
+            }
+        };
+        let changed = sources.resolve(&name).and_then(|profile| {
+            if *session.execution_profile() != profile {
+                session.change_execution_profile(profile)?;
+            }
+            Ok(())
+        });
+        if let Err(error) = changed {
+            return self.error_item(format!(
+                "execution profile not changed: {error} · using {current} for this session"
+            ));
+        }
+        if let Err(error) = write_interactive_default(&sources.file, &name) {
+            return self.error_item(format!(
+                "execution profile set to {name} for this session but not saved as your \
+                 default: {error}"
+            ));
+        }
+        self.notice_item(format!(
+            "execution profile set to {name} and saved as your default · change it with /profile"
+        ))
+    }
+
+    /// First-run picker Esc: keep this session's profile without saving, so
+    /// the picker returns next launch. On a fresh start that is `full`; a
+    /// resume keeps what the resume rule chose, so Esc never loosens it.
+    pub(super) fn defer_first_run_profile(&mut self) -> CoreEffect {
+        let AppState::Idle { session } = &self.state else {
+            return CoreEffect::None;
+        };
+        let current = session.execution_profile().name.clone();
+        self.notice_item(format!(
+            "using {current} for this session (not saved) · you'll be asked again next time, or \
+             use /profile"
+        ))
+    }
+
     pub(super) fn open_permissions_picker(&mut self) -> CoreEffect {
         let AppState::Idle { session } = &self.state else {
             return self.notice_item("permissions wait for the active turn".to_owned());
@@ -651,4 +717,46 @@ impl AppCore {
             Err(error) => self.error_item(format!("revoke failed: {error}")),
         }
     }
+}
+
+/// The first-run profile picker (ADR 0026 section 5), or `None` when the
+/// profiles file already holds `defaults.interactive`: the presets, `full`
+/// first and recommended, the session's profile marked. Enter saves to the
+/// profiles file; Esc keeps the session's profile.
+pub(super) fn first_run_profile_picker(
+    session: &Session<TuiDecider>,
+    first_run: &FirstRunProfile,
+) -> Result<Option<crate::ui::commands::PickerSpec>> {
+    let sources =
+        ProfileSources::load_file(first_run.profiles_file.clone(), session.workspace_root())?;
+    if sources.profiles.has_interactive_default() {
+        return Ok(None);
+    }
+    let current = session.execution_profile().name.clone();
+    let choices = sources
+        .runnable()
+        .iter()
+        .filter(|profile| Preset::parse(&profile.name).is_some())
+        .map(|profile| {
+            let mut detail = profile_boundary(profile);
+            if profile.name == Preset::Full.name() {
+                detail.push_str("   (recommended)");
+            }
+            crate::ui::commands::ProfileChoice {
+                name: profile.name.clone(),
+                detail,
+                current: profile.name == current,
+            }
+        })
+        .collect();
+    let esc_hint = if first_run.resumed {
+        format!("keep {current} for now")
+    } else {
+        format!("use {current} for now")
+    };
+    Ok(Some(crate::ui::commands::PickerSpec::FirstRunProfile {
+        choices,
+        esc_hint,
+        profiles_file: first_run.profiles_file.clone(),
+    }))
 }

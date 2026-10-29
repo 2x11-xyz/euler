@@ -11,7 +11,7 @@ use euler_core::{
 };
 use euler_event::EventEnvelope;
 use std::io::{IsTerminal as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What selects a profile: `--profile`, `--permission-reviewer`, and the
 /// context whose default applies when `--profile` is absent.
@@ -41,25 +41,8 @@ impl LaunchProfile {
 /// repository's tightening overlay; and `defaults.subagent` with the same
 /// overlay. A malformed file or an unavailable profile is a startup error.
 /// Prints the startup summary to stderr.
-///
-/// The first interactive launch without `defaults.interactive` and without
-/// `--profile` shows the first-run picker on a terminal and saves the choice
-/// (ADR 0026 section 5).
 pub(crate) fn launch_profile(request: ProfileRequest<'_>, root: &Path) -> Result<LaunchProfile> {
-    let (mut profiles, overlay, mut notices) = load_profile_sources(root)?;
-    if request.context == ProfileContext::Interactive
-        && request.profile.is_none()
-        && !profiles.has_interactive_default()
-        && std::io::stdin().is_terminal()
-        && std::io::stderr().is_terminal()
-    {
-        if let Ok(home) = EulerHome::resolve() {
-            let file = home.profiles_path();
-            let choice = prompt_first_run_profile(&file)?;
-            write_interactive_default(&file, choice.name())?;
-            profiles = ProfilesConfig::load(&file)?;
-        }
-    }
+    let (profiles, overlay, mut notices) = load_profile_sources(root)?;
     let mut profile = profiles.resolve(request.profile, request.context, overlay.as_ref())?;
     let subagent = resolve_subagent(&profiles, overlay.as_ref())?;
     notices.extend(overlay_notice(overlay.as_ref(), &profile));
@@ -166,9 +149,38 @@ pub(crate) fn install_in_app_resume_profile(
     resolve_resume_profile_from(&profiles, overlay, Vec::new(), request)?.install(config, events)
 }
 
-/// The first-run picker (ADR 0026 section 5): the presets, `full`
-/// preselected, each with its one-line boundary. A line prompt on stderr,
-/// shown once per Euler home before the session starts.
+/// The user's `profiles.json` when an interactive launch names no
+/// `--profile`: where the first-run picker (ADR 0026 section 5) looks for
+/// `defaults.interactive` and saves the choice. `None` for headless runs, for
+/// `--profile`, and when the Euler home does not resolve.
+pub(crate) fn first_run_profiles_file(request: ProfileRequest<'_>) -> Option<PathBuf> {
+    if request.context != ProfileContext::Interactive || request.profile.is_some() {
+        return None;
+    }
+    EulerHome::resolve().ok().map(|home| home.profiles_path())
+}
+
+/// The line-oriented first-run picker: on a terminal (stdin and stderr),
+/// when `profiles.json` has no `defaults.interactive`, ask once before the
+/// session starts and save the choice. The TUI shows the picker in the app
+/// instead.
+pub(crate) fn prompt_first_run_profile_on_terminal(request: ProfileRequest<'_>) -> Result<()> {
+    let Some(file) = first_run_profiles_file(request) else {
+        return Ok(());
+    };
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(());
+    }
+    if ProfilesConfig::load(&file)?.has_interactive_default() {
+        return Ok(());
+    }
+    let choice = prompt_first_run_profile(&file)?;
+    write_interactive_default(&file, choice.name())?;
+    Ok(())
+}
+
+/// The first-run picker as a line prompt on stderr: the presets, `full`
+/// preselected, each with its one-line boundary.
 fn prompt_first_run_profile(file: &Path) -> Result<Preset> {
     const CHOICES: [(Preset, &str); 3] = [
         (
@@ -228,12 +240,17 @@ fn first_run_choice(answer: &str, choices: &[(Preset, &str)]) -> Option<Preset> 
 pub(crate) struct ProfileSources {
     pub(crate) profiles: ProfilesConfig,
     pub(crate) overlay: Option<ProjectOverlay>,
-    pub(crate) file: std::path::PathBuf,
+    pub(crate) file: PathBuf,
 }
 
 impl ProfileSources {
     pub(crate) fn load(root: &Path) -> Result<Self> {
-        let file = EulerHome::resolve()?.profiles_path();
+        Self::load_file(EulerHome::resolve()?.profiles_path(), root)
+    }
+
+    /// Read `file` as the user's `profiles.json`, with the overlay under
+    /// `root`.
+    pub(crate) fn load_file(file: PathBuf, root: &Path) -> Result<Self> {
         Ok(Self {
             profiles: ProfilesConfig::load(&file)?,
             overlay: ProjectOverlay::load(root)?,
@@ -264,7 +281,7 @@ impl ProfileSources {
 pub(crate) fn profile_boundary(profile: &ExecutionProfile) -> String {
     let fields = &profile.fields;
     let place = if fields.sandbox == SandboxSetting::Off {
-        "commands run on this machine".to_owned()
+        "runs on this machine with your permissions".to_owned()
     } else {
         format!("sandboxed, network {}", fields.network.as_str())
     };
@@ -352,7 +369,7 @@ mod tests {
             .expect("locked");
         assert_eq!(
             profile_boundary(&full),
-            "commands run on this machine · only dangerous commands ask"
+            "runs on this machine with your permissions · only dangerous commands ask"
         );
         assert_eq!(
             profile_boundary(&workspace),
