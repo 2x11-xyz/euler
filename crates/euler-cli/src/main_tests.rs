@@ -2754,6 +2754,45 @@ fn project_context_rejects_bad_values_and_duplicates() {
 }
 
 #[test]
+fn profile_flag_parses_for_run_tui_exec_and_rejects_bad_use() {
+    for (args, is_exec) in [
+        (&["run", "--profile", "ci"][..], false),
+        (&["tui", "--profile", "ci"][..], false),
+        (&["exec", "--profile", "ci", "hello"][..], true),
+    ] {
+        let mut args = args.iter().copied().map(str::to_owned);
+        let parsed = Args::parse_with_env(&mut args, EnvArgs::default()).expect("parse");
+        let run = match parsed.command {
+            Command::Exec(exec) if is_exec => exec.run,
+            Command::Run(run) | Command::Tui(run) if !is_exec => run,
+            _ => panic!("unexpected command shape"),
+        };
+        assert_eq!(run.profile.as_deref(), Some("ci"));
+    }
+    for (args, expected) in [
+        (
+            &["run", "--profile"][..],
+            "--profile requires a profile name",
+        ),
+        (
+            &["run", "--profile", ""][..],
+            "--profile requires a profile name",
+        ),
+        (
+            &["run", "--profile", "ci", "--profile", "locked"][..],
+            "--profile was provided more than once",
+        ),
+    ] {
+        let mut args = args.iter().copied().map(str::to_owned);
+        let error = match Args::parse_with_env(&mut args, EnvArgs::default()) {
+            Ok(_) => panic!("expected args error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
 fn permission_reviewer_rejects_bad_values_and_duplicates() {
     for (args, expected) in [
         (

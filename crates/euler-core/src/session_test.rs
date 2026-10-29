@@ -2566,6 +2566,34 @@ fn session_start_records_the_probed_sandbox_backend() {
     );
 }
 
+/// ADR 0026 section 9: `session.start` records the resolved execution
+/// profile, with the reviewer the gate actually consults.
+#[test]
+fn session_start_records_the_execution_profile() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut config = SessionConfig::new(temp.path());
+    config.permission_reviewer = crate::PermissionReviewer::Guardian;
+
+    let session = Session::new(
+        config,
+        ScriptedProvider::new(Vec::new()),
+        ScriptedDecider::new(Vec::new()),
+    );
+    let start = session
+        .events()
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_START)
+        .expect("session.start");
+
+    let mut expected = crate::ExecutionProfile::default();
+    expected.fields.reviewer = crate::PermissionReviewer::Guardian;
+    assert_eq!(
+        start.payload.get("execution_profile"),
+        Some(&expected.record())
+    );
+    assert_eq!(start.payload["execution_profile"]["name"], "locked");
+}
+
 /// Provider whose invoke fails with an error message echoing request
 /// fragments — models real HTTP 4xx bodies that quote what was sent.
 #[derive(Debug)]

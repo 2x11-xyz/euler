@@ -12,8 +12,8 @@ use anyhow::{anyhow, Result};
 use euler_core::{
     check_run_continuation, fold_session, read_resume_prefix, resume_session_continuing_run,
     resume_session_from_folded_prefix, CompactionTier, ContinuationRefusal, FoldedSession,
-    ModelTarget, PermissionDecider, ProvenanceWriter, ReasoningEffort, ResumeError, ResumeOutcome,
-    RunContinuation, Session, SessionConfig, SessionKind, RUN_RESTART_LIMIT,
+    ModelTarget, PermissionDecider, ProfileContext, ProvenanceWriter, ReasoningEffort, ResumeError,
+    ResumeOutcome, RunContinuation, Session, SessionConfig, SessionKind, RUN_RESTART_LIMIT,
 };
 use euler_event::EventEnvelope;
 use euler_provider::ProviderSet;
@@ -24,6 +24,9 @@ use std::sync::Arc;
 
 use crate::auth_validation::validate_provider_auth;
 use crate::companion_run::execute_headless_companion_run;
+use crate::execution_profile_runtime::{
+    install_resume_profile, launch_profile, print_notices, ProfileRequest,
+};
 use crate::extension_cli::resolve_round_observer;
 use crate::extension_enablement::resolve_session_extensions;
 use crate::session_lifecycle::{
@@ -70,10 +73,14 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         run.provider.validate_auth()
     })?;
     let root = std::env::current_dir()?;
+    let profile = launch_profile(
+        run_profile_request(&run, ProfileContext::Interactive),
+        &root,
+    )?;
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.session_kind = SessionKind::Interactive;
-    apply_permission_reviewer(&mut live_session.config, &run);
+    live_session.config.set_execution_profile(profile);
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
@@ -254,10 +261,14 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         run.provider.validate_auth()
     })?;
     let root = std::env::current_dir()?;
+    let profile = launch_profile(
+        run_profile_request(&run, ProfileContext::Interactive),
+        &root,
+    )?;
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.session_kind = SessionKind::Interactive;
-    apply_permission_reviewer(&mut live_session.config, &run);
+    live_session.config.set_execution_profile(profile);
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
@@ -397,6 +408,10 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
     })?;
     let prompt = read_exec_prompt(exec.prompt)?;
     let root = std::env::current_dir()?;
+    let profile = launch_profile(
+        run_profile_request(&exec.run, ProfileContext::Headless),
+        &root,
+    )?;
     let mut live_session = live_session_config(
         root,
         exec.run.provider_id.clone(),
@@ -404,7 +419,7 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
         provenance,
     )?;
     live_session.config.session_kind = SessionKind::NonInteractive;
-    apply_permission_reviewer(&mut live_session.config, &exec.run);
+    live_session.config.set_execution_profile(profile);
     apply_catalog_context_limit(&mut live_session.config, &exec.run.model_catalog);
     apply_exec_config(
         &mut live_session.config,
@@ -595,14 +610,6 @@ impl ExecConfigOverrides {
             compaction_budget_bytes: run.compaction_budget_bytes,
             reasoning_effort: run.reasoning_effort,
         }
-    }
-}
-
-/// Route uncovered permission asks to the guardian reviewer when the
-/// `--permission-reviewer guardian` flag was given (ADR 0011; default: user).
-fn apply_permission_reviewer(config: &mut SessionConfig, run: &RunArgs) {
-    if let Some(reviewer) = run.permission_reviewer {
-        config.permission_reviewer = reviewer;
     }
 }
 
@@ -828,6 +835,7 @@ impl ResumeIntent {
 
 /// How a resume workspace relocation is consented to when the live folder does
 /// not match where the session last ran.
+#[derive(Clone, Copy)]
 enum RelocationConsent {
     /// Headless: accept only if `--accept-relocation` was given, else fail
     /// closed. Never prompts.
@@ -836,6 +844,17 @@ enum RelocationConsent {
     Card(crate::ui::theme::ThemeChoice),
     /// Interactive line-oriented: a plain stdin prompt.
     Line,
+}
+
+impl RelocationConsent {
+    /// The launch context whose default profile a resume resolves: the
+    /// consent mode already distinguishes headless `exec` from interactive.
+    fn profile_context(&self) -> ProfileContext {
+        match self {
+            Self::Headless => ProfileContext::Headless,
+            Self::Card(_) | Self::Line => ProfileContext::Interactive,
+        }
+    }
 }
 
 fn decide_relocation_card(
@@ -932,7 +951,6 @@ where
         .to_owned();
     let root = std::env::current_dir()?;
     let mut config = session_config(root, run.provider_id.clone(), run.model.clone(), session_id);
-    apply_permission_reviewer(&mut config, &run);
     config.extensions_enabled = resolve_session_extensions(&config.root, &run.extensions)?;
     configure(&mut config);
     let observer = resolve_round_observer(&run.observe)?;
@@ -950,6 +968,7 @@ where
         &writer,
     )?;
     let folded = fold_session(&config, prefix)?;
+    install_cli_resume_profile(&mut config, &folded.events, &run, relocation)?;
     let providers = (if let Some(original) = &folded.original_target {
         if invocation_target(&run) != *original {
             eprintln!(
@@ -1000,6 +1019,26 @@ where
         display_label,
         session_name,
     })
+}
+
+/// ADR 0026 section 9 for `--resume`: stderr shows the startup summary.
+fn install_cli_resume_profile(
+    config: &mut SessionConfig,
+    events: &[EventEnvelope],
+    run: &RunArgs,
+    relocation: RelocationConsent,
+) -> Result<()> {
+    let request = run_profile_request(run, relocation.profile_context());
+    print_notices(&install_resume_profile(config, events, request)?);
+    Ok(())
+}
+
+fn run_profile_request(run: &RunArgs, context: ProfileContext) -> ProfileRequest<'_> {
+    ProfileRequest {
+        profile: run.profile.as_deref(),
+        reviewer: run.permission_reviewer,
+        context,
+    }
 }
 
 fn bind_diagnostics_for_log(log_path: &Path) {

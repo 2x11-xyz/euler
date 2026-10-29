@@ -200,6 +200,9 @@ pub(crate) struct RawArgs {
     pub(crate) compaction_budget_bytes: Option<usize>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) permission_reviewer: Option<PermissionReviewer>,
+    /// `--profile <name>`: the execution profile for this launch or resume
+    /// (ADR 0026), ahead of the context default in `profiles.json`.
+    pub(crate) profile: Option<String>,
     pub(crate) extensions: ExtensionSelection,
     pub(crate) observe: ObserveOptions,
     pub(crate) login: bool,

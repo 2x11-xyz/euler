@@ -3,11 +3,11 @@
 use euler_core::permissions::{DeciderVerdict, PermissionDecider, PermissionRequest};
 use euler_core::{
     assemble_canvas, fold_session, project_assistant_response_terminals, read_resume_prefix,
-    resume_session, resume_session_from_folded_prefix, resume_session_from_prefix,
-    resume_session_with_outcome, ApprovalMode, AssistantResponseStatus, AutoCompactionPolicy,
-    CanvasItem, CompactionStatus, CompactionTier, ContextLimitConfig, ModelTarget,
-    ProvenanceWriter, QueueCancellationReason, ReasoningEffort, ResumeError, ResumeWarning,
-    Session, SessionConfig, WorkingStateProjection,
+    recorded_execution_profile, resume_session, resume_session_from_folded_prefix,
+    resume_session_from_prefix, resume_session_with_outcome, ApprovalMode, AssistantResponseStatus,
+    AutoCompactionPolicy, CanvasItem, CompactionStatus, CompactionTier, ContextLimitConfig,
+    ModelTarget, ProvenanceWriter, QueueCancellationReason, ReasoningEffort, ResumeError,
+    ResumeWarning, Session, SessionConfig, WorkingStateProjection,
 };
 use euler_event::{object, EventEnvelope, EventKind};
 use euler_provider::{
@@ -551,6 +551,90 @@ fn fold_leaves_original_target_empty_for_legacy_logs() {
     assert_eq!(
         folded.runtime_identity,
         euler_core::RecordedRuntimeIdentity::LegacyUnknown
+    );
+}
+
+fn guardian_ci_profile() -> euler_core::ExecutionProfile {
+    let locked = euler_core::ExecutionProfile::default();
+    euler_core::ExecutionProfile {
+        name: "ci".to_owned(),
+        fields: euler_core::execution_profile::ProfileFields {
+            reviewer: euler_core::PermissionReviewer::Guardian,
+            ..locked.fields
+        },
+    }
+}
+
+/// ADR 0026 section 9: resume compares against the latest recorded profile,
+/// and a log written before profiles records none.
+#[test]
+fn recorded_execution_profile_reads_the_latest_record() {
+    assert_eq!(
+        recorded_execution_profile(&[session_start("fixture", "fixture")]).expect("legacy"),
+        None
+    );
+
+    let mut start = session_start("fixture", "fixture");
+    start.payload.insert(
+        "execution_profile".to_owned(),
+        euler_core::ExecutionProfile::default().record(),
+    );
+    let resumed = EventEnvelope::new(
+        "session",
+        "agent",
+        Some(start.id.clone()),
+        EventKind::SESSION_RESUMED,
+        object([
+            ("provider", "fixture".into()),
+            ("model", "fixture".into()),
+            ("execution_profile", guardian_ci_profile().record()),
+        ]),
+    );
+    assert_eq!(
+        recorded_execution_profile(std::slice::from_ref(&start)).expect("start"),
+        Some(euler_core::ExecutionProfile::default())
+    );
+    assert_eq!(
+        recorded_execution_profile(&[start.clone(), resumed]).expect("resumed"),
+        Some(guardian_ci_profile())
+    );
+
+    start.payload["execution_profile"]["fields"]["network"] = json!("on");
+    let error = recorded_execution_profile(&[start]).expect_err("tampered profile fails closed");
+    assert!(
+        matches!(error, ResumeError::ExecutionProfile { ref kind, .. } if kind == "session.start"),
+        "{error}"
+    );
+}
+
+#[test]
+fn resumed_session_records_its_execution_profile_on_session_resumed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    write_events(&log, &[session_start("fixture", "fixture")]);
+    let mut config = fixture_config(temp.path());
+    config.execution_profile = guardian_ci_profile();
+    config.permission_reviewer = euler_core::PermissionReviewer::Guardian;
+    let mut session = resume_session(
+        config,
+        ProviderSet::single(ScriptedProvider::new(vec![FixtureResponse::Assistant(
+            "done".to_owned(),
+        )])),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+
+    session.run_turn("continue").expect("continued turn");
+
+    let persisted = read_resume_prefix(&log).expect("read continued session");
+    let marker = persisted
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_RESUMED)
+        .expect("session.resumed");
+    assert_eq!(
+        marker.payload.get("execution_profile"),
+        Some(&guardian_ci_profile().record())
     );
 }
 

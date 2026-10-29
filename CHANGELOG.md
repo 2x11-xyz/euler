@@ -6,6 +6,22 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: plumbing and the `locked` preset (ADR 0026 step 3)
+
+- **`--profile <name>`** on `euler` and `euler exec`, and an optional
+  `<euler home>/profiles.json` with per-context `defaults` and user profiles
+  that `extend` a preset. Only `locked` (today's boundary) is enforced and
+  it stays the default everywhere; `full` and `workspace` are refused with a
+  clear error until they ship. Unknown fields, unknown values, and
+  contradictory combinations are startup errors naming the file and field.
+- A repository's `.euler/profile-overlay.json` can tighten whichever profile
+  resolves and never loosen it.
+- `session.start` and `session.resumed` record `execution_profile`. Resume
+  keeps the recorded profile when the newly resolved one is looser, unless
+  `--profile` is passed; older logs resolve as a new session.
+- The `/permissions` posture formerly labeled "Full access (unsandboxed)" is
+  now "Full access (sandbox unchanged)": it never disabled the sandbox.
+
 ### `command -v` probes are no longer flagged dangerous
 
 - The danger walk now recognizes `command`'s POSIX options `-p`, `-v`,

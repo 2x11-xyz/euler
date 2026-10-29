@@ -70,9 +70,71 @@ and the session still fails closed. The host-level backend probe caches a
 definite result (enforced, or a real unavailability such as `bwrap` missing,
 user namespaces blocked, or Seatbelt refusing the profile) for the process
 lifetime, but never caches a timeout, so the next session probes again. Deliberate unsandboxed
-execution is the explicit "Full access (unsandboxed)" preset of ADR 0021
-row D, which a later release adds; it is never a side effect of an approval
-mode.
+execution is a later execution profile (ADR 0026); it is never a side effect
+of an approval mode, and no `/permissions` posture changes the sandbox.
+
+## Execution profiles
+
+The execution boundary and the default approval policy are a named profile
+(ADR 0026). This release enforces only the `locked` preset, which is the
+boundary described above, unchanged: the no-network sandbox, a private `/tmp`
+and `HOME`, and every command not statically safe or grant-covered asks.
+Its fields are `sandbox: on`, `network: off`, `writable_paths: []`,
+`tmp: private`, `caches: private`, `credentials: private`,
+`approvals: always`, `escalation: not-allowed`, `background_jobs:
+end-with-command` on Linux and `outlive` elsewhere, and `reviewer: user`.
+
+- **Presets.** `full`, `workspace`, and `locked` are reserved names. Naming
+  `full` or `workspace`, directly or through `extends`, is a startup error
+  saying the preset is not available yet; it is never substituted.
+- **`<euler home>/profiles.json`.** Optional. `defaults` holds
+  `interactive` (`euler`, `euler tui`), `headless` (`euler exec`), and
+  `subagent` (`inherit` or a profile name); each must name a preset or a
+  defined profile. `profiles` maps a name (letters, digits, `-`, `_`; not a
+  preset name or `inherit`) to an object with a required `extends` naming a
+  preset and any profile fields. Listed `writable_paths` (absolute or `~/`)
+  add to the preset's; every other field replaces the preset's value. Unknown
+  fields, duplicate keys, unknown values, and contradictory combinations (`approvals: never`
+  with `escalation: allowed`, `sandbox: off` with `escalation: allowed`, and
+  `credentials` set on a sandbox-off profile) are startup errors naming the
+  file and field. A profile extending an unshipped preset is checked for
+  unknown fields and values and refused only when selected. A missing file
+  means the built-in defaults; an unresolvable Euler home reads no file and
+  says so on stderr.
+- **Selection.** `--profile <name>` on `euler` and `euler exec`, then the
+  context default in `profiles.json`, then the built-in default, `locked`
+  for both contexts. An unknown name is a startup error listing the defined
+  profiles. `--permission-reviewer` overrides the profile's `reviewer`.
+  Child agents run inside the parent session's boundary; `defaults.subagent`
+  is validated, and since `locked` is the only enforced boundary a child can
+  never run looser than its parent.
+- **Project overlay.** A repository may hold `.euler/profile-overlay.json`
+  with any profile field except `reviewer` and `extends`. It applies to
+  whichever profile resolves, including one named by `--profile`, and each
+  field it sets must be at least as tight as the resolved value, or startup
+  fails naming the file and field; duplicate keys are errors too. Tighter is: `sandbox` off < on
+  (`bubblewrap` and `seatbelt` order as on); `network` on < off;
+  `writable_paths` a subset; `tmp` host < private; `caches` writable <
+  private; `credentials` pass < private; `approvals` never <
+  escalation-only < always; `escalation` allowed < not-allowed;
+  `background_jobs` outlive < end-with-command. Tightening needs no trust
+  acknowledgment; stderr names the overlay at startup.
+- **Enforcement.** A resolved profile whose fields the `locked` boundary
+  cannot deliver (any field other than `reviewer` differing from `locked`,
+  or a `sandbox` backend name other than this host's) is a startup error
+  naming the profile and field.
+- **Resume.** Resume resolves the profile as a new launch does, then
+  compares it with the latest profile the log recorded (`session.start` or a
+  later `session.resumed`). If the resolved profile is looser on any field,
+  the recorded profile applies unless `--profile` was passed; otherwise the
+  resolved one applies. A kept recorded profile also gets the project
+  overlay, and one this host cannot enforce (for example a Linux
+  `background_jobs: end-with-command` resumed on macOS) is a startup error
+  asking for `--profile`, never a substitution. stderr shows any change;
+  the TUI's in-app `/resume`, which has no `--profile`, applies the same
+  rule with the interactive default and shows the change as its notice. A log without a recorded
+  profile resolves as a new session; no profile is inferred. A malformed
+  recorded profile fails resume closed.
 
 ## Approval Modes
 

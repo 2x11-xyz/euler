@@ -5,6 +5,7 @@ mod auth_validation;
 mod cli;
 mod companion_run;
 mod diagnostics;
+mod execution_profile_runtime;
 mod extension_cli;
 mod extension_enablement;
 mod fixture_script;

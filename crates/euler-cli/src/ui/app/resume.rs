@@ -1,4 +1,5 @@
 use super::*;
+use crate::execution_profile_runtime::install_in_app_resume_profile;
 
 pub(super) struct TuiResume {
     pub(super) session: Session<TuiDecider>,
@@ -65,7 +66,15 @@ impl AppCore {
         }
 
         match self.build_tui_resume(&session_id) {
-            Ok(resume) => self.accept_tui_resume(session_id, resume),
+            Ok((resume, profile_notices)) => {
+                let effect = self.accept_tui_resume(session_id, resume);
+                if effect == CoreEffect::ReplayHistoryWithScrollbackPurge
+                    && !profile_notices.is_empty()
+                {
+                    self.notice = Some(profile_notices.join("; "));
+                }
+                effect
+            }
             Err(error) => self.error_item(format!("resume failed: {error}")),
         }
     }
@@ -111,7 +120,8 @@ impl AppCore {
         Ok(lines[start..].to_vec())
     }
 
-    fn build_tui_resume(&mut self, session_id: &str) -> Result<TuiResume> {
+    /// The resumed session and the execution-profile notices to show for it.
+    fn build_tui_resume(&mut self, session_id: &str) -> Result<(TuiResume, Vec<String>)> {
         let record = self
             .session_store()?
             .find_session(session_id)?
@@ -154,6 +164,7 @@ impl AppCore {
         config.provider = folded.active_target.provider.clone();
         config.model = folded.active_target.model.clone();
         crate::session_lifecycle::apply_catalog_context_limit(&mut config, &self.model_catalog);
+        let profile_notices = install_in_app_resume_profile(&mut config, &folded.events)?;
         let providers = crate::cli::providers::resume_provider_set(
             folded
                 .original_target
@@ -177,17 +188,20 @@ impl AppCore {
         crate::cli::extension_run::wire_session_extensions(&mut session);
         let events = session.events().to_vec();
         let events_replayed = outcome.events_folded;
-        Ok(TuiResume {
-            session,
-            channels,
-            events,
-            active_target: outcome.active_target,
-            display_label: session_resume_label(&record),
-            session_name: record.name().map(str::to_owned),
-            recovery_closure_appended: outcome.recovery_closure_appended,
-            warning_count: outcome.warnings.len(),
-            events_replayed,
-        })
+        Ok((
+            TuiResume {
+                session,
+                channels,
+                events,
+                active_target: outcome.active_target,
+                display_label: session_resume_label(&record),
+                session_name: record.name().map(str::to_owned),
+                recovery_closure_appended: outcome.recovery_closure_appended,
+                warning_count: outcome.warnings.len(),
+                events_replayed,
+            },
+            profile_notices,
+        ))
     }
 
     pub(super) fn accept_tui_resume(

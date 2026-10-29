@@ -12,6 +12,7 @@ use crate::compaction::{
     build_compaction_candidate, projection_prompt, select_layer1_candidates, should_compact,
     validate_candidate, CompactionCandidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
 };
+use crate::execution_profile::ExecutionProfile;
 use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
 use crate::guardian::PermissionReviewer;
 use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, PermissionGate};
@@ -197,6 +198,11 @@ pub struct SessionConfig {
     /// Disabled is the default until a user-facing mode can promise real
     /// enforcement on the current host.
     pub subprocess_sandbox: SubprocessSandbox,
+    /// The resolved execution profile (ADR 0026), recorded on `session.start`
+    /// and `session.resumed`. Default: the `locked` preset, today's boundary.
+    /// Its `reviewer` is recorded from [`Self::permission_reviewer`], which
+    /// is what the gate consults.
+    pub execution_profile: ExecutionProfile,
     /// `None` (default) = unlimited rounds per turn; a turn ends when the
     /// model finishes, fails, or the user cancels. Set only when a hard
     /// ceiling is explicitly wanted (e.g. exec --max-tool-rounds).
@@ -263,6 +269,21 @@ pub struct SessionConfig {
 }
 
 impl SessionConfig {
+    /// Install a resolved execution profile. Its reviewer becomes the
+    /// session's reviewer, the one the gate consults.
+    pub fn set_execution_profile(&mut self, profile: ExecutionProfile) {
+        self.permission_reviewer = profile.fields.reviewer;
+        self.execution_profile = profile;
+    }
+
+    /// The `execution_profile` provenance object, with the reviewer the
+    /// session actually uses.
+    pub(crate) fn execution_profile_record(&self) -> Value {
+        let mut profile = self.execution_profile.clone();
+        profile.fields.reviewer = self.permission_reviewer;
+        profile.record()
+    }
+
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             session_id: "session".to_owned(),
@@ -272,6 +293,7 @@ impl SessionConfig {
             reasoning_effort: ReasoningEffort::Medium,
             root: root.into(),
             subprocess_sandbox: SubprocessSandbox::default(),
+            execution_profile: ExecutionProfile::default(),
             max_tool_rounds: None,
             provider_transport_retries: 2,
             provider_transport_retry_backoff_ms: vec![1000, 3000],
@@ -5973,6 +5995,10 @@ fn session_start_payload(config: &SessionConfig, sandbox: SandboxStatus) -> Json
         ("root", session_root_for_event(&config.root).into()),
     ]);
     payload.extend(sandbox_start_fields(sandbox));
+    payload.insert(
+        "execution_profile".to_owned(),
+        config.execution_profile_record(),
+    );
     crate::root_identity::insert_root_object_identity(&mut payload, &config.root);
     if let Some(bootstrap) = &config.project_context {
         payload.insert(

@@ -1,0 +1,456 @@
+//! Execution profiles (ADR 0026): the execution boundary and the default
+//! approval policy as one named profile.
+//!
+//! Each built-in preset owns a module (`locked.rs`) that defines its fields
+//! and the boundary this build can enforce for it. [`Preset::shipped_fields`]
+//! lists the presets that have shipped; naming any other preset is refused,
+//! never substituted, until its rollout step adds a module and an arm there.
+//! [`ExecutionProfile::check_enforced`] is the one place that decides whether
+//! this build can deliver a resolved profile.
+
+mod config;
+mod locked;
+#[cfg(test)]
+mod tests;
+
+pub use config::{
+    ProfileContext, ProfilesConfig, ProjectOverlay, PROFILES_FILE, PROJECT_OVERLAY_PATH,
+};
+
+use crate::guardian::PermissionReviewer;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use thiserror::Error;
+
+/// Field-by-field order (ADR 0026 section 1, "Tighten"): a higher rank is
+/// tighter. The project overlay and the resume rule compare with it.
+trait Tightness: Copy {
+    fn rank(self) -> u8;
+    fn text(self) -> &'static str;
+}
+
+macro_rules! profile_setting {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident = $text:literal => $rank:literal),+ $(,)? }) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        pub enum $name {
+            $(#[serde(rename = $text)] $variant),+
+        }
+
+        impl $name {
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text),+
+                }
+            }
+        }
+
+        impl Tightness for $name {
+            fn rank(self) -> u8 {
+                match self {
+                    $(Self::$variant => $rank),+
+                }
+            }
+
+            fn text(self) -> &'static str {
+                self.as_str()
+            }
+        }
+    };
+}
+
+profile_setting! {
+    /// `sandbox`: `bubblewrap` and `seatbelt` name a backend and order as `on`.
+    SandboxSetting { Off = "off" => 0, On = "on" => 1, Bubblewrap = "bubblewrap" => 1, Seatbelt = "seatbelt" => 1 }
+}
+profile_setting! {
+    /// `network` for sandboxed commands.
+    NetworkSetting { On = "on" => 0, Off = "off" => 1 }
+}
+profile_setting! {
+    /// `tmp`: the host `/tmp` or a private one.
+    TmpSetting { Host = "host" => 0, Private = "private" => 1 }
+}
+profile_setting! {
+    /// `caches`: named toolchain caches writable at their real paths, or private.
+    CachesSetting { Writable = "writable" => 0, Private = "private" => 1 }
+}
+profile_setting! {
+    /// `credentials`: whether secret-shaped variables and credential stores pass
+    /// into a sandboxed command.
+    CredentialsSetting { Pass = "pass" => 0, Private = "private" => 1 }
+}
+profile_setting! {
+    /// `approvals`: which commands inside the boundary ask.
+    ApprovalsSetting { Never = "never" => 0, EscalationOnly = "escalation-only" => 1, Always = "always" => 2 }
+}
+profile_setting! {
+    /// `escalation`: whether a command may ask to run outside the sandbox.
+    EscalationSetting { Allowed = "allowed" => 0, NotAllowed = "not-allowed" => 1 }
+}
+profile_setting! {
+    /// `background_jobs`: whether a redirected job outlives its command.
+    BackgroundJobsSetting { Outlive = "outlive" => 0, EndWithCommand = "end-with-command" => 1 }
+}
+
+/// The effective fields of a profile (ADR 0026 section 1). `writable_paths`
+/// lists the paths a profile adds to its preset's writable set; the
+/// workspace is always writable and is not listed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileFields {
+    pub sandbox: SandboxSetting,
+    pub network: NetworkSetting,
+    pub writable_paths: Vec<String>,
+    pub tmp: TmpSetting,
+    pub caches: CachesSetting,
+    pub credentials: CredentialsSetting,
+    pub approvals: ApprovalsSetting,
+    pub escalation: EscalationSetting,
+    pub background_jobs: BackgroundJobsSetting,
+    pub reviewer: PermissionReviewer,
+}
+
+impl ProfileFields {
+    /// The first field, in ADR order, on which `self` is looser than
+    /// `baseline`. A profile with the sandbox off is looser than any profile
+    /// with it on; when the baseline's sandbox is off, its boundary fields
+    /// (`network`, `writable_paths`, `tmp`, `caches`, `credentials`) are the
+    /// host's and are not compared. `reviewer` has no order.
+    pub fn first_looser_field(&self, baseline: &Self) -> Option<&'static str> {
+        if self.sandbox.rank() < baseline.sandbox.rank() {
+            return Some("sandbox");
+        }
+        let boundary_compared = baseline.sandbox != SandboxSetting::Off;
+        let looser = |field: &'static str, candidate: u8, baseline: u8| {
+            (candidate < baseline).then_some(field)
+        };
+        let boundary = || {
+            looser("network", self.network.rank(), baseline.network.rank())
+                .or_else(|| {
+                    (!self
+                        .writable_paths
+                        .iter()
+                        .all(|path| baseline.writable_paths.contains(path)))
+                    .then_some("writable_paths")
+                })
+                .or_else(|| looser("tmp", self.tmp.rank(), baseline.tmp.rank()))
+                .or_else(|| looser("caches", self.caches.rank(), baseline.caches.rank()))
+                .or_else(|| {
+                    looser(
+                        "credentials",
+                        self.credentials.rank(),
+                        baseline.credentials.rank(),
+                    )
+                })
+        };
+        boundary_compared
+            .then(boundary)
+            .flatten()
+            .or_else(|| {
+                looser(
+                    "approvals",
+                    self.approvals.rank(),
+                    baseline.approvals.rank(),
+                )
+            })
+            .or_else(|| {
+                looser(
+                    "escalation",
+                    self.escalation.rank(),
+                    baseline.escalation.rank(),
+                )
+            })
+            .or_else(|| {
+                looser(
+                    "background_jobs",
+                    self.background_jobs.rank(),
+                    baseline.background_jobs.rank(),
+                )
+            })
+    }
+
+    /// Contradictory combinations (ADR 0026 section 5, "Validation").
+    /// `credentials_set` says whether the profile or overlay wrote
+    /// `credentials` itself, because only setting it on a sandbox-off
+    /// profile is an error.
+    fn contradiction(&self, credentials_set: bool) -> Option<String> {
+        if self.approvals == ApprovalsSetting::Never
+            && self.escalation == EscalationSetting::Allowed
+        {
+            return Some(
+                "approvals \"never\" with escalation \"allowed\" would make the sandbox advisory"
+                    .to_owned(),
+            );
+        }
+        if self.sandbox == SandboxSetting::Off && self.escalation == EscalationSetting::Allowed {
+            return Some(
+                "sandbox \"off\" with escalation \"allowed\" has no boundary to leave".to_owned(),
+            );
+        }
+        if self.sandbox == SandboxSetting::Off && credentials_set {
+            return Some(
+                "credentials applies only with the sandbox on; remove it or turn the sandbox on"
+                    .to_owned(),
+            );
+        }
+        None
+    }
+
+    fn sha256(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("profile fields serialize");
+        format!("{:x}", Sha256::digest(bytes))
+    }
+}
+
+/// The built-in presets. Their names are reserved: a user profile may not
+/// reuse one and must extend one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Preset {
+    Full,
+    Workspace,
+    Locked,
+}
+
+impl Preset {
+    pub const ALL: [Self; 3] = [Self::Full, Self::Workspace, Self::Locked];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Workspace => "workspace",
+            Self::Locked => "locked",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| preset.name() == name)
+    }
+
+    /// The preset's fields when this build ships it; `None` refuses it.
+    fn shipped_fields(self) -> Option<ProfileFields> {
+        match self {
+            Self::Locked => Some(locked::fields()),
+            Self::Full | Self::Workspace => None,
+        }
+    }
+}
+
+/// A resolved profile: its name and effective fields after any project
+/// overlay. Recorded on `session.start` and `session.resumed`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionProfile {
+    pub name: String,
+    pub fields: ProfileFields,
+}
+
+impl Default for ExecutionProfile {
+    /// The `locked` preset, today's boundary.
+    fn default() -> Self {
+        Self {
+            name: Preset::Locked.name().to_owned(),
+            fields: locked::fields(),
+        }
+    }
+}
+
+impl ExecutionProfile {
+    /// Refuse a profile this build cannot deliver, naming the first field it
+    /// cannot enforce. Only the `locked` boundary is enforced so far.
+    pub fn check_enforced(&self) -> Result<(), ProfileError> {
+        match locked::unenforced_field(&self.fields) {
+            None => Ok(()),
+            Some(field) => Err(ProfileError::Unenforced {
+                profile: self.name.clone(),
+                field,
+            }),
+        }
+    }
+
+    /// The `execution_profile` provenance object: name, effective fields,
+    /// and the SHA-256 of the fields' JSON.
+    pub fn record(&self) -> Value {
+        json!({
+            "name": self.name,
+            "fields": self.fields,
+            "fields_sha256": self.fields.sha256(),
+        })
+    }
+
+    /// Parse an `execution_profile` provenance object, rejecting unknown
+    /// keys, unknown values, and a digest that does not match the fields.
+    pub fn from_record(value: &Value) -> Result<Self, String> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct ProfileRecord {
+            name: String,
+            fields: ProfileFields,
+            fields_sha256: String,
+        }
+        let record = ProfileRecord::deserialize(value).map_err(|error| error.to_string())?;
+        if record.fields.sha256() != record.fields_sha256 {
+            return Err("fields_sha256 does not match the recorded fields".to_owned());
+        }
+        Ok(Self {
+            name: record.name,
+            fields: record.fields,
+        })
+    }
+}
+
+/// Why a resumed session runs under the profile it got (ADR 0026 section 9).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResumeProfileBasis {
+    /// The log records no profile (written before profiles existed), so the
+    /// profile resolves as for a new session; none is inferred.
+    NotRecorded,
+    /// `--profile` was passed, so the resolved profile applies even if looser.
+    Explicit,
+    /// The resolved profile is not looser than the recorded one.
+    Resolved,
+    /// The resolved profile was looser on `looser_field`, so the recorded
+    /// fields apply.
+    KeptRecorded {
+        resolved_name: String,
+        looser_field: &'static str,
+    },
+}
+
+/// The profile a resumed session runs under, with the recorded profile it
+/// was compared against.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResumeProfile {
+    pub profile: ExecutionProfile,
+    pub recorded: Option<ExecutionProfile>,
+    pub basis: ResumeProfileBasis,
+}
+
+impl ResumeProfile {
+    /// Apply the resume rule to `resolved`, which [`ProfilesConfig::resolve`]
+    /// already overlaid: a resolved profile looser than the recorded one on
+    /// any field yields the recorded profile unless `--profile` was passed
+    /// (`explicit`); a tighter or equal one applies as resolved. A kept
+    /// recorded profile gets the project overlay too, since it can only
+    /// tighten. Whichever profile applies is refused, never substituted,
+    /// when this host cannot enforce it.
+    pub fn choose(
+        recorded: Option<ExecutionProfile>,
+        resolved: ExecutionProfile,
+        explicit: bool,
+        overlay: Option<&ProjectOverlay>,
+    ) -> Result<Self, ProfileError> {
+        let Some(recorded) = recorded else {
+            resolved.check_enforced()?;
+            return Ok(Self {
+                profile: resolved,
+                recorded: None,
+                basis: ResumeProfileBasis::NotRecorded,
+            });
+        };
+        if explicit {
+            resolved.check_enforced()?;
+            return Ok(Self {
+                profile: resolved,
+                recorded: Some(recorded),
+                basis: ResumeProfileBasis::Explicit,
+            });
+        }
+        let Some(looser_field) = resolved.fields.first_looser_field(&recorded.fields) else {
+            resolved.check_enforced()?;
+            return Ok(Self {
+                profile: resolved,
+                recorded: Some(recorded),
+                basis: ResumeProfileBasis::Resolved,
+            });
+        };
+        let mut profile = recorded.clone();
+        if let Some(overlay) = overlay {
+            overlay.apply(&mut profile)?;
+        }
+        profile.check_enforced().map_err(|error| match error {
+            ProfileError::Unenforced { profile, field } => {
+                ProfileError::RecordedUnenforced { profile, field }
+            }
+            other => other,
+        })?;
+        Ok(Self {
+            profile,
+            recorded: Some(recorded),
+            basis: ResumeProfileBasis::KeptRecorded {
+                resolved_name: resolved.name,
+                looser_field,
+            },
+        })
+    }
+
+    /// The startup-summary line, when the applied profile differs from the
+    /// recorded one or the log recorded none. `None` when nothing changed.
+    pub fn summary(&self) -> Option<String> {
+        let applied = &self.profile.name;
+        match (&self.basis, &self.recorded) {
+            (ResumeProfileBasis::NotRecorded, _) => Some(format!(
+                "execution profile: {applied} (this session recorded no profile)"
+            )),
+            (
+                ResumeProfileBasis::KeptRecorded {
+                    resolved_name,
+                    looser_field,
+                },
+                _,
+            ) => Some(format!(
+                "execution profile: kept the recorded profile {applied}; {resolved_name} is \
+                 looser on {looser_field}. Pass --profile to change it"
+            )),
+            (_, Some(recorded)) if recorded != &self.profile => Some(format!(
+                "execution profile: {applied} (recorded: {})",
+                recorded.name
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// A profile configuration or selection the user must fix before Euler
+/// starts.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ProfileError {
+    #[error("{}: {message}", file.display())]
+    InvalidFile { file: PathBuf, message: String },
+    #[error("could not read {}: {message}", file.display())]
+    Read { file: PathBuf, message: String },
+    #[error("unknown execution profile \"{name}\"; defined profiles: {}", defined.join(", "))]
+    UnknownProfile { name: String, defined: Vec<String> },
+    #[error("{}", preset_not_shipped_message(requested, *preset))]
+    PresetNotShipped { requested: String, preset: Preset },
+    #[error(
+        "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; only the locked preset's boundary is available"
+    )]
+    Unenforced {
+        profile: String,
+        field: &'static str,
+    },
+    #[error(
+        "this session recorded profile \"{profile}\", whose {field} this host cannot enforce, and the newly resolved profile is looser; pass --profile to resume under a profile this host can enforce"
+    )]
+    RecordedUnenforced {
+        profile: String,
+        field: &'static str,
+    },
+}
+
+fn preset_not_shipped_message(requested: &str, preset: Preset) -> String {
+    let preset = preset.name();
+    if requested == preset {
+        format!(
+            "the {preset} preset is not available in this version yet; use --profile locked or \
+             a profile that extends locked"
+        )
+    } else {
+        format!(
+            "profile \"{requested}\" extends the {preset} preset, which is not available in this \
+             version yet; extend locked instead"
+        )
+    }
+}

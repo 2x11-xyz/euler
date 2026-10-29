@@ -50,6 +50,7 @@ impl RawArgsParser {
                 compaction_budget_bytes: None,
                 reasoning_effort: None,
                 permission_reviewer: None,
+                profile: None,
                 extensions: ExtensionSelection::default(),
                 observe: ObserveOptions::default(),
                 login: false,
@@ -125,6 +126,7 @@ impl RawArgsParser {
             "--compaction-budget-bytes" => self.parse_compaction_budget_bytes(args),
             "--reasoning-effort" => self.parse_reasoning_effort(args),
             "--permission-reviewer" => self.parse_permission_reviewer(args),
+            "--profile" => self.parse_profile(args),
             "--project-context" => self.parse_project_context(args),
             "--accept-relocation" => {
                 self.parsed.accept_relocation = true;
@@ -484,6 +486,15 @@ impl RawArgsParser {
                     .ok_or_else(|| anyhow!("--permission-reviewer must be one of user|guardian"))
             },
         )?;
+        Ok(ArgParseFlow::Continue)
+    }
+
+    fn parse_profile(&mut self, args: &mut impl Iterator<Item = String>) -> Result<ArgParseFlow> {
+        set_once(&mut self.parsed.profile, "--profile", || {
+            args.next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("--profile requires a profile name"))
+        })?;
         Ok(ArgParseFlow::Continue)
     }
 

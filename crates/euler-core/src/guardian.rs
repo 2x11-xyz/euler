@@ -13,10 +13,11 @@ use crate::permissions::PermissionRequest;
 use euler_agents::{AgentBudget, AgentError, AgentResult, AgentTask};
 use euler_event::{object, JsonObject};
 use euler_sdk::Capability;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Who resolves uncovered `ask` permission decisions for a session.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PermissionReviewer {
     /// The configured [`crate::PermissionDecider`] (e.g. the TUI approval
     /// panel). Default.

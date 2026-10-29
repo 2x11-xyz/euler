@@ -98,6 +98,8 @@ pub(crate) struct RunArgs {
     pub(crate) compaction_budget_bytes: Option<usize>,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
     pub(crate) permission_reviewer: Option<PermissionReviewer>,
+    /// `--profile <name>` (ADR 0026); `None` uses the context default.
+    pub(crate) profile: Option<String>,
     pub(crate) extensions: ExtensionSelection,
     pub(crate) observe: ObserveOptions,
     pub(crate) linefeed_history_insert: bool,
@@ -439,6 +441,7 @@ fn build_run_args(
         compaction_budget_bytes: parsed.compaction_budget_bytes,
         reasoning_effort: parsed.reasoning_effort,
         permission_reviewer: parsed.permission_reviewer,
+        profile: parsed.profile.clone(),
         extensions: parsed.extensions.clone(),
         observe,
         linefeed_history_insert: parsed.linefeed_history_insert.unwrap_or(parsed.tui),
