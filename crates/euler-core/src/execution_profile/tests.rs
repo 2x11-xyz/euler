@@ -69,7 +69,7 @@ fn full_preset_runs_on_the_host_with_approvals_off() {
     assert_eq!(fields.background_jobs, BackgroundJobsSetting::Outlive);
     let profile = ProfilesConfig::default()
         .resolve(Some("full"), ProfileContext::Headless, None)
-        .expect("full is shipped");
+        .expect("full resolves");
     profile.check_enforced().expect("full is enforced");
 }
 

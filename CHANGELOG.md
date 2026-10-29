@@ -6,6 +6,18 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: withhold every providers.json credential reference
+
+- A variable that any `providers.json` provider entry references as `$NAME`
+  or `${NAME}` in `api_key` or a header is now withheld from host commands,
+  `credentials: "pass"` commands, and the `workspace` sandbox even when
+  loading ignores that entry as malformed or repeats its provider id.
+  Before, only valid entries counted, so a broken entry's key reached child
+  processes. A file that is not valid JSON still names none. Loading is
+  unchanged: malformed entries are still skipped with a warning.
+- Removed the unreachable "preset is not available in this version" error.
+  The `full`, `workspace`, and `locked` presets all ship.
+
 ### TUI: pasted slash commands run as commands
 
 - A one-line composer draft that starts with a known slash command now runs

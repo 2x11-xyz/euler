@@ -256,9 +256,7 @@ impl ProfilesConfig {
         }
     }
 
-    /// Parse and validate `text` as `profiles.json`. Profiles extending a
-    /// preset that has not shipped are checked for unknown fields and values
-    /// here and refused only when selected.
+    /// Parse and validate `text` as `profiles.json`.
     pub fn parse(file: &Path, text: &str) -> Result<Self, ProfileError> {
         let invalid = |message: String| ProfileError::InvalidFile {
             file: file.to_path_buf(),
@@ -335,17 +333,10 @@ impl ProfilesConfig {
     }
 
     fn named(&self, name: &str) -> Result<ExecutionProfile, ProfileError> {
-        let not_shipped = |preset| ProfileError::PresetNotShipped {
-            requested: name.to_owned(),
-            preset,
-        };
         let fields = if let Some(preset) = Preset::parse(name) {
-            preset.shipped_fields().ok_or_else(|| not_shipped(preset))?
+            preset.fields()
         } else if let Some(profile) = self.profiles.get(name) {
-            let mut fields = profile
-                .extends
-                .shipped_fields()
-                .ok_or_else(|| not_shipped(profile.extends))?;
+            let mut fields = profile.extends.fields();
             profile.overrides.extend(&mut fields);
             if let Some(message) = fields.contradiction(profile.overrides.credentials.is_some()) {
                 return Err(ProfileError::InvalidFile {
@@ -477,11 +468,10 @@ fn parse_user_profile(name: &str, body: &UniqueKeys<Value>) -> Result<UserProfil
     };
     let overrides =
         ProfileOverrides::from_map(body.0.iter().filter(|(key, _)| key.as_str() != "extends"))?;
-    if let Some(mut fields) = extends.shipped_fields() {
-        overrides.extend(&mut fields);
-        if let Some(message) = fields.contradiction(overrides.credentials.is_some()) {
-            return Err(message);
-        }
+    let mut fields = extends.fields();
+    overrides.extend(&mut fields);
+    if let Some(message) = fields.contradiction(overrides.credentials.is_some()) {
+        return Err(message);
     }
     Ok(UserProfile { extends, overrides })
 }
