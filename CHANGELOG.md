@@ -15,7 +15,7 @@ pull requests that landed them; deeper design rationale lives in
   applies it; Esc uses `full` for this session without saving (a resume keeps
   its resumed profile) and asks again next launch. Until you choose, typing
   and submitting do nothing and the status bar reads
-  `choose a profile to start`.
+  `choose a profile to start`; Ctrl+C quits without saving.
 - The line-oriented `euler run` keeps its stderr prompt; `euler exec` never
   asks.
 - The `full` profile's boundary now reads `runs on this machine with your

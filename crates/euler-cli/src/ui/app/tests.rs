@@ -5959,6 +5959,7 @@ fn first_run_profile_picker_enter_saves_and_applies_the_choice() {
 
 /// When the default cannot be saved, the chosen profile still applies to
 /// this session and the error says it was not saved.
+#[cfg(unix)]
 #[test]
 fn first_run_profile_picker_enter_reports_a_default_it_could_not_save() {
     use std::os::unix::fs::PermissionsExt;
@@ -6055,6 +6056,58 @@ fn first_run_profile_picker_blocks_submitting_a_turn() {
         .events()
         .iter()
         .any(|event| event.kind.as_str() == EventKind::USER_MESSAGE));
+}
+
+/// Enter or Esc while the session is busy (a startup queue recovery) keeps
+/// the picker open and saves nothing; the choice applies once it is idle.
+#[test]
+fn first_run_profile_picker_waits_while_the_session_is_busy() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "full", false);
+    let session = core.take_idle_session();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+
+    core.handle_input(key(KeyCode::Down));
+    core.handle_input(key(KeyCode::Down));
+    core.handle_input(key(KeyCode::Enter));
+    core.handle_input(key(KeyCode::Esc));
+
+    assert!(core.bottom.is_first_run_profile_picker());
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("profile change waits for the active turn")
+    );
+    assert!(!temp.path().join("profiles.json").exists());
+    // Ctrl+C keeps interrupting the busy session.
+    core.handle_input(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.bottom.is_first_run_profile_picker());
+
+    core.state = AppState::Idle { session };
+    core.handle_input(key(KeyCode::Enter));
+
+    assert_eq!(session_profile_name(&core), "locked");
+    assert!(temp.path().join("profiles.json").exists());
+}
+
+/// Ctrl+C quits from the picker, as from the composer: the first press
+/// arms, the second quits, and nothing is saved.
+#[test]
+fn first_run_profile_picker_ctrl_c_quits_without_saving() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "full", false);
+    let ctrl_c = || modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    assert_eq!(core.handle_input(ctrl_c()), CoreEffect::Render);
+    assert!(core.bottom.is_first_run_profile_picker());
+    assert_eq!(core.handle_input(ctrl_c()), CoreEffect::Quit);
+    assert!(!temp.path().join("profiles.json").exists());
 }
 
 /// A command-context rebuild (a catalog refresh at launch) leaves the

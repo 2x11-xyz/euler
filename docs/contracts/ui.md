@@ -836,7 +836,10 @@ presets `full` (preselected, marked `(recommended)`), `workspace`, and
 session's profile marked `●`. While it is open, typing, pasting, and submit
 do nothing, no turn starts (queued input included), and the status bar
 reads `choose a profile to start`; a command-context rebuild leaves it
-open. Enter switches the session to the choice, saves it to
+open. Ctrl+C quits from it as from the composer, saving nothing. Enter or
+Esc while the session is busy (a startup queue recovery) leave it open
+with the notice `profile change waits for the active turn`. On an idle
+session, Enter switches the session to the choice, saves it to
 `defaults.interactive`, and shows `execution profile set to <name> and
 saved as your default · change it with /profile`; if the default cannot be
 written, the profile still applies to this session and the error says it

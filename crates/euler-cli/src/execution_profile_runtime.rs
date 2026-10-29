@@ -339,6 +339,36 @@ fn load_profile_sources(
 mod tests {
     use super::*;
 
+    /// Only an interactive launch without `--profile` asks the first-run
+    /// question; `--profile` and `euler exec` never do.
+    #[test]
+    fn first_run_profiles_file_is_only_for_interactive_launches_without_a_profile() {
+        let request = |profile, context| ProfileRequest {
+            profile,
+            reviewer: None,
+            context,
+        };
+        assert_eq!(
+            first_run_profiles_file(request(Some("locked"), ProfileContext::Interactive)),
+            None
+        );
+        assert_eq!(
+            first_run_profiles_file(request(None, ProfileContext::Headless)),
+            None
+        );
+        let _env_lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let home = tempfile::tempdir().expect("euler home");
+        let previous = std::env::var_os("EULER_HOME");
+        std::env::set_var("EULER_HOME", home.path());
+        let file = first_run_profiles_file(request(None, ProfileContext::Interactive));
+        match previous {
+            Some(value) => std::env::set_var("EULER_HOME", value),
+            None => std::env::remove_var("EULER_HOME"),
+        }
+        let home_root = home.path().canonicalize().expect("canonical euler home");
+        assert!(file.expect("interactive asks").starts_with(home_root));
+    }
+
     #[test]
     fn first_run_choice_preselects_full_and_reads_numbers_and_names() {
         let choices = [

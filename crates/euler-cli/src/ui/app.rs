@@ -2117,6 +2117,9 @@ impl AppCore {
         if let Some(effect) = self.handle_visual_scroll_key(&key) {
             return effect;
         }
+        if let Some(effect) = self.first_run_profile_picker_key(&key) {
+            return effect;
+        }
         // Escape is dispatched from the topmost UI layer inward. A palette,
         // picker, search surface, or confirmation prompt gets the first key;
         // only a later Escape, once the composer owns input again, can

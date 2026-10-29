@@ -592,6 +592,30 @@ impl AppCore {
         true
     }
 
+    /// Keys the first-run picker handles before the shared key routing.
+    /// Ctrl+C on an idle session quits, as the line prompt did (a busy
+    /// session keeps its interrupt). Enter or Esc while the session is busy
+    /// (a startup queue recovery) keep the picker open, so the choice is not
+    /// dropped.
+    pub(super) fn first_run_profile_picker_key(&mut self, key: &KeyEvent) -> Option<CoreEffect> {
+        if !self.bottom.is_first_run_profile_picker() {
+            return None;
+        }
+        let idle = matches!(self.state, AppState::Idle { .. });
+        match key.code {
+            KeyCode::Char('c') | KeyCode::Char('C')
+                if idle && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(self.handle_ctrl_c())
+            }
+            KeyCode::Enter | KeyCode::Esc if !idle => {
+                self.notice = Some("profile change waits for the active turn".to_owned());
+                Some(CoreEffect::Render)
+            }
+            _ => None,
+        }
+    }
+
     /// First-run picker Enter: switch this session to `name`, then save it
     /// as `defaults.interactive` (what the line prompt saves). A failure says
     /// which profile the session runs.
