@@ -381,6 +381,22 @@ impl ToolRegistry {
             .map(WorkspaceSandbox::availability)
     }
 
+    /// The execution boundary the `run_shell` description states. It lives in
+    /// the tool description, not the system instructions, so it stays stable
+    /// for a session's prompt cache and follows the registry's real backend.
+    fn model_execution_boundary(&self) -> String {
+        self.workspace_sandbox.as_ref().map_or_else(
+            || "Commands run directly on the host, outside Euler's sandbox.".to_owned(),
+            WorkspaceSandbox::model_boundary,
+        )
+    }
+
+    fn sandbox_network_disabled(&self) -> bool {
+        self.workspace_sandbox
+            .as_ref()
+            .is_some_and(WorkspaceSandbox::network_disabled)
+    }
+
     pub fn required_capability(&self, name: &str) -> Option<Capability> {
         match name {
             "read_file" | "git_status" | "git_diff" | "tool_result_get" => Some(Capability::FsRead),
@@ -593,7 +609,7 @@ impl ToolRegistry {
     }
 
     pub fn model_tools(&self) -> Vec<ToolDefinition> {
-        let mut tools = coding_tool_definitions();
+        let mut tools = coding_tool_definitions(&self.model_execution_boundary());
         tools.push(tool_result_get_definition());
         if !self.skills.is_empty() {
             tools.push(skill_read_definition());
@@ -606,7 +622,7 @@ impl ToolRegistry {
     /// reach them; only the root driver (or an `inherit` child, once that
     /// lands) is eligible (docs/contracts/project-context.md).
     pub fn child_model_tools(&self) -> Vec<ToolDefinition> {
-        let mut tools = coding_tool_definitions();
+        let mut tools = coding_tool_definitions(&self.model_execution_boundary());
         tools.push(tool_result_get_definition());
         tools
     }
@@ -930,7 +946,14 @@ impl ToolRegistry {
         let file_changes = before
             .zip(after)
             .map_or_else(Vec::new, |(before, after)| before.changes_to(&after));
+        let failed_exit =
+            matches!(outcome.termination, ProcessTermination::Exited(status) if status != 0);
         let (status, header, cancelled) = shell_termination(outcome.termination, timeout_ms);
+        let text = if failed_exit && self.sandbox_network_disabled() {
+            with_network_denial_note(text)
+        } else {
+            text
+        };
         // The incompleteness leads the agent-visible text: a model that sees
         // only "exit 0" and an empty change list would otherwise read an
         // unobserved workspace as an unchanged one (ADR 0021 row E).
@@ -1440,6 +1463,61 @@ fn is_parent_control_env_name(name: &std::ffi::OsStr) -> bool {
             | "EULER_TUI_METRICS"
             | "EULER_AUTH_FILE"
     )
+}
+
+/// Appended to a failed sandboxed `run_shell` result whose output reads like a
+/// network denial, so the model does not mistake the sandbox for the host.
+const NETWORK_DENIAL_NOTE: &str = "euler note: network is disabled in Euler's sandbox for this \
+session, so this failure may be the sandbox rather than the host's connection.";
+
+/// Output fragments that, in a no-network sandbox, usually mean the command
+/// tried to reach the network. Matched case-insensitively.
+const NETWORK_DENIAL_MARKERS: &[&str] = &[
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "nodename nor servname provided",
+    "failed to lookup address information",
+    "getaddrinfo enotfound",
+    "getaddrinfo eai_again",
+    "no such host",
+    "network is unreachable",
+    "no route to host",
+    "connect eperm",
+];
+
+/// Connection failures that count only on a line naming no loopback address.
+const NETWORK_DENIAL_REMOTE_MARKERS: &[&str] = &[
+    "connection refused",
+    "econnrefused",
+    "couldn't connect to server",
+    "error connecting to",
+];
+
+/// A heuristic: the command output is kept as is and the note is appended
+/// after it. A failed connection counts only when the line names no loopback
+/// address, so a service the command itself started and that is not
+/// listening yet is not flagged.
+fn with_network_denial_note(mut text: String) -> String {
+    let lowercase = text.to_ascii_lowercase();
+    let denied = NETWORK_DENIAL_MARKERS
+        .iter()
+        .any(|marker| lowercase.contains(marker))
+        || lowercase.lines().any(|line| {
+            NETWORK_DENIAL_REMOTE_MARKERS
+                .iter()
+                .any(|marker| line.contains(marker))
+                && !["localhost", "127.", "::1", "0.0.0.0"]
+                    .iter()
+                    .any(|loopback| line.contains(loopback))
+        });
+    if denied {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(NETWORK_DENIAL_NOTE);
+    }
+    text
 }
 
 /// The exit code, the header line, and whether the shell result is a
@@ -2018,7 +2096,7 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
     index
 }
 
-fn coding_tool_definitions() -> Vec<ToolDefinition> {
+fn coding_tool_definitions(execution_boundary: &str) -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".to_owned(),
@@ -2064,9 +2142,10 @@ fn coding_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "run_shell".to_owned(),
-            description: "Run a shell command in the workspace root. Commands time out \
-after 120000 ms by default; pass timeout_ms (up to 600000) for longer runs."
-                .to_owned(),
+            description: format!(
+                "Run a shell command in the workspace root. Commands time out after 120000 ms \
+by default; pass timeout_ms (up to 600000) for longer runs. {execution_boundary}"
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {

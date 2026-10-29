@@ -20,6 +20,18 @@ pull requests that landed them; deeper design rationale lives in
   reason, instead of three identical "Allow once" rows. Arrow navigation
   skips the absent rows, and `a`/`p`/`u` no longer silently allow once.
 
+### The model knows its execution boundary (#268)
+
+- **`run_shell` describes the session's real boundary**: sandboxed or host,
+  the backend, whether network is available, where writes land, and whether
+  temporary files persist between commands, derived from the probed backend
+  and profile. The model is told to report a blocked action as a sandbox
+  limit with the exact command the user can run outside Euler.
+- A failed sandboxed command whose output looks like a network denial (for
+  example `Could not resolve host`) gets one appended note that network is
+  disabled in Euler's sandbox for this session, so the model no longer
+  mistakes the sandbox for the host being offline.
+
 ## 0.1.5 (2026-10-28)
 
 ### Custom providers speak OpenAI Responses (#264)

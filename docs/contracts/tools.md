@@ -288,6 +288,33 @@ probes and prints the diagnostic, which names the likely cause (user namespaces
 disabled by sysctl or AppArmor, a container, WSL1, `bwrap` missing, or Seatbelt
 refusing the profile) and the host change that fixes it.
 
+The model is told the same boundary. The `run_shell` description ends with
+facts derived from the registry's probed backend and profile, never from
+platform defaults: whether commands (git included) run in Euler's sandbox and
+which backend, whether network is available (when it is not, the host's
+localhost services are not reachable either), where writes persist, whether
+temporary files persist between commands (Bubblewrap's `/tmp`, which holds
+`$HOME`, is discarded after each command; Seatbelt's `$TMPDIR` and `$HOME`
+persist for the session, while `.git` and `/tmp` are not writable), and that
+a blocked action is reported as a sandbox limit with the exact command the
+user can run outside Euler. A host registry says commands run on the host; an
+unavailable sandbox says commands are refused and points at
+`euler --check-sandbox`. The facts live in the tool description rather than
+the system instructions, so `SYSTEM_INSTRUCTIONS_VERSION` is unchanged and the
+description is stable for a session's prompt cache.
+
+When a sandboxed `run_shell` command whose profile disables network exits
+nonzero and its output reads like a network denial (a DNS resolution failure,
+`Network is unreachable`, `No route to host`, `connect EPERM`, or a refused or
+failed connection on a line naming no loopback address), Euler appends one
+line after the command output: `euler note: network is disabled in Euler's
+sandbox for this session, so this failure may be the sandbox rather than the
+host's connection.` The note is a heuristic. The command output before it is
+unchanged, and successful, host, and `git_*` results are never annotated.
+This amends the last sentence of ADR 0021 row B (no attribution to network
+denial from stderr) as rollout step 1 of ADR 0026 (accepted 2026-10-28): the note is
+hedged text that names the boundary, and it offers no retry or grant.
+
 Euler's own Git invocations are neutralized before they run (ADR 0021 row G).
 `git_status` and `git_diff` set `core.hooksPath=/dev/null`,
 `safe.bareRepository=explicit`, `attr.tree=`, `core.attributesFile=`, and

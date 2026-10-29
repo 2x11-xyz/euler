@@ -36,6 +36,12 @@ impl SandboxProfile {
             Self::WorkspaceNoNetwork => "sandboxed workspace (network disabled)",
         }
     }
+
+    pub(crate) const fn network_enabled(self) -> bool {
+        match self {
+            Self::WorkspaceNoNetwork => false,
+        }
+    }
 }
 
 /// The execution boundary that actually ran, or would run, an agent command.
@@ -542,6 +548,49 @@ impl WorkspaceSandbox {
 
     pub(crate) const fn backend(&self) -> SandboxBackend {
         self.backend
+    }
+
+    /// Whether the probed profile cuts commands off from the network.
+    pub(crate) const fn network_disabled(&self) -> bool {
+        matches!(self.availability, SandboxAvailability::Enforced(profile) if !profile.network_enabled())
+    }
+
+    /// The execution boundary in the words the model reads in the `run_shell`
+    /// description, chosen by the probed launcher and profile rather than the
+    /// platform. The write and temporary-file facts restate each launcher's
+    /// mounts (`bwrap_command`) or profile (`seatbelt_profile.sbpl`) for one
+    /// profile, so a new profile must state its own.
+    pub(crate) fn model_boundary(&self) -> String {
+        let (SandboxAvailability::Enforced(profile), Some(launcher)) =
+            (self.availability, &self.launcher)
+        else {
+            return "Euler's sandbox could not start in this session, so commands are refused; \
+the user can run `euler --check-sandbox` to see why."
+                .to_owned();
+        };
+        let network = if profile.network_enabled() {
+            "network is available"
+        } else {
+            "network is disabled, so DNS lookups and downloads fail even when the host is online, \
+and services on the host's localhost are not reachable"
+        };
+        let writes = match (launcher, profile) {
+            (SandboxLauncher::Bubblewrap(_), SandboxProfile::WorkspaceNoNetwork) => {
+                "writes persist only in the workspace; /tmp (which holds $HOME) is writable but \
+private and discarded after each command"
+            }
+            (SandboxLauncher::Seatbelt { .. }, SandboxProfile::WorkspaceNoNetwork) => {
+                "writes are allowed only in the workspace and in $TMPDIR and $HOME, which persist \
+between commands in this session; .git and /tmp are not writable, so git commands that write \
+the repository fail"
+            }
+        };
+        format!(
+            "Commands, including git, run in Euler's {} sandbox: {network}; {writes}. If the \
+sandbox blocks something the task needs, report it as a sandbox limit and give the user the \
+exact command to run outside Euler.",
+            launcher.backend().as_str()
+        )
     }
 
     /// The availability with its cause attached, using what this sandbox's own
