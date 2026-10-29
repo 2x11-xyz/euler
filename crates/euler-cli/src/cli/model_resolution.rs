@@ -52,13 +52,14 @@ pub(crate) fn resolve_live_options(
 
 pub(crate) fn canonical_model_preference(
     mut preference: ModelPreference,
+    custom_providers: &ProviderConfigRegistry,
 ) -> Option<ModelPreference> {
-    match canonical_provider_id(&preference.provider) {
-        Some(provider) => {
-            preference.provider = provider.to_owned();
+    match parse_provider_id(&preference.provider, custom_providers) {
+        Ok(provider) => {
+            preference.provider = provider;
             Some(preference)
         }
-        None => {
+        Err(_) => {
             eprintln!(
                 "warning: ignored model preference with unknown provider {}",
                 preference.provider

@@ -28,6 +28,13 @@ pull requests that landed them; deeper design rationale lives in
   shell command that writes a privileged file is still not flagged
   (`secrets.md`).
 
+### Saved model preference accepts custom providers
+
+- **Fix**: a model saved with `/model` on a custom provider from
+  `providers.json` is used on the next start instead of being dropped with
+  `warning: ignored model preference with unknown provider <id>`. The warning
+  now appears only when no built-in or custom provider has that id.
+
 ### Execution profiles: headless default (ADR 0026 step 7)
 
 - **Behavior change**: `euler exec` now runs under the `workspace` profile

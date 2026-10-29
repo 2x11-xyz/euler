@@ -264,9 +264,9 @@ fn build_command_from_parsed(
         build_models_args(parsed)?;
         Command::Models(parsed.models_command)
     } else if parsed.exec {
-        let preference = load_known_model_preference(paths.preference);
-        let model_catalog = load_known_model_catalog(paths.model_catalog);
         let custom_providers = load_custom_provider_config(paths.provider_config);
+        let preference = load_known_model_preference(paths.preference, &custom_providers);
+        let model_catalog = load_known_model_catalog(paths.model_catalog);
         Command::Exec(build_exec_args(
             parsed,
             preference.as_ref(),
@@ -300,9 +300,9 @@ fn build_command_from_parsed(
             },
         }
     } else {
-        let preference = load_known_model_preference(paths.preference);
-        let model_catalog = load_known_model_catalog(paths.model_catalog);
         let custom_providers = load_custom_provider_config(paths.provider_config);
+        let preference = load_known_model_preference(paths.preference, &custom_providers);
+        let model_catalog = load_known_model_catalog(paths.model_catalog);
         *default_interactive = !parsed.explicit_run;
         Command::Run(build_run_args(
             parsed,
@@ -318,9 +318,9 @@ fn build_tui_command(parsed: &RawArgs, paths: CatalogPaths<'_>) -> Result<Comman
     if parsed.no_tty {
         return Err(anyhow!("tui cannot be combined with --no-tty"));
     }
-    let preference = load_known_model_preference(paths.preference);
-    let model_catalog = load_known_model_catalog(paths.model_catalog);
     let custom_providers = load_custom_provider_config(paths.provider_config);
+    let preference = load_known_model_preference(paths.preference, &custom_providers);
+    let model_catalog = load_known_model_catalog(paths.model_catalog);
     let run = build_run_args(
         parsed,
         preference.as_ref(),
