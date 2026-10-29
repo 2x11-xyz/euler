@@ -3504,6 +3504,46 @@ fn pasted_path_or_multiline_command_text_submits_as_message() {
     }
 }
 
+/// A known command pasted into a recalled queue item replaces that item
+/// instead of running, and one pasted during a turn is dispatched as a
+/// command (here `/profile` answers with its busy notice) instead of queueing.
+#[test]
+fn pasted_slash_command_keeps_queue_edit_and_runs_mid_turn() {
+    let mut core = core();
+    core.queued_inputs
+        .push_follow_up_back("idle pending".to_owned())
+        .expect("pending follow-up");
+    core.handle_input(key(KeyCode::Up));
+    assert!(core.recalled_queue_id.is_some());
+    core.bottom.replace_composer_text("");
+    core.handle_input(InputEvent::Paste("/profile".to_owned()));
+    core.handle_input(key(KeyCode::Enter));
+    wait_for_queue_mutation(&mut core);
+
+    assert_eq!(core.queued_inputs.snapshot(), ["/profile"]);
+    assert!(core.recalled_queue_id.is_none());
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert_eq!(core.bottom.composer().submit_text(), "");
+    assert_eq!(user_message_count(&core), 0);
+
+    let (mut core, gate) = core_gated();
+    submit_without_wait(&mut core, "active");
+    wait_for_model_call(&mut core);
+    core.handle_input(InputEvent::Paste("/profile".to_owned()));
+    core.handle_input(key(KeyCode::Enter));
+
+    assert_eq!(
+        core.visual_canvas.finalized_items().last(),
+        Some(&TranscriptItem::Notice(
+            "profile change waits for the active turn".to_owned()
+        ))
+    );
+    assert!(core.queued_inputs.is_empty());
+    gate.open();
+    wait_for_idle(&mut core);
+    assert_eq!(user_message_count(&core), 1);
+}
+
 #[test]
 fn multiline_bracketed_paste_inserts_paste_token_and_waits_for_enter() {
     let mut core = core();
