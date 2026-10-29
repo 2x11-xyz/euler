@@ -72,6 +72,28 @@ impl EulerHome {
         self.root.join(EXTENSIONS_DIR)
     }
 
+    /// Files and directories under this home that hold secrets or decide
+    /// trust: the auth file, `profiles.json`, the durable user grants, the
+    /// project-grant consent store, the project-context acknowledgments, and
+    /// the extension enablement, link, and launch-consent records. A
+    /// structured write to one asks a human under every execution profile
+    /// (`secrets.md` "Config-Edit Guardrail"); the rest of the home follows
+    /// the normal profile rules. `providers.json` resolves outside this type
+    /// and is marked by the caller.
+    pub fn privileged_config_paths(&self) -> Vec<PathBuf> {
+        let extensions = self.extensions_dir();
+        vec![
+            self.auth_path(),
+            self.profiles_path(),
+            crate::grants::ProjectGrantStore::user_grants_path(&self.root),
+            self.root.join(crate::grants::PROJECT_GRANTS_CONSENT_DIR),
+            self.root.join(crate::project_context::ACK_SUBDIR),
+            extensions.join(crate::extension_registry::STATE_LOG_FILE),
+            extensions.join(crate::extension_registry::LINK_INVENTORY_FILE),
+            extensions.join(crate::extension_registry::LINKED_ACTIVATION_LOG_FILE),
+        ]
+    }
+
     /// User-global Euler skills. Discovery treats this as a read-only input
     /// root; it is not created merely by resolving Euler home.
     pub fn skills_dir(&self) -> PathBuf {

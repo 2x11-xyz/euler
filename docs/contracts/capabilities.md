@@ -268,8 +268,8 @@ and `reviewer: user`. Under `full`:
   included, as the Full access posture did; the configured capability
   modes are unchanged and `always-deny` still denies. A command still
   asks when the dangerous-command list flags it, and a structured write to
-  interpreter-honored configuration or into the Euler home asks a human
-  (all rules below that hold under every profile). Extension install and
+  interpreter-honored configuration or to a privileged Euler file asks a
+  human (all rules below that hold under every profile). Extension install and
   launch consent keep their own prompts. The `sensitive_path` flag does
   not ask: `read_file .env`, `cat .env`, and `python3 x.py .env` all run.
 - The environment passes through to host commands except Euler's own
@@ -306,11 +306,23 @@ interpreter-honored configuration (anything under `.git`,
 `.npmrc`, `.netrc`, shell startup files, `.cargo/config.toml`) is marked
 like a dangerous command: it asks a human, no grant covers it, and it never
 reaches the guardian (ADR 0026 resolved question 15). A structured write
-whose target resolves under the Euler home, `providers.json`, or the auth
-file is a privileged secret and config edit (`secrets.md`) and is marked
-the same way. For the Euler home, `providers.json`, and the auth file only
-the structured form is checked: a `run_shell` command under `full` that
-writes them is not flagged. An interpreter (`sed`,
+whose target resolves to a privileged Euler file is a privileged secret
+and config edit (`secrets.md` "Config-Edit Guardrail") and is marked the
+same way. The privileged Euler files are the ones that hold secrets or
+decide trust: `providers.json`, the auth file (`<euler home>/auth.json` and
+an `--auth-file` or `EULER_AUTH_FILE` override), `<euler home>/profiles.json`,
+`<euler home>/user-grants.json`, the project-grant consent store
+`<euler home>/project-grants/`, the project-context acknowledgments
+`<euler home>/project-context/`, and the extension records
+`<euler home>/extensions/state.jsonl`, `links.json`, and
+`linked-activation.jsonl`. The rest of the Euler home (skills, sessions,
+`preferences.json`, installed extension packages) follows the normal
+profile rules; a changed installed package needs re-consent through its
+fingerprint (ADR 0015). For the privileged Euler files only the structured
+form is checked: a `run_shell` command that writes one
+(`echo > ~/.euler/providers.json`) is not flagged and runs under the
+profile's shell rules, so under `full` it runs without asking. An
+interpreter (`sed`,
 `awk`, `perl`, `ruby`, `python`, `node`, `patch`, `ed`) whose operands
 mention a sensitive path sets the request's `sensitive_path` flag rather
 than the dangerous flag, as a sensitive path named anywhere in a

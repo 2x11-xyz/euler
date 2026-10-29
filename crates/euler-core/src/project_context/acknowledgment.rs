@@ -37,7 +37,7 @@ const MAX_ACK_FILE_BYTES: u64 = 8 * 1024;
 /// Subdirectory of the user consent directory that holds per-root
 /// acknowledgment records. Distinct from `project-grants/` so keys never
 /// collide with the grant consent store.
-const ACK_SUBDIR: &str = "project-context";
+pub(crate) const ACK_SUBDIR: &str = "project-context";
 
 /// The workspace-identity block recorded alongside the acknowledgment. It is
 /// the same `{ algorithm, version, digest }` shape the snapshot records, so a

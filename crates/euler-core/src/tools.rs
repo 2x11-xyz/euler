@@ -291,9 +291,10 @@ pub struct ToolRegistry {
     writes_outside_workspace: bool,
     background_jobs: crate::background_jobs::BackgroundJobs,
     euler_credentials: EulerCredentials,
-    /// Canonical paths whose files hold Euler's secrets and configuration
-    /// (the Euler home, the auth file). A structured write under one is a
-    /// privileged secret and config edit (`secrets.md`).
+    /// Canonical paths whose files hold Euler's secrets or decide trust
+    /// (`providers.json`, the auth file, the Euler home's grant and consent
+    /// records). A structured write under one is a privileged secret and
+    /// config edit (`secrets.md`).
     privileged_config_paths: Vec<PathBuf>,
     /// The execution profile whose `escalation` field governs `run_shell`'s
     /// `escalate` object (ADR 0026 section 3): its name for messages, and
