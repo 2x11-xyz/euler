@@ -954,6 +954,10 @@ fn exec_under_full_asks_before_writing_euler_secrets_and_trust_records() {
         "extensions/state.jsonl",
         "extensions/links.json",
         "extensions/linked-activation.jsonl",
+        // On a case-insensitive filesystem these create the files above.
+        "PROFILES.json",
+        "USER-GRANTS.json",
+        "Auth.json",
     ]
     .into_iter()
     .filter(|relative| {

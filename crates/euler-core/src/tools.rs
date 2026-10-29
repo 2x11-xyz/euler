@@ -493,7 +493,9 @@ impl ToolRegistry {
 
     /// Whether a structured write to `requested` lands under a path
     /// [`Self::add_privileged_config_path`] marked, resolved as the write
-    /// resolves it.
+    /// resolves it. The match ignores ASCII case: resolving keeps the
+    /// requested case for a file that does not exist yet, and on a
+    /// case-insensitive filesystem `PROFILES.json` creates `profiles.json`.
     pub(crate) fn writes_privileged_config(&self, requested: &str) -> bool {
         let Ok(resolved) = self.resolve_write_path(requested, false) else {
             return false;
@@ -501,7 +503,7 @@ impl ToolRegistry {
         let target = resolved.absolute();
         self.privileged_config_paths
             .iter()
-            .any(|privileged| target.starts_with(privileged))
+            .any(|privileged| starts_with_ignoring_ascii_case(&target, privileged))
     }
 
     /// Background jobs started with the sandbox off that are still running,
@@ -1632,6 +1634,19 @@ see them.\n"
     fn read_resolved_file(&self, path: &ResolvedWorkspacePath) -> Result<String, ToolError> {
         read_confined(&path.confine()?, path)
     }
+}
+
+/// `path.starts_with(prefix)`, comparing each component without regard to
+/// ASCII case.
+fn starts_with_ignoring_ascii_case(path: &Path, prefix: &Path) -> bool {
+    let mut components = path.components();
+    prefix.components().all(|expected| {
+        components.next().is_some_and(|actual| {
+            actual
+                .as_os_str()
+                .eq_ignore_ascii_case(expected.as_os_str())
+        })
+    })
 }
 
 /// The canonical form of `full`: symlinks resolved for an existing path, or

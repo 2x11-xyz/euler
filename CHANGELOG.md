@@ -23,8 +23,10 @@ pull requests that landed them; deeper design rationale lives in
   `project-context/` consent stores, and the extension records
   `extensions/state.jsonl`, `links.json`, and `linked-activation.jsonl`.
   Other writes there, such as a skill under `skills/`, follow the profile's
-  normal rules, so under `full` they no longer ask. A shell command that
-  writes a privileged file is still not flagged (`secrets.md`).
+  normal rules, so under `full` they no longer ask. The match ignores ASCII
+  case, so `PROFILES.json` on a case-insensitive filesystem still asks. A
+  shell command that writes a privileged file is still not flagged
+  (`secrets.md`).
 
 ### Execution profiles: headless default (ADR 0026 step 7)
 

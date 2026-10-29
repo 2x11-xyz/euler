@@ -317,9 +317,11 @@ an `--auth-file` or `EULER_AUTH_FILE` override), `<euler home>/profiles.json`,
 `<euler home>/extensions/state.jsonl`, `links.json`, and
 `linked-activation.jsonl`. The rest of the Euler home (skills, sessions,
 `preferences.json`, installed extension packages) follows the normal
-profile rules; a changed installed package needs re-consent through its
-fingerprint (ADR 0015). For the privileged Euler files only the structured
-form is checked: a `run_shell` command that writes one
+profile rules; installed extension packages are inert today, and launch
+consent is keyed to the reviewed fingerprint (ADR 0015). The match ignores
+ASCII case, so on a case-insensitive filesystem a write to
+`<euler home>/PROFILES.json` asks too. For the privileged Euler files only
+the structured form is checked: a `run_shell` command that writes one
 (`echo > ~/.euler/providers.json`) is not flagged and runs under the
 profile's shell rules, so under `full` it runs without asking. An
 interpreter (`sed`,

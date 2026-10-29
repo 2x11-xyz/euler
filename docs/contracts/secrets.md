@@ -61,14 +61,18 @@ no grant covers it, and it never reaches the guardian:
 - the extension records `<euler home>/extensions/state.jsonl`,
   `links.json`, and `linked-activation.jsonl`.
 
-Other writes under the Euler home (skills, sessions, `preferences.json`)
-follow the normal profile rules (`capabilities.md`).
+The match ignores ASCII case, so on a case-insensitive filesystem a write
+to `PROFILES.json` is recognized as `profiles.json`. Other writes under the
+Euler home (skills, sessions, `preferences.json`) follow the normal profile
+rules (`capabilities.md`).
 
 Known gap: only the structured write is checked. A shell command that
 writes one of these files (`echo > ~/.euler/providers.json`) is not
 flagged; it follows the profile's shell rules, so under `full` it runs
 without asking. A hard link to one of these files made from the shell is
-the same gap: a structured write through it is not recognized.
+the same gap: a structured write through it is not recognized. The match
+ignores ASCII case only, so a non-ASCII name that a case-insensitive
+filesystem folds onto one of these files is not recognized either.
 
 Euler must not execute a secret shell command that was written or modified by an agent in the current session unless the user explicitly approved that config edit.
 
