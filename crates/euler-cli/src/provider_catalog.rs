@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn embedded_release_authenticates_and_contains_kimi_k3() {
         let release = embedded_release();
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.5");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.1.6");
         assert!(release
             .catalog
             .provider("openrouter")
@@ -922,12 +922,12 @@ mod tests {
     #[test]
     fn newer_catalog_protocol_is_rejected_before_artifact_use() {
         let mut manifest = embedded_release().manifest;
-        manifest.minimum_euler_version = "0.1.6".to_owned();
+        manifest.minimum_euler_version = "0.1.7".to_owned();
 
         let error = ensure_compatible(&manifest).expect_err("future protocol must fail");
 
-        assert!(error.to_string().contains("requires Euler 0.1.6"));
-        assert!(error.to_string().contains("this binary is 0.1.5"));
+        assert!(error.to_string().contains("requires Euler 0.1.7"));
+        assert!(error.to_string().contains("this binary is 0.1.6"));
     }
 
     #[test]
