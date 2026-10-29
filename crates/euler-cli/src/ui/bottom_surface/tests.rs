@@ -181,6 +181,7 @@ fn palette_confirm_on_disabled_extension_returns_muted_notice_every_time() {
     surface.open_palette();
     surface.palette_insert("review-brief");
     assert_eq!(surface.confirm(), expected);
+    assert!(!matches!(surface.owner(), BottomOwner::Palette(_)));
 
     // Invoke the same disabled command again: still teaches, not silenced.
     surface.open_palette();
@@ -268,6 +269,37 @@ fn palette_cursor_editing_keeps_slash_command_shape() {
     assert_eq!(palette.input(), "/ffort");
     assert_eq!(palette.cursor(), 1);
     assert!(palette.input().starts_with('/'));
+}
+
+/// A command error from the palette keeps the palette and what was typed,
+/// so trailing text after a no-argument command is not silently dropped.
+#[test]
+fn palette_command_error_keeps_typed_input_open() {
+    let mut surface = BottomSurface::new(CommandContext::default());
+    surface.open_palette();
+    surface.palette_insert("quit now");
+    assert_eq!(
+        surface.confirm(),
+        SurfaceEvent::Message("/quit takes no arguments; remove the text after it".to_owned())
+    );
+    let BottomOwner::Palette(palette) = surface.owner() else {
+        panic!("palette should stay open after a command error");
+    };
+    assert_eq!(palette.input(), "/quit now");
+
+    let mut unknown = BottomSurface::new(CommandContext::default());
+    unknown.open_palette();
+    unknown.palette_insert("zz arg");
+    assert_eq!(
+        unknown.confirm(),
+        SurfaceEvent::Message("unknown command: /zz".to_owned())
+    );
+    assert!(matches!(unknown.owner(), BottomOwner::Palette(_)));
+
+    let mut bare = BottomSurface::new(CommandContext::default());
+    bare.open_palette();
+    bare.palette_insert("quit");
+    assert_eq!(bare.confirm(), SurfaceEvent::Action(CommandAction::Quit));
 }
 
 #[test]

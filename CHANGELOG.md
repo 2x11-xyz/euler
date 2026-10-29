@@ -17,6 +17,17 @@ pull requests that landed them; deeper design rationale lives in
   the new location starts empty, so pick the model again with `/model` (or
   copy the file). With `EULER_HOME` unset the location is unchanged.
 
+### TUI: text after a no-argument command is a usage error
+
+- `/quit now` or `/compact the history please`, typed or pasted, no longer
+  runs the command and drops the text. It shows
+  `/quit takes no arguments; remove the text after it` and keeps the draft.
+  Commands that take arguments are unchanged.
+- A command error from the slash palette (usage, unavailable skill, unknown
+  command) now
+  keeps the palette open with what was typed, instead of closing it and
+  discarding the input.
+
 ### Execution profiles: withhold every providers.json credential reference
 
 - A variable that any `providers.json` provider entry references as `$NAME`

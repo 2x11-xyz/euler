@@ -582,8 +582,10 @@ impl BottomSurface {
         }
         match dispatch_command(&palette.confirmation_input(), &self.context) {
             CommandEffect::Action(action) => self.apply_action(action),
+            // A command error keeps the palette and its input so the user
+            // can fix what they typed.
             CommandEffect::Message(message) => {
-                self.composer = palette.saved_draft;
+                self.owner = BottomOwner::Palette(palette);
                 SurfaceEvent::Message(message)
             }
             CommandEffect::Notice(message) => {
