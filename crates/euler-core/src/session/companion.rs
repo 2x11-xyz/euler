@@ -9,6 +9,7 @@ use super::{
     RoundOutcome, Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
+use crate::execution_profile::ExecutionProfile;
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
 use crate::{ProviderRuntimeObserver, ProviderRuntimeScope};
 use euler_agents::{generated_agent_id, AgentResult, AgentTask, SpawnedAgent};
@@ -85,10 +86,14 @@ struct CompanionLoop<'a, D> {
     cancellation: CancellationToken,
 }
 
-struct CompanionLoopInit {
+struct CompanionLoopInit<'a> {
     task: AgentTask,
     target: ModelTarget,
     modes: Vec<(Capability, ApprovalMode)>,
+    profile: ExecutionProfile,
+    /// The child's own registry when its profile differs from the session's;
+    /// `None` uses the session's.
+    child_tools: Option<&'a crate::tools::ToolRegistry>,
     writer: Arc<crate::provenance::ProvenanceWriter>,
     agent_id: String,
     cancellation: CancellationToken,
@@ -175,9 +180,11 @@ impl<D: PermissionDecider> Session<D> {
             .as_ref()
             .cloned()
             .ok_or(SessionError::CompanionProvenanceUnavailable)?;
+        let profile = self.config.child_execution_profile();
+        let child_tools = self.child_tool_registry(&profile)?;
         self.persist_new_events()?;
 
-        let mut spawned = self.record_companion_spawn(&task, &target, &writer)?;
+        let mut spawned = self.record_companion_spawn(&task, &target, &profile, &writer)?;
         let resolved_provider = target.provider.clone();
         let resolved_model = target.model.clone();
         let (result, cancelled) = {
@@ -187,6 +194,8 @@ impl<D: PermissionDecider> Session<D> {
                     task,
                     target,
                     modes,
+                    profile,
+                    child_tools: child_tools.as_ref(),
                     writer,
                     agent_id: spawned.child_agent_id().to_owned(),
                     cancellation,
@@ -194,6 +203,9 @@ impl<D: PermissionDecider> Session<D> {
             );
             loop_.run()
         };
+        if let Some(child_tools) = &child_tools {
+            child_tools.hand_background_jobs_to(&self.tools);
+        }
         let result_event_id =
             self.record_agent_result_before_handle_loss(&mut spawned, result.clone())?;
         if cancelled {
@@ -231,16 +243,41 @@ impl<D: PermissionDecider> Session<D> {
         Ok(target)
     }
 
+    /// The registry a child under `profile` uses: `None` when `profile` is
+    /// the session's, so the child shares the session's registry; otherwise
+    /// one with `profile`'s boundary. A boundary this host cannot deliver is
+    /// refused before the spawn is recorded.
+    fn child_tool_registry(
+        &self,
+        profile: &ExecutionProfile,
+    ) -> Result<Option<crate::tools::ToolRegistry>, SessionError> {
+        if *profile == self.config.reviewed_execution_profile() {
+            return Ok(None);
+        }
+        let sandbox = profile
+            .subprocess_sandbox()
+            .map_err(SessionError::ChildProfileUnenforced)?;
+        Ok(Some(self.tools.for_child_profile(
+            profile,
+            sandbox,
+            self.config.sandbox_home(),
+        )))
+    }
+
+    /// Record `agent.spawn` for a live child, with its resolved target and
+    /// the `execution_profile` it runs under.
     pub(super) fn record_companion_spawn(
         &mut self,
         task: &AgentTask,
         target: &ModelTarget,
+        profile: &ExecutionProfile,
         writer: &Arc<crate::provenance::ProvenanceWriter>,
     ) -> Result<SpawnedAgent, SessionError> {
         let child_agent_id = generated_agent_id(&self.config.agent_id);
         let mut payload = euler_agents::agent_spawn_payload(task, &child_agent_id);
         payload.insert("provider".to_owned(), target.provider.clone().into());
         payload.insert("model".to_owned(), target.model.clone().into());
+        payload.insert("execution_profile".to_owned(), profile.record());
         let agent_id = self.config.agent_id.clone();
         let event =
             self.appender_as(writer, &agent_id)
@@ -258,22 +295,22 @@ impl<D: PermissionDecider> Session<D> {
 }
 
 impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
-    fn new(session: &'a mut Session<D>, init: CompanionLoopInit) -> Self {
+    fn new(session: &'a mut Session<D>, init: CompanionLoopInit<'a>) -> Self {
         let CompanionLoopInit {
             task,
             target,
             modes,
+            profile,
+            child_tools,
             writer,
             agent_id,
             cancellation,
         } = init;
         let run_id = session.active_run.clone();
-        // A child runs under the parent's execution profile (ADR 0026
-        // section 7, `inherit`).
-        let profile = session.permissions.execution_profile().clone();
-        let sandbox_enforced = session.permissions.sandbox_enforced();
+        let tools = child_tools.unwrap_or(&session.tools);
+        let sandbox_enforced = matches!(tools.sandbox_status(), crate::SandboxStatus::Enforced(_));
         let mut permissions = PermissionGate::new_deny_all(session.permissions.decider_mut());
-        permissions.set_execution_profile(profile, sandbox_enforced);
+        permissions.set_execution_profile(profile.fields, sandbox_enforced);
         for (capability, mode) in modes {
             permissions.set_mode(capability, mode);
         }
@@ -293,7 +330,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             provider_liveness: session.config.provider_liveness,
             provider_runtime_observer: session.provider_runtime_observer.clone(),
             providers: &session.providers,
-            tools: &session.tools,
+            tools,
             writer,
             run_id,
             accepted_events: session

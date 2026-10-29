@@ -377,11 +377,19 @@ is not tracked.
   `/profile` in the TUI, then the context default in `profiles.json`, then
   the built-in default: `full` interactive, `workspace` headless. An unknown
   name is a startup error listing the defined profiles.
-  `--permission-reviewer` overrides the profile's `reviewer`. Child agents
-  and companions run inside the session's boundary and approvals:
-  `defaults.subagent` is validated but not applied yet, so a child never
-  runs looser than its parent, and when it names a profile rather than
-  `inherit`, startup prints a warning saying so.
+  `--permission-reviewer` overrides the profile's `reviewer`.
+- **Child agents.** A companion or parallel reviewer runs under
+  `defaults.subagent` (resolved at startup like a selected profile, overlay
+  included) tightened field by field against the session's current profile:
+  a field looser than the session's takes the session's value, so a child
+  never runs looser than its parent. Unset or `inherit` is the session's
+  profile. The child keeps the session's `reviewer`, since its asks go to
+  the session's reviewer. A child whose profile differs from the session's
+  gets its own boundary, structured-write scope, and escalation; jobs its
+  sandboxed or escalated commands leave running end when the child ends,
+  and host background jobs it starts are listed at exit with the session's.
+  A `defaults.subagent` this host cannot enforce is a startup error naming
+  the setting. `agent.spawn` records the child's `execution_profile`.
 - **First run.** An interactive launch without `--profile` whose
   `profiles.json` has no `defaults.interactive` asks once, on a terminal
   (stdin and stderr both terminals), which preset to use: `full`

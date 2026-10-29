@@ -541,6 +541,119 @@ fn first_looser_field_follows_the_tighten_order() {
 }
 
 #[test]
+fn child_profile_inherits_without_a_subagent_default() {
+    let parent = ExecutionProfile {
+        name: "full".to_owned(),
+        fields: full::fields(),
+    };
+    assert_eq!(parent.child_profile(None), parent);
+}
+
+#[test]
+fn child_profile_takes_the_parent_value_for_each_looser_field() {
+    let parent = ExecutionProfile {
+        name: "workspace".to_owned(),
+        fields: ProfileFields {
+            reviewer: PermissionReviewer::Guardian,
+            ..workspace::fields()
+        },
+    };
+    let subagent = ExecutionProfile {
+        name: "full".to_owned(),
+        fields: full::fields(),
+    };
+
+    let child = parent.child_profile(Some(&subagent));
+
+    assert_eq!(child.name, "full");
+    assert_eq!(
+        child.fields,
+        ProfileFields {
+            // Looser in the subagent default, so the parent's.
+            sandbox: parent.fields.sandbox,
+            approvals: ApprovalsSetting::EscalationOnly,
+            // Tighter in the subagent default, so kept.
+            escalation: EscalationSetting::NotAllowed,
+            // No order: the child's asks go to the session's reviewer.
+            reviewer: PermissionReviewer::Guardian,
+            ..workspace::fields()
+        }
+    );
+    assert_eq!(child.fields.first_looser_field(&parent.fields), None);
+    child.check_enforced().expect("enforceable");
+}
+
+#[test]
+fn child_profile_keeps_a_tighter_subagent_default() {
+    let parent = ExecutionProfile {
+        name: "full".to_owned(),
+        fields: full::fields(),
+    };
+    let locked = ExecutionProfile::default();
+
+    assert_eq!(parent.child_profile(Some(&locked)), locked);
+}
+
+#[test]
+fn child_profile_replaces_writable_paths_the_parent_lacks() {
+    let parent = ExecutionProfile {
+        name: "data".to_owned(),
+        fields: ProfileFields {
+            writable_paths: vec!["~/data".to_owned()],
+            ..workspace::fields()
+        },
+    };
+    let subset = ExecutionProfile {
+        name: "workspace".to_owned(),
+        fields: workspace::fields(),
+    };
+    let wider = ExecutionProfile {
+        name: "scratch".to_owned(),
+        fields: ProfileFields {
+            writable_paths: vec!["~/scratch".to_owned()],
+            ..workspace::fields()
+        },
+    };
+
+    assert!(parent
+        .child_profile(Some(&subset))
+        .fields
+        .writable_paths
+        .is_empty());
+    assert_eq!(
+        parent.child_profile(Some(&wider)).fields.writable_paths,
+        vec!["~/data".to_owned()]
+    );
+}
+
+#[test]
+fn subagent_default_resolves_with_the_overlay_and_inherit_resolves_to_none() {
+    let root = tempfile::tempdir().expect("root");
+    let overlay = overlay(root.path(), r#"{"approvals": "always"}"#);
+    for text in [r#"{}"#, r#"{"defaults": {"subagent": "inherit"}}"#] {
+        let config = parse(text).expect("parses");
+        assert_eq!(
+            config.resolve_subagent(Some(&overlay)).expect("resolves"),
+            None
+        );
+    }
+
+    let config = parse(r#"{"defaults": {"subagent": "workspace"}}"#).expect("parses");
+    let subagent = config
+        .resolve_subagent(Some(&overlay))
+        .expect("resolves")
+        .expect("named");
+    assert_eq!(subagent.name, "workspace");
+    assert_eq!(
+        subagent.fields,
+        ProfileFields {
+            approvals: ApprovalsSetting::Always,
+            ..workspace::fields()
+        }
+    );
+}
+
+#[test]
 fn resume_keeps_the_recorded_profile_when_the_resolved_one_is_looser() {
     let recorded = ExecutionProfile::default();
     let resolved = ExecutionProfile {

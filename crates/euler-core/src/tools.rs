@@ -477,6 +477,37 @@ impl ToolRegistry {
         self.background_jobs.hand_over(&fresh.background_jobs);
     }
 
+    /// The registry a child agent uses when its execution profile differs
+    /// from the session's (ADR 0026 section 7): `profile`'s boundary,
+    /// structured-write scope, and escalation, with this registry's
+    /// workspace, skills, observation bound, and Euler's credentials. Jobs
+    /// its sandboxed commands leave running end when it drops, at the end of
+    /// the child; host background jobs move back with
+    /// [`Self::hand_background_jobs_to`].
+    pub(crate) fn for_child_profile(
+        &self,
+        profile: &crate::ExecutionProfile,
+        subprocess_sandbox: SubprocessSandbox,
+        sandbox_home: Option<PathBuf>,
+    ) -> Self {
+        let mut child =
+            Self::with_sandbox_home(self.root.clone(), subprocess_sandbox, sandbox_home);
+        child.skills = self.skills.clone();
+        child.observation_bound = self.observation_bound;
+        child.euler_credentials = self.euler_credentials.clone();
+        child.privileged_config_paths = self.privileged_config_paths.clone();
+        child.writes_outside_workspace =
+            profile.fields.sandbox == crate::execution_profile::SandboxSetting::Off;
+        child.set_execution_profile(profile);
+        child
+    }
+
+    /// Move the host background jobs still running here to `session`, which
+    /// lists them at exit.
+    pub(crate) fn hand_background_jobs_to(&self, session: &ToolRegistry) {
+        self.background_jobs.hand_over(&session.background_jobs);
+    }
+
     /// Mark `path` (a directory and everything under it, or one file) as
     /// holding Euler's secrets and configuration: a structured write there
     /// asks a human under every execution profile (`secrets.md`

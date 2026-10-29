@@ -1129,6 +1129,13 @@ extension error does not consume the later result.
   unconfigured target, for example) still consumes it: keys may skip numbers
   but never repeat within one execution. Other spawns carry neither field.
   These fields are recorded only; resume does not read them yet.
+  `execution_profile` (the `session.start` shape) records the profile a live
+  child runs under (companions and parallel reviewers; ADR 0026 section 7):
+  the session's profile, or `defaults.subagent` tightened field by field to
+  be no looser than it, with the session's `reviewer` (`name` stays the
+  `defaults.subagent` profile's; `fields` are what the child got). Recorded
+  only; spawns written before the field existed and background agents carry
+  none.
 - `agent.message`: `from_agent_id`, `to_agent_id`, `spawn_event_id`,
   `queued_ts`, `payload`. This is a parent-drained child-to-parent report from
   a live current-process background child, not transcript content and not a

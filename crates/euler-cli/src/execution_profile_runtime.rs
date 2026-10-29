@@ -1,7 +1,7 @@
 //! Execution profile selection for a launch or a resume (ADR 0026 sections
 //! 5 and 9).
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use euler_core::execution_profile::{
     write_interactive_default, ApprovalsSetting, Preset, SandboxSetting, PROJECT_OVERLAY_PATH,
 };
@@ -22,15 +22,30 @@ pub(crate) struct ProfileRequest<'a> {
     pub(crate) context: ProfileContext,
 }
 
+/// The profiles a launch resolves: the session's, and `defaults.subagent`
+/// for its child agents (`None` is `inherit`).
+pub(crate) struct LaunchProfile {
+    pub(crate) profile: ExecutionProfile,
+    pub(crate) subagent: Option<ExecutionProfile>,
+}
+
+impl LaunchProfile {
+    pub(crate) fn install(self, config: &mut SessionConfig) {
+        config.set_execution_profile(self.profile);
+        config.subagent_profile = self.subagent;
+    }
+}
+
 /// Resolve the profile for a fresh launch: `--profile`, then the context
 /// default in `profiles.json`, then the built-in default, then the
-/// repository's tightening overlay. A malformed file or an unavailable
-/// profile is a startup error. Prints the startup summary to stderr.
+/// repository's tightening overlay; and `defaults.subagent` with the same
+/// overlay. A malformed file or an unavailable profile is a startup error.
+/// Prints the startup summary to stderr.
 ///
 /// The first interactive launch without `defaults.interactive` and without
 /// `--profile` shows the first-run picker on a terminal and saves the choice
 /// (ADR 0026 section 5).
-pub(crate) fn launch_profile(request: ProfileRequest<'_>, root: &Path) -> Result<ExecutionProfile> {
+pub(crate) fn launch_profile(request: ProfileRequest<'_>, root: &Path) -> Result<LaunchProfile> {
     let (mut profiles, overlay, mut notices) = load_profile_sources(root)?;
     if request.context == ProfileContext::Interactive
         && request.profile.is_none()
@@ -46,12 +61,13 @@ pub(crate) fn launch_profile(request: ProfileRequest<'_>, root: &Path) -> Result
         }
     }
     let mut profile = profiles.resolve(request.profile, request.context, overlay.as_ref())?;
+    let subagent = resolve_subagent(&profiles, overlay.as_ref())?;
     notices.extend(overlay_notice(overlay.as_ref(), &profile));
     print_notices(&notices);
     if let Some(reviewer) = request.reviewer {
         profile.fields.reviewer = reviewer;
     }
-    Ok(profile)
+    Ok(LaunchProfile { profile, subagent })
 }
 
 /// A resume's profile resolved as a launch resolves it, before the resume
@@ -60,6 +76,7 @@ pub(crate) fn launch_profile(request: ProfileRequest<'_>, root: &Path) -> Result
 /// to the log.
 pub(crate) struct ResolvedResumeProfile {
     resolved: ExecutionProfile,
+    subagent: Option<ExecutionProfile>,
     overlay: Option<ProjectOverlay>,
     notices: Vec<String>,
     explicit: bool,
@@ -83,8 +100,10 @@ fn resolve_resume_profile_from(
     request: ProfileRequest<'_>,
 ) -> Result<ResolvedResumeProfile> {
     let resolved = profiles.resolve(request.profile, request.context, overlay.as_ref())?;
+    let subagent = resolve_subagent(profiles, overlay.as_ref())?;
     Ok(ResolvedResumeProfile {
         resolved,
+        subagent,
         overlay,
         notices,
         explicit: request.profile.is_some(),
@@ -104,6 +123,7 @@ impl ResolvedResumeProfile {
     ) -> Result<Vec<String>> {
         let Self {
             resolved,
+            subagent,
             overlay,
             mut notices,
             explicit,
@@ -123,6 +143,7 @@ impl ResolvedResumeProfile {
         notices.extend(overlay_notice(overlay.as_ref(), &choice.profile));
         notices.extend(choice.summary());
         config.set_execution_profile(choice.profile);
+        config.subagent_profile = subagent;
         Ok(notices)
     }
 }
@@ -270,6 +291,17 @@ fn overlay_notice(overlay: Option<&ProjectOverlay>, profile: &ExecutionProfile) 
     })
 }
 
+/// `defaults.subagent` resolved for child agents; an unusable one is a
+/// startup error that names the setting.
+fn resolve_subagent(
+    profiles: &ProfilesConfig,
+    overlay: Option<&ProjectOverlay>,
+) -> Result<Option<ExecutionProfile>> {
+    profiles
+        .resolve_subagent(overlay)
+        .context("defaults.subagent in profiles.json cannot be applied to child agents")
+}
+
 fn load_profile_sources(
     root: &Path,
 ) -> Result<(ProfilesConfig, Option<ProjectOverlay>, Vec<String>)> {
@@ -283,19 +315,7 @@ fn load_profile_sources(
             ProfilesConfig::default()
         }
     };
-    notices.extend(subagent_notice(&profiles));
     Ok((profiles, ProjectOverlay::load(root)?, notices))
-}
-
-/// `defaults.subagent` naming a profile is not applied yet; say so rather
-/// than let a user believe child agents run under it.
-fn subagent_notice(profiles: &ProfilesConfig) -> Option<String> {
-    profiles.unapplied_subagent_default().map(|name| {
-        format!(
-            "warning: defaults.subagent \"{name}\" is not applied yet; child agents run under \
-             the session's execution profile"
-        )
-    })
 }
 
 #[cfg(test)]

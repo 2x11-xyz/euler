@@ -209,6 +209,10 @@ pub struct SessionConfig {
     /// Its `reviewer` is recorded from [`Self::permission_reviewer`], which
     /// is what the gate consults.
     pub execution_profile: ExecutionProfile,
+    /// `defaults.subagent` resolved (ADR 0026 section 7); `None` (default)
+    /// is `inherit`. A child agent runs under
+    /// [`ExecutionProfile::child_profile`] of the session's profile and this.
+    pub subagent_profile: Option<ExecutionProfile>,
     /// `None` (default) = unlimited rounds per turn; a turn ends when the
     /// model finishes, fails, or the user cancels. Set only when a hard
     /// ceiling is explicitly wanted (e.g. exec --max-tool-rounds).
@@ -313,9 +317,21 @@ impl SessionConfig {
     /// The `execution_profile` provenance object, with the reviewer the
     /// session actually uses.
     pub(crate) fn execution_profile_record(&self) -> Value {
+        self.reviewed_execution_profile().record()
+    }
+
+    /// The profile a child agent spawned now runs under (ADR 0026 section
+    /// 7), recorded on its `agent.spawn`.
+    pub(crate) fn child_execution_profile(&self) -> ExecutionProfile {
+        self.reviewed_execution_profile()
+            .child_profile(self.subagent_profile.as_ref())
+    }
+
+    /// The session's profile with the reviewer the gate consults.
+    fn reviewed_execution_profile(&self) -> ExecutionProfile {
         let mut profile = self.execution_profile.clone();
         profile.fields.reviewer = self.permission_reviewer;
-        profile.record()
+        profile
     }
 
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -329,6 +345,7 @@ impl SessionConfig {
             subprocess_sandbox: SubprocessSandbox::default(),
             session_store_dir: None,
             execution_profile: ExecutionProfile::default(),
+            subagent_profile: None,
             max_tool_rounds: None,
             provider_transport_retries: 2,
             provider_transport_retry_backoff_ms: vec![1000, 3000],
@@ -455,6 +472,8 @@ pub enum SessionError {
     InvalidCompanionTask(String),
     #[error("companion spawn requires provenance writer")]
     CompanionProvenanceUnavailable,
+    #[error("a child agent cannot run under its execution profile: {0}")]
+    ChildProfileUnenforced(crate::execution_profile::ProfileError),
     #[error("scrub requires provenance writer")]
     ScrubRequiresProvenance,
     #[error(transparent)]

@@ -306,7 +306,30 @@ impl ProfilesConfig {
             Some(name) => name.to_owned(),
             None => self.default_name(context),
         };
-        let mut profile = self.named(&name)?;
+        self.resolve_named(&name, overlay)
+    }
+
+    /// Resolve `defaults.subagent` as a launch resolves a profile, overlay
+    /// included: `None` when it is unset or `inherit`, so child agents run
+    /// under the session's profile. The session tightens the result against
+    /// its own profile when a child spawns
+    /// ([`ExecutionProfile::child_profile`]).
+    pub fn resolve_subagent(
+        &self,
+        overlay: Option<&ProjectOverlay>,
+    ) -> Result<Option<ExecutionProfile>, ProfileError> {
+        match self.defaults.subagent.as_deref() {
+            None | Some(INHERIT) => Ok(None),
+            Some(name) => self.resolve_named(name, overlay).map(Some),
+        }
+    }
+
+    fn resolve_named(
+        &self,
+        name: &str,
+        overlay: Option<&ProjectOverlay>,
+    ) -> Result<ExecutionProfile, ProfileError> {
+        let mut profile = self.named(name)?;
         if let Some(overlay) = overlay {
             // Name the overlay when it, not the profile, makes the profile
             // one this build cannot enforce.
@@ -361,16 +384,6 @@ impl ProfilesConfig {
     /// first interactive launch offers the first-run picker.
     pub fn has_interactive_default(&self) -> bool {
         self.defaults.interactive.is_some()
-    }
-
-    /// `defaults.subagent` when it names a profile rather than `inherit`.
-    /// It is validated but not applied yet: child agents and companions run
-    /// under the session's profile, so startup says so.
-    pub fn unapplied_subagent_default(&self) -> Option<&str> {
-        self.defaults
-            .subagent
-            .as_deref()
-            .filter(|name| *name != INHERIT)
     }
 
     /// Every profile a user can select: the presets, then user profiles.
