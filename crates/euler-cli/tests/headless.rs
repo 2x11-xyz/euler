@@ -1252,6 +1252,70 @@ fn models_command_warns_when_euler_home_cannot_hold_provider_config() {
     );
 }
 
+fn run_fixture_exec_for_preferences(home: &tempfile::TempDir, euler_home: Option<&Path>) -> String {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let mut command = command_with_home(exe, home);
+    match euler_home {
+        Some(euler_home) => command.env("EULER_HOME", euler_home),
+        None => command.env_remove("EULER_HOME"),
+    };
+    let output = command
+        .args(["exec", "--provider", "fixture", "hello preferences"])
+        .output()
+        .expect("run exec");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stderr).expect("stderr utf8")
+}
+
+#[test]
+fn exec_reads_model_preference_from_euler_home() {
+    let home = isolated_home();
+    let euler_home = tempfile::tempdir().expect("euler home");
+    fs::write(euler_home.path().join("preferences.json"), "not json").expect("write preferences");
+
+    let stderr = run_fixture_exec_for_preferences(&home, Some(euler_home.path()));
+
+    assert!(
+        stderr.contains("warning: ignored model preference: malformed model preference"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn exec_ignores_model_preference_under_home_when_euler_home_is_set() {
+    let home = isolated_home();
+    let euler_home = tempfile::tempdir().expect("euler home");
+    let old_dir = home.path().join(".euler");
+    fs::create_dir_all(&old_dir).expect("old euler dir");
+    fs::write(old_dir.join("preferences.json"), "not json").expect("write preferences");
+
+    let stderr = run_fixture_exec_for_preferences(&home, Some(euler_home.path()));
+
+    assert!(
+        !stderr.contains("ignored model preference"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn exec_reads_model_preference_under_home_when_euler_home_is_unset() {
+    let home = isolated_home();
+    let old_dir = home.path().join(".euler");
+    fs::create_dir_all(&old_dir).expect("euler dir");
+    fs::write(old_dir.join("preferences.json"), "not json").expect("write preferences");
+
+    let stderr = run_fixture_exec_for_preferences(&home, None);
+
+    assert!(
+        stderr.contains("warning: ignored model preference: malformed model preference"),
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn headless_exec_and_offline_listing_do_not_start_catalog_refresh() {
     let exe = env!("CARGO_BIN_EXE_euler");
