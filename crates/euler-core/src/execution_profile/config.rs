@@ -25,9 +25,9 @@ pub const PROJECT_OVERLAY_PATH: &str = ".euler/profile-overlay.json";
 
 /// `defaults.subagent` value meaning the parent's resolved profile.
 const INHERIT: &str = "inherit";
-/// Built-in `defaults.interactive` and `defaults.headless`: both stay
-/// `locked`, today's behavior, until later rollout steps change them.
-const BUILT_IN_INTERACTIVE: Preset = Preset::Locked;
+/// Built-in `defaults.interactive` is `full`; `defaults.headless` stays
+/// `locked`, today's behavior, until a later rollout step changes it.
+const BUILT_IN_INTERACTIVE: Preset = Preset::Full;
 const BUILT_IN_HEADLESS: Preset = Preset::Locked;
 
 const PROFILE_FIELDS: &str = "sandbox, network, writable_paths, tmp, caches, credentials, \
@@ -310,7 +310,15 @@ impl ProfilesConfig {
         };
         let mut profile = self.named(&name)?;
         if let Some(overlay) = overlay {
+            // Name the overlay when it, not the profile, makes the profile
+            // one this build cannot enforce.
+            let enforced_before = profile.check_enforced().is_ok();
             overlay.apply(&mut profile)?;
+            if enforced_before {
+                if let Err(ProfileError::Unenforced { profile, field }) = profile.check_enforced() {
+                    return Err(ProfileError::OverlayUnenforced { profile, field });
+                }
+            }
         }
         profile.check_enforced()?;
         Ok(profile)
@@ -358,6 +366,27 @@ impl ProfilesConfig {
         })
     }
 
+    /// Whether the user's file names `defaults.interactive`. Without it the
+    /// first interactive launch offers the first-run picker.
+    pub fn has_interactive_default(&self) -> bool {
+        self.defaults.interactive.is_some()
+    }
+
+    /// `defaults.subagent` when it names a profile rather than `inherit`.
+    /// It is validated but not applied yet: child agents and companions run
+    /// under the session's profile, so startup says so.
+    pub fn unapplied_subagent_default(&self) -> Option<&str> {
+        self.defaults
+            .subagent
+            .as_deref()
+            .filter(|name| *name != INHERIT)
+    }
+
+    /// Every profile a user can select: the presets, then user profiles.
+    pub fn profile_names(&self) -> Vec<String> {
+        self.defined_names()
+    }
+
     fn is_defined(&self, name: &str) -> bool {
         Preset::parse(name).is_some() || self.profiles.contains_key(name)
     }
@@ -369,6 +398,57 @@ impl ProfilesConfig {
             .chain(self.profiles.keys().cloned())
             .collect()
     }
+}
+
+/// Write `defaults.interactive` into `file`, keeping every other entry. A
+/// missing file is created with only that default. Refuses a file that is
+/// not a JSON object rather than replacing what the user wrote. The new
+/// file replaces the old by rename, so an Euler process interrupted
+/// mid-write cannot leave a truncated file that fails every later launch.
+pub fn write_interactive_default(file: &Path, name: &str) -> Result<(), ProfileError> {
+    let invalid = |message: String| ProfileError::InvalidFile {
+        file: file.to_path_buf(),
+        message,
+    };
+    let mut document = match fs::read_to_string(file) {
+        Ok(text) => {
+            serde_json::from_str::<Value>(&text).map_err(|error| invalid(error.to_string()))?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Value::Object(Default::default()),
+        Err(error) => {
+            return Err(ProfileError::Read {
+                file: file.to_path_buf(),
+                message: error.to_string(),
+            })
+        }
+    };
+    let Value::Object(root) = &mut document else {
+        return Err(invalid("expected a JSON object".to_owned()));
+    };
+    let defaults = root
+        .entry("defaults")
+        .or_insert_with(|| Value::Object(Default::default()));
+    let Value::Object(defaults) = defaults else {
+        return Err(invalid("defaults: expected a JSON object".to_owned()));
+    };
+    defaults.insert("interactive".to_owned(), Value::String(name.to_owned()));
+    let write_error = |error: io::Error| ProfileError::Write {
+        file: file.to_path_buf(),
+        message: error.to_string(),
+    };
+    let parent = file
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).map_err(write_error)?;
+    let mut text = serde_json::to_string_pretty(&document).expect("JSON value serializes");
+    text.push('\n');
+    let mut staged = tempfile::NamedTempFile::new_in(parent).map_err(write_error)?;
+    io::Write::write_all(&mut staged, text.as_bytes()).map_err(write_error)?;
+    staged
+        .persist(file)
+        .map(|_| ())
+        .map_err(|error| write_error(error.error))
 }
 
 fn parse_user_profile(name: &str, body: &UniqueKeys<Value>) -> Result<UserProfile, String> {

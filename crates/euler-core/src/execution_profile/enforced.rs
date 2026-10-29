@@ -1,12 +1,14 @@
 //! The boundaries this build can enforce, and the subprocess sandbox each
-//! one becomes. A profile with the sandbox on maps to one of two shapes:
+//! one becomes. A profile with the sandbox off runs on the host (`full.rs`
+//! names the fields host execution can deliver). A profile with the sandbox
+//! on maps to one of two shapes:
 //! the `locked` boundary (no network, private `/tmp` and caches) or the
 //! `workspace` boundary (network, host `/tmp`, writable caches), which also
 //! honors `writable_paths` and `credentials`. Any other mix is refused with
 //! the first field this build cannot deliver.
 
 use super::{
-    locked, workspace, ApprovalsSetting, CredentialsSetting, NetworkSetting, ProfileFields,
+    full, locked, workspace, ApprovalsSetting, CredentialsSetting, NetworkSetting, ProfileFields,
     SandboxSetting,
 };
 use crate::sandbox::{SandboxProfile, SubprocessSandbox, WorkspaceNetworkAccess};
@@ -21,7 +23,12 @@ pub(super) fn subprocess_sandbox(
         SandboxSetting::On => true,
         SandboxSetting::Bubblewrap => cfg!(target_os = "linux"),
         SandboxSetting::Seatbelt => cfg!(target_os = "macos"),
-        SandboxSetting::Off => false,
+        SandboxSetting::Off => {
+            return match full::unenforced_field(fields) {
+                None => Ok(SubprocessSandbox::Host),
+                Some(field) => Err(field),
+            };
+        }
     };
     if !backend_enforced {
         return Err("sandbox");

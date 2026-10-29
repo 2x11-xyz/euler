@@ -1,5 +1,6 @@
 use euler_core::{EulerHome, EulerHomeError};
 use euler_provider::provider_config::ProviderConfigRegistry;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -62,9 +63,43 @@ pub(crate) fn load_provider_config(path: Option<&Path>) -> ProviderConfigLoad {
     ProviderConfigLoad { registry, warnings }
 }
 
+/// Environment variables `providers.json` references as `$NAME` or
+/// `${NAME}` in an `api_key` or a header value
+/// ([`ProviderConfigRegistry::referenced_env_names`], the rule the
+/// `workspace` sandbox withholds too). A missing or unreadable file names
+/// none.
+pub(crate) fn referenced_env_variables(path: Option<&Path>) -> BTreeSet<String> {
+    load_provider_config(path).registry.referenced_env_names()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn referenced_env_variables_names_every_secret_reference() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("providers.json");
+        fs::write(
+            &path,
+            r#"{"providers": {"proxy": {
+                "api_family": "openai_chat_completions",
+                "base_url": "https://proxy.example.com/v1",
+                "api_key": "$PROXY_API_KEY",
+                "headers": {"x-team": "${TEAM_TOKEN}", "x-literal": "$$NOT_A_VAR", "x-bang": "$!literal"},
+                "models": [{"id": "m"}]
+            }}}"#,
+        )
+        .expect("write");
+
+        let names = referenced_env_variables(Some(&path));
+
+        assert_eq!(
+            names.into_iter().collect::<Vec<_>>(),
+            vec!["PROXY_API_KEY".to_owned(), "TEAM_TOKEN".to_owned()]
+        );
+        assert!(referenced_env_variables(Some(&temp.path().join("missing.json"))).is_empty());
+    }
 
     #[test]
     fn missing_provider_config_is_silent_builtin_fallback() {

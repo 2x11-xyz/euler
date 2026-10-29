@@ -1,6 +1,6 @@
 //! Execution profile selection, validation, and recording through the CLI
-//! (ADR 0026 rollout steps 3 and 5: profile plumbing, the `locked` preset,
-//! and the `workspace` preset).
+//! (ADR 0026 rollout steps 3 to 5: profile plumbing and the `locked`,
+//! `full`, and `workspace` presets).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -52,7 +52,17 @@ fn exec(workspace: &Workspace, args: &[&str]) -> Output {
 }
 
 fn exec_in(workspace: &Workspace, root: &Path, args: &[&str]) -> Output {
+    exec_with_env(workspace, root, &[], args)
+}
+
+fn exec_with_env(
+    workspace: &Workspace,
+    root: &Path,
+    env: &[(&str, &str)],
+    args: &[&str],
+) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_euler"))
+        .envs(env.iter().copied())
         .env("HOME", &workspace.home)
         .env_remove("EULER_HOME")
         .env_remove("EULER_PROVIDER")
@@ -192,23 +202,43 @@ fn profile_reviewer_applies_and_the_reviewer_flag_overrides_it() {
 }
 
 #[test]
-fn presets_not_shipped_yet_and_unknown_names_are_startup_errors() {
+fn subagent_default_naming_a_profile_warns_that_it_is_not_applied() {
     let workspace = workspace();
-    for (profile, expected) in [
-        (
-            "full",
-            "the full preset is not available in this version yet",
+    write_profiles(&workspace, r#"{"defaults": {"subagent": "locked"}}"#);
+    let output = exec_new(&workspace, &["--profile", "full"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "warning: defaults.subagent \"locked\" is not applied yet; child agents run under \
+             the session's execution profile"
         ),
-        (
-            "fulll",
-            "unknown execution profile \"fulll\"; defined profiles: full, workspace, locked",
+        "{}",
+        stderr(&output)
+    );
+
+    write_profiles(&workspace, r#"{"defaults": {"subagent": "inherit"}}"#);
+    let output = exec_resume(&workspace, &["--profile", "full"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("defaults.subagent"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn unknown_profile_names_are_startup_errors() {
+    let workspace = workspace();
+    let output = exec_new(&workspace, &["--profile", "fulll"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains(
+            "unknown execution profile \"fulll\"; defined profiles: full, workspace, locked"
         ),
-    ] {
-        let output = exec_new(&workspace, &["--profile", profile]);
-        assert!(!output.status.success());
-        assert!(stderr(&output).contains(expected), "{}", stderr(&output));
-        assert!(!workspace.log.exists(), "no session starts");
-    }
+        "{}",
+        stderr(&output)
+    );
+    assert!(!workspace.log.exists(), "no session starts");
 }
 
 /// A scripted provider turn whose one command writes its `HOME` to
@@ -389,6 +419,20 @@ fn project_overlay_can_tighten_but_never_loosen() {
         message.contains("network \"on\" is looser than the profile's \"off\""),
         "{message}"
     );
+
+    // A valid tightening of `full` that this build cannot enforce names the
+    // overlay and the way out.
+    write_overlay(&workspace, r#"{"network": "off"}"#);
+    let output = exec_new(&workspace, &["--profile", "full"]);
+    assert!(!output.status.success());
+    let message = stderr(&output);
+    assert!(
+        message.contains(
+            "the project overlay .euler/profile-overlay.json sets network on profile \"full\""
+        ),
+        "{message}"
+    );
+    assert!(message.contains("--profile locked"), "{message}");
 }
 
 #[test]
@@ -511,5 +555,233 @@ fn resume_of_a_log_without_a_profile_resolves_as_a_new_session() {
         stderr(&output).contains("execution profile: locked (this session recorded no profile)"),
         "{}",
         stderr(&output)
+    );
+}
+
+/// A fixture script that makes one `run_shell` call, then finishes.
+fn shell_script(workspace: &Workspace, command: &str) -> String {
+    tool_script(
+        workspace,
+        "run_shell",
+        serde_json::json!({ "command": command }),
+    )
+}
+
+/// A fixture script that makes one call to tool `name`, then finishes.
+fn tool_script(workspace: &Workspace, name: &str, input: serde_json::Value) -> String {
+    let script = workspace.home.join("tool-script.json");
+    let body = serde_json::json!({
+        "version": 1,
+        "responses": [
+            {"events": [
+                {"tool_call": {"id": "call-tool", "name": name, "input": input}},
+                {"finished": {"stop_reason": "tool_use"}}
+            ]},
+            {"events": [
+                {"text_delta": "done"},
+                {"finished": {"stop_reason": "completed"}}
+            ]}
+        ]
+    });
+    fs::write(&script, body.to_string()).expect("write script");
+    format!("event-script={}", script.display())
+}
+
+fn session_start(log: &Path) -> serde_json::Value {
+    fs::read_to_string(log)
+        .expect("read log")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .find(|event| event["kind"] == "session.start")
+        .expect("session.start")["payload"]
+        .clone()
+}
+
+#[test]
+fn exec_under_full_runs_shell_on_the_host_without_asking() {
+    let workspace = workspace();
+    let script = shell_script(&workspace, "printf host-ran > out.txt");
+    let output = exec_new(
+        &workspace,
+        &["--profile", "full", "--provider-option", &script],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    assert_eq!(
+        fs::read_to_string(workspace.root.join("out.txt")).expect("written"),
+        "host-ran"
+    );
+    let start = session_start(&workspace.log);
+    assert_eq!(start["execution_profile"]["name"], "full");
+    assert_eq!(start["sandbox_backend"], "host");
+    assert_eq!(start["command_approvals"], "off");
+    assert!(
+        !stderr(&output).contains("--auto-approve"),
+        "no notice without the flag: {}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn exec_under_full_withholds_variables_providers_json_references() {
+    let workspace = workspace();
+    fs::write(
+        workspace.home.join(".euler").join("providers.json"),
+        r#"{"version": 1, "providers": {"proxy": {
+            "api_family": "openai_chat_completions",
+            "base_url": "https://litellm.example.com/v1",
+            "api_key": "$MY_PROXY_KEY",
+            "models": [{"id": "proxy-model"}]
+        }}}"#,
+    )
+    .expect("write providers.json");
+    let script = shell_script(
+        &workspace,
+        "printf '[%s][%s]' \"$MY_PROXY_KEY\" \"$UNRELATED_SETTING\" > out.txt",
+    );
+    let log = workspace.log.to_str().expect("utf8 log");
+    let output = exec_with_env(
+        &workspace,
+        &workspace.root,
+        &[
+            ("MY_PROXY_KEY", "proxy-key-value"),
+            ("UNRELATED_SETTING", "kept"),
+        ],
+        &[
+            "--provenance",
+            log,
+            "--profile",
+            "full",
+            "--provider-option",
+            &script,
+            "hello",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(workspace.root.join("out.txt")).expect("written"),
+        "[][kept]"
+    );
+}
+
+#[test]
+fn exec_under_full_asks_before_writing_into_the_euler_home() {
+    let workspace = workspace();
+    let providers = workspace.home.join(".euler").join("providers.json");
+    let script = tool_script(
+        &workspace,
+        "write_file",
+        serde_json::json!({
+            "path": providers.to_str().expect("utf8 path"),
+            "content": "{\"version\": 1, \"providers\": {}}",
+        }),
+    );
+    let output = exec_new(
+        &workspace,
+        &["--profile", "full", "--provider-option", &script],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    // Headless exec denies every ask, so the privileged write never lands.
+    assert!(!providers.exists());
+    let log = fs::read_to_string(&workspace.log).expect("read log");
+    let decision = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .find(|event| event["kind"] == "permission.decision")
+        .expect("permission.decision");
+    assert_eq!(decision["payload"]["allowed"], false, "{decision}");
+}
+
+#[test]
+fn auto_approve_under_full_is_a_noop_with_a_notice() {
+    let workspace = workspace();
+    let script = shell_script(&workspace, "printf host-ran > out.txt");
+    let output = exec_new(
+        &workspace,
+        &[
+            "--profile",
+            "full",
+            "--auto-approve",
+            "read-only",
+            "--provider-option",
+            &script,
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(
+            "--auto-approve has no effect: execution profile full already allows what it asks for"
+        ),
+        "{}",
+        stderr(&output)
+    );
+    // The read-only tier did not tighten the profile.
+    assert!(workspace.root.join("out.txt").exists());
+}
+
+#[test]
+fn exec_under_full_lists_background_jobs_still_running_at_exit() {
+    let workspace = workspace();
+    let script = shell_script(&workspace, "sleep 30 > /dev/null 2>&1 &");
+    let output = exec_new(
+        &workspace,
+        &["--profile", "full", "--provider-option", &script],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stderr(&output);
+    assert!(
+        text.contains("Background jobs Euler started are still running:"),
+        "{text}"
+    );
+    let line = text
+        .lines()
+        .find(|line| line.contains(": sleep 30 > /dev/null 2>&1 &"))
+        .unwrap_or_else(|| panic!("job listed: {text}"));
+    let group: i32 = line
+        .trim()
+        .strip_prefix("process group ")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|group| group.parse().ok())
+        .expect("group id");
+    // Euler left the job running; end it so the test leaves nothing behind.
+    let killed = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{group}")])
+        .status()
+        .expect("kill");
+    assert!(killed.success());
+}
+
+#[test]
+fn interactive_default_is_full_and_no_picker_runs_without_a_terminal() {
+    let workspace = workspace();
+    let log = workspace.log.to_str().expect("utf8 log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_euler"))
+        .env("HOME", &workspace.home)
+        .env_remove("EULER_HOME")
+        .env_remove("EULER_PROVIDER")
+        .env_remove("EULER_MODEL")
+        .current_dir(&workspace.root)
+        .args(["--provider", "fixture", "--provenance", log])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn euler");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(b"hello\n")
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait euler");
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let start = session_start(&workspace.log);
+    assert_eq!(start["execution_profile"]["name"], "full");
+    assert_eq!(start["sandbox_backend"], "host");
+    assert!(
+        !workspace.home.join(".euler").join("profiles.json").exists(),
+        "the first-run picker needs a terminal and writes nothing without one"
     );
 }

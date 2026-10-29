@@ -634,7 +634,10 @@ pub(crate) fn prepare_checkpoint(
     patch: &PatchEvents,
 ) -> Result<Option<PreparedCheckpoint>, String> {
     // v0: modify-only. Adds have empty before; restore-as-delete is product debt.
-    if patch.action != "modify" {
+    // A write outside the workspace (sandbox off, ADR 0026 resolved question
+    // 22) is recorded, but no checkpoint covers it and `/rollback` cannot
+    // restore it.
+    if patch.action != "modify" || patch.outside_workspace() {
         return Ok(None);
     }
     prepare_checkpoint_for(

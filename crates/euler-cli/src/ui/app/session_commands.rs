@@ -1,4 +1,6 @@
 use super::*;
+use crate::execution_profile_runtime::{profile_boundary, ProfileSources};
+use euler_core::execution_profile::write_interactive_default;
 
 impl AppCore {
     pub(super) fn show_session_diff(&mut self) -> CoreEffect {
@@ -513,6 +515,71 @@ impl AppCore {
             "permission posture set to {} · cleared {cleared} session {grants}",
             posture.label()
         ))
+    }
+
+    /// `/profile` (ADR 0026): the profiles this host can run here, the
+    /// current one marked.
+    pub(super) fn open_profile_picker(&mut self) -> CoreEffect {
+        let AppState::Idle { session } = &self.state else {
+            return self.notice_item("profile change waits for the active turn".to_owned());
+        };
+        let current = session.execution_profile().name.clone();
+        let sources = match ProfileSources::load(session.workspace_root()) {
+            Ok(sources) => sources,
+            Err(error) => return self.error_item(format!("could not read profiles: {error}")),
+        };
+        let choices = sources
+            .runnable()
+            .iter()
+            .map(|profile| crate::ui::commands::ProfileChoice {
+                name: profile.name.clone(),
+                detail: profile_boundary(profile),
+                current: profile.name == current,
+            })
+            .collect();
+        self.bottom
+            .open_picker(crate::ui::commands::PickerSpec::Profiles(choices));
+        CoreEffect::Render
+    }
+
+    /// Switch this session's execution profile between turns. The change is
+    /// recorded, rebuilds the subprocess boundary, and supersedes
+    /// `--profile` for the rest of the session.
+    pub(super) fn set_execution_profile(&mut self, name: String) -> CoreEffect {
+        let AppState::Idle { session } = &mut self.state else {
+            return self.notice_item("profile change waits for the active turn".to_owned());
+        };
+        let profile = match ProfileSources::load(session.workspace_root())
+            .and_then(|sources| sources.resolve(&name))
+        {
+            Ok(profile) => profile,
+            Err(error) => return self.error_item(format!("profile not changed: {error}")),
+        };
+        let boundary = profile_boundary(&profile);
+        if let Err(error) = session.change_execution_profile(profile) {
+            return self.error_item(format!("profile not changed: {error}"));
+        }
+        self.notice_item(format!("execution profile set to {name} · {boundary}"))
+    }
+
+    /// `/profile default <name>`: new interactive sessions start with it.
+    pub(super) fn set_default_profile(&mut self, name: String) -> CoreEffect {
+        let root = match &self.state {
+            AppState::Idle { session } => session.workspace_root().to_path_buf(),
+            _ => return self.notice_item("profile change waits for the active turn".to_owned()),
+        };
+        let written = ProfileSources::load(&root).and_then(|sources| {
+            sources.resolve(&name)?;
+            write_interactive_default(&sources.file, &name)?;
+            Ok(sources.file)
+        });
+        match written {
+            Ok(file) => self.notice_item(format!(
+                "new sessions start with execution profile {name} (saved to {})",
+                file.display()
+            )),
+            Err(error) => self.error_item(format!("default profile not saved: {error}")),
+        }
     }
 
     pub(super) fn open_permissions_picker(&mut self) -> CoreEffect {

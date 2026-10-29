@@ -17,9 +17,10 @@ const SESSION_OPTIONS: &str = "  \
                              (default: extension-defined)
   --permission-reviewer <r>  user or guardian: who reviews permission asks
                              (default: the profile's reviewer, else user)
-  --profile <name>           Execution profile: locked or a profile in
+  --profile <name>           Execution profile: full, locked, or a profile in
                              profiles.json (default: the defaults entry for
-                             interactive or exec, else locked)
+                             interactive or exec, else full interactive and
+                             locked for exec)
   --project-context <p>      auto, on, or off: load this project's EULER.md
                              guidance (default: auto)
   --accept-relocation        On resume, move the session to the current folder

@@ -81,6 +81,7 @@ authority.
 - `session.start`
 - `session.resumed`
 - `session.renamed`
+- `session.profile_changed`
 - `session.summary`
 - `run.started`
 - `run.terminal`
@@ -833,6 +834,11 @@ extension error does not consume the later result.
   release, where omission means unknown, never `host`. They are provenance for
   the session that produced the stream, and `session.resumed` carries the same
   two fields for the host that resumed it.
+  `command_approvals` is `off` when commands inside the execution profile's
+  boundary never ask (`approvals: never`, the `full` preset) and `on`
+  otherwise; it is recorded beside `sandbox_backend` as a separate fact (ADR
+  0021 row D, ADR 0026 section 2). Streams written before this release omit
+  it.
   Optional `permission_reviewer` is `user` or `guardian` (ADR 0011),
   recording which reviewer the session was configured with at start. Omitted
   in older streams means `user`. It is config projection for visibility, not
@@ -929,8 +935,14 @@ extension error does not consume the later result.
   a marker without it (an older binary, or an unreadable root) resets the
   governing identity to unknown.
   `execution_profile` has the `session.start` shape and records the profile
-  the resumed lifetime runs under; the latest one recorded governs the next
-  resume's comparison. Markers from older binaries omit it.
+  the resumed lifetime runs under; the latest one recorded (on
+  `session.start`, `session.resumed`, or `session.profile_changed`) governs
+  the next resume's comparison. Markers from older binaries omit it.
+- `session.profile_changed`: `execution_profile` (the `session.start`
+  shape), `command_approvals`, `sandbox_backend`, and
+  `sandbox_unavailable_reason`. Records a `/profile` switch between turns
+  (ADR 0026 section 5); the latest recorded profile governs the next
+  resume's comparison.
 - `session.renamed`: `name`. Records the latest user-visible session name;
   sidecars and indexes are projections of this event, not naming authority.
   For sessions created by current new-Euler builds before this event existed,

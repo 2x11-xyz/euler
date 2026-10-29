@@ -8099,3 +8099,324 @@ fn the_rollback_baseline_matches_an_equivalent_path_spelling() {
         "prefix\nalpha\nsuffix\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The `full` execution profile (ADR 0026 section 2, rollout step 4).
+// ---------------------------------------------------------------------------
+
+fn full_profile_config(root: &std::path::Path) -> SessionConfig {
+    let mut config = SessionConfig::new(root);
+    let profile = crate::ProfilesConfig::default()
+        .resolve(Some("full"), crate::ProfileContext::Interactive, None)
+        .expect("full resolves");
+    config.set_execution_profile(profile);
+    config
+}
+
+fn model_tool_call(id: &str, name: &str, input: Value) -> euler_provider::ToolCall {
+    euler_provider::ToolCall {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        input,
+    }
+}
+
+#[test]
+fn full_profile_runs_shell_on_the_host_without_asking() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![model_tool_call(
+            "call-shell",
+            "run_shell",
+            json!({ "command": "printf host-ran > out.txt" }),
+        )]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    // The decider denies anything that reaches it, so a prompt fails the run.
+    let mut session = Session::new(
+        full_profile_config(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("write a file").expect("turn");
+
+    assert!(events_of_kind(session.events(), EventKind::PERMISSION_PROMPT).is_empty());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("out.txt")).expect("written"),
+        "host-ran"
+    );
+    let start = events_of_kind(session.events(), EventKind::SESSION_START)[0];
+    assert_eq!(start.payload["sandbox_backend"], json!("host"));
+    assert_eq!(start.payload["command_approvals"], json!("off"));
+    assert_eq!(start.payload["execution_profile"]["name"], json!("full"));
+}
+
+#[test]
+fn full_profile_reads_sensitive_paths_without_asking_but_config_writes_ask_a_human() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(temp.path().join(".env"), "TOKEN=plain-value").expect(".env");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![read_file_call("call-read", ".env")]),
+        FixtureResponse::ToolCalls(vec![model_tool_call(
+            "call-sed",
+            "run_shell",
+            json!({ "command": "sed -n 1p .env" }),
+        )]),
+        FixtureResponse::ToolCalls(vec![model_tool_call(
+            "call-write",
+            "write_file",
+            json!({ "path": ".gitattributes", "content": "* filter=x\n" }),
+        )]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        full_profile_config(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("inspect").expect("turn");
+
+    // Only the structured write to interpreter-honored configuration asks
+    // (ADR 0026 resolved question 15); the decider denies it.
+    let prompts = events_of_kind(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert_eq!(prompts[0].payload["capability"], json!("fs-write"));
+    assert!(!temp.path().join(".gitattributes").exists());
+    let results = events_of_kind(session.events(), EventKind::TOOL_RESULT);
+    let output = |id: &str| {
+        results
+            .iter()
+            .find(|event| event.payload.get("id") == Some(&json!(id)))
+            .and_then(|event| event.payload.get("output"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(output("call-read").contains("TOKEN="), "{results:?}");
+    assert!(output("call-sed").contains("TOKEN="), "{results:?}");
+}
+
+#[test]
+fn full_profile_writes_outside_the_workspace_without_a_checkpoint() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    let target = outside
+        .path()
+        .canonicalize()
+        .expect("canonical")
+        .join("notes.txt");
+    let target_text = target.to_string_lossy().into_owned();
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![model_tool_call(
+            "call-create",
+            "write_file",
+            json!({ "path": target_text, "content": "one\n" }),
+        )]),
+        FixtureResponse::ToolCalls(vec![model_tool_call(
+            "call-edit",
+            "edit_file",
+            json!({ "path": target_text, "old": "one", "new": "two" }),
+        )]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        full_profile_config(workspace.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("write outside").expect("turn");
+
+    assert_eq!(std::fs::read_to_string(&target).expect("written"), "two\n");
+    assert!(events_of_kind(session.events(), EventKind::CHECKPOINT_STORED).is_empty());
+    let changes = events_of_kind(session.events(), EventKind::FILE_CHANGE);
+    assert_eq!(changes.len(), 2);
+    assert!(changes
+        .iter()
+        .all(|change| change.payload["path"] == json!(target_text)));
+}
+
+#[test]
+fn full_profile_checkpoints_an_absolute_path_to_a_workspace_file() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let note = workspace
+        .path()
+        .canonicalize()
+        .expect("canonical")
+        .join("note.txt");
+    std::fs::write(&note, "alpha\n").expect("fixture");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![model_tool_call(
+            "call-edit",
+            "edit_file",
+            json!({ "path": note.to_string_lossy(), "old": "alpha", "new": "beta" }),
+        )]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        full_profile_config(workspace.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("edit by absolute path").expect("turn");
+
+    assert_eq!(std::fs::read_to_string(&note).expect("edited"), "beta\n");
+    let changes = events_of_kind(session.events(), EventKind::FILE_CHANGE);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].payload["path"], json!("note.txt"));
+    let checkpoints = session.workspace_checkpoints();
+    assert_eq!(checkpoints.len(), 1);
+    let checkpoint_id = checkpoints[0].event_id.clone();
+    session
+        .restore_workspace_checkpoint(&checkpoint_id)
+        .expect("rollback restores the workspace file");
+    assert_eq!(std::fs::read_to_string(&note).expect("restored"), "alpha\n");
+}
+
+#[test]
+fn locked_profile_keeps_structured_writes_in_the_workspace() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let outside = tempfile::tempdir().expect("outside");
+    let target = outside.path().join("notes.txt");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![model_tool_call(
+            "call-create",
+            "write_file",
+            json!({ "path": target.to_string_lossy(), "content": "one\n" }),
+        )]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(workspace.path()),
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+
+    session.run_turn("write outside").expect("turn");
+
+    assert!(!target.exists());
+}
+
+#[test]
+fn profile_change_switches_the_boundary_and_is_recorded() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![model_tool_call(
+            "call-shell",
+            "run_shell",
+            json!({ "command": "printf changed > out.txt" }),
+        )]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+    let full = full_profile_config(temp.path()).execution_profile;
+
+    session
+        .change_execution_profile(full.clone())
+        .expect("profile change");
+    session.run_turn("write a file").expect("turn");
+
+    let changes = events_of_kind(session.events(), EventKind::SESSION_PROFILE_CHANGED);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].payload["execution_profile"], full.record());
+    assert_eq!(changes[0].payload["sandbox_backend"], json!("host"));
+    assert_eq!(changes[0].payload["command_approvals"], json!("off"));
+    assert_eq!(
+        crate::recorded_execution_profile(session.events()).expect("parses"),
+        Some(full)
+    );
+    assert!(events_of_kind(session.events(), EventKind::PERMISSION_PROMPT).is_empty());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("out.txt")).expect("written"),
+        "changed"
+    );
+}
+
+/// A profile change ends the jobs a sandboxed command left running before
+/// the boundary changes, while the session goes on (ADR 0026 resolved
+/// question 12). Seatbelt has no PID namespace, so the job outlives its
+/// command there.
+#[cfg(target_os = "macos")]
+#[test]
+fn profile_change_ends_jobs_started_under_a_sandboxed_profile() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![model_tool_call(
+            "call-job",
+            "run_shell",
+            json!({ "command": "sleep 30 >/dev/null 2>&1 & echo $! > job.pid" }),
+        )]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+    if !matches!(session.tools.sandbox_status(), SandboxStatus::Enforced(_)) {
+        // A nested Seatbelt cannot start another one.
+        return;
+    }
+    session.run_turn("start a job").expect("turn");
+    let job: libc::pid_t = std::fs::read_to_string(temp.path().join("job.pid"))
+        .expect("job pid")
+        .trim()
+        .parse()
+        .expect("pid");
+    // SAFETY: signal 0 only probes for existence.
+    let alive = || unsafe { libc::kill(job, 0) == 0 };
+    assert!(alive(), "the job outlives its command");
+
+    session
+        .change_execution_profile(full_profile_config(temp.path()).execution_profile)
+        .expect("profile change");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while alive() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job survived the profile change"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn full_profile_asks_a_human_for_patches_to_interpreter_config() {
+    let patch = "*** Begin Patch\n*** Add File: .gitattributes\n+* filter=x\n*** End Patch";
+    for (tool, input) in [
+        ("apply_patch", json!({ "patch": patch })),
+        (
+            "run_shell",
+            json!({ "command": format!("apply_patch <<'EOF'\n{patch}\nEOF") }),
+        ),
+    ] {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let provider = ScriptedProvider::new(vec![
+            FixtureResponse::ToolCalls(vec![model_tool_call("call-patch", tool, input)]),
+            FixtureResponse::Assistant("done".to_owned()),
+        ]);
+        let mut session = Session::new(
+            full_profile_config(temp.path()),
+            provider,
+            ScriptedDecider::new(Vec::new()),
+        );
+
+        session.run_turn("patch").expect("turn");
+
+        // The patch names `.gitattributes`, so it asks and the decider denies.
+        assert_eq!(
+            events_of_kind(session.events(), EventKind::PERMISSION_PROMPT).len(),
+            1,
+            "{tool}"
+        );
+        assert!(!temp.path().join(".gitattributes").exists(), "{tool}");
+    }
+}

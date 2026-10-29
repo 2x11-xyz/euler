@@ -1143,7 +1143,7 @@ fn non_apply_patch_shell_commands_still_execute_normally() {
 }
 
 #[test]
-fn run_shell_isolates_euler_controls_and_keeps_project_env() {
+fn run_shell_on_the_host_withholds_only_euler_credentials_and_controls() {
     let _guard = ENV_LOCK.lock().expect("env lock");
     let workspace = tempfile::tempdir().expect("workspace");
     let user_home = tempfile::tempdir().expect("user home");
@@ -1190,6 +1190,13 @@ fn run_shell_isolates_euler_controls_and_keeps_project_env() {
     env::set_var("rust_log", "project-log");
     env::set_var("Euler_Home", "project-home");
     let registry = ToolRegistry::new(workspace.path());
+    // ADR 0026 resolved question 7: host commands lose only Euler's own
+    // credentials (built-in provider variables, values Euler holds, and
+    // variables `providers.json` names) and parent controls.
+    registry.euler_credentials().add_value("api-key-secret");
+    registry
+        .euler_credentials()
+        .add_variable("EULER_TEST_SECRET");
 
     let execution = registry
         .execute(
@@ -1209,7 +1216,10 @@ fn run_shell_isolates_euler_controls_and_keeps_project_env() {
     assert_eq!(values.len(), 15);
     assert_eq!(values[0], "visible");
     assert_eq!(Path::new(values[1]), user_home.path());
-    assert!(values[2..8].iter().all(|value| value.is_empty()));
+    assert!(values[2..5].iter().all(|value| value.is_empty()));
+    assert_eq!(values[5], "access-key-secret");
+    assert_eq!(values[6], "token-secret");
+    assert_eq!(values[7], "");
     assert_eq!(values[8], "tokenizer-visible");
     let isolated_euler_home = PathBuf::from(values[9]);
     assert!(isolated_euler_home.is_absolute());
@@ -1218,7 +1228,14 @@ fn run_shell_isolates_euler_controls_and_keeps_project_env() {
     assert_ne!(isolated_euler_home, default_euler_home);
     assert!(values[10..14].iter().all(|value| value.is_empty()));
     assert_eq!(values[14], "my_crate=trace");
-    assert_secret_sentinels_absent(&execution.output);
+    for withheld in [
+        "anthropic-secret",
+        "auth-file-secret",
+        "api-key-secret",
+        "generic-secret",
+    ] {
+        assert!(!execution.output.contains(withheld), "leaked: {withheld}");
+    }
 
     fs::write(isolated_euler_home.join("marker"), "persisted").expect("isolated marker");
     let reused = registry
@@ -1261,19 +1278,6 @@ fn run_shell_isolates_euler_controls_and_keeps_project_env() {
 
     drop(registry);
     assert!(!isolated_euler_home.exists());
-}
-
-fn assert_secret_sentinels_absent(output: &str) {
-    for secret in [
-        "anthropic-secret",
-        "auth-file-secret",
-        "api-key-secret",
-        "access-key-secret",
-        "token-secret",
-        "generic-secret",
-    ] {
-        assert!(!output.contains(secret), "secret leaked: {secret}");
-    }
 }
 
 #[test]
@@ -3378,4 +3382,108 @@ fn network_denial_note_matches_resolver_and_unreachable_failures_only() {
     ] {
         assert_eq!(with_network_denial_note(output.to_owned()), output);
     }
+}
+
+/// ADR 0026 resolved questions 6 and 12: a host job that redirects its
+/// output outlives its command and is listed for the exit summary.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn run_shell_lists_a_host_background_job_that_outlives_its_command() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let registry = ToolRegistry::new(workspace.path());
+
+    let execution = registry
+        .execute(
+            "run_shell",
+            &json!({ "command": "sleep 30 > /dev/null 2>&1 &" }),
+        )
+        .expect("shell");
+
+    assert!(
+        execution.output.starts_with("exit 0"),
+        "{}",
+        execution.output
+    );
+    let jobs = registry.running_background_jobs();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert!(
+        jobs[0].ends_with(": sleep 30 > /dev/null 2>&1 &"),
+        "{jobs:?}"
+    );
+    let group: i32 = jobs[0]
+        .strip_prefix("process group ")
+        .and_then(|rest| rest.split(':').next())
+        .and_then(|group| group.parse().ok())
+        .expect("group id");
+    // SAFETY: the registry still holds the unreaped leader that pins this
+    // group id.
+    unsafe {
+        libc::kill(-group, libc::SIGKILL);
+    }
+}
+
+/// A profile change between the two sandboxed boundaries rebuilds the
+/// sandbox for the new boundary.
+#[test]
+fn set_subprocess_sandbox_switches_between_sandboxed_boundaries() {
+    use crate::sandbox::{SandboxProfile, WorkspaceNetworkAccess};
+    let workspace = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("sandbox home");
+    let mut registry = ToolRegistry::with_subprocess_sandbox(
+        workspace.path(),
+        SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork),
+    );
+    let profile = |registry: &ToolRegistry| {
+        registry
+            .workspace_sandbox
+            .as_ref()
+            .map(|sandbox| sandbox.profile().clone())
+    };
+    let network = SandboxProfile::WorkspaceNetwork(WorkspaceNetworkAccess::default());
+
+    registry.set_subprocess_sandbox(
+        SubprocessSandbox::Enforce(network.clone()),
+        Some(home.path().to_path_buf()),
+    );
+    assert_eq!(profile(&registry), Some(network));
+
+    registry.set_subprocess_sandbox(
+        SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork),
+        None,
+    );
+    assert_eq!(profile(&registry), Some(SandboxProfile::WorkspaceNoNetwork));
+
+    registry.set_subprocess_sandbox(SubprocessSandbox::Host, None);
+    assert_eq!(profile(&registry), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn writes_privileged_config_resolves_absolute_relative_and_symlinked_paths() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("euler home");
+    std::fs::write(home.path().join("providers.json"), "{}").expect("fixture");
+    symlink(home.path(), workspace.path().join("innocent")).expect("symlink");
+    let mut registry = ToolRegistry::new(workspace.path());
+    registry.set_writes_outside_workspace(true);
+    registry.add_privileged_config_path(home.path());
+
+    let absolute = home.path().join("providers.json");
+    assert!(registry.writes_privileged_config(&absolute.to_string_lossy()));
+    assert!(registry.writes_privileged_config("innocent/providers.json"));
+    assert!(registry.writes_privileged_config("innocent/new-file.json"));
+    assert!(!registry.writes_privileged_config("notes.txt"));
+
+    // One file outside the home (an auth-file override), and `/new` keeps
+    // both.
+    let elsewhere = tempfile::tempdir().expect("elsewhere");
+    let auth_file = elsewhere.path().join("auth.json");
+    registry.add_privileged_config_path(&auth_file);
+    let mut fresh = ToolRegistry::new(workspace.path());
+    fresh.set_writes_outside_workspace(true);
+    registry.carry_into(&mut fresh);
+    assert!(fresh.writes_privileged_config(&auth_file.to_string_lossy()));
+    assert!(fresh.writes_privileged_config(&absolute.to_string_lossy()));
+    let sibling = elsewhere.path().join("other.json");
+    assert!(!fresh.writes_privileged_config(&sibling.to_string_lossy()));
 }

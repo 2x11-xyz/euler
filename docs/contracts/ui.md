@@ -786,6 +786,24 @@ posture clears transient session grants, so a prior session approval cannot
 silently survive a switch to **Ask every time**; explicit project/user rules
 remain separately visible in the advanced controls.
 
+`/profile` opens the execution profile picker (ADR 0026): every profile
+this host can run in the current folder (the shipped presets, then user
+profiles from `profiles.json`), each with a one-line boundary, the current
+one marked. Choosing one, or typing `/profile <name>`, switches the session
+between turns; a running turn makes it wait with a notice. The switch is
+recorded as `session.profile_changed`, and the notice names the new
+profile and its boundary. `/profile default <name>` writes
+`defaults.interactive` so new sessions start with it.
+
+The first interactive launch without `--profile` and without
+`defaults.interactive` asks once, as plain lines on stderr before the
+session starts, which preset to use: `full` (preselected; Enter picks it)
+or `locked`, each with a one-line boundary, saved to `defaults.interactive`.
+It needs a terminal on stdin and stderr; otherwise nothing is asked. At
+exit, `euler`, `euler tui`, and `euler exec` list on stderr the background
+jobs Euler started with the sandbox off that are still running, after the
+TUI restores the terminal.
+
 Runs that did not prompt render their provenance as a dim tag on the tool
 header instead of a standalone decision record: `· session grant` /
 `· project grant` for covered grants, `· safe` for static-safety

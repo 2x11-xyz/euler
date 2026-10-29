@@ -794,27 +794,22 @@ const SENSITIVE_NAMES: &[&str] = &[
 /// Path components whose entire subtree is sensitive.
 const SENSITIVE_COMPONENTS: &[&str] = &[".git"];
 
-/// Whether `path` names something categorically sensitive, denied even
-/// inside the workspace (security review F1, audit F34).
-///
-/// Despite the name this inspects the whole path, not only the final
-/// component: `.git` is sensitive as a **component**, so everything under
-/// `.git/` (and the worktree pointer file itself) is covered, and
-/// `.cargo/config.toml` is sensitive only under `.cargo`.
-///
-/// The single sensitive-name list (one list, not two): statically-safe shell
-/// analysis rejects these path arguments outright, and the fs-tool permission
-/// braid escalates a blanket `session-allow` to an explicit ask when a tool
-/// path names one (deep review P1-b — `read_file .env` must not run
-/// unprompted while `cat .env` asks).
-pub fn sensitive_basename(path: &Path) -> bool {
-    let components: Vec<String> = path
-        .components()
+fn lowercase_components(path: &Path) -> Vec<String> {
+    path.components()
         .filter_map(|component| match component {
             Component::Normal(name) => name.to_str().map(str::to_ascii_lowercase),
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// Whether `path` is configuration another program later executes: anything
+/// under a `.git` component, git, npm, and Cargo configuration, and shell
+/// startup files (the part of [`sensitive_basename`]'s list that is not a
+/// secret). A structured write to one asks a human under every execution
+/// profile (ADR 0026 resolved question 15).
+pub fn interpreter_honored_config(path: &Path) -> bool {
+    let components = lowercase_components(path);
     if components
         .iter()
         .any(|component| SENSITIVE_COMPONENTS.contains(&component.as_str()))
@@ -827,14 +822,48 @@ pub fn sensitive_basename(path: &Path) -> bool {
     if SENSITIVE_NAMES.contains(&name.as_str()) {
         return true;
     }
+    let parent = |index_from_end: usize| {
+        components
+            .len()
+            .checked_sub(index_from_end)
+            .map(|index| components[index].as_str())
+    };
     // `.cargo/config.toml` (and its extensionless form) selects the linker
-    // and build runner for the next `cargo` invocation.
-    if matches!(name.as_str(), "config.toml" | "config")
-        && components.len() >= 2
-        && components[components.len() - 2] == ".cargo"
-    {
+    // and build runner for the next `cargo` invocation. `.config/git/config`
+    // and `.config/git/attributes` are git's XDG twins of `.gitconfig` and
+    // `.gitattributes`.
+    match name.as_str() {
+        "config.toml" => parent(2) == Some(".cargo"),
+        "config" => {
+            parent(2) == Some(".cargo")
+                || (parent(2) == Some("git") && parent(3) == Some(".config"))
+        }
+        "attributes" => parent(2) == Some("git") && parent(3) == Some(".config"),
+        _ => false,
+    }
+}
+
+/// Whether `path` names something categorically sensitive, denied even
+/// inside the workspace (security review F1, audit F34).
+///
+/// Despite the name this inspects the whole path, not only the final
+/// component: `.git` is sensitive as a **component**, so everything under
+/// `.git/` (and the worktree pointer file itself) is covered, and
+/// `.cargo/config.toml` is sensitive only under `.cargo`.
+///
+/// The single sensitive-name list (one list, not two): statically-safe shell
+/// analysis rejects these path arguments outright, and the fs-tool permission
+/// braid escalates a blanket `session-allow` to an explicit ask when a tool
+/// path names one (deep review P1-b: `read_file .env` must not run
+/// unprompted while `cat .env` asks).
+pub fn sensitive_basename(path: &Path) -> bool {
+    if interpreter_honored_config(path) {
         return true;
     }
+    let components = lowercase_components(path);
+    let Some(name) = components.last() else {
+        return false;
+    };
     name.starts_with(".env")
         || name.contains("secret")
         || name.contains("credential")
@@ -885,10 +914,35 @@ fn is_statically_safe_at_depth(command: &str, workspace_root: &Path, depth: usiz
 /// honors. `run_shell` runs with stdin closed, so `rm -r` never gets its
 /// interactive confirmation and is as destructive as `rm -rf`.
 pub fn contains_dangerous_command(command: &str) -> bool {
-    script_is_dangerous(command, 0)
+    script_is_dangerous(command, 0, WalkRule::Danger)
 }
 
-fn script_is_dangerous(script: &str, depth: usize) -> bool {
+/// Whether an interpreter in `command` (`sed`, `awk`, `perl`, `ruby`,
+/// `python`, `node`, `patch`, `ed`) takes an operand that mentions a
+/// sensitive path, through the same wrappers and nesting the danger walk
+/// reads: `python3 x.py .env`, `sudo awk '{print > ".bashrc"}'`.
+///
+/// This was a dangerous-list rule; ADR 0026 (resolved question 15) moved it
+/// to the request's `sensitive_path` flag, so it asks where sensitive paths
+/// ask and stays grant-coverable and guardian-routable. A command the danger
+/// walk cannot read counts here too, which costs nothing: that command is
+/// already flagged dangerous.
+pub fn interpreter_mentions_sensitive_path(command: &str) -> bool {
+    script_is_dangerous(command, 0, WalkRule::InterpreterMention)
+}
+
+/// Which table one walk of the command tree applies. Both walks share the
+/// parser, the wrapper unwrapping, and the fail-closed rules.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WalkRule {
+    /// [`contains_dangerous_command`]: destructive commands and writes to
+    /// interpreter-honored configuration.
+    Danger,
+    /// [`interpreter_mentions_sensitive_path`].
+    InterpreterMention,
+}
+
+fn script_is_dangerous(script: &str, depth: usize, rule: WalkRule) -> bool {
     if depth > MAX_WRAPPER_DEPTH {
         return true;
     }
@@ -912,10 +966,13 @@ fn script_is_dangerous(script: &str, depth: usize) -> bool {
         // command (`{ printf x; } > .git/hooks/pre-commit`), so the
         // write-side check visits every `redirected_statement`, not only a
         // command's own parent.
-        if node.kind() == "redirected_statement" && redirect_targets_are_sensitive(node, script) {
+        if rule == WalkRule::Danger
+            && node.kind() == "redirected_statement"
+            && redirect_targets_are_sensitive(node, script)
+        {
             return true;
         }
-        if node.kind() == "command" && command_node_is_dangerous(node, script, depth) {
+        if node.kind() == "command" && command_node_is_dangerous(node, script, depth, rule) {
             return true;
         }
         let mut cursor = node.walk();
@@ -926,9 +983,9 @@ fn script_is_dangerous(script: &str, depth: usize) -> bool {
     false
 }
 
-fn command_node_is_dangerous(node: Node<'_>, src: &str, depth: usize) -> bool {
+fn command_node_is_dangerous(node: Node<'_>, src: &str, depth: usize, rule: WalkRule) -> bool {
     let words = literal_or_dynamic_words(node, src);
-    words_are_dangerous(&words, depth)
+    words_are_dangerous(&words, depth, rule)
 }
 
 /// `printf x > .git/hooks/pre-commit` is the shell twin of `write_file
@@ -1048,7 +1105,7 @@ fn literal_or_dynamic_words(node: Node<'_>, src: &str) -> Vec<Option<String>> {
     words
 }
 
-fn words_are_dangerous(words: &[Option<String>], depth: usize) -> bool {
+fn words_are_dangerous(words: &[Option<String>], depth: usize, rule: WalkRule) -> bool {
     if depth > MAX_WRAPPER_DEPTH {
         return true;
     }
@@ -1070,14 +1127,31 @@ fn words_are_dangerous(words: &[Option<String>], depth: usize) -> bool {
     let name = name.as_str();
     let dynamic_args = words[1..].iter().any(Option::is_none);
     let literal: Vec<&str> = words[1..].iter().filter_map(Option::as_deref).collect();
-    if let Some(destructive) = destructive_verdict(name, &literal) {
+    let verdict = match rule {
+        WalkRule::Danger => destructive_verdict(name, &literal),
+        WalkRule::InterpreterMention => interpreter_mention_verdict(name, &literal),
+    };
+    if let Some(flagged) = verdict {
         // `rm $FLAGS file` may be `rm -rf file`.
-        return dynamic_args || destructive;
+        return dynamic_args || flagged;
     }
     let Some(spec) = wrapper_spec(name) else {
         return false;
     };
-    dynamic_args || wrapper_is_dangerous(spec, &literal, depth)
+    dynamic_args || wrapper_is_dangerous(spec, &literal, depth, rule)
+}
+
+/// Interpreters take their program as an operand, so a sensitive path can
+/// hide in the program text (`awk '{print > ".bashrc"}'`, `perl -e
+/// 'open(F,">",".bashrc")'`) or be its input (`python3 x.py .env`). Any
+/// operand that so much as mentions one counts; this needs no interpreter
+/// semantics at all. `None` means the name is not an interpreter.
+fn interpreter_mention_verdict(name: &str, args: &[&str]) -> Option<bool> {
+    matches!(
+        name,
+        "sed" | "perl" | "ruby" | "awk" | "gawk" | "python" | "python3" | "node" | "patch" | "ed"
+    )
+    .then(|| args.iter().any(|arg| mentions_sensitive_path(arg)))
 }
 
 /// Commands that destroy data with no undo, or hand an interpreter new
@@ -1113,14 +1187,19 @@ fn destructive_verdict(name: &str, args: &[&str]) -> Option<bool> {
         }),
         // Global options come before the subcommand: `git -C . clean -fdx`.
         "git" => git_is_destructive(&skip_git_global_options(args)),
-        // Interpreters take their program as an operand, so a write can
-        // hide in the program text: `awk '{print > ".bashrc"}'`,
-        // `perl -e 'open(F,">",".bashrc")'`. Any operand that so much as
-        // MENTIONS a sensitive path is dangerous — reading one deserves the
-        // same prompt as writing it, and this needs no interpreter
-        // semantics at all.
-        "sed" | "perl" | "ruby" | "awk" | "gawk" | "python" | "python3" | "node" | "patch"
-        | "ed" => args.iter().any(|arg| mentions_sensitive_path(arg)),
+        // In-place editors write their file operands, and rewriting a file
+        // an interpreter later honors is the same act as writing it. Only
+        // the write stays here: an interpreter that merely mentions a
+        // sensitive path is `interpreter_mentions_sensitive_path`.
+        "sed" | "perl" | "ruby" => {
+            edits_in_place(args) && args.iter().any(|arg| writes_interpreter_config(arg))
+        }
+        "awk" | "gawk" => {
+            args.iter().any(|arg| arg.contains("inplace"))
+                && args.iter().any(|arg| writes_interpreter_config(arg))
+        }
+        // `ed FILE` always edits its file in place.
+        "patch" | "ed" => args.iter().any(|arg| writes_interpreter_config(arg)),
         // Write-position operands: a copy, move, link, or tee onto a file an
         // interpreter later honors is the shell twin of `write_file` on it.
         "cp" | "mv" | "tee" | "install" | "ln" | "rsync" | "mktemp" => {
@@ -1137,6 +1216,15 @@ fn destructive_verdict(name: &str, args: &[&str]) -> Option<bool> {
 }
 
 const RM_LONGS: &[&str] = &["--force", "--recursive", "--dir"];
+
+/// `-i` in any short cluster (`-i`, `-i.bak`, `-pi`) or `--in-place`, before
+/// `--`. Over-matching a cluster costs one prompt.
+fn edits_in_place(args: &[&str]) -> bool {
+    args.iter().take_while(|arg| **arg != "--").any(|arg| {
+        arg.starts_with("--in-place")
+            || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('i'))
+    })
+}
 
 /// `git` subcommands that destroy work with no undo and no prompt, judged
 /// by the same criterion as `rm -r`.
@@ -1881,14 +1969,14 @@ fn scan_short_cluster<'a>(
     Some(index)
 }
 
-fn wrapper_is_dangerous(spec: &WrapperSpec, args: &[&str], depth: usize) -> bool {
+fn wrapper_is_dangerous(spec: &WrapperSpec, args: &[&str], depth: usize, rule: WalkRule) -> bool {
     let Some(scan) = scan_wrapper_options(spec, args) else {
         return true;
     };
     if scan
         .scripts
         .iter()
-        .any(|script| script_is_dangerous(script, depth + 1))
+        .any(|script| script_is_dangerous(script, depth + 1, rule))
     {
         return true;
     }
@@ -1899,12 +1987,12 @@ fn wrapper_is_dangerous(spec: &WrapperSpec, args: &[&str], depth: usize) -> bool
         WrapperTail::Shell => scan.scripts.is_empty(),
         WrapperTail::Script => {
             // The shell joins `eval`'s operands with spaces before parsing.
-            !rest.is_empty() && script_is_dangerous(&rest.join(" "), depth + 1)
+            !rest.is_empty() && script_is_dangerous(&rest.join(" "), depth + 1, rule)
         }
         WrapperTail::Command | WrapperTail::Env => {
             let words: Vec<Option<String>> =
                 rest.iter().map(|word| Some((*word).to_owned())).collect();
-            words_are_dangerous(&words, depth + 1)
+            words_are_dangerous(&words, depth + 1, rule)
         }
     }
 }
@@ -2475,6 +2563,8 @@ mod tests {
             ".gitconfig",
             ".cargo/config.toml",
             ".cargo/config",
+            "/home/user/.config/git/config",
+            "~/.config/git/attributes",
             ".npmrc",
             ".netrc",
             ".bashrc",
@@ -2493,6 +2583,8 @@ mod tests {
             "Cargo.toml",
             "config.toml",
             "src/config",
+            "git/config",
+            ".config/git/ignore",
             "README.md",
             ".gitignore",
         ] {
@@ -3138,15 +3230,22 @@ mod tests {
             "perl -pi -e 's/a/b/' .bashrc",
             "patch .bashrc",
             "awk -i inplace '{print}' .zshrc",
+            "printf 'a\\nx\\n.\\nw\\n' | ed -s ~/.bashrc",
         ] {
             assert!(
                 contains_dangerous_command(command),
                 "expected dangerous: {command}"
             );
         }
-        // Reading one deserves the same prompt as writing it.
-        assert!(contains_dangerous_command("sed -n 1p .bashrc"));
-        for command in ["sed -i s/a/b/ src/lib.rs", "sed -n 1p src/lib.rs"] {
+        // Reading one is a sensitive-path mention, not a dangerous command
+        // (ADR 0026 resolved question 15).
+        assert!(!contains_dangerous_command("sed -n 1p .bashrc"));
+        assert!(interpreter_mentions_sensitive_path("sed -n 1p .bashrc"));
+        for command in [
+            "sed -i s/a/b/ src/lib.rs",
+            "sed -n 1p src/lib.rs",
+            "ed -s src/lib.rs",
+        ] {
             assert!(
                 !contains_dangerous_command(command),
                 "expected not dangerous: {command}"
@@ -3229,29 +3328,38 @@ mod tests {
     }
 
     #[test]
-    fn interpreter_program_text_naming_a_sensitive_path_is_dangerous() {
-        // Review round 4, finding 3: the write hides in the program, not
-        // in a flag.
+    fn interpreter_program_text_naming_a_sensitive_path_is_a_sensitive_mention() {
+        // Review round 4, finding 3: the path hides in the program, not in a
+        // flag. ADR 0026 resolved question 15 moved this rule from the
+        // dangerous list to the request's sensitive-path flag.
         for command in [
             "awk '{print > \".bashrc\"}' /dev/null",
             "perl -e 'open(F,\">\",\".bashrc\")'",
             "python3 -c 'open(\".git/config\",\"w\")'",
             "node -e 'require(\"fs\").writeFileSync(\".npmrc\",\"x\")'",
             "ruby -e 'File.write(\".zshrc\", \"x\")'",
+            "python3 x.py .env",
+            "sudo python3 x.py .env",
+            "sh -c 'python3 x.py .env'",
         ] {
             assert!(
-                contains_dangerous_command(command),
-                "expected dangerous: {command}"
+                interpreter_mentions_sensitive_path(command),
+                "expected a sensitive mention: {command}"
+            );
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
             );
         }
         for command in [
             "awk '{print $1}' data.csv",
             "perl -e 'print 1'",
             "python3 -c 'print(1)'",
+            "cat .env",
         ] {
             assert!(
-                !contains_dangerous_command(command),
-                "expected not dangerous: {command}"
+                !interpreter_mentions_sensitive_path(command),
+                "expected no sensitive mention: {command}"
             );
         }
     }
@@ -3321,8 +3429,8 @@ mod tests {
             "awk '{print > \".bashrc\"}' /dev/null",
         ] {
             assert!(
-                contains_dangerous_command(command),
-                "expected dangerous: {command}"
+                interpreter_mentions_sensitive_path(command),
+                "expected a sensitive mention: {command}"
             );
         }
         for command in [
@@ -3333,8 +3441,8 @@ mod tests {
             "perl -e 'print 1'",
         ] {
             assert!(
-                !contains_dangerous_command(command),
-                "expected not dangerous: {command}"
+                !interpreter_mentions_sensitive_path(command),
+                "expected no sensitive mention: {command}"
             );
         }
     }

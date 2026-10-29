@@ -121,12 +121,31 @@ pub(crate) fn live_session_config(
 /// set so tool output can never carry them to the canvas or the ledger
 /// (secrets contract; issue #56). Best-effort: a missing/corrupt auth file
 /// only means fewer known values — the shape-based layer still applies.
+///
+/// The same values, and the variables `providers.json` references, are
+/// Euler's own credentials: host commands never see them (ADR 0026 resolved
+/// question 7). The Euler home, `providers.json`, and the auth file are
+/// privileged config: a structured write to them asks a human.
 pub(crate) fn seed_secret_redaction<D>(
     session: &mut euler_core::Session<D>,
     auth_file: Option<&std::path::Path>,
 ) {
     for value in stored_credential_values(auth_file) {
-        session.add_redacted_secret(value);
+        session.add_euler_credential(value);
+    }
+    if let Ok(home) = EulerHome::resolve() {
+        session.add_privileged_config_path(home.root());
+    }
+    if let Some(auth_file) = auth_file {
+        session.add_privileged_config_path(auth_file);
+    }
+    let provider_config = crate::provider_config_runtime::resolve_provider_config_path().ok();
+    if let Some(provider_config) = provider_config.as_deref() {
+        session.add_privileged_config_path(provider_config);
+    }
+    for name in crate::provider_config_runtime::referenced_env_variables(provider_config.as_deref())
+    {
+        session.add_euler_credential_variable(name);
     }
 }
 

@@ -329,6 +329,16 @@ const MIN_VALUE_LEN: usize = 8;
 /// Minimum run length after a known prefix before it reads as a credential.
 const MIN_TOKEN_TAIL: usize = 12;
 
+/// The API-key variables the built-in providers read. Host commands never
+/// see them (ADR 0026 resolved question 7), and the secret classifier lists
+/// them explicitly.
+pub(crate) const BUILT_IN_PROVIDER_KEY_VARIABLES: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+];
+
 /// Environment-variable NAME classifier for secret-bearing values: the
 /// explicit provider keys (all also covered by the `_API_KEY` suffix rule —
 /// listed so the guarantee survives rule edits) plus any `*_API_KEY` /
@@ -348,10 +358,8 @@ pub(crate) fn is_secret_env_name(name: &std::ffi::OsStr) -> bool {
         return false;
     };
     let upper = name.to_ascii_uppercase();
-    matches!(
-        upper.as_str(),
-        "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "OPENROUTER_API_KEY" | "XAI_API_KEY"
-    ) || upper.ends_with("_API_KEY")
+    BUILT_IN_PROVIDER_KEY_VARIABLES.contains(&upper.as_str())
+        || upper.ends_with("_API_KEY")
         || upper.ends_with("_ACCESS_KEY")
         || upper.split('_').any(|segment| {
             matches!(

@@ -279,8 +279,8 @@ pub fn fold_session(
     })
 }
 
-/// The latest execution profile a log recorded, on the first
-/// `session.start` or a later `session.resumed` (ADR 0026 section 9). `None`
+/// The latest execution profile a log recorded, on `session.start`, a later
+/// `session.resumed`, or a `session.profile_changed` (ADR 0026 section 9). `None`
 /// means not recorded: the log predates profiles, so the session resolves
 /// its profile as a new one and none is inferred. A malformed record fails
 /// resume closed rather than reading as not recorded, which could loosen
@@ -288,14 +288,18 @@ pub fn fold_session(
 pub fn recorded_execution_profile(
     events: &[EventEnvelope],
 ) -> Result<Option<ExecutionProfile>, ResumeError> {
-    let start = events
-        .iter()
-        .find(|event| event.kind.as_str() == EventKind::SESSION_START);
-    let resumed = events
-        .iter()
-        .filter(|event| event.kind.as_str() == EventKind::SESSION_RESUMED);
+    // In log order: the start, each resume, and each in-session profile
+    // change; the latest record governs.
+    let records = events.iter().filter(|event| {
+        matches!(
+            event.kind.as_str(),
+            EventKind::SESSION_START
+                | EventKind::SESSION_RESUMED
+                | EventKind::SESSION_PROFILE_CHANGED
+        )
+    });
     let mut latest = None;
-    for event in start.into_iter().chain(resumed) {
+    for event in records {
         if let Some(record) = event.payload.get("execution_profile") {
             let profile = ExecutionProfile::from_record(record).map_err(|reason| {
                 ResumeError::ExecutionProfile {

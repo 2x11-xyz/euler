@@ -444,17 +444,11 @@ impl<D> Session<D> {
                 .permissions
                 .configured_mode(capability)
                 .unwrap_or(ApprovalMode::Ask);
-            // Mirrors `PermissionGate::mode_for_request` on the configured
-            // mode: `always-deny` still denies, and a dangerous or
-            // sensitive request rides no blanket allowance (ADR 0021
-            // decision D).
-            let mode = if configured == ApprovalMode::AlwaysDeny
-                || !(request.dangerous_command || request.sensitive_path)
-            {
-                configured
-            } else {
-                ApprovalMode::Ask
-            };
+            // `PermissionGate::mode_for_request` on the configured mode:
+            // `always-deny` still denies, the execution profile's override
+            // applies, and a dangerous or sensitive request rides no
+            // blanket allowance (ADR 0021 decision D).
+            let mode = self.permissions.effective_mode(configured, &request);
             match mode {
                 ApprovalMode::SessionAllow => {}
                 ApprovalMode::AlwaysDeny => {

@@ -7321,6 +7321,7 @@ impl PtyHarness {
         args: &[&str],
     ) -> Self {
         record_recent_catalog_refresh_for_test(home);
+        pin_locked_interactive_profile(home);
         let pty = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -7914,7 +7915,21 @@ fn record_recent_catalog_refresh_for_test(home: &Path) {
     .expect("catalog state");
 }
 
+/// These tests exercise approvals and the sandbox, which the `locked`
+/// execution profile keeps. Pin it as the interactive default so the
+/// first-run picker never appears and `full` (the built-in interactive
+/// default) does not change what they observe. An existing file wins.
+fn pin_locked_interactive_profile(home: &Path) {
+    let file = home.join(".euler").join("profiles.json");
+    if file.exists() {
+        return;
+    }
+    fs::create_dir_all(file.parent().expect("profiles dir")).expect("profiles dir");
+    fs::write(&file, r#"{"defaults": {"interactive": "locked"}}"#).expect("profiles.json");
+}
+
 fn command_with_home(exe: &str, home: &tempfile::TempDir) -> Command {
+    pin_locked_interactive_profile(home.path());
     let mut command = Command::new(exe);
     command.env("HOME", home.path());
     // Pin the working directory to the isolated home. Sessions record their

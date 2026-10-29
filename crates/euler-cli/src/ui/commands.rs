@@ -557,6 +557,17 @@ pub enum CommandAction {
     /// Kept as a visible picker row so users understand the intended future
     /// posture without mistaking an approval policy for a sandbox.
     PermissionSandboxUnavailable,
+    /// Open the execution profile picker (ADR 0026). Profiles are read from
+    /// `profiles.json` at open time.
+    OpenProfilePicker,
+    /// Switch this session to the named execution profile.
+    SetExecutionProfile {
+        name: String,
+    },
+    /// Write the named profile to `defaults.interactive` for new sessions.
+    SetDefaultProfile {
+        name: String,
+    },
     /// Open the permissions picker with live session/project grants.
     OpenPermissions,
     /// §5.1: drill into the per-capability controls from the posture picker.
@@ -638,6 +649,16 @@ pub enum PickerSpec {
     Compaction(CompactionSettings),
     /// §5.1 Advanced, one level down from the posture picker.
     PermissionsAdvanced(Vec<PermissionChoice>),
+    /// Execution profiles (ADR 0026): presets, then user profiles.
+    Profiles(Vec<ProfileChoice>),
+}
+
+/// One execution profile row in the `/profile` picker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileChoice {
+    pub name: String,
+    pub detail: String,
+    pub current: bool,
 }
 
 /// What the model-targets picker does with the checked set.
@@ -796,6 +817,11 @@ const COMMAND_TABLE: &[CommandSpec] = &[
         token: "/name",
         summary: "name this session",
         args: "<name>",
+    },
+    CommandSpec {
+        token: "/profile",
+        summary: "execution profile: where commands run and what asks",
+        args: "[name | default <name>]",
     },
     CommandSpec {
         token: "/permissions",
@@ -1064,6 +1090,7 @@ fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> Comma
                 name: name.to_owned(),
             }
         }),
+        "/profile" => profile_effect(parsed.arg),
         "/permissions" => CommandEffect::Action(CommandAction::OpenPermissions),
         "/resume" => CommandEffect::Action(CommandAction::OpenResumePicker),
         "/rollback" => rollback_effect(context),
@@ -1322,6 +1349,22 @@ fn effort_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
     }
 }
 
+fn profile_effect(arg: Option<&str>) -> CommandEffect {
+    let Some(arg) = arg.map(str::trim).filter(|arg| !arg.is_empty()) else {
+        return CommandEffect::Action(CommandAction::OpenProfilePicker);
+    };
+    let words: Vec<&str> = arg.split_whitespace().collect();
+    match words.as_slice() {
+        ["default", name] => CommandEffect::Action(CommandAction::SetDefaultProfile {
+            name: (*name).to_owned(),
+        }),
+        [name] if *name != "default" => CommandEffect::Action(CommandAction::SetExecutionProfile {
+            name: (*name).to_owned(),
+        }),
+        _ => CommandEffect::Message("usage: /profile [name | default <name>]".to_owned()),
+    }
+}
+
 fn theme_effect(arg: Option<&str>, context: &CommandContext) -> CommandEffect {
     let Some(theme) = arg else {
         return CommandEffect::OpenPicker(PickerSpec::Theme(context.theme_choices.clone()));
@@ -1445,6 +1488,35 @@ fn mode_label(mode: ApprovalMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ADR 0026: `/profile` opens the picker, `/profile <name>` switches
+    /// this session, and `/profile default <name>` saves the default.
+    #[test]
+    fn profile_command_opens_the_picker_switches_and_saves_the_default() {
+        let context = CommandContext::default();
+        assert_eq!(
+            dispatch_command("/profile", &context),
+            CommandEffect::Action(CommandAction::OpenProfilePicker)
+        );
+        assert_eq!(
+            dispatch_command("/profile locked", &context),
+            CommandEffect::Action(CommandAction::SetExecutionProfile {
+                name: "locked".to_owned()
+            })
+        );
+        assert_eq!(
+            dispatch_command("/profile default full", &context),
+            CommandEffect::Action(CommandAction::SetDefaultProfile {
+                name: "full".to_owned()
+            })
+        );
+        for input in ["/profile default", "/profile a b"] {
+            assert_eq!(
+                dispatch_command(input, &context),
+                CommandEffect::Message("usage: /profile [name | default <name>]".to_owned())
+            );
+        }
+    }
 
     #[test]
     fn permission_postures_have_explicit_non_sandboxed_mappings() {

@@ -113,6 +113,9 @@ pub(crate) struct RunArgs {
 pub(crate) struct ExecArgs {
     pub(crate) run: RunArgs,
     pub(crate) auto_approve: AutoApproveTier,
+    /// Whether `--auto-approve` was given, so a profile that makes it a
+    /// no-op can say so (ADR 0026 resolved question 2).
+    pub(crate) auto_approve_explicit: bool,
     pub(crate) prompt: Option<String>,
     pub(crate) resume_path: Option<PathBuf>,
     /// Continue the interrupted run instead of starting a new turn.
@@ -476,6 +479,7 @@ fn build_exec_args(
     Ok(ExecArgs {
         run: build_run_args(parsed, preference, catalog, custom_providers)?,
         auto_approve: parsed.auto_approve.unwrap_or(AutoApproveTier::DEFAULT),
+        auto_approve_explicit: parsed.auto_approve.is_some(),
         prompt: (!parsed.exec_prompt.is_empty()).then(|| parsed.exec_prompt.join(" ")),
         resume_path: parsed.resume_path.clone(),
         continue_run: parsed.continue_run,
