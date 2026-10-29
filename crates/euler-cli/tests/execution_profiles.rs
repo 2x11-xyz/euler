@@ -377,11 +377,10 @@ fn headless_default_runs_commands_and_the_locked_profile_restores_read_only() {
 
     let (start, result) = run(&[]);
     assert_eq!(start["execution_profile"]["name"], "workspace");
-    // Without a backend the profile lifts nothing: the command fails closed
-    // and the read-only tier applies, as under `locked`.
-    if start["sandbox_backend"] != "unavailable" {
-        assert_eq!(result["ok"], true, "{result}");
-    }
+    // Without a backend the profile lifts no approval and the command fails
+    // closed.
+    let backend_enforced = start["sandbox_backend"] != "unavailable";
+    assert_eq!(result["ok"], backend_enforced, "{result}");
 
     let (start, result) = run(&["--profile", "locked"]);
     assert_eq!(start["execution_profile"]["name"], "locked");
