@@ -914,16 +914,80 @@ fn exec_under_full_withholds_variables_providers_json_references() {
     );
 }
 
+/// Whether any request in the log asked a human (`permission.prompt`).
+fn asked_permission(log: &Path) -> bool {
+    fs::read_to_string(log)
+        .expect("read log")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .any(|event| event["kind"] == "permission.prompt")
+}
+
+/// Run one `write_file` to `target` under `full`; true when it asked and
+/// never landed (headless exec denies every ask).
+fn full_asks_before_writing(workspace: &Workspace, target: &Path) -> bool {
+    let script = tool_script(
+        workspace,
+        "write_file",
+        serde_json::json!({
+            "path": target.to_str().expect("utf8 path"),
+            "content": "{}",
+        }),
+    );
+    let output = exec_new(
+        workspace,
+        &["--profile", "full", "--provider-option", &script],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    asked_permission(&workspace.log) && !target.exists()
+}
+
 #[test]
-fn exec_under_full_asks_before_writing_into_the_euler_home() {
+fn exec_under_full_asks_before_writing_euler_secrets_and_trust_records() {
+    let unguarded: Vec<&str> = [
+        "providers.json",
+        "auth.json",
+        "profiles.json",
+        "user-grants.json",
+        "project-grants/root.json",
+        "project-context/root.json",
+        "extensions/state.jsonl",
+        "extensions/links.json",
+        "extensions/linked-activation.jsonl",
+        // On a case-insensitive filesystem these create the files above.
+        "PROFILES.json",
+        "USER-GRANTS.json",
+        "Auth.json",
+    ]
+    .into_iter()
+    .filter(|relative| {
+        let workspace = workspace();
+        let target = workspace.home.join(".euler").join(relative);
+        // A write into a missing directory fails before it lands, so give
+        // each target the parent it has once Euler has used it.
+        fs::create_dir_all(target.parent().expect("parent")).expect("parent dir");
+        !full_asks_before_writing(&workspace, &target)
+    })
+    .collect();
+    assert!(unguarded.is_empty(), "wrote without asking: {unguarded:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_under_full_asks_before_writing_the_auth_file_through_a_skills_symlink() {
     let workspace = workspace();
-    let providers = workspace.home.join(".euler").join("providers.json");
+    let euler = workspace.home.join(".euler");
+    let auth = euler.join("auth.json");
+    fs::write(&auth, "{}").expect("auth file");
+    let link = euler.join("skills").join("note");
+    fs::create_dir_all(link.parent().expect("parent")).expect("skills dir");
+    std::os::unix::fs::symlink(&auth, &link).expect("symlink");
     let script = tool_script(
         &workspace,
         "write_file",
         serde_json::json!({
-            "path": providers.to_str().expect("utf8 path"),
-            "content": "{\"version\": 1, \"providers\": {}}",
+            "path": link.to_str().expect("utf8 path"),
+            "content": "{\"stolen\": true}",
         }),
     );
     let output = exec_new(
@@ -931,16 +995,38 @@ fn exec_under_full_asks_before_writing_into_the_euler_home() {
         &["--profile", "full", "--provider-option", &script],
     );
     assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        asked_permission(&workspace.log),
+        "the symlinked write did not ask"
+    );
+    assert_eq!(fs::read_to_string(&auth).expect("auth file"), "{}");
+}
 
-    // Headless exec denies every ask, so the privileged write never lands.
-    assert!(!providers.exists());
-    let log = fs::read_to_string(&workspace.log).expect("read log");
-    let decision = log
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
-        .find(|event| event["kind"] == "permission.decision")
-        .expect("permission.decision");
-    assert_eq!(decision["payload"]["allowed"], false, "{decision}");
+#[test]
+fn exec_under_full_writes_a_skill_into_the_euler_home_without_asking() {
+    let workspace = workspace();
+    let skill = workspace
+        .home
+        .join(".euler")
+        .join("skills")
+        .join("notes")
+        .join("SKILL.md");
+    fs::create_dir_all(skill.parent().expect("parent")).expect("skill dir");
+    let script = tool_script(
+        &workspace,
+        "write_file",
+        serde_json::json!({
+            "path": skill.to_str().expect("utf8 path"),
+            "content": "---\nname: notes\ndescription: Take notes.\n---\nTake notes.\n",
+        }),
+    );
+    let output = exec_new(
+        &workspace,
+        &["--profile", "full", "--provider-option", &script],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(skill.exists(), "the skill write did not land");
+    assert!(!asked_permission(&workspace.log), "the skill write asked");
 }
 
 #[test]

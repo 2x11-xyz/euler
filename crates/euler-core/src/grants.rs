@@ -39,6 +39,9 @@ const MAX_GRANTS_FILE_BYTES: u64 = 64 * 1024;
 const GRANTS_FILE: &str = "grants.json";
 const USER_GRANTS_FILE: &str = "user-grants.json";
 const EULER_DIR: &str = ".euler";
+/// Subdirectory of the user consent directory holding the per-root
+/// project-grant consent store.
+pub(crate) const PROJECT_GRANTS_CONSENT_DIR: &str = "project-grants";
 const GRANTS_VERSION: u64 = 1;
 
 /// Opaque bounded pattern for a scoped grant.
@@ -436,7 +439,7 @@ impl ProjectGrantStore {
             let _ = write!(name, "{byte:02x}");
         }
         consent_dir
-            .join("project-grants")
+            .join(PROJECT_GRANTS_CONSENT_DIR)
             .join(format!("{name}.json"))
     }
 

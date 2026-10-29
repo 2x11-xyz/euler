@@ -14,6 +14,20 @@ pull requests that landed them; deeper design rationale lives in
   Multi-line drafts and lines whose first token is not a known command (for
   example `/tmp/foo is broken`) still submit as messages.
 
+### Execution profiles: narrower privileged-write prompt
+
+- **Behavior change**: a structured write under the Euler home asks a human
+  under every profile only when it targets a file that holds secrets or
+  decides trust: `providers.json`, the auth file (and its override),
+  `profiles.json`, `user-grants.json`, the `project-grants/` and
+  `project-context/` consent stores, and the extension records
+  `extensions/state.jsonl`, `links.json`, and `linked-activation.jsonl`.
+  Other writes there, such as a skill under `skills/`, follow the profile's
+  normal rules, so under `full` they no longer ask. The match ignores ASCII
+  case, so `PROFILES.json` on a case-insensitive filesystem still asks. A
+  shell command that writes a privileged file is still not flagged
+  (`secrets.md`).
+
 ### Execution profiles: headless default (ADR 0026 step 7)
 
 - **Behavior change**: `euler exec` now runs under the `workspace` profile

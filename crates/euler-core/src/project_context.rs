@@ -24,6 +24,7 @@ pub(crate) use relocation::{
     validate_candidate_relocation,
 };
 
+pub(crate) use acknowledgment::ACK_SUBDIR;
 pub use acknowledgment::{AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError};
 
 pub(crate) use budget::{admission_required_tokens, fits_context_limit, request_required_tokens};

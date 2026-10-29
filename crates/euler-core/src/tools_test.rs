@@ -3531,3 +3531,24 @@ fn writes_privileged_config_resolves_absolute_relative_and_symlinked_paths() {
     let sibling = elsewhere.path().join("other.json");
     assert!(!fresh.writes_privileged_config(&sibling.to_string_lossy()));
 }
+
+#[test]
+fn writes_privileged_config_ignores_case_for_a_file_that_does_not_exist_yet() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let home = tempfile::tempdir().expect("euler home");
+    let mut registry = ToolRegistry::new(workspace.path());
+    registry.set_writes_outside_workspace(true);
+    registry.add_privileged_config_path(&home.path().join("profiles.json"));
+    registry.add_privileged_config_path(&home.path().join("project-grants"));
+
+    // A different case matches everywhere; on a case-insensitive
+    // filesystem these writes would create the protected files.
+    let upper = home.path().join("PROFILES.json");
+    assert!(registry.writes_privileged_config(&upper.to_string_lossy()));
+    let mixed = home.path().join("Project-Grants");
+    assert!(registry.writes_privileged_config(&mixed.to_string_lossy()));
+    let sibling = home.path().join("preferences.json");
+    assert!(!registry.writes_privileged_config(&sibling.to_string_lossy()));
+    let longer_name = home.path().join("PROFILES.json.bak");
+    assert!(!registry.writes_privileged_config(&longer_name.to_string_lossy()));
+}

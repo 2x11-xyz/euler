@@ -19,11 +19,11 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
-const STATE_LOG_FILE: &str = "state.jsonl";
+pub(crate) const STATE_LOG_FILE: &str = "state.jsonl";
 const STATE_LOG_LOCK_FILE: &str = "state.jsonl.lock";
-const LINKED_ACTIVATION_LOG_FILE: &str = "linked-activation.jsonl";
+pub(crate) const LINKED_ACTIVATION_LOG_FILE: &str = "linked-activation.jsonl";
 const LINKED_ACTIVATION_LOG_LOCK_FILE: &str = "linked-activation.jsonl.lock";
-const LINK_INVENTORY_FILE: &str = "links.json";
+pub(crate) const LINK_INVENTORY_FILE: &str = "links.json";
 const LINK_INVENTORY_LOCK_FILE: &str = "links.json.lock";
 const INSTALLED_DIR: &str = "installed";
 const STATE_ENTRY_VERSION: u64 = 1;

@@ -124,7 +124,8 @@ pub(crate) fn live_session_config(
 ///
 /// The same values, and the variables `providers.json` references, are
 /// Euler's own credentials: host commands never see them (ADR 0026 resolved
-/// question 7). The Euler home, `providers.json`, and the auth file are
+/// question 7). `providers.json`, the auth file, and the Euler home's
+/// secret and trust records ([`EulerHome::privileged_config_paths`]) are
 /// privileged config: a structured write to them asks a human.
 pub(crate) fn seed_secret_redaction<D>(
     session: &mut euler_core::Session<D>,
@@ -134,7 +135,9 @@ pub(crate) fn seed_secret_redaction<D>(
         session.add_euler_credential(value);
     }
     if let Ok(home) = EulerHome::resolve() {
-        session.add_privileged_config_path(home.root());
+        for path in home.privileged_config_paths() {
+            session.add_privileged_config_path(&path);
+        }
     }
     if let Some(auth_file) = auth_file {
         session.add_privileged_config_path(auth_file);

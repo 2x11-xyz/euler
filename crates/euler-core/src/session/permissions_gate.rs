@@ -385,9 +385,9 @@ pub(crate) fn permission_request_for_tool(
             tools.workspace_relative_path(&path),
             tools.host_write_target(&path),
         ];
-        // A write into the Euler home or the auth file is a privileged
-        // secret and config edit (`secrets.md`) and asks a human the same
-        // way.
+        // A write to `providers.json`, the auth file, or an Euler home
+        // grant or consent record is a privileged secret and config edit
+        // (`secrets.md`) and asks a human the same way.
         if forms
             .iter()
             .flatten()

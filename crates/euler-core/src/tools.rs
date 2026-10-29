@@ -291,9 +291,10 @@ pub struct ToolRegistry {
     writes_outside_workspace: bool,
     background_jobs: crate::background_jobs::BackgroundJobs,
     euler_credentials: EulerCredentials,
-    /// Canonical paths whose files hold Euler's secrets and configuration
-    /// (the Euler home, the auth file). A structured write under one is a
-    /// privileged secret and config edit (`secrets.md`).
+    /// Canonical paths whose files hold Euler's secrets or decide trust
+    /// (`providers.json`, the auth file, the Euler home's grant and consent
+    /// records). A structured write under one is a privileged secret and
+    /// config edit (`secrets.md`).
     privileged_config_paths: Vec<PathBuf>,
     /// The execution profile whose `escalation` field governs `run_shell`'s
     /// `escalate` object (ADR 0026 section 3): its name for messages, and
@@ -492,7 +493,9 @@ impl ToolRegistry {
 
     /// Whether a structured write to `requested` lands under a path
     /// [`Self::add_privileged_config_path`] marked, resolved as the write
-    /// resolves it.
+    /// resolves it. The match ignores ASCII case: resolving keeps the
+    /// requested case for a file that does not exist yet, and on a
+    /// case-insensitive filesystem `PROFILES.json` creates `profiles.json`.
     pub(crate) fn writes_privileged_config(&self, requested: &str) -> bool {
         let Ok(resolved) = self.resolve_write_path(requested, false) else {
             return false;
@@ -500,7 +503,7 @@ impl ToolRegistry {
         let target = resolved.absolute();
         self.privileged_config_paths
             .iter()
-            .any(|privileged| target.starts_with(privileged))
+            .any(|privileged| starts_with_ignoring_ascii_case(&target, privileged))
     }
 
     /// Background jobs started with the sandbox off that are still running,
@@ -1631,6 +1634,19 @@ see them.\n"
     fn read_resolved_file(&self, path: &ResolvedWorkspacePath) -> Result<String, ToolError> {
         read_confined(&path.confine()?, path)
     }
+}
+
+/// `path.starts_with(prefix)`, comparing each component without regard to
+/// ASCII case.
+fn starts_with_ignoring_ascii_case(path: &Path, prefix: &Path) -> bool {
+    let mut components = path.components();
+    prefix.components().all(|expected| {
+        components.next().is_some_and(|actual| {
+            actual
+                .as_os_str()
+                .eq_ignore_ascii_case(expected.as_os_str())
+        })
+    })
 }
 
 /// The canonical form of `full`: symlinks resolved for an existing path, or
