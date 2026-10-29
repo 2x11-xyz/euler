@@ -3454,6 +3454,32 @@ fn user_message_count(core: &AppCore) -> usize {
         .count()
 }
 
+/// Pasted text after a no-argument command is a usage error: the command
+/// does not run and the draft stays for editing (#276).
+#[test]
+fn pasted_no_argument_command_with_trailing_text_keeps_draft() {
+    let mut draft_core = core();
+
+    draft_core.handle_input(InputEvent::Paste("/quit now".to_owned()));
+    assert_ne!(
+        draft_core.handle_input(key(KeyCode::Enter)),
+        CoreEffect::Quit
+    );
+
+    assert_eq!(user_message_count(&draft_core), 0);
+    assert_eq!(
+        draft_core.visual_canvas.finalized_items().last(),
+        Some(&TranscriptItem::Notice(
+            "/quit takes no arguments; remove the text after it".to_owned()
+        ))
+    );
+    assert_eq!(draft_core.bottom.composer().submit_text(), "/quit now");
+
+    let mut bare = core();
+    bare.handle_input(InputEvent::Paste("/quit".to_owned()));
+    assert_eq!(bare.handle_input(key(KeyCode::Enter)), CoreEffect::Quit);
+}
+
 /// A slash command that arrives as a bracketed paste runs like a typed one
 /// instead of going to the model as a chat message.
 #[test]

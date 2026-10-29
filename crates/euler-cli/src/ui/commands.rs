@@ -1082,6 +1082,16 @@ pub fn help_text(context: &CommandContext) -> String {
 }
 
 fn dispatch_parsed(parsed: ParsedCommand<'_>, context: &CommandContext) -> CommandEffect {
+    if parsed.arg.is_some()
+        && command_table()
+            .iter()
+            .any(|spec| spec.token == parsed.token && command_args(spec).is_empty())
+    {
+        return CommandEffect::Message(format!(
+            "{} takes no arguments; remove the text after it",
+            parsed.token
+        ));
+    }
     match parsed.token {
         "/new" => CommandEffect::Action(CommandAction::NewSession),
         "/model" => model_effect(parsed.arg, context),
@@ -1538,6 +1548,39 @@ mod tests {
                 CommandEffect::Message("usage: /profile [name | default <name>]".to_owned())
             );
         }
+    }
+
+    /// Text after a command whose table entry takes no arguments is a usage
+    /// error, not silently dropped; the bare command still runs.
+    #[test]
+    fn no_argument_command_with_trailing_text_is_a_usage_error() {
+        let context = CommandContext::default();
+        for spec in command_table()
+            .iter()
+            .filter(|spec| command_args(spec).is_empty())
+        {
+            assert_eq!(
+                dispatch_command(&format!("{} the history please", spec.token), &context),
+                CommandEffect::Message(format!(
+                    "{} takes no arguments; remove the text after it",
+                    spec.token
+                ))
+            );
+        }
+        assert_eq!(
+            dispatch_command("/quit", &context),
+            CommandEffect::Action(CommandAction::Quit)
+        );
+        assert_eq!(
+            dispatch_command("/compact ", &context),
+            CommandEffect::Action(CommandAction::CompactSession)
+        );
+        assert_eq!(
+            dispatch_command("/theme dark", &context),
+            CommandEffect::Action(CommandAction::SetTheme {
+                choice: ThemeChoice::parse("dark").expect("dark theme"),
+            })
+        );
     }
 
     #[test]
