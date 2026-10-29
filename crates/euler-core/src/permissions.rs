@@ -1,4 +1,4 @@
-use crate::execution_profile::{ExecutionProfile, ProfileFields};
+use crate::execution_profile::{profile_mode_override, ExecutionProfile, ProfileFields};
 use crate::grants::{
     bound_command, bound_instruction, ActiveGrant, GrantList, GrantScope, ProjectGrantError,
     ProjectGrantStore, ScopePattern,
@@ -40,16 +40,23 @@ pub struct PermissionRequest {
     /// `.git` component, git/npm/cargo/shell configuration, `.env*`,
     /// `*secret*`, `*credential*`, `id_rsa`, `id_ed25519`, `*.pem`,
     /// `*.key`), checked on the literal argument AND its canonicalized
-    /// workspace form. Such a
-    /// request never rides a blanket `session-allow`:
+    /// workspace form. For a shell command it is true when an interpreter's
+    /// operands mention such a path
+    /// ([`crate::command_safety::interpreter_mentions_sensitive_path`]).
+    /// Such a request never rides a blanket `session-allow`:
     /// [`PermissionGate::mode_for_request`] escalates it to `ask`, so
     /// accessing the file takes an explicit decision or a covering grant
-    /// (deep review P1-b).
+    /// (deep review P1-b), except under an execution profile with
+    /// `approvals: never` (ADR 0026), where it does not ask.
     pub sensitive_path: bool,
     /// True when the permissive danger walk
     /// ([`crate::command_safety::contains_dangerous_command`]) flagged the
-    /// command. Walked ONCE over the full command text, in
-    /// [`PermissionRequest::with_command`].
+    /// command, walked ONCE over the full command text in
+    /// [`PermissionRequest::with_command`], or when a structured write
+    /// targets interpreter-honored configuration
+    /// ([`crate::command_safety::interpreter_honored_config`]), the
+    /// structured twin of a dangerous shell write (ADR 0026 resolved
+    /// question 15).
     ///
     /// Such a request is auto-approved by nothing: no grant covers it
     /// ([`PermissionGate::granted_source`]) and no capability mode short of
@@ -116,6 +123,10 @@ impl PermissionRequest {
         // SCOPED grant matching, which needs text nobody can show the user
         // (`command_for_matching`).
         self.dangerous_command = crate::command_safety::contains_dangerous_command(&full);
+        // ADR 0026 resolved question 15: an interpreter whose operands
+        // mention a sensitive path asks where sensitive paths ask, rather
+        // than sitting on the dangerous list.
+        self.sensitive_path |= crate::command_safety::interpreter_mentions_sensitive_path(&full);
         self
     }
 
@@ -495,29 +506,36 @@ impl<D> PermissionGate<D> {
     /// deliberate decision is required, not a hard deny. `AlwaysDeny` is
     /// never weakened.
     pub fn mode_for_request(&self, request: &PermissionRequest) -> ApprovalMode {
-        let mode = self.mode(request.capability);
-        if mode == ApprovalMode::AlwaysDeny {
-            return mode;
+        self.effective_mode(self.mode(request.capability), request)
+    }
+
+    /// [`Self::mode_for_request`] from an already chosen `configured` mode
+    /// (extension capability approval reads an unconfigured capability as
+    /// `ask`). `always-deny` wins; then a dangerous or unreadable command
+    /// asks, since under ADR 0021 decision D the danger veto holds in EVERY
+    /// mode; then the execution profile's override
+    /// ([`profile_mode_override`]); then a sensitive path never rides a
+    /// blanket allow (deep review P1-b).
+    pub fn effective_mode(
+        &self,
+        configured: ApprovalMode,
+        request: &PermissionRequest,
+    ) -> ApprovalMode {
+        if configured == ApprovalMode::AlwaysDeny {
+            return configured;
         }
-        // A sensitive path never rides a blanket allow (deep review P1-b),
-        // and neither does a dangerous or unreadable command: under ADR
-        // 0021 decision D the danger veto holds in EVERY mode, so a forced
-        // `rm` prompts even under full access.
         if request.dangerous_command {
             return ApprovalMode::Ask;
         }
-        if let Some(mode) = crate::execution_profile::profile_mode_override(
-            &self.profile,
-            request,
-            mode,
-            self.sandbox_enforced,
-        ) {
+        if let Some(mode) =
+            profile_mode_override(&self.profile, request, configured, self.sandbox_enforced)
+        {
             return mode;
         }
         if request.sensitive_path {
             return ApprovalMode::Ask;
         }
-        mode
+        configured
     }
 
     pub fn configured_capabilities(&self) -> impl Iterator<Item = Capability> + '_ {
@@ -1456,6 +1474,54 @@ mod tests {
             1
         );
         assert_eq!(gate.mode(Capability::ShellExec), ApprovalMode::Ask);
+    }
+
+    /// ADR 0026: under `approvals: never` every request runs except a
+    /// dangerous one, sensitive paths included; `always-deny` still wins, a
+    /// profile with `approvals: always` keeps the configured modes, and
+    /// `escalation-only` asks for a shell operand naming a sensitive path.
+    #[test]
+    fn profile_approvals_never_allows_all_but_dangerous_requests() {
+        let profile = |name| {
+            crate::ProfilesConfig::default()
+                .resolve(Some(name), crate::ProfileContext::Interactive, None)
+                .expect("preset resolves")
+                .fields
+        };
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.set_execution_profile(profile("full"), false);
+        let mut sensitive = PermissionRequest::new(Capability::FsRead, "tool read_file");
+        sensitive.sensitive_path = true;
+        let interpreter = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("python3 x.py .env");
+        assert!(interpreter.sensitive_path && !interpreter.dangerous_command);
+        let dangerous = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("rm -rf x");
+        assert_eq!(
+            gate.mode_for_request(&sensitive),
+            ApprovalMode::SessionAllow
+        );
+        assert_eq!(
+            gate.mode_for_request(&interpreter),
+            ApprovalMode::SessionAllow
+        );
+        assert_eq!(gate.mode_for_request(&dangerous), ApprovalMode::Ask);
+        gate.set_mode(Capability::ShellExec, ApprovalMode::AlwaysDeny);
+        assert_eq!(
+            gate.mode_for_request(&interpreter),
+            ApprovalMode::AlwaysDeny
+        );
+
+        gate.set_mode(Capability::ShellExec, ApprovalMode::Ask);
+        gate.set_execution_profile(profile("locked"), true);
+        assert_eq!(gate.mode_for_request(&interpreter), ApprovalMode::Ask);
+        assert_eq!(gate.mode_for_request(&sensitive), ApprovalMode::Ask);
+
+        // The interpreter mention is a sensitive-path flag, so `workspace`
+        // asks for it inside its boundary (resolved questions 14 and 15).
+        gate.set_execution_profile(profile("workspace"), true);
+        assert_eq!(gate.mode_for_request(&interpreter), ApprovalMode::Ask);
+        assert_eq!(gate.mode_for_request(&dangerous), ApprovalMode::Ask);
     }
 
     #[test]

@@ -732,6 +732,11 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             "Permissions".to_owned(),
             permission_items(choices),
         ),
+        PickerSpec::Profiles(choices) => (
+            PickerKind::Generic,
+            "Execution profile".to_owned(),
+            profile_items(choices),
+        ),
         PickerSpec::PermissionsAdvanced(choices) => (
             PickerKind::PermissionsAdvanced,
             "Permissions › Advanced".to_owned(),
@@ -889,6 +894,21 @@ fn effort_items(choices: Vec<EffortChoice>) -> Vec<PickerItem> {
             action: CommandAction::SetReasoningEffort {
                 effort: choice.effort,
             },
+        })
+        .collect()
+}
+
+fn profile_items(choices: Vec<ProfileChoice>) -> Vec<PickerItem> {
+    choices
+        .into_iter()
+        .map(|choice| PickerItem {
+            label: choice.name.clone(),
+            detail: Some(choice.detail),
+            status: choice.current.then(|| "current".to_owned()),
+            group: None,
+            provider_tag: None,
+            current: choice.current,
+            action: CommandAction::SetExecutionProfile { name: choice.name },
         })
         .collect()
 }

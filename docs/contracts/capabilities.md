@@ -70,13 +70,15 @@ and the session still fails closed. The host-level backend probe caches a
 definite result (enforced, or a real unavailability such as `bwrap` missing,
 user namespaces blocked, or Seatbelt refusing the profile) for the process
 lifetime, but never caches a timeout, so the next session probes again. Deliberate unsandboxed
-execution is a later execution profile (ADR 0026); it is never a side effect
-of an approval mode, and no `/permissions` posture changes the sandbox.
+execution is the `full` execution profile (ADR 0026, below); it is never a
+side effect of an approval mode, and no `/permissions` posture changes the
+sandbox.
 
 ## Execution profiles
 
 The execution boundary and the default approval policy are a named profile
-(ADR 0026). This release enforces the `locked` and `workspace` presets.
+(ADR 0026). This release enforces the `full`, `workspace`, and `locked`
+presets.
 
 `locked` is the boundary described above, unchanged: the no-network
 sandbox, a private `/tmp` and `HOME`, and every command not statically safe
@@ -174,21 +176,107 @@ escalation ships.
 - **Background jobs.** As `locked`: on Linux they end with their command;
   on macOS a job that redirects its output outlives its command. Under any
   sandboxed profile Euler ends the jobs its commands left running when the
-  session ends, without signalling a reused process group.
+  session ends and on a profile change, without signalling a reused process
+  group.
 
-Only these two boundaries are enforced: a profile with `network: on` must
-keep `workspace`'s `tmp`, `caches`, `escalation`, and `background_jobs`, and
-one with `network: off` must keep `locked`'s, with no `writable_paths` and
-private credentials. `approvals` may be `escalation-only` or `always` with
+With the sandbox on, only these two boundaries are enforced: a profile with
+`network: on` must keep `workspace`'s `tmp`, `caches`, `escalation`, and
+`background_jobs`, and one with `network: off` must keep `locked`'s, with no
+`writable_paths` and private credentials. `approvals` may be `escalation-only` or `always` with
 either boundary, so `{"extends": "locked", "approvals": "escalation-only"}`
 runs commands without a prompt inside the no-network sandbox.
 `approvals: never` belongs to the `full` preset and is refused with the
 sandbox on. Changing `network` alone moves a profile to the other boundary
 with the wrong `tmp` and `caches`, so the startup error names `network`.
 
-- **Presets.** `full`, `workspace`, and `locked` are reserved names. Naming
-  `full`, directly or through `extends`, is a startup error saying the
-  preset is not available yet; it is never substituted.
+`full` is unrestricted local execution. Its fields are `sandbox: off`,
+`network: on`, `writable_paths: []`, `tmp: host`, `caches: writable` (with
+the sandbox off these four are the host's and are not read),
+`credentials: private` (not applicable with the sandbox off),
+`approvals: never`, `escalation: not-allowed`, `background_jobs: outlive`,
+and `reviewer: user`. Under `full`:
+
+- `run_shell` and the `git_*` tools run on the host with the user's
+  authority (`sandbox_backend: "host"`), and `session.start` records
+  `command_approvals: "off"` as a separate fact.
+- Every request inside the boundary is allowed, extension capabilities
+  included, as the Full access posture did; the configured capability
+  modes are unchanged and `always-deny` still denies. A command still
+  asks when the dangerous-command list flags it, and a structured write to
+  interpreter-honored configuration or into the Euler home asks a human
+  (all rules below that hold under every profile). Extension install and
+  launch consent keep their own prompts. The `sensitive_path` flag does
+  not ask: `read_file .env`, `cat .env`, and `python3 x.py .env` all run.
+- The environment passes through to host commands except Euler's own
+  credentials and parent-control variables (ADR 0026 resolved question 7).
+  Euler's own credentials are the built-in provider variables
+  (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
+  `XAI_API_KEY`), the variables `providers.json` references in `api_key` or
+  a header (`$NAME`, `${NAME}`), and any variable whose value is a credential Euler holds (the
+  auth file's values and secrets its providers resolve). Other
+  secret-shaped variables (`GITHUB_TOKEN`, cloud keys) reach commands and
+  stay registered with the redactor; row C's denylist is not applied. This
+  rule applies to every host-backend command, including an unsupported
+  platform's.
+- `write_file`, `edit_file`, and `apply_patch` accept a path outside the
+  workspace (absolute, or relative and leaving it). The write is recorded
+  with its canonical absolute path; no checkpoint covers it and `/rollback`
+  cannot restore it (resolved question 22). Writes inside the workspace
+  checkpoint as under every profile.
+- A job that redirects its output outlives its command and the session;
+  Euler lists the jobs it started that are still running at exit (resolved
+  questions 6 and 12).
+
+A user profile extending `full` may set `approvals: always` (today's
+prompts, on the host); `escalation-only` and any tighter host boundary
+field (`network: off`, a private `tmp`, `writable_paths`) are refused as
+claims the host does not keep.
+
+**Rules under every profile.** The dangerous-command list always applies
+(see "Static command safety"). A structured write (`write_file`,
+`edit_file`, `apply_patch`, or an `apply_patch` heredoc through
+`run_shell`) whose named path, workspace form, or host target is
+interpreter-honored configuration (anything under `.git`,
+`.gitmodules`, `.gitattributes`, `.gitconfig`, `.config/git/config`,
+`.npmrc`, `.netrc`, shell startup files, `.cargo/config.toml`) is marked
+like a dangerous command: it asks a human, no grant covers it, and it never
+reaches the guardian (ADR 0026 resolved question 15). A structured write
+whose target resolves under the Euler home, `providers.json`, or the auth
+file is a privileged secret and config edit (`secrets.md`) and is marked
+the same way. For the Euler home, `providers.json`, and the auth file only
+the structured form is checked: a `run_shell` command under `full` that
+writes them is not flagged. An interpreter (`sed`,
+`awk`, `perl`, `ruby`, `python`, `node`, `patch`, `ed`) whose operands
+mention a sensitive path sets the request's `sensitive_path` flag rather
+than the dangerous flag, as a sensitive path named anywhere in a
+`run_shell` command does (see "Sensitive-path shell ask"): it asks under
+`approvals: escalation-only`, keeps the shell's configured mode under
+`approvals: always`, stays grant-coverable and guardian-routable, and does
+not ask under `approvals: never`.
+
+**Approval override.** A profile's `approvals` acts per request through one
+function, `execution_profile::profile_mode_override`, which the permission
+gate applies after `always-deny` and the danger veto and before the
+structured sensitive-path escalation, for tool calls, companion loops,
+extension capability approval, and idle contributors. `never` returns allow
+for every request that reaches it, sensitive paths included.
+`escalation-only` asks for a `run_shell` sensitive-path request and, while
+the sandbox backend is enforced, turns an `ask` for `fs-write` or
+`shell-exec` into `session-allow` (see `workspace` above). `always` keeps a
+`run_shell` sensitive-path request at the capability's configured mode and
+otherwise returns nothing, so the configured modes apply as before.
+
+**Background jobs.** Each `run_shell` command runs in its own process group.
+When its shell exits while other members of the group still run, Euler
+keeps the leader exited but unreaped, which pins the group id. Jobs a host
+command started keep running, are only reaped at session end (or carried
+to the next session on `/new`), and are listed on stderr at exit (`euler`,
+`euler tui`, `euler exec`). Jobs a sandboxed command started are ended when
+the session ends and on a profile change (Bubblewrap already ends them with
+their command). A descendant that moves itself into another process group
+is not tracked.
+
+- **Presets.** `full`, `workspace`, and `locked` are reserved names.
 - **`<euler home>/profiles.json`.** Optional. `defaults` holds `interactive`
   (`euler`, `euler tui`), `headless` (`euler exec`), and `subagent`
   (`inherit` or a profile name); each must name a preset or a defined
@@ -199,17 +287,36 @@ with the wrong `tmp` and `caches`, so the startup error names `network`.
   fields, duplicate keys, unknown values, and contradictory combinations
   (`approvals: never` with `escalation: allowed`, `sandbox: off` with
   `escalation: allowed`, and `credentials` set on a sandbox-off profile) are
-  startup errors naming the file and field. A profile extending an unshipped
-  preset is checked for unknown fields and values and refused only when
-  selected. A missing file means the built-in defaults; an unresolvable
+  startup errors naming the file and field. A missing file means the built-in defaults; an unresolvable
   Euler home reads no file and says so on stderr.
-- **Selection.** `--profile <name>` on `euler` and `euler exec`, then the
-  context default in `profiles.json`, then the built-in default, `locked`
-  for both contexts. An unknown name is a startup error listing the defined
-  profiles. `--permission-reviewer` overrides the profile's `reviewer`.
-  Child agents run inside the parent session's boundary and approvals;
+- **Selection.** `--profile <name>` on `euler` and `euler exec`, then
+  `/profile` in the TUI, then the context default in `profiles.json`, then
+  the built-in default: `full` interactive, `locked` headless. An unknown
+  name is a startup error listing the defined profiles.
+  `--permission-reviewer` overrides the profile's `reviewer`. Child agents
+  and companions run inside the session's boundary and approvals:
   `defaults.subagent` is validated but not applied yet, so a child never
-  runs looser than its parent.
+  runs looser than its parent, and when it names a profile rather than
+  `inherit`, startup prints a warning saying so.
+- **First run.** An interactive launch without `--profile` whose
+  `profiles.json` has no `defaults.interactive` asks once, on a terminal
+  (stdin and stderr both terminals), which preset to use: `full`
+  (preselected), `workspace`, or `locked`, each with a one-line boundary.
+  The choice is written to `defaults.interactive`, keeping the rest of the
+  file, and never asked again. Without a terminal nothing is asked or
+  written and the built-in default applies. End of input at the prompt
+  quits without starting a session.
+- **`--auto-approve`** is accepted under every profile. Under
+  `approvals: always` its tiers configure the gate as before. Under any
+  other profile commands and writes inside the boundary already run, so the
+  flag is a no-op; when it was given, stderr says so in one line naming the
+  profile. The implicit read-only tier never tightens a profile.
+- **Profile change.** `/profile <name>` (or the `/profile` picker) switches
+  the session between turns: it rebuilds the subprocess boundary and the
+  structured-write scope, applies the new profile's approval override, and
+  records `session.profile_changed`. Jobs started under a sandboxed profile
+  are ended first; host background jobs keep running.
+  `/profile default <name>` writes `defaults.interactive` for new sessions.
 - **Project overlay.** A repository may hold `.euler/profile-overlay.json`
   with any profile field except `reviewer` and `extends`. It applies to
   whichever profile resolves, including one named by `--profile`, and each
@@ -225,23 +332,28 @@ with the wrong `tmp` and `caches`, so the startup error names `network`.
   error naming `network`, because no enforced boundary has network off with
   the host `/tmp` and writable caches; set `tmp: private` and
   `caches: private` with it.
-- **Enforcement.** A resolved profile neither enforced boundary delivers
-  (see above, or a `sandbox` backend name other than this host's) is a
-  startup error naming the profile and field. On a host whose sandbox
-  backend is missing, sandbox-requiring tools fail closed; the headless
-  startup failure of ADR 0026 section 5 is not implemented yet.
+- **Enforcement.** A resolved profile this build cannot deliver is a
+  startup error naming the profile and field: with the sandbox on, one
+  neither sandboxed boundary delivers (see above, or a `sandbox` backend
+  name other than this host's); with it off, any field the `full`
+  paragraph above refuses. When the project overlay is what makes the
+  profile unenforceable (for example `{"network": "off"}` on `full`), the
+  error names the overlay and suggests `--profile locked`. On a host whose
+  sandbox backend is missing, sandbox-requiring tools fail closed; the
+  headless startup failure of ADR 0026 section 5 is not implemented yet.
 - **Resume.** Resume resolves the profile as a new launch does, then
-  compares it with the latest profile the log recorded (`session.start` or a
-  later `session.resumed`). If the resolved profile is looser on any field,
-  the recorded profile applies unless `--profile` was passed; otherwise the
-  resolved one applies. A kept recorded profile also gets the project
-  overlay, and one this host cannot enforce (for example a Linux
-  `background_jobs: end-with-command` resumed on macOS) is a startup error
-  asking for `--profile`, never a substitution. A bad `profiles.json`,
-  overlay, or `--profile` fails resume before anything is appended to the
-  log. stderr shows any change, naming the fields that changed; the TUI's
-  in-app `/resume`, which has no `--profile`, applies the same rule with the
-  interactive default and shows the change as its notice. A log without a
+  compares it with the latest profile the log recorded (`session.start`, a
+  later `session.resumed`, or a `session.profile_changed`). If the resolved
+  profile is looser on any field, the recorded profile applies unless
+  `--profile` was passed; otherwise the resolved one applies. A kept
+  recorded profile also gets the project overlay, and one this host cannot
+  enforce (for example a Linux `background_jobs: end-with-command` resumed
+  on macOS) is a startup error asking for `--profile`, never a
+  substitution. A bad `profiles.json`, overlay, or `--profile` fails
+  resume before anything is appended to the log. stderr shows any change,
+  naming the fields that changed; the TUI's in-app `/resume`, which has no
+  `--profile`, applies the same rule with the interactive default and shows
+  the change as its notice. A log without a
   recorded profile resolves as a new session; no profile is inferred. A
   malformed recorded profile fails resume closed.
 
@@ -577,7 +689,8 @@ distinct nodes.
   - anything with a `.git` path component — the directory, the worktree
     pointer file, and everything under it;
   - `.gitmodules`, `.gitattributes`, `.gitconfig`, `.npmrc`, `.netrc`,
-    `.cargo/config.toml` (and `.cargo/config`) — configuration an
+    `.cargo/config.toml` (and `.cargo/config`), `.config/git/config` and
+    `.config/git/attributes`: configuration an
     interpreter or build tool honors on its next run;
   - shell startup files: `.bashrc`, `.bash_profile`, `.bash_login`,
     `.bash_logout`, `.profile`, `.zshrc`, `.zshenv`, `.zprofile`,
@@ -613,15 +726,18 @@ clean -f`, `reset --hard`, `rm -f`, `checkout` that forces, marks paths with `--
 restores an unmistakable path operand (branch creation and ref-shaped
 names like `feature/x` stay clean),
 `restore <path>`, `branch -D` (and `-d` with `-f`), `stash drop`/`clear`,
-`shred`, `truncate`, `wipefs`, `dd of=`, the `mkfs*` family, and any
-interpreter invocation (`sed`, `awk`, `perl`, `python`, `ruby`, `node`,
-`patch`, `ed`) whose operands — program text included — mention a sensitive
-path. "Mention" splits the operand into path-shaped tokens and applies the
-sensitive list to each, so `open(".env")` counts and `os.environ` does
-not. Command names are matched
+`shred`, `truncate`, `wipefs`, `dd of=`, and the `mkfs*` family. An
+interpreter (`sed`, `awk`, `perl`, `python`, `ruby`, `node`, `patch`, `ed`)
+whose operands, program text included, mention a sensitive path is not on
+this list: it sets the request's `sensitive_path` flag instead (ADR 0026
+resolved question 15; "Execution profiles" above). "Mention" splits the
+operand into path-shaped tokens and applies the sensitive list to each, so
+`open(".env")` counts and `os.environ` does not. Command names are matched
 case-insensitively, because the default macOS filesystem is.
 It also flags **writes an interpreter later honors**: a redirect target or a
-`cp`/`mv`/`tee`/`install`/`ln`/`rsync` destination on the sensitive list, so
+`cp`/`mv`/`tee`/`install`/`ln`/`rsync` destination on the sensitive list, an
+in-place edit (`sed -i`, `perl -pi`, `ruby -i`, `awk -i inplace`, `patch
+FILE`, `ed FILE`) of a file on it, so
 `printf x > .git/hooks/pre-commit` and `echo x > .bashrc` ask exactly as
 `write_file` on those paths does (audit F34, write side), including when
 the redirection hangs off a compound statement
@@ -817,13 +933,17 @@ covers later sensitive reads), or deny. This is an ask, not a deny:
 permission gates — root session and companion loop — apply the same
 escalation. In headless auto-approve tiers the escalated ask reaches the
 fail-closed headless decider and is therefore denied unless a durable grant
-covers it.
+covers it. Under an execution profile with `approvals: never` (`full`) the
+escalation does not happen, and a write tool's path on the
+interpreter-honored part of the list is a dangerous request instead (see
+"Execution profiles").
 
 **Sensitive-path shell ask.** A `run_shell` request also carries the
 sensitive-path flag when its command text names a path on the same list,
 anywhere (operands, nested scripts, redirections, here-documents), with `@`
-read as a separator so `curl -d @.env` counts. Under `approvals:
+read as a separator so `curl -d @.env` counts, or when an interpreter's
+operands mention one (`python3 x.py .env`). Under `approvals:
 escalation-only` (`workspace`) the flag asks like the structured-tool
 escalation above, grant-coverable and guardian-routable; under `approvals:
 always` (`locked`) it leaves the capability's mode alone, as before
-profiles.
+profiles; under `approvals: never` (`full`) it does not ask.

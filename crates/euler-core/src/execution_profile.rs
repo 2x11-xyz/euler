@@ -1,22 +1,24 @@
 //! Execution profiles (ADR 0026): the execution boundary and the default
 //! approval policy as one named profile.
 //!
-//! Each built-in preset owns a module (`locked.rs`, `workspace.rs`) that
-//! defines its fields. [`Preset::shipped_fields`] lists the presets that have
-//! shipped; naming any other preset is refused, never substituted, until its
-//! rollout step adds a module and an arm there. `enforced.rs` is the one
-//! place that decides whether this build can deliver a resolved profile and
-//! which subprocess sandbox it becomes.
+//! Each built-in preset owns a module (`full.rs`, `locked.rs`,
+//! `workspace.rs`) that defines its fields. [`Preset::shipped_fields`] lists
+//! the presets that have shipped; naming any other preset is refused, never
+//! substituted, until its rollout step adds a module and an arm there.
+//! `enforced.rs` is the one place that decides whether this build can
+//! deliver a resolved profile and which subprocess sandbox it becomes.
 
 mod config;
 mod enforced;
+mod full;
 mod locked;
 #[cfg(test)]
 mod tests;
 mod workspace;
 
 pub use config::{
-    ProfileContext, ProfilesConfig, ProjectOverlay, PROFILES_FILE, PROJECT_OVERLAY_PATH,
+    write_interactive_default, ProfileContext, ProfilesConfig, ProjectOverlay, PROFILES_FILE,
+    PROJECT_OVERLAY_PATH,
 };
 
 use crate::guardian::PermissionReviewer;
@@ -270,9 +272,9 @@ impl Preset {
     /// The preset's fields when this build ships it; `None` refuses it.
     fn shipped_fields(self) -> Option<ProfileFields> {
         match self {
+            Self::Full => Some(full::fields()),
             Self::Locked => Some(locked::fields()),
             Self::Workspace => Some(workspace::fields()),
-            Self::Full => None,
         }
     }
 }
@@ -344,9 +346,14 @@ impl ExecutionProfile {
 /// The approval mode a profile's `approvals` gives one request in place of
 /// the capability's configured `mode` (ADR 0026 row P), or `None` for the
 /// gate's ordinary rule (a sensitive path asks, anything else keeps
-/// `mode`). The gate has already denied `always-deny` and sent dangerous
-/// commands to a prompt.
+/// `mode`). The one place a profile lifts or adds asks. The gate has
+/// already denied `always-deny` and sent dangerous requests to a prompt;
+/// structured writes to interpreter-honored configuration or into the Euler
+/// home (privileged secret and config edits) arrive marked dangerous, and
+/// extension consent asks through its own path.
 ///
+/// - Under `never` every remaining request runs, a sensitive path included
+///   (resolved question 15).
 /// - A `run_shell` command whose operands mention a sensitive path asks
 ///   under `escalation-only` (resolved question 14) and keeps `mode` under
 ///   `always`, as before profiles.
@@ -355,14 +362,15 @@ impl ExecutionProfile {
 ///   becomes `session-allow`: commands run inside the boundary and
 ///   structured writes stay workspace-confined. Without an enforced backend
 ///   the request keeps its mode (ADR 0021 row D).
-///
-/// `never` is the `full` preset's rule and is not enforced yet.
 pub fn profile_mode_override(
     fields: &ProfileFields,
     request: &PermissionRequest,
     mode: ApprovalMode,
     sandbox_enforced: bool,
 ) -> Option<ApprovalMode> {
+    if fields.approvals == ApprovalsSetting::Never {
+        return Some(ApprovalMode::SessionAllow);
+    }
     let escalation_only = fields.approvals == ApprovalsSetting::EscalationOnly;
     if request.sensitive_path {
         let shell = request.capability == Capability::ShellExec;
@@ -521,14 +529,23 @@ pub enum ProfileError {
     InvalidFile { file: PathBuf, message: String },
     #[error("could not read {}: {message}", file.display())]
     Read { file: PathBuf, message: String },
+    #[error("could not write {}: {message}", file.display())]
+    Write { file: PathBuf, message: String },
     #[error("unknown execution profile \"{name}\"; defined profiles: {}", defined.join(", "))]
     UnknownProfile { name: String, defined: Vec<String> },
     #[error("{}", preset_not_shipped_message(requested, *preset))]
     PresetNotShipped { requested: String, preset: Preset },
     #[error(
-        "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; the locked and workspace presets' boundaries are available, and writable_paths must name existing paths"
+        "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; the full, workspace, and locked presets' boundaries are available, and writable_paths must name existing paths"
     )]
     Unenforced {
+        profile: String,
+        field: &'static str,
+    },
+    #[error(
+        "the project overlay {PROJECT_OVERLAY_PATH} sets {field} on profile \"{profile}\" to a value this version cannot enforce on this host; remove that field from the overlay or pass --profile locked"
+    )]
+    OverlayUnenforced {
         profile: String,
         field: &'static str,
     },
@@ -545,13 +562,14 @@ fn preset_not_shipped_message(requested: &str, preset: Preset) -> String {
     let preset = preset.name();
     if requested == preset {
         format!(
-            "the {preset} preset is not available in this version yet; use --profile workspace, \
+            "the {preset} preset is not available in this version yet; use --profile full, \
+             --profile workspace, \
              --profile locked, or a profile that extends one of them"
         )
     } else {
         format!(
             "profile \"{requested}\" extends the {preset} preset, which is not available in this \
-             version yet; extend workspace or locked instead"
+             version yet; extend full, workspace, or locked instead"
         )
     }
 }

@@ -12,7 +12,7 @@ use crate::compaction::{
     build_compaction_candidate, projection_prompt, select_layer1_candidates, should_compact,
     validate_candidate, CompactionCandidate, WorkingStateProjection, PROJECTION_SCHEMA_VERSION,
 };
-use crate::execution_profile::ExecutionProfile;
+use crate::execution_profile::{ApprovalsSetting, ExecutionProfile, SandboxSetting};
 use crate::grants::{ActiveGrant, ProjectGrantError, ScopePattern};
 use crate::guardian::PermissionReviewer;
 use crate::permissions::{ApprovalMode, GrantSource, PermissionDecider, PermissionGate};
@@ -276,9 +276,10 @@ pub struct SessionConfig {
 impl SessionConfig {
     /// Install a resolved execution profile. Its reviewer becomes the
     /// session's reviewer, the one the gate consults, and its boundary
-    /// becomes the subprocess sandbox. A profile this build cannot enforce
-    /// is refused before it reaches here, so the sandbox keeps its value
-    /// only for a profile resolution already rejected.
+    /// becomes the subprocess sandbox: `sandbox: off` runs commands on the
+    /// host. A profile this build cannot enforce is refused before it
+    /// reaches here, so the sandbox keeps its value only for a profile
+    /// resolution already rejected.
     pub fn set_execution_profile(&mut self, profile: ExecutionProfile) {
         self.permission_reviewer = profile.fields.reviewer;
         if let Ok(sandbox) = profile.subprocess_sandbox() {
@@ -411,6 +412,8 @@ pub enum SessionError {
     InvalidModelSwitchEvent(String),
     #[error("invalid session name: {name}")]
     InvalidSessionName { name: String },
+    #[error("an execution profile change waits for the active run to finish")]
+    ProfileChangeDuringRun,
     #[error("invalid skill command; usage: /skill:<name> [request]")]
     InvalidSkillCommand,
     #[error("skill is not available in this session: {name}")]
@@ -1367,11 +1370,7 @@ impl<D> Session<D> {
     }
 
     pub fn new_with_providers(config: SessionConfig, providers: ProviderSet, decider: D) -> Self {
-        let mut tools = ToolRegistry::with_sandbox_home(
-            config.root.clone(),
-            config.subprocess_sandbox.clone(),
-            config.sandbox_home(),
-        );
+        let mut tools = profile_tool_registry(&config);
         if let Some(project_context) = config.project_context.as_ref() {
             tools.set_frozen_skills(project_context.frozen_skills());
         }
@@ -1452,8 +1451,12 @@ impl<D> Session<D> {
     /// the sink captures a clone of the CURRENT one.
     fn install_provider_secret_sink(&self) {
         let redactor = self.redactor.clone();
+        let credentials = self.tools.euler_credentials().clone();
         self.providers
             .install_resolved_secret_sink(Arc::new(move |value| {
+                // A resolved provider secret is one of Euler's own
+                // credentials, so host commands never see it either.
+                credentials.add_value(value);
                 redactor.add_value(value);
             }));
     }
@@ -1550,6 +1553,9 @@ impl<D> Session<D> {
         // runtime-resolved) carry into the fresh session — /new must not
         // silently drop redaction back to env-only (review finding on #56).
         fresh.redactor = redactor;
+        // Euler's credentials stay withheld from host commands, and host
+        // background jobs stay listed for exit.
+        self.tools.carry_into(&mut fresh.tools);
         // Re-point the provider secret sink at the carried redactor: the
         // constructor above bound it to the from_env one just replaced.
         fresh.install_provider_secret_sink();
@@ -1916,6 +1922,80 @@ impl<D> Session<D> {
     /// redaction minimum are ignored.
     pub fn add_redacted_secret(&mut self, value: impl Into<String>) {
         self.redactor.add_value(value);
+    }
+
+    /// Register one of Euler's own credential values (an auth-file
+    /// credential): redacted like any secret, and withheld from host
+    /// commands (ADR 0026 resolved question 7).
+    pub fn add_euler_credential(&mut self, value: impl Into<String>) {
+        let value = value.into();
+        self.tools.euler_credentials().add_value(value.clone());
+        self.redactor.add_value(value);
+    }
+
+    /// Withhold an environment variable that holds one of Euler's own
+    /// credentials (a variable `providers.json` references) from host
+    /// commands.
+    pub fn add_euler_credential_variable(&mut self, name: impl Into<String>) {
+        self.tools.euler_credentials().add_variable(name);
+    }
+
+    /// Mark a path holding Euler's secrets and configuration (the Euler
+    /// home, the auth file): a structured write there asks a human under
+    /// every execution profile (`secrets.md` "Config-Edit Guardrail").
+    pub fn add_privileged_config_path(&mut self, path: &std::path::Path) {
+        self.tools.add_privileged_config_path(path);
+    }
+
+    /// The execution profile this session runs under (ADR 0026).
+    pub fn execution_profile(&self) -> &ExecutionProfile {
+        &self.config.execution_profile
+    }
+
+    /// Switch to another execution profile between turns (ADR 0026 section
+    /// 5): rebuilds the subprocess boundary and the structured-write scope,
+    /// applies the profile's approvals, and records
+    /// `session.profile_changed`. Jobs started with the sandbox off keep
+    /// running and are listed at exit. Refused while a run is active.
+    pub fn change_execution_profile(
+        &mut self,
+        profile: ExecutionProfile,
+    ) -> Result<(), SessionError> {
+        if self.active_run.is_some() {
+            return Err(SessionError::ProfileChangeDuringRun);
+        }
+        self.persist_new_events()?;
+        // Jobs started under a sandboxed profile end before the boundary
+        // changes; host jobs keep running (ADR 0026 resolved question 12).
+        self.tools.end_sandboxed_jobs();
+        self.config.set_execution_profile(profile);
+        self.tools.set_subprocess_sandbox(
+            self.config.subprocess_sandbox.clone(),
+            self.config.sandbox_home(),
+        );
+        self.tools.set_writes_outside_workspace(
+            self.config.execution_profile.fields.sandbox == SandboxSetting::Off,
+        );
+        self.permissions.set_execution_profile(
+            self.config.execution_profile.fields.clone(),
+            matches!(self.tools.sandbox_status(), SandboxStatus::Enforced(_)),
+        );
+        let mut payload = sandbox_start_fields(self.tools.sandbox_status());
+        payload.extend(execution_profile_fields(&self.config));
+        let event = EventEnvelope::new(
+            self.config.session_id.clone(),
+            self.config.agent_id.clone(),
+            self.previous_persisted_event_id(),
+            EventKind::SESSION_PROFILE_CHANGED,
+            payload,
+        );
+        self.accept_control_event(event)
+    }
+
+    /// Background jobs started with the sandbox off that are still running,
+    /// one display line each. A surface lists them at exit.
+    pub fn running_background_jobs(&self) -> Vec<String> {
+        self.tools.running_background_jobs()
     }
 
     #[cfg(test)]
@@ -3017,11 +3097,7 @@ impl<D> Session<D> {
             .into_iter()
             .filter(|event| event.kind.as_str() != EventKind::SESSION_RESUMED)
             .collect::<Vec<_>>();
-        let mut tools = ToolRegistry::with_sandbox_home(
-            config.root.clone(),
-            config.subprocess_sandbox.clone(),
-            config.sandbox_home(),
-        );
+        let mut tools = profile_tool_registry(&config);
         if let Ok(fold) = crate::project_context::fold_project_context(&events) {
             if let Some(pinned) = fold.admitted() {
                 tools.set_frozen_skills(pinned.frozen_skills());
@@ -6058,10 +6134,7 @@ fn session_start_payload(config: &SessionConfig, sandbox: SandboxStatus) -> Json
         ("root", session_root_for_event(&config.root).into()),
     ]);
     payload.extend(sandbox_start_fields(sandbox));
-    payload.insert(
-        "execution_profile".to_owned(),
-        config.execution_profile_record(),
-    );
+    payload.extend(execution_profile_fields(config));
     crate::root_identity::insert_root_object_identity(&mut payload, &config.root);
     if let Some(bootstrap) = &config.project_context {
         payload.insert(
@@ -6086,6 +6159,43 @@ fn session_start_payload(config: &SessionConfig, sandbox: SandboxStatus) -> Json
         serde_json::to_value(runtime).expect("runtime identity serializes"),
     );
     payload
+}
+
+/// Whether commands inside the profile's boundary can ask: false only under
+/// `approvals: never`.
+fn profile_commands_ask(profile: &ExecutionProfile) -> bool {
+    profile.fields.approvals != ApprovalsSetting::Never
+}
+
+/// The tool registry for `config`: its subprocess boundary, and structured
+/// writes outside the workspace when the profile's sandbox is off (ADR 0026
+/// resolved question 22).
+fn profile_tool_registry(config: &SessionConfig) -> ToolRegistry {
+    let mut tools = ToolRegistry::with_sandbox_home(
+        config.root.clone(),
+        config.subprocess_sandbox.clone(),
+        config.sandbox_home(),
+    );
+    tools.set_writes_outside_workspace(
+        config.execution_profile.fields.sandbox == SandboxSetting::Off,
+    );
+    tools
+}
+
+/// `execution_profile` and `command_approvals`, recorded on `session.start`
+/// and `session.profile_changed`. `command_approvals` is `off` when commands
+/// inside the profile's boundary never ask, `on` otherwise: a fact separate
+/// from `sandbox_backend` (ADR 0021 row D, ADR 0026 section 2).
+fn execution_profile_fields(config: &SessionConfig) -> JsonObject {
+    let command_approvals = if profile_commands_ask(&config.execution_profile) {
+        "on"
+    } else {
+        "off"
+    };
+    object([
+        ("execution_profile", config.execution_profile_record()),
+        ("command_approvals", command_approvals.into()),
+    ])
 }
 
 /// The execution boundary agent subprocesses actually got, probed rather than

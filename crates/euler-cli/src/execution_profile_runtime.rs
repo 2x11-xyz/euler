@@ -2,12 +2,15 @@
 //! 5 and 9).
 
 use anyhow::Result;
-use euler_core::execution_profile::PROJECT_OVERLAY_PATH;
+use euler_core::execution_profile::{
+    write_interactive_default, ApprovalsSetting, Preset, SandboxSetting, PROJECT_OVERLAY_PATH,
+};
 use euler_core::{
     recorded_execution_profile, EulerHome, ExecutionProfile, PermissionReviewer, ProfileContext,
     ProfilesConfig, ProjectOverlay, ResumeProfile, SessionConfig,
 };
 use euler_event::EventEnvelope;
+use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
 
 /// What selects a profile: `--profile`, `--permission-reviewer`, and the
@@ -23,8 +26,25 @@ pub(crate) struct ProfileRequest<'a> {
 /// default in `profiles.json`, then the built-in default, then the
 /// repository's tightening overlay. A malformed file or an unavailable
 /// profile is a startup error. Prints the startup summary to stderr.
+///
+/// The first interactive launch without `defaults.interactive` and without
+/// `--profile` shows the first-run picker on a terminal and saves the choice
+/// (ADR 0026 section 5).
 pub(crate) fn launch_profile(request: ProfileRequest<'_>, root: &Path) -> Result<ExecutionProfile> {
-    let (profiles, overlay, mut notices) = load_profile_sources(root)?;
+    let (mut profiles, overlay, mut notices) = load_profile_sources(root)?;
+    if request.context == ProfileContext::Interactive
+        && request.profile.is_none()
+        && !profiles.has_interactive_default()
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal()
+    {
+        if let Ok(home) = EulerHome::resolve() {
+            let file = home.profiles_path();
+            let choice = prompt_first_run_profile(&file)?;
+            write_interactive_default(&file, choice.name())?;
+            profiles = ProfilesConfig::load(&file)?;
+        }
+    }
     let mut profile = profiles.resolve(request.profile, request.context, overlay.as_ref())?;
     notices.extend(overlay_notice(overlay.as_ref(), &profile));
     print_notices(&notices);
@@ -125,6 +145,116 @@ pub(crate) fn install_in_app_resume_profile(
     resolve_resume_profile_from(&profiles, overlay, Vec::new(), request)?.install(config, events)
 }
 
+/// The first-run picker (ADR 0026 section 5): the presets, `full`
+/// preselected, each with its one-line boundary. A line prompt on stderr,
+/// shown once per Euler home before the session starts.
+fn prompt_first_run_profile(file: &Path) -> Result<Preset> {
+    const CHOICES: [(Preset, &str); 3] = [
+        (
+            Preset::Full,
+            "commands run on this machine with your permissions; only dangerous commands ask",
+        ),
+        (
+            Preset::Workspace,
+            "commands run in a sandbox with network; dangerous commands and sensitive paths ask",
+        ),
+        (
+            Preset::Locked,
+            "commands run in a sandbox without network; every command asks",
+        ),
+    ];
+    eprintln!(
+        "How should Euler run commands? Saved to {}; change it later with /profile.",
+        file.display()
+    );
+    for (index, (preset, boundary)) in CHOICES.iter().enumerate() {
+        eprintln!("  {}) {:<7} {boundary}", index + 1, preset.name());
+    }
+    loop {
+        eprint!("Choose [1]: ");
+        let _ = std::io::stderr().flush();
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer)? == 0 {
+            anyhow::bail!("no execution profile chosen; pass --profile or run euler again");
+        }
+        if let Some(preset) = first_run_choice(answer.trim(), &CHOICES) {
+            return Ok(preset);
+        }
+        eprintln!("Type 1, 2, or 3, or a profile name.");
+    }
+}
+
+/// Read one first-run answer: empty picks the first (preselected) choice; a
+/// number or a preset name picks that choice.
+fn first_run_choice(answer: &str, choices: &[(Preset, &str)]) -> Option<Preset> {
+    if answer.is_empty() {
+        return choices.first().map(|(preset, _)| *preset);
+    }
+    if let Ok(number) = answer.parse::<usize>() {
+        return number
+            .checked_sub(1)
+            .and_then(|index| choices.get(index))
+            .map(|(preset, _)| *preset);
+    }
+    choices
+        .iter()
+        .find(|(preset, _)| preset.name() == answer)
+        .map(|(preset, _)| *preset)
+}
+
+/// What `/profile` reads: the user's `profiles.json` (and its path, for
+/// writing `defaults.interactive`) and the repository overlay under `root`.
+pub(crate) struct ProfileSources {
+    pub(crate) profiles: ProfilesConfig,
+    pub(crate) overlay: Option<ProjectOverlay>,
+    pub(crate) file: std::path::PathBuf,
+}
+
+impl ProfileSources {
+    pub(crate) fn load(root: &Path) -> Result<Self> {
+        let file = EulerHome::resolve()?.profiles_path();
+        Ok(Self {
+            profiles: ProfilesConfig::load(&file)?,
+            overlay: ProjectOverlay::load(root)?,
+            file,
+        })
+    }
+
+    /// Resolve `name` for an interactive session, overlay included.
+    pub(crate) fn resolve(&self, name: &str) -> Result<ExecutionProfile> {
+        Ok(self.profiles.resolve(
+            Some(name),
+            ProfileContext::Interactive,
+            self.overlay.as_ref(),
+        )?)
+    }
+
+    /// Every profile this host can run here, with its boundary in words.
+    pub(crate) fn runnable(&self) -> Vec<ExecutionProfile> {
+        self.profiles
+            .profile_names()
+            .iter()
+            .filter_map(|name| self.resolve(name).ok())
+            .collect()
+    }
+}
+
+/// A profile's boundary in one line, for `/profile` and its notices.
+pub(crate) fn profile_boundary(profile: &ExecutionProfile) -> String {
+    let fields = &profile.fields;
+    let place = if fields.sandbox == SandboxSetting::Off {
+        "commands run on this machine".to_owned()
+    } else {
+        format!("sandboxed, network {}", fields.network.as_str())
+    };
+    let asks = match fields.approvals {
+        ApprovalsSetting::Never => "only dangerous commands ask",
+        ApprovalsSetting::EscalationOnly => "dangerous commands and sensitive paths ask",
+        ApprovalsSetting::Always => "every command asks",
+    };
+    format!("{place} · {asks}")
+}
+
 pub(crate) fn print_notices(notices: &[String]) {
     for notice in notices {
         eprintln!("{notice}");
@@ -153,5 +283,64 @@ fn load_profile_sources(
             ProfilesConfig::default()
         }
     };
+    notices.extend(subagent_notice(&profiles));
     Ok((profiles, ProjectOverlay::load(root)?, notices))
+}
+
+/// `defaults.subagent` naming a profile is not applied yet; say so rather
+/// than let a user believe child agents run under it.
+fn subagent_notice(profiles: &ProfilesConfig) -> Option<String> {
+    profiles.unapplied_subagent_default().map(|name| {
+        format!(
+            "warning: defaults.subagent \"{name}\" is not applied yet; child agents run under \
+             the session's execution profile"
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_run_choice_preselects_full_and_reads_numbers_and_names() {
+        let choices = [
+            (Preset::Full, "host"),
+            (Preset::Workspace, "sandbox with network"),
+            (Preset::Locked, "sandbox"),
+        ];
+        assert_eq!(first_run_choice("", &choices), Some(Preset::Full));
+        assert_eq!(first_run_choice("1", &choices), Some(Preset::Full));
+        assert_eq!(first_run_choice("2", &choices), Some(Preset::Workspace));
+        assert_eq!(first_run_choice("locked", &choices), Some(Preset::Locked));
+        for answer in ["0", "4", "fulll", "yes"] {
+            assert_eq!(first_run_choice(answer, &choices), None, "{answer}");
+        }
+    }
+
+    #[test]
+    fn profile_boundary_states_where_commands_run_and_what_asks() {
+        let profiles = ProfilesConfig::default();
+        let full = profiles
+            .resolve(Some("full"), ProfileContext::Interactive, None)
+            .expect("full");
+        let workspace = profiles
+            .resolve(Some("workspace"), ProfileContext::Interactive, None)
+            .expect("workspace");
+        let locked = profiles
+            .resolve(Some("locked"), ProfileContext::Interactive, None)
+            .expect("locked");
+        assert_eq!(
+            profile_boundary(&full),
+            "commands run on this machine · only dangerous commands ask"
+        );
+        assert_eq!(
+            profile_boundary(&workspace),
+            "sandboxed, network on · dangerous commands and sensitive paths ask"
+        );
+        assert_eq!(
+            profile_boundary(&locked),
+            "sandboxed, network off · every command asks"
+        );
+    }
 }

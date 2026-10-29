@@ -907,12 +907,17 @@ impl<D: PermissionDecider> Session<D> {
     ) -> bool {
         let operation = format!("extension {extension_id}.{command}");
         required_capabilities.iter().all(|&capability| {
-            match self.permissions.configured_mode(capability) {
-                Some(crate::permissions::ApprovalMode::SessionAllow) => true,
-                Some(crate::permissions::ApprovalMode::AlwaysDeny) => false,
-                Some(crate::permissions::ApprovalMode::Ask) | None => {
-                    let request =
-                        crate::permissions::PermissionRequest::new(capability, &operation);
+            let request = crate::permissions::PermissionRequest::new(capability, &operation);
+            let configured = self
+                .permissions
+                .configured_mode(capability)
+                .unwrap_or(crate::permissions::ApprovalMode::Ask);
+            // The execution profile's override applies (ADR 0026: `full`
+            // session-allows extension capabilities).
+            match self.permissions.effective_mode(configured, &request) {
+                crate::permissions::ApprovalMode::SessionAllow => true,
+                crate::permissions::ApprovalMode::AlwaysDeny => false,
+                crate::permissions::ApprovalMode::Ask => {
                     self.permissions.granted_source(&request).is_some()
                 }
             }

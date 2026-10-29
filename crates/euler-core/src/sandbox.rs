@@ -617,6 +617,10 @@ impl WorkspaceSandbox {
         self.availability.is_enforced() && !self.profile.network_enabled()
     }
 
+    pub(crate) const fn profile(&self) -> &SandboxProfile {
+        &self.profile
+    }
+
     /// Whether secret-shaped variables pass into the command
     /// (`credentials: "pass"`).
     pub(crate) const fn passes_credentials(&self) -> bool {

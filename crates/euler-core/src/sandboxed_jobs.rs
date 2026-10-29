@@ -10,6 +10,7 @@
 //! another process group (`setsid`) is outside this ownership, as it is for
 //! cancellation.
 
+use crate::background_jobs::group_has_other_members;
 use std::process::Child;
 use std::sync::Mutex;
 
@@ -29,13 +30,13 @@ impl SandboxedJobs {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         leaders.retain_mut(|kept| {
-            let live = group_has_other_members(kept.id());
+            let live = group_has_other_members(kept.id() as i32);
             if !live {
                 let _ = kept.wait();
             }
             live
         });
-        if group_has_other_members(leader.id()) {
+        if group_has_other_members(leader.id() as i32) {
             leaders.push(leader);
         } else {
             let _ = leader.wait();
@@ -66,63 +67,10 @@ impl Drop for SandboxedJobs {
     }
 }
 
-/// Whether the process group led by `leader` has a member besides the
-/// leader, which is a zombie by now.
-#[cfg(target_os = "macos")]
-fn group_has_other_members(leader: u32) -> bool {
-    let leader = leader as libc::pid_t;
-    let mut pids = vec![0 as libc::pid_t; 64];
-    loop {
-        let capacity = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
-        // SAFETY: `pids` is a live buffer of `capacity` bytes for the call.
-        // It returns the number of pids written, zombies included.
-        let count = unsafe { libc::proc_listpgrppids(leader, pids.as_mut_ptr().cast(), capacity) };
-        let Ok(count) = usize::try_from(count) else {
-            return false;
-        };
-        if count < pids.len() {
-            return pids[..count].iter().any(|pid| *pid != leader && *pid != 0);
-        }
-        pids.resize(pids.len() * 2, 0);
-    }
-}
-
-/// Bubblewrap's PID namespace ends every job with its command.
-#[cfg(not(target_os = "macos"))]
-fn group_has_other_members(_leader: u32) -> bool {
-    false
-}
-
-/// The exit code of `child` if it has exited, without reaping it, so its
-/// process-group id stays pinned. `-1` for a signal death, as
-/// `ExitStatus::code` reads it.
-pub(crate) fn exit_code_without_reaping(child: &Child) -> std::io::Result<Option<i32>> {
-    // SAFETY: an all-zero siginfo_t is a valid out-parameter for waitid.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    // SAFETY: waits on our own child without reaping it (WNOWAIT) and
-    // without blocking (WNOHANG); `info` outlives the call.
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            child.id() as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: waitid filled `info` for an exited child, or left it zeroed.
-    let (pid, code, status) = unsafe { (info.si_pid(), info.si_code, info.si_status()) };
-    if pid == 0 {
-        return Ok(None);
-    }
-    Ok(Some(if code == libc::CLD_EXITED { status } else { -1 }))
-}
-
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+    use crate::background_jobs::exit_code_without_reaping;
     use std::os::unix::process::CommandExt as _;
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
@@ -130,7 +78,7 @@ mod tests {
     fn exited(child: &Child) -> i32 {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(code) = exit_code_without_reaping(child).expect("waitid") {
+            if let Some(code) = exit_code_without_reaping(child.id() as i32).expect("waitid") {
                 return code;
             }
             assert!(Instant::now() < deadline, "leader did not exit");

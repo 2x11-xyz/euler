@@ -6,6 +6,42 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: the `full` preset (ADR 0026 step 4)
+
+- **Behavior change: `full` is the built-in interactive default.** Commands
+  run on the host with your permissions and do not ask, except the
+  dangerous-command list, structured writes to interpreter-honored
+  configuration, structured writes into the Euler home or the auth file
+  (privileged secret and config edits), and extension consent. A shell
+  command writing the Euler home or the auth file is not checked. `euler exec` stays
+  `locked`. `--profile locked` or `/profile default locked` restores the
+  old interactive behavior.
+- **New prompt, once per Euler home:** the first interactive launch on a
+  terminal asks whether to use `full` (preselected), `workspace`, or
+  `locked` and saves the answer to `defaults.interactive`.
+- `/profile` switches the session's profile between turns (recorded as
+  `session.profile_changed`) and ends the background jobs sandboxed
+  commands left running; `/profile default <name>` saves the default.
+- Under `full`, host commands see your environment except Euler's own
+  credentials (built-in provider keys, variables `providers.json`
+  references, auth-file values) and Euler's control variables; write tools
+  accept paths outside the workspace, recorded but not covered by
+  `/rollback` (an absolute path to a workspace file is checkpointed as
+  usual); and background jobs keep running and are listed at exit.
+- `defaults.subagent` naming a profile is not applied yet; startup warns
+  that child agents run under the session's profile.
+- **Under every profile:** `write_file`, `edit_file`, and `apply_patch` on
+  interpreter-honored configuration (`.git/...`, `.gitconfig`,
+  `.config/git/config`, `.npmrc`, shell startup files,
+  `.cargo/config.toml`) ask a human and never reach the
+  guardian. An interpreter mentioning a sensitive path (`python3 x.py .env`)
+  is no longer a dangerous command; it asks as a sensitive-path request
+  where those ask, so it is grant-coverable. `ed FILE` on interpreter
+  config joins the in-place editors that stay dangerous.
+- `--auto-approve` under a profile whose approvals are not `always` is a
+  no-op with a one-line notice. `session.start` records
+  `command_approvals`.
+
 ### Execution profiles: the `workspace` preset (ADR 0026 step 5)
 
 - **`--profile workspace`**: commands run in the sandbox with network, the
@@ -19,7 +55,8 @@ pull requests that landed them; deeper design rationale lives in
   workspace, `HOME`, `/tmp`, and `TMPDIR` (not the SSH agent or Docker).
   With an enforced sandbox backend, `run_shell`, `git_*`, and workspace
   writes run without a prompt; dangerous commands and sensitive paths still
-  ask. Escalation is not available yet. Built-in defaults stay `locked`.
+  ask. Escalation is not available yet. The built-in headless default stays
+  `locked`.
 - A user profile extending `workspace` can add existing `writable_paths`
   and set `credentials: "pass"` to hand secret-shaped variables, the SSH
   agent, and the named credential stores to sandboxed commands, for

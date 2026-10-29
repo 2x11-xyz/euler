@@ -2,7 +2,7 @@ use crate::git_neutralization::{
     cached_fsmonitor_daemon_support, fsmonitor_override, parse_executable_config, GitNeutralization,
 };
 use crate::sandbox::WorkspaceSandbox;
-use crate::sandboxed_jobs::{exit_code_without_reaping, SandboxedJobs};
+use crate::sandboxed_jobs::SandboxedJobs;
 use crate::structured_file;
 use crate::{
     apply_patch_update_chunks, capture_workspace_snapshot, parse_single_file_apply_patch,
@@ -16,7 +16,7 @@ use euler_sdk::{CancellationToken, Capability, ReplayPolicy};
 use serde_json::json;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io::Read as _;
@@ -172,6 +172,14 @@ pub struct PatchEvents {
     write_content: String,
 }
 
+impl PatchEvents {
+    /// Whether this write lands outside the workspace, where no checkpoint
+    /// covers it (ADR 0026 resolved question 22).
+    pub(crate) fn outside_workspace(&self) -> bool {
+        self.target.outside_workspace
+    }
+}
+
 /// A model-supplied path already resolved against the workspace root, kept as
 /// the root plus the normalized components beneath it. The structured tools
 /// re-open the target from `root` hop by hop at apply time; the joined
@@ -180,6 +188,10 @@ pub struct PatchEvents {
 pub(crate) struct ResolvedWorkspacePath {
     root: PathBuf,
     relative: PathBuf,
+    /// A structured write outside the workspace, possible only with the
+    /// sandbox off (ADR 0026 resolved question 22). `root` is then the
+    /// filesystem root and `relative` the rest of the canonical path.
+    outside_workspace: bool,
 }
 
 impl ResolvedWorkspacePath {
@@ -189,9 +201,29 @@ impl ResolvedWorkspacePath {
 
     /// The model-visible form of this path: workspace-relative, control
     /// characters scrubbed and length capped by [`display_path`]. The host
-    /// root never appears in a tool error or a durability warning.
+    /// root never appears in a tool error or a durability warning. A target
+    /// outside the workspace shows its absolute path, which is what the
+    /// model asked for.
     fn display(&self) -> String {
+        if self.outside_workspace {
+            return display_path(&self.absolute().to_string_lossy());
+        }
         display_path(&self.relative.to_string_lossy())
+    }
+
+    /// The path a patch records: the model's `requested` form inside the
+    /// workspace, the canonical absolute path outside it. An absolute path
+    /// naming a workspace file (sandbox off) records its workspace-relative
+    /// form, so the checkpoint and `/rollback` cover it as under every
+    /// profile (ADR 0026 section 9).
+    fn recorded_path(&self, requested: &str) -> String {
+        if self.outside_workspace {
+            self.absolute().to_string_lossy().into_owned()
+        } else if Path::new(requested).is_absolute() {
+            self.relative.to_string_lossy().into_owned()
+        } else {
+            requested.to_owned()
+        }
     }
 
     /// Resolve this target to a descriptor on its confined parent directory.
@@ -243,6 +275,69 @@ pub struct ToolRegistry {
     agent_euler_home: OnceLock<tempfile::TempDir>,
     skills: BTreeMap<String, FrozenSkill>,
     observation_bound: usize,
+    /// Whether structured writes may target paths outside the workspace.
+    /// Follows the execution profile's `sandbox` (ADR 0026 section 1).
+    writes_outside_workspace: bool,
+    background_jobs: crate::background_jobs::BackgroundJobs,
+    euler_credentials: EulerCredentials,
+    /// Canonical paths whose files hold Euler's secrets and configuration
+    /// (the Euler home, the auth file). A structured write under one is a
+    /// privileged secret and config edit (`secrets.md`).
+    privileged_config_paths: Vec<PathBuf>,
+}
+
+/// Euler's own credentials, withheld from host commands (ADR 0026 resolved
+/// question 7): variables named by `providers.json`, and credential values
+/// (the auth file's, and secrets its providers resolve at request time). The
+/// built-in provider variables are always withheld. Clones share one set, so
+/// a provider resolving a secret on another thread is seen at once.
+#[derive(Clone, Debug, Default)]
+pub struct EulerCredentials {
+    inner: std::sync::Arc<std::sync::RwLock<EulerCredentialSet>>,
+}
+
+#[derive(Debug, Default)]
+struct EulerCredentialSet {
+    variables: BTreeSet<String>,
+    values: BTreeSet<String>,
+}
+
+impl EulerCredentials {
+    pub fn add_variable(&self, name: impl Into<String>) {
+        self.write().variables.insert(name.into());
+    }
+
+    pub fn add_value(&self, value: impl Into<String>) {
+        let value = value.into();
+        if !value.is_empty() {
+            self.write().values.insert(value);
+        }
+    }
+
+    /// Whether the variable `name=value` carries one of Euler's credentials.
+    fn covers(&self, name: &std::ffi::OsStr, value: &std::ffi::OsStr) -> bool {
+        let built_in = name.to_str().is_some_and(|name| {
+            crate::redaction::BUILT_IN_PROVIDER_KEY_VARIABLES
+                .contains(&name.to_ascii_uppercase().as_str())
+        });
+        let set = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        built_in
+            || name
+                .to_str()
+                .is_some_and(|name| set.variables.contains(name))
+            || value
+                .to_str()
+                .is_some_and(|value| set.values.contains(value))
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, EulerCredentialSet> {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -316,7 +411,92 @@ impl ToolRegistry {
             agent_euler_home: OnceLock::new(),
             skills: BTreeMap::new(),
             observation_bound: MAX_WORKSPACE_SNAPSHOT_FILES,
+            writes_outside_workspace: false,
+            background_jobs: Default::default(),
+            euler_credentials: EulerCredentials::default(),
+            privileged_config_paths: Vec::new(),
         }
+    }
+
+    /// The shared set of Euler's own credentials that host commands never
+    /// see. Register auth-file values and resolved provider secrets here.
+    pub fn euler_credentials(&self) -> &EulerCredentials {
+        &self.euler_credentials
+    }
+
+    /// Replace the subprocess boundary for commands started from now on (an
+    /// execution profile change, ADR 0026 section 5). The caller ends the
+    /// sandboxed jobs first ([`Self::end_sandboxed_jobs`]); host background
+    /// jobs keep running. An unchanged boundary keeps its probed sandbox and
+    /// scratch.
+    pub fn set_subprocess_sandbox(
+        &mut self,
+        subprocess_sandbox: SubprocessSandbox,
+        sandbox_home: Option<PathBuf>,
+    ) {
+        match subprocess_sandbox {
+            SubprocessSandbox::Host => self.workspace_sandbox = None,
+            // The same boundary, already probed.
+            SubprocessSandbox::Enforce(profile)
+                if self
+                    .workspace_sandbox
+                    .as_ref()
+                    .is_some_and(|sandbox| *sandbox.profile() == profile) => {}
+            SubprocessSandbox::Enforce(profile) => {
+                self.workspace_sandbox =
+                    Some(WorkspaceSandbox::new(&self.root, profile, sandbox_home));
+            }
+        }
+    }
+
+    /// Hand what outlives one session to a fresh session in the same
+    /// process (`/new`): Euler's credentials, and the host background jobs,
+    /// which keep running and are listed at exit.
+    pub(crate) fn carry_into(&self, fresh: &mut ToolRegistry) {
+        fresh.euler_credentials = self.euler_credentials.clone();
+        fresh.privileged_config_paths = self.privileged_config_paths.clone();
+        self.background_jobs.hand_over(&fresh.background_jobs);
+    }
+
+    /// Mark `path` (a directory and everything under it, or one file) as
+    /// holding Euler's secrets and configuration: a structured write there
+    /// asks a human under every execution profile (`secrets.md`
+    /// "Config-Edit Guardrail"). Stored canonical so a symlink or a relative
+    /// path to it is still recognized.
+    pub fn add_privileged_config_path(&mut self, path: &Path) {
+        let canonical = path.canonicalize().ok().or_else(|| {
+            let parent = path.parent()?.canonicalize().ok()?;
+            Some(parent.join(path.file_name()?))
+        });
+        self.privileged_config_paths
+            .push(canonical.unwrap_or_else(|| path.to_path_buf()));
+    }
+
+    /// Whether a structured write to `requested` lands under a path
+    /// [`Self::add_privileged_config_path`] marked, resolved as the write
+    /// resolves it.
+    pub(crate) fn writes_privileged_config(&self, requested: &str) -> bool {
+        let Ok(resolved) = self.resolve_write_path(requested, false) else {
+            return false;
+        };
+        let target = resolved.absolute();
+        self.privileged_config_paths
+            .iter()
+            .any(|privileged| target.starts_with(privileged))
+    }
+
+    /// Background jobs started with the sandbox off that are still running,
+    /// one display line each, for the exit listing.
+    pub fn running_background_jobs(&self) -> Vec<String> {
+        self.background_jobs.running()
+    }
+
+    /// Let `write_file`, `edit_file`, and `apply_patch` target any path the
+    /// user can write: an absolute path, or a relative one that leaves the
+    /// workspace. Set for execution profiles with the sandbox off. Such a
+    /// write is recorded but no checkpoint covers it.
+    pub fn set_writes_outside_workspace(&mut self, allowed: bool) {
+        self.writes_outside_workspace = allowed;
     }
 
     /// Override the workspace-observation entry bound (ADR 0021 row E). The
@@ -326,6 +506,18 @@ impl ToolRegistry {
     pub fn with_observation_bound(mut self, bound: usize) -> Self {
         self.observation_bound = bound.max(1);
         self
+    }
+
+    /// Keep the unreaped `leader` of a `run_shell` command whose group still
+    /// runs. A sandboxed command's jobs end with the session or a profile
+    /// change; a host command's jobs keep running and are listed at exit
+    /// (ADR 0026 resolved questions 6 and 12).
+    fn keep_background_jobs(&self, leader: std::process::Child, sandboxed: bool, command: &str) {
+        if sandboxed {
+            self.sandboxed_jobs.keep_or_reap(leader);
+        } else {
+            self.background_jobs.track(leader, command);
+        }
     }
 
     /// End the background jobs sandboxed commands left running (ADR 0026
@@ -412,10 +604,17 @@ impl ToolRegistry {
     /// the tool description, not the system instructions, so it stays stable
     /// for a session's prompt cache and follows the registry's real backend.
     fn model_execution_boundary(&self) -> String {
-        self.workspace_sandbox.as_ref().map_or_else(
-            || "Commands run directly on the host, outside Euler's sandbox.".to_owned(),
-            WorkspaceSandbox::model_boundary,
-        )
+        match &self.workspace_sandbox {
+            Some(sandbox) => sandbox.model_boundary(),
+            None if self.writes_outside_workspace => {
+                "Commands run directly on the host with the user's authority, outside Euler's \
+sandbox; background jobs must redirect their output and keep running after Euler exits. \
+write_file, edit_file, and apply_patch also accept absolute paths outside the workspace; \
+those writes cannot be rolled back."
+                    .to_owned()
+            }
+            None => "Commands run directly on the host, outside Euler's sandbox.".to_owned(),
+        }
     }
 
     fn sandbox_network_disabled(&self) -> bool {
@@ -706,7 +905,7 @@ impl ToolRegistry {
         if old.is_empty() {
             return self.prepare_create(relative, new, "edit_file");
         }
-        let path = self.resolve_path(relative)?;
+        let path = self.resolve_write_path(relative, false)?;
         let content = self.read_resolved_file(&path)?;
         let count = overlapping_match_count(&content, old);
         if count != 1 {
@@ -724,7 +923,7 @@ impl ToolRegistry {
             sandbox_backend: None,
             exit_code: None,
             patch: Some(PatchEvents {
-                path: relative.to_owned(),
+                path: path.recorded_path(relative),
                 // Full file contents, not the matched snippets: downstream
                 // diff projections derive line numbers from these.
                 before: content,
@@ -759,7 +958,7 @@ impl ToolRegistry {
         content: &str,
         origin: &'static str,
     ) -> Result<ToolExecution, ToolError> {
-        let path = self.resolve_create_path(relative)?;
+        let path = self.resolve_write_path(relative, true)?;
         if path.absolute().exists() {
             return Err(ToolError::FileAlreadyExists);
         }
@@ -771,7 +970,7 @@ impl ToolRegistry {
             sandbox_backend: None,
             exit_code: None,
             patch: Some(PatchEvents {
-                path: relative.to_owned(),
+                path: path.recorded_path(relative),
                 before: String::new(),
                 after: content.to_owned(),
                 origin,
@@ -805,7 +1004,7 @@ impl ToolRegistry {
         };
         match parse_single_file_apply_patch(patch).map_err(tool_error_from_apply_patch)? {
             ApplyPatchDocument::Add { path, content } => {
-                let target = self.resolve_create_path(&path)?;
+                let target = self.resolve_write_path(&path, true)?;
                 if target.absolute().exists() {
                     return Err(ToolError::FileAlreadyExists);
                 }
@@ -817,7 +1016,7 @@ impl ToolRegistry {
                     sandbox_backend: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
-                        path,
+                        path: target.recorded_path(&path),
                         before: String::new(),
                         after_sha256: hash_bytes(content.as_bytes()),
                         after_byte_len: content.len(),
@@ -834,7 +1033,7 @@ impl ToolRegistry {
                 })
             }
             ApplyPatchDocument::Update { path, chunks } => {
-                let target = self.resolve_path(&path)?;
+                let target = self.resolve_write_path(&path, false)?;
                 let content = self.read_resolved_file(&target)?;
                 let updated = apply_patch_update_chunks(&content, &chunks)
                     .map_err(tool_error_from_apply_patch)?;
@@ -846,7 +1045,7 @@ impl ToolRegistry {
                     sandbox_backend: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
-                        path,
+                        path: target.recorded_path(&path),
                         before_sha256: Some(hash_bytes(content.as_bytes())),
                         after_sha256: hash_bytes(updated.as_bytes()),
                         before_byte_len: content.len(),
@@ -956,9 +1155,11 @@ impl ToolRegistry {
         let child = self.agent_subprocess("sh", &["-c", command], &[])?;
         let sandboxed = child.sandboxed;
         let sandbox_backend = child.backend;
-        let jobs = sandboxed.then_some(&self.sandboxed_jobs);
-        let outcome = run_process(child.command, Some(timeout_ms), cancellation, jobs)
+        let mut outcome = run_process(child.command, Some(timeout_ms), cancellation, true)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
+        if let Some(leader) = outcome.live_group.take() {
+            self.keep_background_jobs(leader, sandboxed, command);
+        }
         let text = collected_agent_output(
             outcome.stdout,
             outcome.stderr,
@@ -1032,7 +1233,7 @@ impl ToolRegistry {
         let sandbox_backend = child.backend;
         let mut command = child.command;
         neutralization.strip_inherited_redirects(&mut command);
-        let outcome = run_process(command, None, cancellation, None)
+        let outcome = run_process(command, None, cancellation, false)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         let cancelled = outcome.termination == ProcessTermination::Cancelled;
         let text = collected_agent_output(outcome.stdout, outcome.stderr, sandboxed, cancelled)?;
@@ -1133,7 +1334,7 @@ see them.\n"
         let sandboxed = child.sandboxed;
         let mut command = child.command;
         neutralization.strip_inherited_redirects(&mut command);
-        let outcome = run_process(command, Some(GIT_PROBE_TIMEOUT_MS), cancellation, None)
+        let outcome = run_process(command, Some(GIT_PROBE_TIMEOUT_MS), cancellation, false)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         match outcome.termination {
             ProcessTermination::Exited(0) => {}
@@ -1181,14 +1382,14 @@ see them.\n"
                 command
             }
         };
-        // Defense in depth: both launchers clear this environment too, while
-        // ordinary host execution needs an explicit child-process boundary.
-        // A sandbox under `credentials: "pass"` passes secrets on purpose.
-        let pass_secrets = self
-            .workspace_sandbox
-            .as_ref()
-            .is_some_and(WorkspaceSandbox::passes_credentials);
-        scrub_agent_subprocess_env(&mut child, pass_secrets);
+        // Defense in depth: both launchers clear this environment too. A
+        // sandbox under `credentials: "pass"` passes secrets on purpose; host
+        // execution passes the environment through except Euler's own
+        // credentials (ADR 0026 resolved question 7).
+        match &self.workspace_sandbox {
+            Some(sandbox) => scrub_agent_subprocess_env(&mut child, sandbox.passes_credentials()),
+            None => withhold_euler_credentials(&mut child, &self.euler_credentials),
+        }
         if !sandboxed {
             child.env("EULER_HOME", self.agent_euler_home()?);
         }
@@ -1254,25 +1455,7 @@ see them.\n"
             });
         }
         let root = self.root.canonicalize()?;
-        let full = root.join(path);
-        let canonical = if full.exists() {
-            full.canonicalize()?
-        } else {
-            if full.symlink_metadata().is_ok() {
-                return Err(ToolError::PathOutsideWorkspace {
-                    path: display_path(relative),
-                    reason:
-                        "path is a symlink whose target cannot be verified inside the workspace",
-                });
-            }
-            let parent = full.parent().ok_or(ToolError::InvalidField("path"))?;
-            if parent_must_be_directory && !parent.is_dir() {
-                return Err(ToolError::ParentDirectoryMissing);
-            }
-            let parent = parent.canonicalize()?;
-            let file_name = full.file_name().ok_or(ToolError::InvalidField("path"))?;
-            parent.join(file_name)
-        };
+        let canonical = canonical_target(&root.join(path), relative, parent_must_be_directory)?;
         let Ok(relative_path) = canonical.strip_prefix(&root) else {
             return Err(ToolError::PathOutsideWorkspace {
                 path: display_path(relative),
@@ -1283,7 +1466,74 @@ see them.\n"
         Ok(ResolvedWorkspacePath {
             root,
             relative: relative_path,
+            outside_workspace: false,
         })
+    }
+
+    /// Resolve a structured-write target. Inside the workspace this is
+    /// [`Self::resolve_path_inner`]; a path that leaves it resolves on the
+    /// host only when [`Self::set_writes_outside_workspace`] allowed it.
+    fn resolve_write_path(
+        &self,
+        requested: &str,
+        parent_must_be_directory: bool,
+    ) -> Result<ResolvedWorkspacePath, ToolError> {
+        match self.resolve_path_inner(requested, parent_must_be_directory) {
+            Err(ToolError::PathOutsideWorkspace { .. }) if self.writes_outside_workspace => {
+                self.resolve_outside_path(requested, parent_must_be_directory)
+            }
+            result => result,
+        }
+    }
+
+    fn resolve_outside_path(
+        &self,
+        requested: &str,
+        parent_must_be_directory: bool,
+    ) -> Result<ResolvedWorkspacePath, ToolError> {
+        let path = Path::new(requested);
+        let full = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.canonicalize()?.join(path)
+        };
+        let canonical = canonical_target(&full, requested, parent_must_be_directory)?;
+        let workspace = self.root.canonicalize()?;
+        if let Ok(relative) = canonical.strip_prefix(&workspace) {
+            // An absolute path that names a workspace file is a workspace
+            // write: it gets a checkpoint like any other.
+            return Ok(ResolvedWorkspacePath {
+                relative: relative.to_path_buf(),
+                root: workspace,
+                outside_workspace: false,
+            });
+        }
+        let root = canonical
+            .ancestors()
+            .last()
+            .ok_or(ToolError::InvalidField("path"))?
+            .to_path_buf();
+        let relative = canonical
+            .strip_prefix(&root)
+            .map_err(|_| ToolError::InvalidField("path"))?
+            .to_path_buf();
+        Ok(ResolvedWorkspacePath {
+            root,
+            relative,
+            outside_workspace: true,
+        })
+    }
+
+    /// The canonical host path a structured write to `requested` would
+    /// change, when structured writes may leave the workspace (an absolute
+    /// path naming a workspace file included). The permission gate checks it
+    /// against the sensitive lists so an absolute or relative path or a
+    /// symlink cannot hide where the write lands.
+    pub(crate) fn host_write_target(&self, requested: &str) -> Option<PathBuf> {
+        if !self.writes_outside_workspace {
+            return None;
+        }
+        Some(self.resolve_write_path(requested, false).ok()?.absolute())
     }
 
     /// Read a structured-tool target through its confined descriptor. The
@@ -1291,6 +1541,32 @@ see them.\n"
     fn read_resolved_file(&self, path: &ResolvedWorkspacePath) -> Result<String, ToolError> {
         read_confined(&path.confine()?, path)
     }
+}
+
+/// The canonical form of `full`: symlinks resolved for an existing path, or
+/// for its parent when the file does not exist yet. A dangling symlink is
+/// refused because its target cannot be verified.
+fn canonical_target(
+    full: &Path,
+    requested: &str,
+    parent_must_be_directory: bool,
+) -> Result<PathBuf, ToolError> {
+    if full.exists() {
+        return Ok(full.canonicalize()?);
+    }
+    if full.symlink_metadata().is_ok() {
+        return Err(ToolError::PathOutsideWorkspace {
+            path: display_path(requested),
+            reason: "path is a symlink whose target cannot be verified inside the workspace",
+        });
+    }
+    let parent = full.parent().ok_or(ToolError::InvalidField("path"))?;
+    if parent_must_be_directory && !parent.is_dir() {
+        return Err(ToolError::ParentDirectoryMissing);
+    }
+    let parent = parent.canonicalize()?;
+    let file_name = full.file_name().ok_or(ToolError::InvalidField("path"))?;
+    Ok(parent.join(file_name))
 }
 
 /// Read an already-confined target, refusing anything that is not a regular
@@ -1473,6 +1749,21 @@ fn scrub_agent_subprocess_env(command: &mut Command, pass_secrets: bool) {
     for (name, _) in std::env::vars_os() {
         let secret = !pass_secrets && crate::redaction::is_secret_env_name(&name);
         if secret || is_parent_control_env_name(&name) {
+            command.env_remove(name);
+        }
+    }
+}
+
+/// Host execution (ADR 0026 resolved question 7): the environment passes
+/// through except Euler's own credentials ([`EulerCredentials`]) and
+/// parent-control variables. Other secret-shaped variables (`GITHUB_TOKEN`,
+/// cloud keys) reach the command, as in an unsandboxed local agent, and stay
+/// registered with the redactor; row C's denylist is not applied, so the
+/// user's own toolchain setup (`LD_LIBRARY_PATH`, `NODE_OPTIONS`) is left
+/// alone.
+fn withhold_euler_credentials(command: &mut Command, credentials: &EulerCredentials) {
+    for (name, value) in std::env::vars_os() {
+        if is_parent_control_env_name(&name) || credentials.covers(&name, &value) {
             command.env_remove(name);
         }
     }
@@ -1678,6 +1969,9 @@ struct ShellOutcome {
     termination: ProcessTermination,
     stdout: String,
     stderr: String,
+    /// The exited, unreaped leader of a group whose other members still run
+    /// (`keep_live_group` only); its owner must reap it.
+    live_group: Option<std::process::Child>,
 }
 
 struct SupervisedProcess {
@@ -1726,14 +2020,14 @@ fn spawn_supervised_process(mut child: Command) -> Result<SupervisedProcess, Too
 /// that deliberately moves itself into another process group is outside this
 /// ownership guarantee.
 ///
-/// With `jobs`, a leader that exits while background jobs of its group
-/// still run is handed to `jobs` unreaped instead of reaped, so the session
-/// can end those jobs later without signalling a reused group.
+/// With `keep_live_group`, a leader that exits while other members of its
+/// group still run is returned unreaped in [`ShellOutcome::live_group`], so
+/// the group id stays pinned for whoever ends or lists the job later.
 fn run_process(
     child: Command,
     timeout_ms: Option<u64>,
     cancellation: &CancellationToken,
-    jobs: Option<&SandboxedJobs>,
+    keep_live_group: bool,
 ) -> Result<ShellOutcome, ToolError> {
     use std::time::{Duration, Instant};
 
@@ -1751,7 +2045,7 @@ fn run_process(
     let mut stderr_bytes = Vec::new();
 
     let deadline = timeout_ms.map(|timeout_ms| Instant::now() + Duration::from_millis(timeout_ms));
-    let termination = loop {
+    let (termination, live_group) = loop {
         if let Err(error) = drain_process_pipe(
             &mut stdout,
             &mut stdout_open,
@@ -1782,7 +2076,7 @@ fn run_process(
                 &mut stderr_open,
                 &mut stderr_bytes,
             );
-            break ProcessTermination::Cancelled;
+            break (ProcessTermination::Cancelled, false);
         }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             kill_process_group(pid);
@@ -1795,15 +2089,13 @@ fn run_process(
                 &mut stderr_open,
                 &mut stderr_bytes,
             );
-            break ProcessTermination::TimedOut;
+            break (ProcessTermination::TimedOut, false);
         }
 
-        // Do not reap (or even `try_wait`) while a descendant can still own a
-        // pipe. Keeping the leader unreaped pins its pid/process-group id, so
-        // a later cancellation cannot signal an unrelated reused group.
+        // Only once both pipes close (`poll_leader`).
         if !stdout_open && !stderr_open {
-            match leader_exit_code(&mut handle, jobs.is_some()) {
-                Ok(Some(code)) => break ProcessTermination::Exited(code),
+            match poll_leader(&mut handle, pid, keep_live_group) {
+                Ok(Some((code, live))) => break (ProcessTermination::Exited(code), live),
                 Ok(None) => {}
                 Err(error) => {
                     kill_process_group(pid);
@@ -1814,25 +2106,39 @@ fn run_process(
         }
         std::thread::sleep(Duration::from_millis(25));
     };
-    if let (Some(jobs), ProcessTermination::Exited(_)) = (jobs, &termination) {
-        jobs.keep_or_reap(handle);
-    }
     Ok(ShellOutcome {
         termination,
         stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
         stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+        live_group: live_group.then_some(handle),
     })
 }
 
-/// The exit code of a leader whose pipes have closed, once it has exited.
-/// With `pin`, the leader stays unreaped so its process-group id stays
-/// reserved for [`SandboxedJobs`]; otherwise it is reaped.
-fn leader_exit_code(handle: &mut std::process::Child, pin: bool) -> std::io::Result<Option<i32>> {
-    if pin {
-        exit_code_without_reaping(handle)
-    } else {
-        Ok(handle.try_wait()?.map(|status| status.code().unwrap_or(-1)))
+/// Whether the leader has exited, as `(exit code, group still running)`.
+/// Do not reap (or even `try_wait`) while a descendant can still own a pipe:
+/// keeping the leader unreaped pins its pid and process-group id, so a later
+/// signal cannot reach an unrelated reused group. With `keep_live_group`, a
+/// leader whose group still runs stays unreaped for the caller; any other
+/// exited leader is reaped here.
+fn poll_leader(
+    handle: &mut std::process::Child,
+    pid: i32,
+    keep_live_group: bool,
+) -> std::io::Result<Option<(i32, bool)>> {
+    if keep_live_group {
+        match crate::background_jobs::exit_code_without_reaping(pid)? {
+            // Not exited: `try_wait` now could reap a leader that exits in
+            // between, untracked.
+            None => return Ok(None),
+            Some(code) if crate::background_jobs::group_has_other_members(pid) => {
+                return Ok(Some((code, true)));
+            }
+            Some(_) => {}
+        }
     }
+    Ok(handle
+        .try_wait()?
+        .map(|status| (status.code().unwrap_or(-1), false)))
 }
 
 const PROCESS_PIPE_DRAIN_BUDGET: usize = 256 * 1024;
@@ -1972,6 +2278,33 @@ fn strict_apply_patch_heredoc(command: &str) -> Result<String, ToolError> {
 
 fn is_shell_apply_patch_request(name: &str, input: &Value) -> bool {
     name == "run_shell" && required_str(input, "command").is_ok_and(command_begins_apply_patch)
+}
+
+/// The file a structured write names, for permission classification:
+/// `path` for `edit_file` and `write_file`, and the patch's file for
+/// `apply_patch` and an intercepted `run_shell` `apply_patch` heredoc. `None`
+/// when the input names none or does not parse; the tool then fails before
+/// writing.
+pub(crate) fn structured_write_path(tool_name: &str, input: &Value) -> Option<String> {
+    let patch = match tool_name {
+        "edit_file" | "write_file" => {
+            return input.get("path").and_then(Value::as_str).map(str::to_owned);
+        }
+        "apply_patch" => input.get("patch").and_then(Value::as_str)?.to_owned(),
+        "run_shell" => {
+            let command = input.get("command").and_then(Value::as_str)?;
+            if !command_begins_apply_patch(command) {
+                return None;
+            }
+            strict_apply_patch_heredoc(command).ok()?
+        }
+        _ => return None,
+    };
+    match parse_single_file_apply_patch(&patch).ok()? {
+        ApplyPatchDocument::Add { path, .. } | ApplyPatchDocument::Update { path, .. } => {
+            Some(path)
+        }
+    }
 }
 
 fn command_begins_apply_patch(command: &str) -> bool {

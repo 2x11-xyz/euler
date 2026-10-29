@@ -262,8 +262,9 @@ pub(crate) fn permission_request_for_tool(
                 request = request.with_command(command);
                 // Read from the full command, as the danger walk is; the
                 // profile decides whether it asks
-                // (`execution_profile::profile_mode_override`).
-                request.sensitive_path =
+                // (`execution_profile::profile_mode_override`). `|=` keeps
+                // the interpreter-mention flag `with_command` set.
+                request.sensitive_path |=
                     crate::command_safety::command_mentions_sensitive_path(command);
             }
         }
@@ -289,14 +290,37 @@ pub(crate) fn permission_request_for_tool(
     // list, mirroring the resolved-path check statically-safe shell analysis
     // applies. Living HERE means every permission gate — root session AND
     // companion loop — gets the same classification.
-    // `|=` keeps the shell flag `with_command` set.
-    request.sensitive_path |= request
-        .path
-        .as_deref()
-        .is_some_and(crate::command_safety::sensitive_basename)
-        || resolved
-            .as_deref()
-            .is_some_and(crate::command_safety::sensitive_basename);
+    // A shell request already carries the interpreter-mention flag from
+    // `with_command`; this adds the structured-path check.
+    request.sensitive_path = request.sensitive_path
+        || [request.path.as_deref(), resolved.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(crate::command_safety::sensitive_basename);
+    // A structured write to configuration another program later executes is
+    // the twin of the dangerous shell write: it asks a human under every
+    // execution profile, rides no grant, and never reaches the guardian
+    // (ADR 0026 resolved question 15). Checked on the path the write names
+    // (an `apply_patch` file included) and on every form it resolves to, so
+    // a relative path or a symlink cannot launder it.
+    if let Some(path) = crate::tools::structured_write_path(tool_name, input) {
+        let forms = [
+            Some(std::path::PathBuf::from(&path)),
+            tools.workspace_relative_path(&path),
+            tools.host_write_target(&path),
+        ];
+        // A write into the Euler home or the auth file is a privileged
+        // secret and config edit (`secrets.md`) and asks a human the same
+        // way.
+        if forms
+            .iter()
+            .flatten()
+            .any(|form| crate::command_safety::interpreter_honored_config(form))
+            || tools.writes_privileged_config(&path)
+        {
+            request.dangerous_command = true;
+        }
+    }
     if request.sensitive_path && capability == Capability::FsRead {
         // Plain-language ask: name the file and say why it needs a
         // deliberate decision. FsWrite reasons stay verbatim (`tool

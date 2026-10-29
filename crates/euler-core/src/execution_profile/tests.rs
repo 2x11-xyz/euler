@@ -40,43 +40,110 @@ fn escalating_fields() -> ProfileFields {
 }
 
 #[test]
-fn built_in_defaults_resolve_locked_in_every_context() {
+fn built_in_defaults_are_full_interactive_and_locked_headless() {
     let config = ProfilesConfig::default();
-    for context in [ProfileContext::Interactive, ProfileContext::Headless] {
-        let profile = config.resolve(None, context, None).expect("resolves");
-        assert_eq!(profile, ExecutionProfile::default());
-        assert_eq!(profile.name, "locked");
+    let interactive = config
+        .resolve(None, ProfileContext::Interactive, None)
+        .expect("resolves");
+    assert_eq!(interactive.name, "full");
+    assert_eq!(interactive.fields, full::fields());
+    let headless = config
+        .resolve(None, ProfileContext::Headless, None)
+        .expect("resolves");
+    assert_eq!(headless, ExecutionProfile::default());
+    assert_eq!(headless.name, "locked");
+}
+
+#[test]
+fn full_preset_runs_on_the_host_with_approvals_off() {
+    let fields = full::fields();
+    assert_eq!(fields.sandbox, SandboxSetting::Off);
+    assert_eq!(fields.approvals, ApprovalsSetting::Never);
+    assert_eq!(fields.escalation, EscalationSetting::NotAllowed);
+    assert_eq!(fields.background_jobs, BackgroundJobsSetting::Outlive);
+    let profile = ProfilesConfig::default()
+        .resolve(Some("full"), ProfileContext::Headless, None)
+        .expect("full is shipped");
+    profile.check_enforced().expect("full is enforced");
+}
+
+#[test]
+fn full_accepts_approvals_always_and_refuses_claims_the_host_does_not_keep() {
+    let config = parse(
+        r#"{"profiles": {
+            "careful": {"extends": "full", "approvals": "always"},
+            "half": {"extends": "full", "approvals": "escalation-only"},
+            "offline": {"extends": "full", "network": "off"}
+        }}"#,
+    )
+    .expect("loads");
+    let careful = config
+        .resolve(Some("careful"), ProfileContext::Interactive, None)
+        .expect("approvals always works on the host");
+    assert_eq!(careful.fields.approvals, ApprovalsSetting::Always);
+    for (name, field) in [("half", "approvals"), ("offline", "network")] {
+        let message = error_text(config.resolve(Some(name), ProfileContext::Interactive, None));
+        assert!(
+            message.contains(&format!(
+                "sets {field} to a value this version cannot enforce"
+            )),
+            "{message}"
+        );
     }
+}
+
+#[test]
+fn interactive_default_is_written_beside_existing_entries() {
+    let temp = tempfile::tempdir().expect("temp");
+    let file = temp.path().join("profiles.json");
+    write_interactive_default(&file, "locked").expect("creates the file");
+    let config = ProfilesConfig::load(&file).expect("loads");
+    assert!(config.has_interactive_default());
+    assert_eq!(
+        config
+            .resolve(None, ProfileContext::Interactive, None)
+            .expect("resolves")
+            .name,
+        "locked"
+    );
+
+    std::fs::write(
+        &file,
+        r#"{"defaults": {"headless": "ci"}, "profiles": {"ci": {"extends": "locked"}}}"#,
+    )
+    .expect("write");
+    write_interactive_default(&file, "full").expect("updates the file");
+    let config = ProfilesConfig::load(&file).expect("loads");
+    assert_eq!(
+        config
+            .resolve(None, ProfileContext::Interactive, None)
+            .expect("resolves")
+            .name,
+        "full"
+    );
+    assert_eq!(
+        config
+            .resolve(None, ProfileContext::Headless, None)
+            .expect("resolves")
+            .name,
+        "ci"
+    );
+
+    std::fs::write(&file, "[]").expect("write");
+    let message = error_text(write_interactive_default(&file, "full"));
+    assert!(message.contains("expected a JSON object"), "{message}");
+    assert_eq!(std::fs::read_to_string(&file).expect("read"), "[]");
 }
 
 #[test]
 fn missing_profiles_file_is_the_built_in_configuration() {
     let temp = tempfile::tempdir().expect("temp");
     let config = ProfilesConfig::load(&temp.path().join("profiles.json")).expect("loads");
+    assert!(!config.has_interactive_default());
     let profile = config
         .resolve(None, ProfileContext::Interactive, None)
         .expect("resolves");
-    assert_eq!(profile.name, "locked");
-}
-
-#[test]
-fn presets_not_shipped_yet_are_refused_never_substituted() {
-    let config = ProfilesConfig::default();
-    let message = error_text(config.resolve(Some("full"), ProfileContext::Headless, None));
-    assert!(
-        message.contains("the full preset is not available"),
-        "{message}"
-    );
-
-    // A profile extending an unshipped preset loads, and is refused only
-    // when selected.
-    let config = parse(r#"{"profiles": {"mine": {"extends": "full", "reviewer": "guardian"}}}"#)
-        .expect("loads");
-    let message = error_text(config.resolve(Some("mine"), ProfileContext::Interactive, None));
-    assert!(
-        message.contains("profile \"mine\" extends the full preset"),
-        "{message}"
-    );
+    assert_eq!(profile.name, "full");
 }
 
 #[test]
@@ -641,4 +708,69 @@ fn record_round_trips_and_rejects_tampering() {
     let mut unknown = record;
     unknown["fields"]["sandbox_mode"] = "on".into();
     assert!(ExecutionProfile::from_record(&unknown).is_err());
+}
+
+#[test]
+fn profile_mode_override_follows_each_approvals_setting() {
+    use crate::permissions::{ApprovalMode, PermissionRequest};
+    use euler_sdk::Capability;
+    let write = PermissionRequest::new(Capability::FsWrite, "tool write_file");
+    let shell = PermissionRequest::new(Capability::ShellExec, "tool run_shell");
+    let spawn = PermissionRequest::new(Capability::AgentSpawn, "tool spawn_agent");
+    let mut sensitive_read = PermissionRequest::new(Capability::FsRead, "tool read_file");
+    sensitive_read.sensitive_path = true;
+    let mut sensitive_shell = shell.clone();
+    sensitive_shell.sensitive_path = true;
+    let ask = ApprovalMode::Ask;
+    let allow = Some(ApprovalMode::SessionAllow);
+
+    // `never` (full): every request the gate passes on runs, a sensitive
+    // path included (resolved question 15), with or without a sandbox.
+    let full = full::fields();
+    for request in [&write, &shell, &spawn, &sensitive_read, &sensitive_shell] {
+        assert_eq!(profile_mode_override(&full, request, ask, false), allow);
+    }
+
+    // `escalation-only` (workspace): commands and writes run only inside an
+    // enforced sandbox, and a shell operand naming a sensitive path asks
+    // (resolved question 14).
+    let workspace = networked_fields();
+    for request in [&write, &shell] {
+        assert_eq!(profile_mode_override(&workspace, request, ask, true), allow);
+        assert_eq!(profile_mode_override(&workspace, request, ask, false), None);
+    }
+    assert_eq!(profile_mode_override(&workspace, &spawn, ask, true), None);
+    assert_eq!(
+        profile_mode_override(&workspace, &sensitive_read, ask, true),
+        None
+    );
+    for enforced in [true, false] {
+        assert_eq!(
+            profile_mode_override(
+                &workspace,
+                &sensitive_shell,
+                ApprovalMode::SessionAllow,
+                enforced
+            ),
+            Some(ApprovalMode::Ask)
+        );
+    }
+
+    // `always` (locked): no lift, and a shell operand naming a sensitive
+    // path keeps the configured mode, as before profiles.
+    assert_eq!(
+        profile_mode_override(
+            &locked::fields(),
+            &sensitive_shell,
+            ApprovalMode::SessionAllow,
+            true
+        ),
+        allow
+    );
+    for request in [&write, &shell, &spawn] {
+        assert_eq!(
+            profile_mode_override(&locked::fields(), request, ask, true),
+            None
+        );
+    }
 }

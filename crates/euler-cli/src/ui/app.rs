@@ -272,6 +272,9 @@ pub struct AppCore {
     /// of the `TurnInFlight` state; `install_state` consumes it and
     /// diagnoses any unlicensed replacement.
     in_flight_session_returned: bool,
+    /// Exit listing of host background jobs from sessions this app already
+    /// replaced (`/new`, `/resume`): those jobs keep running (ADR 0026).
+    replaced_session_background_jobs: Vec<String>,
     permission_rx: Receiver<PermissionPromptEnvelope>,
     reply_tx: Sender<PermissionReply>,
     active_permission_cancellation: Option<euler_sdk::CancellationToken>,
@@ -755,6 +758,13 @@ impl App {
             self.start_pending_provider_catalog_refresh();
             self.flush_resize_replay()?;
         }
+    }
+
+    /// Host background jobs Euler started that are still running. Read
+    /// after [`Self::run`] returns and printed once the terminal is
+    /// restored.
+    pub fn running_background_jobs(&self) -> Vec<String> {
+        self.core.running_background_jobs()
     }
 
     pub fn schedule_provider_catalog_refresh(&mut self, model_catalog_path: PathBuf) {
@@ -1280,6 +1290,7 @@ impl AppCore {
                 session: Box::new(session),
             },
             in_flight_session_returned: false,
+            replaced_session_background_jobs: Vec::new(),
             permission_rx: channels.request_rx,
             reply_tx: inactive_permission_reply_sender(),
             active_permission_cancellation: None,
@@ -3335,7 +3346,21 @@ impl AppCore {
                 "internal error: in-flight worker state was replaced before its session returned; the previous session may be lost — please report this".to_owned(),
             );
         }
+        if let AppState::Idle { session } = &self.state {
+            self.replaced_session_background_jobs
+                .extend(session.running_background_jobs());
+        }
         self.state = next;
+    }
+
+    /// Host background jobs Euler started in this app that are still
+    /// running, for the exit listing.
+    fn running_background_jobs(&self) -> Vec<String> {
+        let mut jobs = self.replaced_session_background_jobs.clone();
+        if let AppState::Idle { session } = &self.state {
+            jobs.extend(session.running_background_jobs());
+        }
+        jobs
     }
 
     fn take_idle_session(&mut self) -> Box<Session<TuiDecider>> {
@@ -3533,6 +3558,9 @@ impl AppCore {
                 "auto in workspace sandbox is not available yet; no permission policy changed"
                     .to_owned(),
             ),
+            CommandAction::OpenProfilePicker => self.open_profile_picker(),
+            CommandAction::SetExecutionProfile { name } => self.set_execution_profile(name),
+            CommandAction::SetDefaultProfile { name } => self.set_default_profile(name),
             CommandAction::OpenPermissions => self.open_permissions_picker(),
             CommandAction::OpenPermissionsAdvanced => self.open_permissions_advanced_picker(),
             CommandAction::RevokeGrant {

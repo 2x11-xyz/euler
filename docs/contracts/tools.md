@@ -138,6 +138,19 @@ for a symlink, the root itself substituted — fails the walk rather than
 escaping the root. Every subsequent check runs on a descriptor obtained from
 that directory, so it describes the file that is actually read or written.
 
+Under an execution profile with the sandbox off (`full`, ADR 0026 resolved
+question 22), `edit_file`, `write_file`, and `apply_patch` also accept a path
+outside the workspace: an absolute path, or a relative one that leaves it.
+Such a path is canonicalized (symlinks resolved, or the parent's for a new
+file) and walked the same way from the filesystem root instead of the
+workspace root. `patch.proposed`, `patch.applied`, `file.change`, and
+`file.diff` record its canonical absolute path, and no `checkpoint.stored` is
+written for it, so `/rollback` cannot restore it. An absolute path whose
+canonical form is inside the workspace is a workspace write: it records the
+workspace-relative path and is checkpointed as under every profile.
+`read_file` stays workspace-confined under every profile, and with the
+sandbox on every write stays workspace-confined.
+
 Mount crossings inside the workspace are allowed. Refusing them would break
 ordinary setups (a devcontainer volume at `node_modules/`, a tmpfs at
 `target/`), while planting a hostile mount inside the workspace needs
@@ -240,8 +253,18 @@ Bubblewrap on Linux and Seatbelt on macOS are the default enforced backends for
 a private root tmpfs, its
 workspace bound read-write at `/workspace`, a private `/tmp`, `/proc` and
 `/dev`, a tmpfs `HOME`, no host network namespace, and a cleared environment.
-Unsupported platforms run those tools directly on the host under the ordinary
-permission decision.
+Unsupported platforms, and execution profiles with `sandbox: off` (`full`,
+ADR 0026), run those tools directly on the host under the ordinary
+permission decision. A host command inherits Euler's environment except
+Euler's own credentials and parent-control variables (capabilities
+contract, "Execution profiles").
+
+Each `run_shell` command runs in its own process group. A job that redirects
+its output can outlive the command: on the host and under Seatbelt it keeps
+running after the shell exits, while Bubblewrap's PID namespace ends it with
+the command. For a host command Euler keeps the exited leader of such a
+group unreaped so the group id cannot be reused, and lists the job at exit
+(capabilities contract).
 
 Because `HOME` inside the sandbox is a private tmpfs, toolchains installed
 under the real home would otherwise be unreachable. Euler detects the
@@ -291,8 +314,8 @@ the parent environment under ADR 0021 row C instead of clearing it.
 A sandboxed `run_shell` command whose process-group leader exits while
 another process of its group still runs (on macOS, a background job that
 redirected its output) leaves that leader unreaped and tracked; the session
-kills each tracked group and reaps its leader when it ends, so the group id
-cannot have been reused. Bubblewrap's PID namespace already ends every job
+kills each tracked group and reaps its leader when it ends or changes
+execution profile, so the group id cannot have been reused. Bubblewrap's PID namespace already ends every job
 with its command, so nothing is tracked on Linux. A job that moves itself to
 another process group is outside this, as it is for cancellation.
 
@@ -322,7 +345,11 @@ persist for the session, while `.git` and `/tmp` are not writable; under
 whether credentials are available and that background jobs must redirect
 their output and when they end), and that
 a blocked action is reported as a sandbox limit with the exact command the
-user can run outside Euler. A host registry says commands run on the host; an
+user can run outside Euler. A host registry says commands run on the host;
+under a sandbox-off execution profile it adds that they run with the user's
+authority, that background jobs must redirect their output and keep running
+after Euler exits, and that the write tools accept absolute paths outside
+the workspace that cannot be rolled back. An
 unavailable sandbox says commands are refused and points at
 `euler --check-sandbox`. The facts live in the tool description rather than
 the system instructions, so `SYSTEM_INSTRUCTIONS_VERSION` is unchanged and the

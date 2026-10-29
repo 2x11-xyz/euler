@@ -9,6 +9,7 @@ use super::terminal::{
     decide_interactive_launch, euler_no_tty_env, terminal_width, InteractiveLaunch, TuiLaunchIntent,
 };
 use anyhow::{anyhow, Result};
+use euler_core::execution_profile::ApprovalsSetting;
 use euler_core::{
     check_run_continuation, fold_session, read_resume_prefix, resume_session_continuing_run,
     resume_session_from_folded_prefix, CompactionTier, ContinuationRefusal, FoldedSession,
@@ -110,7 +111,9 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     }
     wire_session_extensions(&mut session);
     report_sandbox_status(&session);
-    run_stdin_loop(&mut session, live_session.refresh.as_ref())
+    let result = run_stdin_loop(&mut session, live_session.refresh.as_ref());
+    print_running_background_jobs(&session);
+    result
 }
 
 /// Surface an unavailable sandbox once, at session start.
@@ -334,7 +337,12 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     if let Some(path) = crate::model_catalog::default_model_catalog_path() {
         app.schedule_provider_catalog_refresh(path);
     }
-    app.run()
+    let result = app.run();
+    let jobs = app.running_background_jobs();
+    // Restore the terminal before printing the exit listing.
+    drop(app);
+    print_background_job_lines(&jobs);
+    result
 }
 
 /// Run a turn while streaming each event's line-oriented rendering to stdout
@@ -389,18 +397,14 @@ fn stream_run_to_stdout<D: PermissionDecider>(
 }
 
 pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()> {
+    let auto_approve = auto_approve_request(&exec);
     if let Some(path) = exec.resume_path {
         if exec.continue_run {
             // `--continue` takes no prompt and never reads stdin.
-            return run_exec_continue(path, exec.run, exec.auto_approve, exec.retry);
+            return run_exec_continue(path, exec.run, auto_approve, exec.retry);
         }
         let prompt = read_exec_prompt(exec.prompt)?;
-        return run_exec_resume(
-            resolve_resume_target(path)?,
-            exec.run,
-            exec.auto_approve,
-            prompt,
-        );
+        return run_exec_resume(resolve_resume_target(path)?, exec.run, auto_approve, prompt);
     }
     let target = invocation_target(&exec.run);
     validate_provider_auth(&target.provider, exec.run.auth_file.as_deref(), || {
@@ -442,7 +446,6 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
     )?;
     let bootstrap = crate::session_lifecycle::finalize_project_context_headless(resolution)?;
     live_session.config.project_context = Some(bootstrap);
-    let tier = exec.auto_approve;
     let providers = ProviderSet::single_named(exec.run.provider_id.clone(), exec.run.provider)
         .with_model_catalog(exec.run.model_catalog.clone());
     let log_path = live_session.log_path.clone();
@@ -460,8 +463,9 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
     }
     wire_session_extensions(&mut session);
     report_sandbox_status(&session);
-    SubagentDecider::apply_tier(tier, &mut session);
+    apply_auto_approve(auto_approve, &mut session);
     let turn_result = run_turn_streaming(&mut session, &prompt);
+    print_running_background_jobs(&session);
     if let Some(refresh) = refresh.as_ref() {
         if let Err(error) = refresh.refresh() {
             eprintln!("warning: failed to refresh session metadata: {error}");
@@ -473,22 +477,23 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
 fn run_exec_resume(
     target: ResumeTarget,
     run: RunArgs,
-    auto_approve: AutoApproveTier,
+    auto_approve: AutoApproveRequest,
     prompt: String,
 ) -> Result<()> {
     let overrides = ExecConfigOverrides::from_run(&run);
     let mut outcome = resume_cli_session(
         target,
         run,
-        SubagentDecider::new(auto_approve),
+        SubagentDecider::new(auto_approve.tier),
         RelocationConsent::Headless,
         ResumeIntent::CloseOpenRun,
         |config| {
             apply_exec_config(config, overrides);
         },
     )?;
-    SubagentDecider::apply_tier(auto_approve, &mut outcome.session);
+    apply_auto_approve(auto_approve, &mut outcome.session);
     let turn_result = run_turn_streaming(&mut outcome.session, &prompt);
+    print_running_background_jobs(&outcome.session);
     if let Some(refresh) = outcome.refresh.as_ref() {
         if let Err(error) = refresh.refresh() {
             eprintln!("warning: failed to refresh session metadata: {error}");
@@ -502,7 +507,7 @@ fn run_exec_resume(
 fn run_exec_continue(
     path: PathBuf,
     run: RunArgs,
-    auto_approve: AutoApproveTier,
+    auto_approve: AutoApproveRequest,
     retry: bool,
 ) -> Result<()> {
     let session_arg = shell_word(&path.to_string_lossy());
@@ -510,7 +515,7 @@ fn run_exec_continue(
     let mut outcome = resume_cli_session(
         resolve_resume_target(path)?,
         run,
-        SubagentDecider::new(auto_approve),
+        SubagentDecider::new(auto_approve.tier),
         RelocationConsent::Headless,
         ResumeIntent::ContinueRun { retry },
         |config| {
@@ -524,7 +529,7 @@ fn run_exec_continue(
             continued.run_id, continued.restart_count
         );
     }
-    SubagentDecider::apply_tier(auto_approve, &mut outcome.session);
+    apply_auto_approve(auto_approve, &mut outcome.session);
     let turn_result = stream_run_to_stdout(&mut outcome.session, |session, cancel, sink| {
         session.continue_run_with_sink(cancel, sink)
     });
@@ -714,7 +719,9 @@ fn resume_line_oriented(target: ResumeTarget, run: RunArgs) -> Result<()> {
             "not appended"
         }
     );
-    run_stdin_loop(&mut outcome.session, outcome.refresh.as_ref())
+    let result = run_stdin_loop(&mut outcome.session, outcome.refresh.as_ref());
+    print_running_background_jobs(&outcome.session);
+    result
 }
 
 fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
@@ -775,11 +782,15 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
         app.schedule_provider_catalog_refresh(path);
     }
     let app_result = app.run();
+    let jobs = app.running_background_jobs();
+    // Restore the terminal before printing the exit listing.
+    drop(app);
     if let Some(refresh) = outcome.refresh.take() {
         if let Err(error) = refresh.refresh() {
             eprintln!("warning: failed to refresh session metadata: {error}");
         }
     }
+    print_background_job_lines(&jobs);
     app_result
 }
 
@@ -1030,6 +1041,53 @@ where
         display_label,
         session_name,
     })
+}
+
+/// `--auto-approve` as given: the tier, and whether the flag was passed.
+#[derive(Clone, Copy)]
+struct AutoApproveRequest {
+    tier: AutoApproveTier,
+    explicit: bool,
+}
+
+fn auto_approve_request(exec: &ExecArgs) -> AutoApproveRequest {
+    AutoApproveRequest {
+        tier: exec.auto_approve,
+        explicit: exec.auto_approve_explicit,
+    }
+}
+
+/// `--auto-approve` under the resolved profile (ADR 0026 resolved question
+/// 2). Its tiers configure the gate as today under `approvals: always`.
+/// Under any other profile commands and writes inside the boundary already
+/// run, so every tier is a no-op; a given flag gets a one-line notice and
+/// never tightens the profile.
+fn apply_auto_approve<D>(request: AutoApproveRequest, session: &mut Session<D>) {
+    if session.execution_profile().fields.approvals == ApprovalsSetting::Always {
+        SubagentDecider::apply_tier(request.tier, session);
+    } else if request.explicit {
+        eprintln!(
+            "note: --auto-approve has no effect: execution profile {} already allows what it \
+             asks for",
+            session.execution_profile().name
+        );
+    }
+}
+
+/// At exit, name the background jobs started with the sandbox off that are
+/// still running: Euler leaves them running (ADR 0026 resolved question 6).
+fn print_running_background_jobs<D>(session: &Session<D>) {
+    print_background_job_lines(&session.running_background_jobs());
+}
+
+fn print_background_job_lines(jobs: &[String]) {
+    if jobs.is_empty() {
+        return;
+    }
+    eprintln!("Background jobs Euler started are still running:");
+    for job in jobs {
+        eprintln!("  {job}");
+    }
 }
 
 fn run_profile_request(run: &RunArgs, context: ProfileContext) -> ProfileRequest<'_> {

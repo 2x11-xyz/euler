@@ -6,6 +6,7 @@ use euler_event::EventEnvelope;
 pub mod apply_patch;
 pub mod assistant_response;
 pub mod auth_storage;
+mod background_jobs;
 pub mod canvas;
 pub mod checkpoints;
 pub mod command_safety;

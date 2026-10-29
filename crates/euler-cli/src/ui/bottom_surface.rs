@@ -1,8 +1,8 @@
 use super::commands::{
     dispatch_command, filter_palette_entries, CheckpointItem, CommandAction, CommandContext,
     CommandEffect, CompactionSettings, EffortChoice, ExtensionManagerItem, ModelChoice,
-    ModelTargetsConfirm, PaletteEntry, PaletteEntryKind, PermissionChoice, PickerSpec, ResumeItem,
-    ThemeChoiceItem,
+    ModelTargetsConfirm, PaletteEntry, PaletteEntryKind, PermissionChoice, PickerSpec,
+    ProfileChoice, ResumeItem, ThemeChoiceItem,
 };
 use super::composer::ComposerDraft;
 use super::search::TranscriptSearch;

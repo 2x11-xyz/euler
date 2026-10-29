@@ -72,6 +72,10 @@ impl EventKind {
     /// from which tail event. Makes resumed lifetimes auditable in provenance.
     pub const SESSION_RESUMED: &'static str = "session.resumed";
     pub const SESSION_RENAMED: &'static str = "session.renamed";
+    /// The session switched execution profiles between turns (ADR 0026).
+    /// Carries the new `execution_profile` record; the latest one governs
+    /// the next resume's comparison.
+    pub const SESSION_PROFILE_CHANGED: &'static str = "session.profile_changed";
     pub const SESSION_SUMMARY: &'static str = "session.summary";
     /// Starts one product-level user run. The run identity lives on the
     /// envelope's `run` field; the payload records only how it was admitted.
@@ -148,6 +152,7 @@ impl EventKind {
         Self::SESSION_START,
         Self::SESSION_RESUMED,
         Self::SESSION_RENAMED,
+        Self::SESSION_PROFILE_CHANGED,
         Self::SESSION_SUMMARY,
         Self::RUN_STARTED,
         Self::RUN_TERMINAL,
@@ -532,6 +537,13 @@ mod tests {
             object([("name", "research branch".into())]),
         );
         assert_round_trip(
+            EventKind::SESSION_PROFILE_CHANGED,
+            object([(
+                "execution_profile",
+                object([("name", "full".into())]).into(),
+            )]),
+        );
+        assert_round_trip(
             EventKind::SESSION_SUMMARY,
             object([("summary", "done".into())]),
         );
@@ -650,6 +662,7 @@ mod tests {
             EventKind::SESSION_START,
             EventKind::SESSION_RESUMED,
             EventKind::SESSION_RENAMED,
+            EventKind::SESSION_PROFILE_CHANGED,
             EventKind::SESSION_SUMMARY,
             EventKind::RUN_STARTED,
             EventKind::RUN_TERMINAL,
@@ -1187,6 +1200,7 @@ mod tests {
             }
             EventKind::SESSION_START => vec!["provider", "model"],
             EventKind::SESSION_RENAMED => vec!["name"],
+            EventKind::SESSION_PROFILE_CHANGED => vec!["execution_profile"],
             EventKind::RUN_STARTED => vec!["trigger"],
             EventKind::RUN_TERMINAL => vec!["status"],
             EventKind::QUEUE_ENQUEUED => vec!["queue_id", "mode", "position", "content"],
