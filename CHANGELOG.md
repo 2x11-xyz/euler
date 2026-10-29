@@ -129,8 +129,6 @@ pull requests that landed them; deeper design rationale lives in
   accept paths outside the workspace, recorded but not covered by
   `/rollback` (an absolute path to a workspace file is checkpointed as
   usual); and background jobs keep running and are listed at exit.
-- `defaults.subagent` naming a profile is not applied yet; startup warns
-  that child agents run under the session's profile.
 - **Under every profile:** `write_file`, `edit_file`, and `apply_patch` on
   interpreter-honored configuration (`.git/...`, `.gitconfig`,
   `.config/git/config`, `.npmrc`, shell startup files,

@@ -384,10 +384,12 @@ is not tracked.
   a field looser than the session's takes the session's value, so a child
   never runs looser than its parent. Unset or `inherit` is the session's
   profile. The child keeps the session's `reviewer`, since its asks go to
-  the session's reviewer. A child whose profile differs from the session's
-  gets its own boundary, structured-write scope, and escalation; jobs its
-  sandboxed or escalated commands leave running end when the child ends,
-  and host background jobs it starts are listed at exit with the session's.
+  the session's reviewer. A child with capabilities whose profile differs
+  from the session's gets its own boundary, structured-write scope, and
+  escalation; jobs its sandboxed or escalated commands leave running end
+  when the child ends, and host background jobs it starts are listed at
+  exit with the session's. A child without capabilities (the guardian, the
+  observer) runs no tool and shares the session's registry.
   A `defaults.subagent` this host cannot enforce is a startup error naming
   the setting. `agent.spawn` records the child's `execution_profile`.
 - **First run.** An interactive launch without `--profile` whose

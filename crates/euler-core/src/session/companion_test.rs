@@ -186,6 +186,89 @@ fn companion_spawn_with_an_unenforceable_child_profile_records_nothing() {
         .any(|event| event.kind.as_str() == EventKind::AGENT_SPAWN));
 }
 
+/// The guardian and observer carry no capabilities: they share the session's
+/// registry, so no child sandbox is built or probed for them.
+#[test]
+fn companion_without_capabilities_shares_the_session_registry() {
+    let unenforceable = ExecutionProfile {
+        name: "data".to_owned(),
+        fields: crate::execution_profile::ProfileFields {
+            writable_paths: vec!["/nonexistent/euler-child-path".to_owned()],
+            ..crate::ProfilesConfig::default()
+                .resolve(Some("workspace"), crate::ProfileContext::Interactive, None)
+                .expect("workspace")
+                .fields
+        },
+    };
+    let (_temp, mut session) =
+        full_session_with_subagent_default(Some(unenforceable), child_shell_call());
+
+    session
+        .spawn_companion(task_with_caps([]))
+        .expect("tool-free companion");
+
+    let spawn = only_event(session.events(), EventKind::AGENT_SPAWN);
+    assert_eq!(spawn.payload["execution_profile"]["name"], json!("data"));
+    // The child's scripted `run_shell` call does not run.
+    assert!(!tool_results(session.events())
+        .iter()
+        .any(|result| result.payload["ok"] == json!(true)));
+}
+
+/// A child with a host registry of its own hands the background jobs it
+/// leaves running to the session, which lists them at exit.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn companion_hands_its_host_background_jobs_to_the_session() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let writer = ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer");
+    let mut config = SessionConfig::new(temp.path());
+    let full = crate::ProfilesConfig::default()
+        .resolve(Some("full"), crate::ProfileContext::Interactive, None)
+        .expect("full");
+    let mut full_ask = full.clone();
+    full_ask.name = "full-ask".to_owned();
+    full_ask.fields.approvals = crate::execution_profile::ApprovalsSetting::Always;
+    config.set_execution_profile(full);
+    config.subagent_profile = Some(full_ask);
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![ToolCall {
+            id: "call-job".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({"command": "sleep 30 > /dev/null 2>&1 &"}),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let mut session = Session::new(
+        config,
+        provider,
+        ScriptedDecider::new(vec![DeciderVerdict::Allow]),
+    )
+    .with_provenance(writer);
+    session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
+
+    session
+        .spawn_companion(task_with_caps([Capability::ShellExec]))
+        .expect("companion");
+
+    let jobs = session.running_background_jobs();
+    for job in &jobs {
+        let group: i32 = job
+            .strip_prefix("process group ")
+            .and_then(|rest| rest.split(':').next())
+            .and_then(|group| group.parse().ok())
+            .expect("group id");
+        // SAFETY: the session's registry still holds the unreaped leader
+        // that pins this group id.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    }
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    let result = only_event(session.events(), EventKind::TOOL_RESULT);
+    assert_eq!(result.payload["ok"], json!(true), "{:?}", result.payload);
+}
+
 #[test]
 fn companion_batched_tool_calls_replay_as_calls_then_outputs() {
     let requests = Arc::new(Mutex::new(Vec::new()));

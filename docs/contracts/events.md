@@ -1134,7 +1134,8 @@ extension error does not consume the later result.
   the session's profile, or `defaults.subagent` tightened field by field to
   be no looser than it, with the session's `reviewer` (`name` stays the
   `defaults.subagent` profile's; `fields` are what the child got). Recorded
-  only; spawns written before the field existed and background agents carry
+  only; spawns written before the field existed and spawns that run no live
+  child in this process (background agents and `agent-record` records) carry
   none.
 - `agent.message`: `from_agent_id`, `to_agent_id`, `spawn_event_id`,
   `queued_ts`, `payload`. This is a parent-drained child-to-parent report from

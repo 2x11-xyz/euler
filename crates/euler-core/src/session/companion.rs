@@ -181,7 +181,13 @@ impl<D: PermissionDecider> Session<D> {
             .cloned()
             .ok_or(SessionError::CompanionProvenanceUnavailable)?;
         let profile = self.config.child_execution_profile();
-        let child_tools = self.child_tool_registry(&profile)?;
+        // A child without capabilities (the guardian, the observer) runs no
+        // tool, so it shares the session's registry, like parallel reviewers.
+        let child_tools = if task.capabilities().is_empty() {
+            None
+        } else {
+            self.child_tool_registry(&profile)?
+        };
         self.persist_new_events()?;
 
         let mut spawned = self.record_companion_spawn(&task, &target, &profile, &writer)?;
