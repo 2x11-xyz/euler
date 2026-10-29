@@ -974,6 +974,28 @@ pub fn parse_command(input: &str) -> Result<ParsedCommand<'_>, String> {
     })
 }
 
+/// Whether `input` starts with a slash command the user can run here: a
+/// built-in, an extension slash command, or a skill in this session's
+/// catalog. Composer submission runs such a line as a command whether it was
+/// typed or pasted, while a line like `/tmp/foo is broken` stays a message.
+pub fn is_known_command(input: &str, context: &CommandContext) -> bool {
+    let Ok(parsed) = parse_command(input) else {
+        return false;
+    };
+    let token = parsed.token;
+    command_table().iter().any(|spec| spec.token == token)
+        || context
+            .extension_slash_commands
+            .iter()
+            .any(|command| command.token == token)
+        || token.strip_prefix("/skill:").is_some_and(|name| {
+            context
+                .skill_commands
+                .iter()
+                .any(|skill| skill.name == name)
+        })
+}
+
 pub fn dispatch_command(input: &str, context: &CommandContext) -> CommandEffect {
     match parse_command(input) {
         Ok(parsed) => dispatch_parsed(parsed, context),
@@ -1788,6 +1810,43 @@ mod tests {
             substring.iter().map(|spec| spec.token).collect::<Vec<_>>(),
             vec!["/model"]
         );
+    }
+
+    #[test]
+    fn is_known_command_accepts_built_in_extension_and_skill_tokens_only() {
+        let context = CommandContext {
+            skill_commands: vec![SkillCatalogEntry {
+                name: "review".to_owned(),
+                description: "Review a change carefully.".to_owned(),
+            }],
+            extension_slash_commands: vec![ExtensionSlashCommand {
+                token: "/summarize".to_owned(),
+                summary: "note-taker · summarize".to_owned(),
+                extension_id: "note-taker".to_owned(),
+                command: "summarize".to_owned(),
+                enabled: true,
+                required_model_targets: None,
+            }],
+            ..CommandContext::default()
+        };
+
+        for known in [
+            "/profile",
+            "  /profile locked",
+            "/summarize --all",
+            "/skill:review focus on safety",
+        ] {
+            assert!(is_known_command(known, &context), "{known:?}");
+        }
+        for unknown in [
+            "/tmp/foo is broken",
+            "/skill:missing",
+            "/Profile",
+            "profile",
+            "/",
+        ] {
+            assert!(!is_known_command(unknown, &context), "{unknown:?}");
+        }
     }
 
     #[test]

@@ -6,6 +6,14 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### TUI: pasted slash commands run as commands
+
+- A one-line composer draft that starts with a known slash command now runs
+  as that command when submitted, whether it was typed or pasted. Before, a
+  pasted `/profile` followed by Enter went to the model as a chat message.
+  Multi-line drafts and lines whose first token is not a known command (for
+  example `/tmp/foo is broken`) still submit as messages.
+
 ### Execution profiles: headless default (ADR 0026 step 7)
 
 - **Behavior change**: `euler exec` now runs under the `workspace` profile

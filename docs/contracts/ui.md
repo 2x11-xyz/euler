@@ -336,6 +336,17 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   without starting a turn. Transcript and composer history show the compact
   literal command. The exact expanded model input remains inspectable in the
   event's `model_content` and provenance blob when externalized.
+- Command lines in the composer: submitting a draft that is exactly one line
+  (surrounding whitespace ignored) whose first token is a known slash command
+  (a built-in, an extension slash command, or a `/skill:<name>` in the
+  session catalog) runs it through the same dispatch as the palette, whether
+  it was typed or pasted. It is never sent as a plain chat message; a
+  `/skill:` line activates the skill as described above. A
+  command that runs clears the draft; a command error (usage, unavailable)
+  shows a notice and keeps the draft for fixing. Multi-line drafts and lines
+  whose first token is not a known command (`/tmp/foo is broken`) submit as
+  messages. While a recalled queue item or recovery draft is being edited,
+  submission replaces that item as before.
 - Footer: **one** line below the composer — two hard-edged clusters:
   contextual hints then `cwd (branch)` flush-left; `model · ctx N%` with an
   optional `· $N.NNN` (plus the session name once named) flush-right. The cost
