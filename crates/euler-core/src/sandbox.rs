@@ -631,8 +631,10 @@ impl WorkspaceSandbox {
     /// description, chosen by the probed launcher and profile rather than the
     /// platform. The write and temporary-file facts restate each launcher's
     /// mounts (`bwrap_command`) or profile (`seatbelt_profile.sbpl`) for one
-    /// profile, so a new profile must state its own.
-    pub(crate) fn model_boundary(&self) -> String {
+    /// profile, so a new profile must state its own. With `escalation`, the
+    /// last sentence points at `run_shell`'s `escalate` object instead of
+    /// handing the command to the user.
+    pub(crate) fn model_boundary(&self, escalation: bool) -> String {
         let (SandboxAvailability::Enforced, Some(launcher)) = (self.availability, &self.launcher)
         else {
             return "Euler's sandbox could not start in this session, so commands are refused; \
@@ -689,10 +691,15 @@ must redirect their output; {jobs}"
                 )
             }
         };
+        let blocked = if escalation {
+            "set escalate with a reason to run that one command outside the sandbox, after the \
+user approves"
+        } else {
+            "report it as a sandbox limit and give the user the exact command to run outside Euler"
+        };
         format!(
             "Commands, including git, run in Euler's {} sandbox: {network}; {writes}. If the \
-sandbox blocks something the task needs, report it as a sandbox limit and give the user the \
-exact command to run outside Euler.",
+sandbox blocks something the task needs, {blocked}.",
             launcher.backend().as_str()
         )
     }

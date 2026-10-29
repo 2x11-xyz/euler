@@ -244,7 +244,9 @@ pub(crate) fn adjudicates_verbatim(request: &PermissionRequest) -> bool {
     if request
         .command
         .as_deref()
-        .is_some_and(|command| command.len() > MAX_TASK_FIELD_BYTES)
+        .into_iter()
+        .chain(request.escalation.as_deref())
+        .any(|field| field.len() > MAX_TASK_FIELD_BYTES)
     {
         return false;
     }
@@ -287,6 +289,15 @@ fn guardian_task_text(request: &PermissionRequest) -> String {
         text.push_str(&format!(
             "path: {}\n",
             bounded_text(&path.to_string_lossy(), MAX_TASK_FIELD_BYTES)
+        ));
+    }
+    if let Some(reason) = request.escalation.as_deref() {
+        // ADR 0026 section 7: an escalation is an ordinary ask, but the
+        // reviewer must know the command leaves the sandbox.
+        text.push_str(&format!(
+            "escalation: runs on the host outside the sandbox, with the user's own HOME and \
+network; the agent's stated reason: {}\n",
+            bounded_text(reason, MAX_TASK_FIELD_BYTES)
         ));
     }
     text.push_str("Review the session transcript above as evidence and return your verdict JSON.");
@@ -579,6 +590,27 @@ mod tests {
         assert!(task.task().contains("capability: shell-exec"));
         assert!(task.task().contains("command: rm -rf /tmp/scratch"));
         assert!(task.system_prompt().expect("prompt").contains("guardian"));
+    }
+
+    /// ADR 0026 section 7: an escalation reaches the guardian as an ordinary
+    /// ask whose brief says the command leaves the sandbox and why, and an
+    /// overlong reason goes to a person instead.
+    #[test]
+    fn guardian_brief_names_an_escalation_and_its_reason() {
+        let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_escalation("gh needs the user's login")
+            .with_command("gh pr list");
+        assert!(adjudicates_verbatim(&request));
+        let task = guardian_task(&request).expect("task");
+        assert!(task.task().contains(
+            "escalation: runs on the host outside the sandbox, with the user's own HOME and \
+network; the agent's stated reason: gh needs the user's login"
+        ));
+
+        let overlong = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_escalation("x".repeat(MAX_TASK_FIELD_BYTES + 1))
+            .with_command("gh pr list");
+        assert!(!adjudicates_verbatim(&overlong));
     }
 
     #[test]

@@ -89,4 +89,8 @@ impl PermissionDecider for SubagentDecider {
         // or blocking on an impossible prompt.
         DeciderVerdict::Deny
     }
+
+    fn never_prompts(&self) -> bool {
+        true
+    }
 }

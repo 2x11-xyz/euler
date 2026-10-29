@@ -6,6 +6,29 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: escalation (ADR 0026 step 6)
+
+- **`workspace` allows escalation**: `run_shell` gains an optional
+  `escalate: {"reason": ...}` that runs one command on the host, outside the
+  sandbox, with the user's own `HOME`, after the user approves. The result
+  records `sandbox_backend: "host"`, `escalated: true`, and the reason.
+  Escalated commands see the same environment as `full`: yours, except
+  Euler's own credentials and control variables.
+- **New prompt**: each escalation asks, offering allow once or allow the
+  same first token outside the sandbox for the session. No session grant is
+  offered for shells, interpreters, wrappers, task runners, local installs,
+  or `git`, `cargo`, `go`, and container commands told to run another
+  program, and escalation grants never cover sandboxed commands or the
+  reverse. Under `reviewer: guardian` escalations go to the guardian.
+- `escalate` under a profile without escalation (`locked`, `full`) is a
+  tool error naming the profile, before any prompt. `escalation` is now
+  enforceable with either sandbox boundary, so a user profile extending
+  `workspace` with `approvals: "never"` now fails at load (escalation
+  with `never` would make the sandbox advisory) instead of at enforcement.
+- Headless `euler exec` denials of an ask now name the execution profile
+  and what would allow it instead of "denied by the user" (for an
+  escalation, a profile with `credentials: "pass"`).
+
 ### Execution profiles: the `full` preset (ADR 0026 step 4)
 
 - **Behavior change: `full` is the built-in interactive default.** Commands
@@ -55,8 +78,7 @@ pull requests that landed them; deeper design rationale lives in
   workspace, `HOME`, `/tmp`, and `TMPDIR` (not the SSH agent or Docker).
   With an enforced sandbox backend, `run_shell`, `git_*`, and workspace
   writes run without a prompt; dangerous commands and sensitive paths still
-  ask. Escalation is not available yet. The built-in headless default stays
-  `locked`.
+  ask. The built-in headless default stays `locked`.
 - A user profile extending `workspace` can add existing `writable_paths`
   and set `credentials: "pass"` to hand secret-shaped variables, the SSH
   agent, and the named credential stores to sandboxed commands, for

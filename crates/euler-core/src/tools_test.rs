@@ -1142,6 +1142,48 @@ fn non_apply_patch_shell_commands_still_execute_normally() {
     );
 }
 
+/// ADR 0026 resolved question 7: an escalated command gets the environment a
+/// `full` host command gets. Secret-shaped variables that are not Euler's own
+/// (`GH_TOKEN`, cloud keys) pass through for credentialed CLIs; Euler's own
+/// credentials and parent controls do not.
+#[test]
+fn an_escalated_run_shell_gets_the_full_host_environment() {
+    let _guard = ENV_LOCK.lock().expect("env lock");
+    let workspace = tempfile::tempdir().expect("workspace");
+    let _env_restore = EnvRestore::capture(&[
+        "EULER_ESCALATION_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "EULER_ESCALATION_PROVIDER_KEY",
+        "EULER_PROVIDER",
+    ]);
+    env::set_var("EULER_ESCALATION_TOKEN", "cli-token");
+    env::set_var("ANTHROPIC_API_KEY", "anthropic-secret");
+    env::set_var("EULER_ESCALATION_PROVIDER_KEY", "provider-secret");
+    env::set_var("EULER_PROVIDER", "parent-provider");
+    let mut registry = ToolRegistry::new(workspace.path());
+    registry.set_execution_profile(
+        &crate::ProfilesConfig::default()
+            .resolve(Some("workspace"), crate::ProfileContext::Headless, None)
+            .expect("workspace ships"),
+    );
+    registry
+        .euler_credentials()
+        .add_variable("EULER_ESCALATION_PROVIDER_KEY");
+
+    let execution = registry
+        .execute(
+            "run_shell",
+            &json!({
+                "command": "printf '%s|%s|%s|%s' \"$EULER_ESCALATION_TOKEN\" \"$ANTHROPIC_API_KEY\" \"$EULER_ESCALATION_PROVIDER_KEY\" \"$EULER_PROVIDER\"",
+                "escalate": {"reason": "the CLI reads its token from the environment"}
+            }),
+        )
+        .expect("escalated shell");
+
+    assert_eq!(execution.sandbox_backend, Some(SandboxBackend::Host));
+    assert_eq!(execution.output, "exit 0\ncli-token|||");
+}
+
 #[test]
 fn run_shell_on_the_host_withholds_only_euler_credentials_and_controls() {
     let _guard = ENV_LOCK.lock().expect("env lock");

@@ -704,6 +704,17 @@ command safety, or a once-only request. Arrow navigation moves between those
 two rows. The `a`, `p`, and `u` keys decide nothing on such a panel; with an
 empty draft they type into the composer like any other character.
 
+A `run_shell` escalation (ADR 0026) is titled `Run command outside the
+sandbox?` and adds a muted line saying the command runs on the host with the
+user's `HOME` and network, followed by the model's reason. Its choices are
+`y  Allow once`, `a  Allow <token> * outside the sandbox for this session`
+when the gate would install that grant, and deny; project and durable-user
+choices are absent and the `p` and `u` keys type into the composer. When no
+session grant is offered (a shell, interpreter, wrapper, task runner, local
+install, or more than one program), the panel shows allow once and deny with
+a muted line saying a grant covers one program that runs no other code. The
+line-mode prompt names the command and the reason.
+
 An extension command with several uncovered static capabilities renders one
 operation panel that names the command and lists every requested capability.
 Its choices are allow once, allow every listed capability for this session, or

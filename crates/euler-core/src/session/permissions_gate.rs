@@ -71,10 +71,7 @@ impl<D: PermissionDecider> Session<D> {
         let prompt_id = if needs_prompt {
             let prompt_id = self.emit(
                 EventKind::PERMISSION_PROMPT,
-                object([
-                    ("capability", capability.as_str().into()),
-                    ("reason", request.reason.clone().into()),
-                ]),
+                permission_prompt_payload(request),
             )?;
             sink.flush(self.bus.events());
             Some(prompt_id)
@@ -86,10 +83,10 @@ impl<D: PermissionDecider> Session<D> {
         // field) never consults the guardian — adjudicating a command it
         // cannot see exactly would judge a lie (ADR 0011 amendment, security
         // review F3). The ask goes to the human decider below instead.
-        if needs_prompt
+        let guardian_consulted = needs_prompt
             && self.config.permission_reviewer == PermissionReviewer::Guardian
-            && guardian::adjudicates_verbatim(request)
-        {
+            && guardian::adjudicates_verbatim(request);
+        if guardian_consulted {
             if let Some(ruling) = self.guardian_permission_ruling(
                 request,
                 &decision_parent,
@@ -127,15 +124,23 @@ impl<D: PermissionDecider> Session<D> {
             Ok(PermissionRuling::Allowed)
         } else {
             turn_state.record_denial(capability);
-            Ok(PermissionRuling::Denied {
-                message: format!(
+            let message = if needs_prompt && self.permissions.decider_mut().never_prompts() {
+                never_prompt_denial(
+                    &self.config.execution_profile.name,
+                    request,
+                    self.config.permission_reviewer,
+                    guardian_consulted,
+                )
+            } else {
+                format!(
                     "permission denied by the user; {} is denied for \
                      the rest of this turn — do not retry {} commands; \
                      use a different tool or ask the user",
                     capability.as_str(),
                     capability.as_str()
-                ),
-            })
+                )
+            };
+            Ok(PermissionRuling::Denied { message })
         }
     }
 
@@ -231,6 +236,68 @@ impl<D: PermissionDecider> Session<D> {
     }
 }
 
+/// `permission.prompt` payload for one request. An escalation is marked so
+/// the ledger can tell a host command from a sandboxed one; the reason is
+/// on the `tool.call` input.
+pub(crate) fn permission_prompt_payload(request: &PermissionRequest) -> JsonObject {
+    let mut payload = object([
+        ("capability", request.capability.as_str().into()),
+        ("reason", request.reason.clone().into()),
+    ]);
+    if request.escalation.is_some() {
+        payload.insert("escalated".to_owned(), true.into());
+    }
+    payload
+}
+
+/// The tool error for an ask a never-prompt decider denied (ADR 0026
+/// section 7): it names the execution profile and what would allow the
+/// request, instead of blaming a user nobody asked. No profile runs an
+/// escalation without asking, so for one it names the sandboxed alternative
+/// ADR 0026 section 3 gives: a profile with `credentials: "pass"`.
+fn never_prompt_denial(
+    profile: &str,
+    request: &PermissionRequest,
+    reviewer: PermissionReviewer,
+    guardian_consulted: bool,
+) -> String {
+    let capability = request.capability.as_str();
+    if request.dangerous_command {
+        return format!(
+            "permission denied: this run cannot ask anyone, and command safety flags this \
+             command as dangerous, which only a person can approve under any profile \
+             (execution profile `{profile}`). Do not retry it; use a command that does not \
+             destroy data, or leave it for an interactive session"
+        );
+    }
+    let (what, alternative) = if request.escalation.is_some() {
+        (
+            "running a command outside the sandbox".to_owned(),
+            "use a profile with credentials \"pass\" so the command can run inside the \
+             sandbox, or run it in an interactive session",
+        )
+    } else {
+        (
+            format!("this {capability} request"),
+            "pass --profile with a profile that allows it, or run it in an interactive session",
+        )
+    };
+    let allow = match reviewer {
+        PermissionReviewer::Guardian if guardian_consulted => {
+            format!("the guardian abstained; {alternative}")
+        }
+        PermissionReviewer::Guardian => format!("the guardian could not review it; {alternative}"),
+        PermissionReviewer::User => format!(
+            "pass --permission-reviewer guardian to have such requests reviewed, or \
+             {alternative}"
+        ),
+    };
+    format!(
+        "permission denied: this run cannot ask anyone, and execution profile `{profile}` asks \
+         before {what}; {allow}. Do not retry {capability} commands this turn"
+    )
+}
+
 pub(crate) fn approval_mode_str(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Ask => "ask",
@@ -258,6 +325,15 @@ pub(crate) fn permission_request_for_tool(
         PermissionRequest::new(capability, reason.to_owned()).with_workspace_root(tools.root());
     match tool_name {
         "run_shell" => {
+            // A refused `escalate` still marks the request an escalation, so
+            // a caller that skipped the dispatch check fails closed: the gate
+            // denies it under a profile without escalation, and no sandboxed
+            // grant or static safety covers it.
+            match tools.requested_escalation(tool_name, input) {
+                Ok(Some(reason)) => request = request.with_escalation(reason),
+                Ok(None) => {}
+                Err(_) => request = request.with_escalation(String::new()),
+            }
             if let Some(command) = input.get("command").and_then(Value::as_str) {
                 request = request.with_command(command);
                 // Read from the full command, as the danger walk is; the
@@ -387,4 +463,48 @@ pub(crate) fn permission_decision_payload(
         }
     }
     payload
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn escalated(command: &str) -> PermissionRequest {
+        PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_escalation("needs the host")
+            .with_command(command)
+    }
+
+    /// ADR 0026 section 3: no profile runs an escalation unasked, so the
+    /// denial names a profile with `credentials: "pass"` instead, and says
+    /// the guardian abstained only when it was consulted.
+    #[test]
+    fn never_prompt_denial_names_the_sandboxed_alternative_for_an_escalation() {
+        let request = escalated("gh pr list");
+        let user = never_prompt_denial("workspace", &request, PermissionReviewer::User, false);
+        assert!(user.contains("--permission-reviewer guardian"), "{user}");
+        assert!(user.contains("credentials \"pass\""), "{user}");
+        assert!(!user.contains("--profile with"), "{user}");
+
+        let abstained =
+            never_prompt_denial("workspace", &request, PermissionReviewer::Guardian, true);
+        assert!(abstained.contains("the guardian abstained"), "{abstained}");
+        assert!(abstained.contains("credentials \"pass\""), "{abstained}");
+
+        let not_consulted =
+            never_prompt_denial("workspace", &request, PermissionReviewer::Guardian, false);
+        assert!(
+            not_consulted.contains("the guardian could not review it"),
+            "{not_consulted}"
+        );
+        assert!(!not_consulted.contains("abstained"), "{not_consulted}");
+
+        let sandboxed = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("gh pr list");
+        let other = never_prompt_denial("workspace", &sandboxed, PermissionReviewer::User, false);
+        assert!(
+            other.contains("--profile with a profile that allows it"),
+            "{other}"
+        );
+    }
 }

@@ -75,6 +75,18 @@ impl<D: PermissionDecider> Session<D> {
                 cancellation,
             );
         }
+        if let Err(error) = self.tools.requested_escalation(&call.name, &call.input) {
+            // Refused before any prompt: `escalate` under a profile that
+            // does not allow it, or a malformed one, is a tool error.
+            self.emit_failed_tool_result(
+                call.id,
+                call.name,
+                error.to_string(),
+                tool_call_event_id,
+                Instant::now(),
+            )?;
+            return Ok(());
+        }
         let mut covered_grant_source: Option<crate::GrantSource> = None;
         let mut static_safe = false;
         if let Some(capability) = self
@@ -128,8 +140,11 @@ impl<D: PermissionDecider> Session<D> {
             // analyzed: the bounded prefix could parse as safe while
             // `sh -c` runs the full string (security review, #66 class) —
             // decomposing a truncated command is decomposing a lie.
+            // An escalation runs on the host, so static safety, which reasons
+            // about the sandboxed run, never skips its ask.
             static_safe = mode == ApprovalMode::Ask
                 && capability == Capability::ShellExec
+                && request.escalation.is_none()
                 && !dangerous_command
                 && !request.command_truncated
                 && request.command.as_deref().is_some_and(|command| {
@@ -488,6 +503,13 @@ pub(crate) fn tool_result_payload(
     if let Some(backend) = execution.sandbox_backend {
         payload.insert("sandbox_backend".to_owned(), backend.as_str().into());
     }
+    if let Some(reason) = &execution.escalation_reason {
+        payload.insert("escalated".to_owned(), true.into());
+        payload.insert(
+            "escalation_reason".to_owned(),
+            redactor.redact(reason).into(),
+        );
+    }
     if let Some(exit_code) = execution.exit_code {
         payload.insert("exit_code".to_owned(), exit_code.into());
     }
@@ -733,6 +755,7 @@ mod sandbox_backend_tests {
             output_preview_budget: None,
             project_context_snapshot_digest: None,
             sandbox_backend: backend,
+            escalation_reason: None,
             exit_code: Some(0),
             patch: None,
             file_changes: Vec::new(),

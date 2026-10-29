@@ -7334,6 +7334,161 @@ fn the_workspace_profile_asks_for_commands_without_an_enforced_backend() {
     assert!(!temp.path().join("notes.txt").exists());
 }
 
+fn escalated_shell_turn(command: &str) -> ScriptedProvider {
+    ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![euler_provider::ToolCall {
+            id: "call-host".to_owned(),
+            name: "run_shell".to_owned(),
+            input: json!({
+                "command": command,
+                "escalate": {"reason": "needs the user's own HOME"}
+            }),
+        }]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ])
+}
+
+fn tool_result_for<'a>(session_events: &'a [EventEnvelope], id: &str) -> &'a EventEnvelope {
+    events_of_kind(session_events, EventKind::TOOL_RESULT)
+        .into_iter()
+        .find(|result| result.payload["id"] == json!(id))
+        .expect("tool result")
+}
+
+/// ADR 0026 section 3: under `workspace` an approved escalation runs its one
+/// command on the host with the user's own HOME, after a prompt marked as an
+/// escalation, and the result records the host backend and the reason.
+#[test]
+fn an_approved_escalation_runs_on_the_host_and_is_recorded() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = std::env::var("HOME").expect("HOME");
+    let mut session = Session::new(
+        workspace_profile_config(temp.path()),
+        escalated_shell_turn("printf '%s' \"$HOME\""),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+    let run_shell = session
+        .tools
+        .model_tools()
+        .into_iter()
+        .find(|tool| tool.name == "run_shell")
+        .expect("run_shell");
+    assert!(run_shell.parameters["properties"]["escalate"].is_object());
+
+    session.run_turn("work").expect("turn");
+
+    let prompts = events_of_kind(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].payload["escalated"], json!(true));
+    let result = tool_result_for(session.events(), "call-host");
+    assert_eq!(result.payload["ok"], json!(true), "{:?}", result.payload);
+    assert_eq!(result.payload["sandbox_backend"], json!("host"));
+    assert_eq!(result.payload["escalated"], json!(true));
+    assert_eq!(
+        result.payload["escalation_reason"],
+        json!("needs the user's own HOME")
+    );
+    assert!(result.payload["output"]
+        .as_str()
+        .expect("output")
+        .ends_with(&home));
+}
+
+/// Static safety reasons about the sandboxed run, so a statically safe
+/// command such as `ls` still asks when it is escalated to the host.
+#[test]
+fn a_statically_safe_escalation_still_asks() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut session = Session::new(
+        workspace_profile_config(temp.path()),
+        escalated_shell_turn("ls"),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+
+    session.run_turn("work").expect("turn");
+
+    let prompts = events_of_kind(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].payload["escalated"], json!(true));
+    assert!(
+        !events_of_kind(session.events(), EventKind::PERMISSION_DECISION)
+            .iter()
+            .any(|decision| decision.payload["mode"] == json!("static-safe"))
+    );
+}
+
+/// `escalate` under a profile without escalation (`locked`) is a tool error
+/// naming the profile, before any prompt, and the command does not run.
+#[test]
+fn escalate_is_refused_before_any_prompt_under_a_profile_without_escalation() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        escalated_shell_turn("touch ran.txt"),
+        ScriptedDecider::new(vec![crate::permissions::DeciderVerdict::Allow]),
+    );
+    let run_shell = session
+        .tools
+        .model_tools()
+        .into_iter()
+        .find(|tool| tool.name == "run_shell")
+        .expect("run_shell");
+    assert!(run_shell.parameters["properties"].get("escalate").is_none());
+
+    session.run_turn("work").expect("turn");
+
+    assert!(events_of_kind(session.events(), EventKind::PERMISSION_PROMPT).is_empty());
+    let result = tool_result_for(session.events(), "call-host");
+    assert_eq!(result.payload["ok"], json!(false));
+    assert!(result.payload["error"]
+        .as_str()
+        .expect("error")
+        .contains("escalate is not available under execution profile `locked`"));
+    assert!(!temp.path().join("ran.txt").exists());
+}
+
+#[derive(Debug)]
+struct NeverPromptDecider;
+
+impl crate::permissions::PermissionDecider for NeverPromptDecider {
+    fn decide(
+        &mut self,
+        _request: &crate::permissions::PermissionRequest,
+    ) -> crate::permissions::DeciderVerdict {
+        crate::permissions::DeciderVerdict::Deny
+    }
+
+    fn never_prompts(&self) -> bool {
+        true
+    }
+}
+
+/// ADR 0026 section 7: a never-prompt decider denies an escalation with a
+/// tool error naming the profile and the flag that would allow it.
+#[test]
+fn a_never_prompt_denial_names_the_profile_and_the_flag() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut session = Session::new(
+        workspace_profile_config(temp.path()),
+        escalated_shell_turn("touch ran.txt"),
+        NeverPromptDecider,
+    );
+
+    session.run_turn("work").expect("turn");
+
+    let result = tool_result_for(session.events(), "call-host");
+    let error = result.payload["error"].as_str().expect("error");
+    assert!(
+        error.contains(
+            "execution profile `workspace` asks before running a command outside the sandbox"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("--permission-reviewer guardian"), "{error}");
+    assert!(!error.contains("by the user"), "{error}");
+    assert!(!temp.path().join("ran.txt").exists());
+}
+
 #[test]
 fn sensitive_basename_read_denial_blocks_the_tool() {
     let temp = tempfile::tempdir().expect("temp dir");

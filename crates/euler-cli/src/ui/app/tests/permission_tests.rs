@@ -733,6 +733,72 @@ fn grantless_ask_enter_on_hidden_grant_row_allows_once() {
     }
 }
 
+fn escalation_request(command: &str) -> PermissionRequest {
+    PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
+        .with_escalation("gh needs the user's login")
+        .with_command(command)
+}
+
+/// ADR 0026 section 3: an escalation panel names the host run and its
+/// reason and offers allow once, a session grant for the first token, and
+/// deny: no project or durable rule (resolved question 8).
+#[test]
+fn escalation_ask_offers_once_session_and_deny_only() {
+    let mut terminal = Terminal::new(VT100Backend::new(110, 24)).expect("terminal");
+    let mut panel = grantless_panel(&escalation_request("gh pr list"));
+    terminal.draw(|frame| panel.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    for present in [
+        "Run command outside the sandbox?",
+        "reason: gh needs the user's login",
+        "y  Allow once",
+        "a  Allow gh * outside the sandbox for this session",
+        "n/esc  Deny with instructions",
+    ] {
+        assert!(contents.contains(present), "{present}: {contents}");
+    }
+    for absent in ["p  Allow", "u  Allow"] {
+        assert!(!contents.contains(absent), "{absent}: {contents}");
+    }
+
+    for letter in ['p', 'u'] {
+        let mut typed = grantless_panel(&escalation_request("gh pr list"));
+        let (reply_tx, reply_rx) = mpsc::channel();
+        typed.reply_tx = reply_tx;
+        typed.handle_input(key(KeyCode::Char(letter)));
+        assert!(reply_rx.try_recv().is_err(), "{letter} must not decide");
+    }
+    let (reply_tx, reply_rx) = mpsc::channel();
+    panel.reply_tx = reply_tx;
+    panel.handle_input(key(KeyCode::Down));
+    assert_eq!(panel.approval_selection, ApprovalOption::AllowSession);
+    panel.handle_input(key(KeyCode::Down));
+    assert_eq!(panel.approval_selection, ApprovalOption::Deny);
+    panel.handle_input(key(KeyCode::Up));
+    panel.handle_input(key(KeyCode::Enter));
+    assert_eq!(
+        reply_rx.recv().expect("reply"),
+        PermissionReply::AllowSessionScope("gh".into())
+    );
+}
+
+/// An escalation of an interpreter offers no session grant at all.
+#[test]
+fn escalation_of_an_interpreter_offers_allow_once_and_deny() {
+    let mut terminal = Terminal::new(VT100Backend::new(110, 24)).expect("terminal");
+    let mut panel = grantless_panel(&escalation_request("python3 fetch.py"));
+    terminal.draw(|frame| panel.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(contents.contains("y  Allow once"), "{contents}");
+    assert!(
+        contents.contains("No session grant for this command: a grant covers one program that runs no other code."),
+        "{contents}"
+    );
+    for absent in ["a  Allow", "p  Allow", "u  Allow"] {
+        assert!(!contents.contains(absent), "{absent}: {contents}");
+    }
+}
+
 #[test]
 fn user_rule_option_renders_and_replies_when_enabled() {
     let mut terminal = Terminal::new(VT100Backend::new(80, 24)).expect("terminal");

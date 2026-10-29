@@ -1,4 +1,7 @@
-use crate::execution_profile::{profile_mode_override, ExecutionProfile, ProfileFields};
+use crate::command_safety::CommandSegment;
+use crate::execution_profile::{
+    profile_mode_override, EscalationSetting, ExecutionProfile, ProfileFields,
+};
 use crate::grants::{
     bound_command, bound_instruction, ActiveGrant, GrantList, GrantScope, ProjectGrantError,
     ProjectGrantStore, ScopePattern,
@@ -68,6 +71,13 @@ pub struct PermissionRequest {
     /// project config ask from a model tool (ADR 0022), so approval surfaces
     /// offer allow-once rather than a session or project scope.
     pub once_only: bool,
+    /// The model's stated reason when this `run_shell` request asks to run
+    /// its command on the host, outside the sandbox (ADR 0026 section 3,
+    /// `escalate`). An escalation always asks: no profile lifts it and
+    /// static safety does not skip it. Only an escalation grant
+    /// ([`Self::escalation_grant_token`]) covers it, and an escalation grant
+    /// covers nothing else.
+    pub escalation: Option<String>,
 }
 
 impl PermissionRequest {
@@ -82,7 +92,14 @@ impl PermissionRequest {
             sensitive_path: false,
             dangerous_command: false,
             once_only: false,
+            escalation: None,
         }
+    }
+
+    /// Mark the request an escalation with the model's `reason`.
+    pub fn with_escalation(mut self, reason: impl Into<String>) -> Self {
+        self.escalation = Some(reason.into());
+        self
     }
 
     /// Mark the request once-only. The flag only shapes what approval
@@ -94,10 +111,48 @@ impl PermissionRequest {
     }
 
     /// Whether an approval surface may offer a session or project grant for
-    /// this request. A danger-flagged command is covered by no grant, and a
-    /// once-only request installs none.
+    /// this request. A danger-flagged command is covered by no grant, a
+    /// once-only request installs none, and an escalation offers one only
+    /// for an eligible first token.
     pub fn offers_grants(&self) -> bool {
-        !self.dangerous_command && !self.once_only
+        !self.dangerous_command
+            && !self.once_only
+            && (self.escalation.is_none() || self.escalation_grant_token().is_some())
+    }
+
+    /// Whether an approval surface may offer a project or durable user grant.
+    /// An escalation grant lasts for the session only (ADR 0026 resolved
+    /// question 8).
+    pub fn offers_durable_grants(&self) -> bool {
+        self.offers_grants() && self.escalation.is_none()
+    }
+
+    /// The first token an escalation session grant may cover for this
+    /// request (ADR 0026 resolved question 8), derived as the session scope
+    /// of a sandboxed command is: the one token shared by every segment that
+    /// is not statically safe. `None` for a request that is not an
+    /// escalation, a flagged, truncated, or unparseable command, more than
+    /// one such token, or any segment that runs arbitrary code
+    /// ([`CommandSegment::runs_arbitrary_code`]).
+    pub fn escalation_grant_token(&self) -> Option<String> {
+        if self.escalation.is_none() || self.dangerous_command {
+            return None;
+        }
+        let segments = crate::command_safety::parse_plain_segments(self.command_for_matching()?)?;
+        if segments.iter().any(CommandSegment::runs_arbitrary_code) {
+            return None;
+        }
+        let root = self.workspace_root.as_deref();
+        let mut unsafe_tokens = segments
+            .iter()
+            .filter(|segment| !root.is_some_and(|root| segment.is_statically_safe(root)))
+            .map(CommandSegment::first_token);
+        let token = match unsafe_tokens.next() {
+            Some(first) if unsafe_tokens.all(|token| token == first) => first,
+            Some(_) => return None,
+            None => segments[0].first_token(),
+        };
+        (!token.is_empty()).then(|| token.to_owned())
     }
 
     pub fn with_workspace_root(mut self, root: impl Into<PathBuf>) -> Self {
@@ -340,6 +395,14 @@ impl GrantDecision {
 pub trait PermissionDecider {
     fn decide(&mut self, request: &PermissionRequest) -> DeciderVerdict;
 
+    /// Whether this decider denies every ask without asking anyone
+    /// (headless `exec`). Its denials then name the profile and the flag
+    /// that would allow the request instead of blaming the user (ADR 0026
+    /// section 7).
+    fn never_prompts(&self) -> bool {
+        false
+    }
+
     /// One decision for one operation whose individual capability effects are
     /// installed by [`PermissionGate`]. Existing deciders remain fail-closed
     /// for multi-capability operations until they opt in to presenting a batch.
@@ -414,6 +477,11 @@ pub struct PermissionGate<D> {
     /// user-authored in the user-owned home and never repo-controlled.
     user_grants: GrantList,
     user_store: Option<ProjectGrantStore>,
+    /// Session grants for escalated commands, keyed apart from every other
+    /// store so an escalated grant never covers the sandboxed form and the
+    /// reverse (ADR 0026 resolved question 8). Not listed or persisted;
+    /// a profile change clears them.
+    escalation_grants: GrantList,
     /// The session's execution profile fields, whose `approvals` can lift a
     /// request's mode ([`crate::execution_profile::profile_mode_override`]).
     profile: ProfileFields,
@@ -442,6 +510,7 @@ impl<D> PermissionGate<D> {
             consent_store: None,
             user_grants: GrantList::new(),
             user_store: None,
+            escalation_grants: GrantList::new(),
             profile: ExecutionProfile::default().fields,
             sandbox_enforced: false,
             decider,
@@ -457,6 +526,7 @@ impl<D> PermissionGate<D> {
             consent_store: None,
             user_grants: GrantList::new(),
             user_store: None,
+            escalation_grants: GrantList::new(),
             profile: ExecutionProfile::default().fields,
             sandbox_enforced: false,
             decider,
@@ -468,10 +538,12 @@ impl<D> PermissionGate<D> {
     }
 
     /// Install the session's execution profile fields and whether its
-    /// sandbox backend is enforced.
+    /// sandbox backend is enforced. Escalation grants end with the profile
+    /// they were granted under.
     pub fn set_execution_profile(&mut self, fields: ProfileFields, sandbox_enforced: bool) {
         self.profile = fields;
         self.sandbox_enforced = sandbox_enforced;
+        self.escalation_grants.clear();
     }
 
     pub fn execution_profile(&self) -> &ProfileFields {
@@ -511,9 +583,10 @@ impl<D> PermissionGate<D> {
 
     /// [`Self::mode_for_request`] from an already chosen `configured` mode
     /// (extension capability approval reads an unconfigured capability as
-    /// `ask`). `always-deny` wins; then a dangerous or unreadable command
-    /// asks, since under ADR 0021 decision D the danger veto holds in EVERY
-    /// mode; then the execution profile's override
+    /// `ask`). `always-deny` wins; then an escalation asks when the profile
+    /// allows escalation and is denied otherwise; then a dangerous or
+    /// unreadable command asks, since under ADR 0021 decision D the danger
+    /// veto holds in EVERY mode; then the execution profile's override
     /// ([`profile_mode_override`]); then a sensitive path never rides a
     /// blanket allow (deep review P1-b).
     pub fn effective_mode(
@@ -523,6 +596,15 @@ impl<D> PermissionGate<D> {
     ) -> ApprovalMode {
         if configured == ApprovalMode::AlwaysDeny {
             return configured;
+        }
+        // An escalation always asks, and only a profile that allows it may
+        // ask at all (ADR 0026 section 3).
+        if request.escalation.is_some() {
+            return if self.profile.escalation == EscalationSetting::Allowed {
+                ApprovalMode::Ask
+            } else {
+                ApprovalMode::AlwaysDeny
+            };
         }
         if request.dangerous_command {
             return ApprovalMode::Ask;
@@ -661,6 +743,18 @@ impl<D> PermissionGate<D> {
             return None;
         }
         let command = request.command_for_matching();
+        if request.escalation.is_some() {
+            // Only an escalation grant covers an escalation, and only for a
+            // command that could have been offered one.
+            let covered = request.escalation_grant_token().is_some()
+                && self.escalation_grants.is_granted(
+                    request.capability,
+                    command,
+                    None,
+                    request.workspace_root.as_deref(),
+                );
+            return covered.then_some(GrantSource::Session);
+        }
         let path = request.path.as_deref();
         let root = request.workspace_root.as_deref();
         if self
@@ -820,6 +914,10 @@ impl<D: PermissionDecider + ?Sized> PermissionDecider for &mut D {
         (**self).decide(request)
     }
 
+    fn never_prompts(&self) -> bool {
+        (**self).never_prompts()
+    }
+
     fn decide_batch(&mut self, batch: &PermissionRequestBatch) -> DeciderVerdict {
         (**self).decide_batch(batch)
     }
@@ -902,6 +1000,11 @@ impl<D: PermissionDecider> PermissionGate<D> {
                     return PermissionDecisionOutcome::Cancelled;
                 }
                 let decision = verdict.as_grant_decision(request.capability);
+                if request.escalation.is_some() {
+                    return PermissionDecisionOutcome::Decided(
+                        self.install_escalation_grant(request, decision),
+                    );
+                }
                 if decision.allowed() {
                     // Durable-store persist failure (project or user): still
                     // allow this once; never claim a grant that did not land.
@@ -918,6 +1021,30 @@ impl<D: PermissionDecider> PermissionGate<D> {
                 }
                 PermissionDecisionOutcome::Decided(decision)
             }
+        }
+    }
+
+    /// Install the session grant an escalation allow names when it is the
+    /// request's eligible first token. Any other allowed scope (unscoped,
+    /// another token, project, or user) is attenuated to once, so an
+    /// escalation never widens past one token for the session.
+    fn install_escalation_grant(
+        &mut self,
+        request: &PermissionRequest,
+        decision: GrantDecision,
+    ) -> GrantDecision {
+        if !decision.allowed() {
+            return decision;
+        }
+        match &decision.scope {
+            GrantScope::Session(pattern)
+                if request.escalation_grant_token().as_deref() == Some(pattern.as_str()) =>
+            {
+                self.escalation_grants
+                    .insert(ActiveGrant::new(request.capability, pattern.clone()));
+                decision
+            }
+            _ => GrantDecision::allow(request.capability, GrantScope::Once),
         }
     }
 
@@ -1601,6 +1728,191 @@ mod tests {
         );
         locked.set_mode(Capability::FsWrite, ApprovalMode::SessionAllow);
         assert_eq!(locked.mode_for_request(&secret_write), ApprovalMode::Ask);
+    }
+
+    fn workspace_fields() -> ProfileFields {
+        crate::execution_profile::ProfilesConfig::default()
+            .resolve(
+                Some("workspace"),
+                crate::execution_profile::ProfileContext::Interactive,
+                None,
+            )
+            .expect("workspace ships")
+            .fields
+    }
+
+    fn escalated(command: &str) -> PermissionRequest {
+        PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_escalation("needs the host")
+            .with_command(command)
+            .with_workspace_root(std::env::temp_dir())
+    }
+
+    /// ADR 0026 section 3: an escalation always asks under a profile that
+    /// allows it, even when the sandboxed form would run unprompted, and is
+    /// denied outright under one that does not.
+    #[test]
+    fn an_escalation_always_asks_and_only_where_the_profile_allows_it() {
+        let mut gate = PermissionGate::new(PanicDecider);
+        gate.set_execution_profile(workspace_fields(), true);
+        gate.set_mode(Capability::ShellExec, ApprovalMode::SessionAllow);
+        assert_eq!(gate.mode_for_request(&escalated("ls")), ApprovalMode::Ask);
+        let locked = PermissionGate::new(PanicDecider);
+        assert_eq!(
+            locked.mode_for_request(&escalated("gh pr list")),
+            ApprovalMode::AlwaysDeny
+        );
+    }
+
+    /// Resolved question 8: an escalation session grant covers later
+    /// escalations with the same first token, never the sandboxed form,
+    /// and a sandboxed grant never covers an escalation. A profile change
+    /// clears it.
+    #[test]
+    fn escalation_grants_are_keyed_apart_from_sandboxed_grants() {
+        let mut gate =
+            PermissionGate::new(ScriptedDecider::new(vec![DeciderVerdict::AllowScoped(
+                GrantScope::Session(ScopePattern::new("gh").expect("pattern")),
+            )]));
+        gate.set_execution_profile(workspace_fields(), true);
+        let first = escalated("gh pr list");
+        assert_eq!(first.escalation_grant_token().as_deref(), Some("gh"));
+        let decision = gate.decide_detailed(&first, ApprovalMode::Ask);
+        assert_eq!(decision.grant_scope_label(), "session");
+
+        assert_eq!(
+            gate.granted_source(&escalated("gh issue view 1")),
+            Some(GrantSource::Session)
+        );
+        let sandboxed = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
+            .with_command("gh issue view 1");
+        assert_eq!(gate.granted_source(&sandboxed), None);
+        assert!(gate.list_grants().is_empty());
+
+        gate.install_grant(
+            Capability::ShellExec,
+            GrantScope::Session(ScopePattern::new("curl").expect("pattern")),
+        )
+        .expect("install");
+        assert_eq!(gate.granted_source(&escalated("curl example.com")), None);
+
+        gate.set_execution_profile(workspace_fields(), true);
+        assert_eq!(gate.granted_source(&escalated("gh issue view 1")), None);
+    }
+
+    /// Resolved question 8: no session grant is offered or installed for a
+    /// shell, interpreter, wrapper, task runner, local install, or flagged
+    /// command; an allow at any other scope covers the one request.
+    #[test]
+    fn escalation_grants_are_never_offered_for_code_runners_or_widened() {
+        for command in [
+            "bash -c 'gh auth status'",
+            "python3 fetch.py",
+            "sudo apt-get update",
+            "env FOO=1 gh pr list",
+            "./deploy.sh",
+            "npm test",
+            "npx prettier .",
+            "uv run pytest",
+            "cargo run --release",
+            "make install",
+            "just deploy",
+            "pip install -e .",
+            "pip install ./vendored",
+            "docker run -v /:/host alpine sh",
+            "strace -f gh pr list",
+            "cargo test",
+            "git -c core.fsmonitor=./hook status",
+            "ssh build-host make",
+            "gh pr list && python3 x.py",
+            "rm -rf build",
+            // A global option before the subcommand fails closed.
+            "cargo +nightly run",
+            "cargo --config build.rustc-wrapper=./w build",
+            "cargo build --config build.rustc-wrapper=./w",
+            "cargo r",
+            "docker --context default run -v /:/h alpine",
+            "docker -H unix:///var/run/docker.sock run alpine",
+            "docker container run alpine",
+            "uv --directory . run x",
+            "go -C . run .",
+            "go build -toolexec=./w",
+            "poetry -C . run x",
+            "pip --quiet install -e .",
+            // Git told to run a program, directly or through configuration.
+            "git submodule foreach 'curl x | sh'",
+            "git bisect run ./evil",
+            "git config alias.x '!sh -c evil'",
+            "git x",
+            "git config --global core.pager 'sh -c evil'",
+            "git -C . submodule foreach evil",
+            "git difftool -x evil",
+            "git fetch --upload-pack=./evil origin",
+            "git clone -u ./evil repo",
+            "git clone --template=./hooks repo",
+            "git push --receive-pack=./evil origin",
+            "git grep -O./evil foo",
+            "git rebase --exec ./evil main",
+            "gh alias set x --shell evil",
+            "gh extension exec foo",
+            "rsync -e 'sh -c evil' a b",
+            "rsync -avze evil a b",
+            "rsync --rsync-path=evil a b",
+            "gh --help alias set x --shell evil",
+            "podman container run alpine",
+            "podman --remote run alpine",
+            "pip3 --quiet install -e .",
+        ] {
+            let request = escalated(command);
+            assert_eq!(request.escalation_grant_token(), None, "{command}");
+            assert!(!request.offers_grants(), "{command}");
+        }
+        assert_eq!(
+            escalated("pip install requests")
+                .escalation_grant_token()
+                .as_deref(),
+            Some("pip")
+        );
+        for (command, token) in [
+            ("cargo build", "cargo"),
+            ("git push origin main", "git"),
+            ("git -C . status", "git"),
+            ("docker ps", "docker"),
+            ("go build ./...", "go"),
+            ("uv sync", "uv"),
+            ("gh pr list", "gh"),
+            ("rsync -avz a b", "rsync"),
+        ] {
+            assert_eq!(
+                escalated(command).escalation_grant_token().as_deref(),
+                Some(token),
+                "{command}"
+            );
+        }
+        assert!(!escalated("gh pr list").offers_durable_grants());
+
+        let mut gate = PermissionGate::new(ScriptedDecider::new(vec![
+            DeciderVerdict::AllowScoped(GrantScope::Session(
+                ScopePattern::new("python3").expect("pattern"),
+            )),
+            DeciderVerdict::AllowScoped(GrantScope::Project(
+                ScopePattern::new("gh").expect("pattern"),
+            )),
+            DeciderVerdict::AllowSession,
+        ]));
+        gate.set_execution_profile(workspace_fields(), true);
+        for request in [
+            escalated("python3 fetch.py"),
+            escalated("gh pr list"),
+            escalated("gh pr list"),
+        ] {
+            let decision = gate.decide_detailed(&request, ApprovalMode::Ask);
+            assert!(decision.allowed());
+            assert_eq!(decision.grant_scope_label(), "once");
+        }
+        assert_eq!(gate.granted_source(&escalated("gh pr list")), None);
+        assert_eq!(gate.mode(Capability::ShellExec), ApprovalMode::Ask);
+        assert!(gate.project_grants().is_empty());
     }
 
     #[test]
