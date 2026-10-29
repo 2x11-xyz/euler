@@ -270,6 +270,10 @@ pub(crate) fn derive_scope_prefix(request: &PermissionRequest) -> Option<String>
         // string may differ past the bound) — offer only unscoped options.
         return None;
     }
+    if request.escalation.is_some() {
+        // The one token the gate would install an escalation grant for.
+        return request.escalation_grant_token();
+    }
     match request.capability {
         Capability::ShellExec => request
             .command
@@ -327,12 +331,13 @@ pub(crate) fn derive_shell_prefix(command: &str, workspace_root: Option<&Path>) 
 pub(crate) fn derive_user_rule_prefix(request: &PermissionRequest) -> Option<String> {
     if request.capability != Capability::ShellExec
         || request.command_truncated
-        || !request.offers_grants()
+        || !request.offers_durable_grants()
     {
         // A truncated command may hide metacharacters past the bound, a
-        // danger-flagged one is covered by no grant at all, and a once-only
-        // one installs none: never offer a durable rule the gate would not
-        // install or honor.
+        // danger-flagged one is covered by no grant at all, a once-only
+        // one installs none, and an escalation grant lasts for the session
+        // only: never offer a durable rule the gate would not install or
+        // honor.
         return None;
     }
     let command = request.command.as_deref()?;
@@ -369,6 +374,8 @@ pub(crate) fn no_grant_reason(request: &PermissionRequest) -> Option<&'static st
         None
     } else if request.dangerous_command {
         Some("Flagged dangerous by command safety: always asks, no grant offered.")
+    } else if request.escalation.is_some() {
+        Some("No session grant for this command: a grant covers one program that runs no other code.")
     } else {
         Some("Once-only request: an allow covers this request only.")
     }
@@ -425,6 +432,33 @@ pub(crate) fn approval_option_lines(
         ));
     }
     lines.push(deny);
+    lines
+}
+
+/// Options for an escalation (ADR 0026 section 3): allow once, a session
+/// grant for `scope_prefix` when the gate would install one, and deny. An
+/// escalation never offers a project or durable rule.
+pub(crate) fn escalation_option_lines(
+    scope_prefix: Option<&str>,
+    selected: ApprovalOption,
+) -> Vec<ApprovalOptionLine> {
+    let mut lines = vec![approval_option_line(
+        "y  Allow once",
+        selected,
+        ApprovalOption::AllowOnce,
+    )];
+    if let Some(prefix) = scope_prefix.filter(|prefix| !prefix.is_empty()) {
+        lines.push(approval_option_line(
+            &format!("a  Allow {prefix} * outside the sandbox for this session"),
+            selected,
+            ApprovalOption::AllowSession,
+        ));
+    }
+    lines.push(approval_option_line(
+        "n/esc  Deny with instructions",
+        selected,
+        ApprovalOption::Deny,
+    ));
     lines
 }
 

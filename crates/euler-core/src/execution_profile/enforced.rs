@@ -4,8 +4,10 @@
 //! on maps to one of two shapes:
 //! the `locked` boundary (no network, private `/tmp` and caches) or the
 //! `workspace` boundary (network, host `/tmp`, writable caches), which also
-//! honors `writable_paths` and `credentials`. Any other mix is refused with
-//! the first field this build cannot deliver.
+//! honors `writable_paths` and `credentials`. `escalation` is enforced on
+//! either shape: an escalated command leaves the boundary through the
+//! permission gate, not the sandbox. Any other mix is refused with the
+//! first field this build cannot deliver.
 
 use super::{
     full, locked, workspace, ApprovalsSetting, CredentialsSetting, NetworkSetting, ProfileFields,
@@ -34,7 +36,7 @@ pub(super) fn subprocess_sandbox(
         return Err("sandbox");
     }
     // `never` drops the sensitive-path asks, which is the `full` preset's
-    // rule; escalation ships in a later step.
+    // rule.
     if fields.approvals == ApprovalsSetting::Never {
         return Err("approvals");
     }
@@ -47,7 +49,6 @@ pub(super) fn subprocess_sandbox(
         [
             ("tmp", fields.tmp == shape.tmp),
             ("caches", fields.caches == shape.caches),
-            ("escalation", fields.escalation == shape.escalation),
             (
                 "background_jobs",
                 fields.background_jobs == shape.background_jobs,

@@ -27,15 +27,21 @@ fn networked_fields() -> ProfileFields {
         tmp: TmpSetting::Host,
         caches: CachesSetting::Writable,
         approvals: ApprovalsSetting::EscalationOnly,
+        escalation: EscalationSetting::Allowed,
         ..locked::fields()
     }
 }
 
-/// A networked profile this build cannot enforce: escalation ships later.
-fn escalating_fields() -> ProfileFields {
+/// A networked profile this build cannot enforce: the other platform's
+/// background-job behavior.
+fn unenforced_fields() -> ProfileFields {
+    let networked = networked_fields();
     ProfileFields {
-        escalation: EscalationSetting::Allowed,
-        ..networked_fields()
+        background_jobs: match networked.background_jobs {
+            BackgroundJobsSetting::Outlive => BackgroundJobsSetting::EndWithCommand,
+            BackgroundJobsSetting::EndWithCommand => BackgroundJobsSetting::Outlive,
+        },
+        ..networked
     }
 }
 
@@ -153,7 +159,7 @@ fn the_workspace_preset_resolves_to_its_boundary() {
         .expect("workspace ships");
     assert_eq!(profile.name, "workspace");
     assert_eq!(profile.fields, networked_fields());
-    assert_eq!(profile.fields.escalation, EscalationSetting::NotAllowed);
+    assert_eq!(profile.fields.escalation, EscalationSetting::Allowed);
     assert_eq!(profile.fields.credentials, CredentialsSetting::Private);
     assert!(matches!(
         profile.subprocess_sandbox(),
@@ -349,8 +355,7 @@ fn a_user_profile_no_enforced_boundary_delivers_is_refused() {
             "keys": {"extends": "locked", "credentials": "pass"},
             "offline": {"extends": "workspace", "network": "off"},
             "missing": {"extends": "workspace", "writable_paths": ["/nonexistent/euler-data"]},
-            "escalate": {"extends": "workspace", "escalation": "allowed"},
-            "quiet": {"extends": "workspace", "approvals": "never"}
+            "quiet": {"extends": "workspace", "approvals": "never", "escalation": "not-allowed"}
         }}"#,
     )
     .expect("loads");
@@ -360,7 +365,6 @@ fn a_user_profile_no_enforced_boundary_delivers_is_refused() {
         ("keys", "credentials"),
         ("offline", "network"),
         ("missing", "writable_paths"),
-        ("escalate", "escalation"),
         ("quiet", "approvals"),
     ] {
         assert_eq!(
@@ -372,6 +376,28 @@ fn a_user_profile_no_enforced_boundary_delivers_is_refused() {
             "{name}"
         );
     }
+}
+
+/// `escalation` is not part of either boundary (ADR 0026 rollout step 6):
+/// `workspace` without it and `locked` with it both resolve.
+#[test]
+fn escalation_resolves_with_either_enforced_boundary() {
+    let config = parse(
+        r#"{"profiles": {
+            "boxed": {"extends": "workspace", "escalation": "not-allowed"},
+            "door": {"extends": "locked", "escalation": "allowed"}
+        }}"#,
+    )
+    .expect("loads");
+    let boxed = config
+        .resolve(Some("boxed"), ProfileContext::Headless, None)
+        .expect("resolves");
+    assert_eq!(boxed.fields.escalation, EscalationSetting::NotAllowed);
+    let door = config
+        .resolve(Some("door"), ProfileContext::Headless, None)
+        .expect("resolves");
+    assert_eq!(door.fields.escalation, EscalationSetting::Allowed);
+    assert_eq!(door.subprocess_sandbox(), Ok(SubprocessSandbox::default()));
 }
 
 /// `approvals` is not part of either boundary: `escalation-only` and
@@ -550,15 +576,15 @@ fn resume_keeps_the_recorded_profile_when_the_resolved_one_is_looser() {
         ResumeProfile::choose(
             Some(recorded.clone()),
             ExecutionProfile {
-                name: "escalate".to_owned(),
-                fields: escalating_fields(),
+                name: "jobs".to_owned(),
+                fields: unenforced_fields(),
             },
             true,
             None
         ),
         Err(ProfileError::Unenforced {
-            profile: "escalate".to_owned(),
-            field: "escalation",
+            profile: "jobs".to_owned(),
+            field: "background_jobs",
         })
     );
     let explicit = ResumeProfile::choose(Some(resolved.clone()), recorded.clone(), true, None)
@@ -569,7 +595,8 @@ fn resume_keeps_the_recorded_profile_when_the_resolved_one_is_looser() {
         explicit.summary().as_deref(),
         Some(
             "execution profile: locked (recorded: net; changed approvals escalation-only -> \
-             always, caches writable -> private, network on -> off, tmp host -> private)"
+             always, caches writable -> private, escalation allowed -> not-allowed, network on \
+             -> off, tmp host -> private)"
         )
     );
 
@@ -582,7 +609,8 @@ fn resume_keeps_the_recorded_profile_when_the_resolved_one_is_looser() {
         tighter.summary().as_deref(),
         Some(
             "execution profile: locked (recorded: net; changed approvals escalation-only -> \
-             always, caches writable -> private, network on -> off, tmp host -> private)"
+             always, caches writable -> private, escalation allowed -> not-allowed, network on \
+             -> off, tmp host -> private)"
         )
     );
 
@@ -637,22 +665,22 @@ fn resume_summary_names_the_fields_that_changed() {
 #[test]
 fn a_kept_recorded_profile_is_overlaid_and_must_be_enforceable() {
     let recorded = ExecutionProfile {
-        name: "escalate".to_owned(),
-        fields: escalating_fields(),
+        name: "jobs".to_owned(),
+        fields: unenforced_fields(),
     };
     let resolved = ExecutionProfile {
         name: "host".to_owned(),
         fields: ProfileFields {
             sandbox: SandboxSetting::Off,
-            ..escalating_fields()
+            ..unenforced_fields()
         },
     };
 
     assert_eq!(
         ResumeProfile::choose(Some(recorded.clone()), resolved.clone(), false, None),
         Err(ProfileError::RecordedUnenforced {
-            profile: "escalate".to_owned(),
-            field: "escalation",
+            profile: "jobs".to_owned(),
+            field: "background_jobs",
         })
     );
 

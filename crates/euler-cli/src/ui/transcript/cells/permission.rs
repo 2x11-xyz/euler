@@ -96,6 +96,9 @@ pub(in crate::ui::transcript) struct PermissionAskView<'a> {
     /// once-only): the panel shows only allow-once and deny, plus this
     /// reason as a muted line.
     pub(in crate::ui::transcript) no_grant_reason: Option<&'static str>,
+    /// `Some` for an escalation: the panel names the host run and its
+    /// reason, and offers at most a session grant.
+    pub(in crate::ui::transcript) escalation_reason: Option<&'a str>,
     pub(in crate::ui::transcript) prior_count: usize,
     pub(in crate::ui::transcript) selected_option: crate::ui::patch_approval::ApprovalOption,
     pub(in crate::ui::transcript) companion_name: Option<&'a str>,
@@ -170,13 +173,17 @@ pub(in crate::ui::transcript) fn render_permission_ask(
         .filter(|command| !command.is_empty())
         .map(|command| format!("$ {command}"))
         .unwrap_or_else(|| format!("request: {}", ask.reason));
+    let base_title = if ask.escalation_reason.is_some() {
+        "Run command outside the sandbox?"
+    } else {
+        crate::ui::patch_approval::approval_title(ask.capability)
+    };
     let title = match ask.companion_name.filter(|name| !name.is_empty()) {
         Some(name) => format!(
-            "{} · {} {name}",
-            crate::ui::patch_approval::approval_title(ask.capability),
+            "{base_title} · {} {name}",
             crate::ui::glyphs::companion_glyph()
         ),
-        None => crate::ui::patch_approval::approval_title(ask.capability).to_owned(),
+        None => base_title.to_owned(),
     };
     let mut rows = vec![
         PermissionPanelRow::title_with_corner(
@@ -185,13 +192,23 @@ pub(in crate::ui::transcript) fn render_permission_ask(
         ),
         PermissionPanelRow::body(preview),
     ];
+    if let Some(reason) = ask.escalation_reason {
+        rows.push(PermissionPanelRow::metadata(format!(
+            "runs on the host with your HOME and network · reason: {reason}"
+        )));
+    }
     if let Some(consequences) = consequences_row(ask.capability, ask.scope_prefix, ask.prior_count)
     {
         rows.push(PermissionPanelRow::metadata(consequences));
     }
     // v2.1 (§7b): a blank line separates the command block from the options.
     rows.push(PermissionPanelRow::body(String::new()));
-    rows.extend(
+    let options = if ask.escalation_reason.is_some() {
+        crate::ui::patch_approval::escalation_option_lines(
+            ask.scope_prefix.filter(|_| ask.no_grant_reason.is_none()),
+            ask.selected_option,
+        )
+    } else {
         crate::ui::patch_approval::approval_option_lines(
             ask.capability,
             ask.scope_prefix,
@@ -199,15 +216,14 @@ pub(in crate::ui::transcript) fn render_permission_ask(
             ask.no_grant_reason.is_none(),
             ask.selected_option,
         )
-        .into_iter()
-        .map(|line| {
-            if line.selected {
-                PermissionPanelRow::selected(line.text)
-            } else {
-                PermissionPanelRow::body(line.text)
-            }
-        }),
-    );
+    };
+    rows.extend(options.into_iter().map(|line| {
+        if line.selected {
+            PermissionPanelRow::selected(line.text)
+        } else {
+            PermissionPanelRow::body(line.text)
+        }
+    }));
     if let Some(reason) = ask.no_grant_reason {
         rows.push(PermissionPanelRow::metadata(reason));
     }

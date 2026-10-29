@@ -1,7 +1,6 @@
 //! The `workspace` preset (ADR 0026 section 3): sandboxed, with network, the
 //! host `/tmp`, writable named toolchain caches, a private per-session
-//! `HOME`, and row P approvals. Escalation stays `not-allowed` until it
-//! ships.
+//! `HOME`, row P approvals, and escalation.
 
 use super::{
     locked, ApprovalsSetting, CachesSetting, EscalationSetting, NetworkSetting, ProfileFields,
@@ -14,7 +13,7 @@ pub(super) fn fields() -> ProfileFields {
         tmp: TmpSetting::Host,
         caches: CachesSetting::Writable,
         approvals: ApprovalsSetting::EscalationOnly,
-        escalation: EscalationSetting::NotAllowed,
+        escalation: EscalationSetting::Allowed,
         // "As locked": the sandbox, private credentials, no added paths, and
         // the platform's background-job behavior.
         ..locked::fields()

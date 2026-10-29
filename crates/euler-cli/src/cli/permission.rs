@@ -14,11 +14,25 @@ pub(crate) struct CliDecider;
 
 impl PermissionDecider for CliDecider {
     fn decide(&mut self, request: &PermissionRequest) -> DeciderVerdict {
-        eprint!(
-            "permission: allow {} for {}? [y/N] ",
-            request.capability.as_str(),
-            request.reason
-        );
+        if let (Some(reason), Some(command)) = (&request.escalation, &request.command) {
+            // Model-supplied text: no terminal control sequences.
+            let printable = |text: &str| -> String {
+                text.chars()
+                    .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+                    .collect()
+            };
+            eprint!(
+                "permission: run `{}` outside the sandbox ({})? [y/N] ",
+                printable(command),
+                printable(reason)
+            );
+        } else {
+            eprint!(
+                "permission: allow {} for {}? [y/N] ",
+                request.capability.as_str(),
+                request.reason
+            );
+        }
         let _ = io::stderr().flush();
         let mut answer = String::new();
         if io::stdin().read_line(&mut answer).is_ok()

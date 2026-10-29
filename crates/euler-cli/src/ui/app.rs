@@ -2871,7 +2871,7 @@ impl AppCore {
                 self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
             }
             KeyCode::Char('p') | KeyCode::Char('P')
-                if draft_empty && !self.modal_is_batch() && self.modal_offers_grants() =>
+                if draft_empty && self.modal_offers_durable_grants() =>
             {
                 let prefix = self.modal_scope_prefix().unwrap_or_default();
                 self.reply_to_modal(PermissionReply::AllowProjectScope(prefix))
@@ -2917,7 +2917,7 @@ impl AppCore {
     }
 
     fn move_approval_selection_up(&mut self) -> CoreEffect {
-        if self.modal_is_batch() {
+        if self.modal_offers_session_grant_only() {
             self.approval_selection = match self.approval_selection {
                 ApprovalOption::AllowOnce => ApprovalOption::AllowOnce,
                 ApprovalOption::AllowSession => ApprovalOption::AllowOnce,
@@ -2936,7 +2936,7 @@ impl AppCore {
     }
 
     fn move_approval_selection_down(&mut self) -> CoreEffect {
-        if self.modal_is_batch() {
+        if self.modal_offers_session_grant_only() {
             self.approval_selection = match self.approval_selection {
                 ApprovalOption::AllowOnce => ApprovalOption::AllowSession,
                 ApprovalOption::AllowSession => ApprovalOption::Deny,
@@ -2953,11 +2953,12 @@ impl AppCore {
     }
 
     fn reply_to_selected_approval(&mut self) -> CoreEffect {
-        if self.modal_is_batch() {
+        if self.modal_offers_session_grant_only() {
             return match self.approval_selection {
                 ApprovalOption::AllowOnce => self.reply_to_modal(PermissionReply::AllowOnce),
                 ApprovalOption::AllowSession => {
-                    self.reply_to_modal(PermissionReply::AllowSessionScope(String::new()))
+                    let prefix = self.modal_scope_prefix().unwrap_or_default();
+                    self.reply_to_modal(PermissionReply::AllowSessionScope(prefix))
                 }
                 ApprovalOption::AllowProject | ApprovalOption::AllowUser | ApprovalOption::Deny => {
                     self.reply_deny_from_modal()
@@ -3002,6 +3003,24 @@ impl AppCore {
     fn modal_offers_grants(&self) -> bool {
         self.modal_permission_request()
             .is_none_or(PermissionRequest::offers_grants)
+    }
+
+    /// Whether the live ask may offer a project grant: not for an operation
+    /// batch, and not for an escalation, whose grants last for the session.
+    fn modal_offers_durable_grants(&self) -> bool {
+        !self.modal_is_batch()
+            && self
+                .modal_permission_request()
+                .is_none_or(PermissionRequest::offers_durable_grants)
+    }
+
+    /// Whether the panel's rows are allow-once, a session grant, and deny:
+    /// an operation batch, or an escalation that offers a session grant.
+    fn modal_offers_session_grant_only(&self) -> bool {
+        self.modal_is_batch()
+            || self
+                .modal_permission_request()
+                .is_some_and(|request| request.escalation.is_some() && request.offers_grants())
     }
 
     fn modal_scope_prefix(&self) -> Option<String> {
@@ -4635,6 +4654,7 @@ impl AppCore {
                     scope_prefix,
                     user_rule_prefix: self.modal_user_rule_prefix(),
                     no_grant_reason: patch_approval::no_grant_reason(request),
+                    escalation_reason: request.escalation.clone(),
                     companion_name: self.in_flight_companion_name.clone(),
                 })
             }

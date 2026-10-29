@@ -148,6 +148,10 @@ pub enum TranscriptItem {
         user_rule_prefix: Option<String>,
         /// Why no grant is offered; `None` when grants are offered.
         no_grant_reason: Option<&'static str>,
+        /// The model's reason when the command asks to run outside the
+        /// sandbox (ADR 0026 escalation); the panel then offers no project
+        /// or durable rule.
+        escalation_reason: Option<String>,
         /// Prior allowed decisions for this capability / scope in the session.
         prior_count: usize,
         /// Currently highlighted approval option; defaults to allow-once.

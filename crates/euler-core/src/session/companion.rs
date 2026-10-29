@@ -3,10 +3,10 @@
 use super::{
     add_provider_error_metadata, approval_mode_str, canvas_snapshot_payload,
     context_budget_exhausted, elapsed_ms, file_change_payload, file_diff_payload, model_input_item,
-    permission_decision_payload, permission_request_for_tool, prepare_checkpoint,
-    tool_cancelled_payload, tool_result_payload, validate_model_target_shape, ModelRoundData,
-    ModelTarget, ProviderRuntimeContext, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome,
-    Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
+    permission_decision_payload, permission_prompt_payload, permission_request_for_tool,
+    prepare_checkpoint, tool_cancelled_payload, tool_result_payload, validate_model_target_shape,
+    ModelRoundData, ModelTarget, ProviderRuntimeContext, RoundLoop, RoundLoopConfig, RoundLoopIo,
+    RoundOutcome, Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
 use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
@@ -380,6 +380,11 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             self.emit_cancelled_tool_result(call, tool_call_event_id, None)?;
             return Err(SessionError::Cancelled);
         }
+        if let Err(error) = self.tools.requested_escalation(&call.name, &call.input) {
+            // Refused before any prompt, as in the root session loop.
+            self.emit_tool_failure(call.id, call.name, error.to_string(), tool_call_event_id)?;
+            return Ok(());
+        }
         if let Some(capability) = self
             .tools
             .required_capability_for_input(&call.name, &call.input)
@@ -404,10 +409,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 Some(
                     self.append(
                         EventKind::PERMISSION_PROMPT,
-                        object([
-                            ("capability", capability.as_str().into()),
-                            ("reason", request.reason.clone().into()),
-                        ]),
+                        permission_prompt_payload(&request),
                         None,
                     )?
                     .id,

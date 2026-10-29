@@ -81,7 +81,8 @@ pub use background::{
 pub use companion::AgentResultSummary;
 pub use observer::RoundObserverConfig;
 pub(crate) use permissions_gate::{
-    approval_mode_str, permission_decision_payload, permission_request_for_tool, PermissionRuling,
+    approval_mode_str, permission_decision_payload, permission_prompt_payload,
+    permission_request_for_tool, PermissionRuling,
 };
 pub(crate) use tool_dispatch::{
     file_change_payload, file_diff_payload, prepare_checkpoint, prepare_checkpoint_for,
@@ -1954,7 +1955,8 @@ impl<D> Session<D> {
 
     /// Switch to another execution profile between turns (ADR 0026 section
     /// 5): rebuilds the subprocess boundary and the structured-write scope,
-    /// applies the profile's approvals, and records
+    /// applies the profile's approvals and escalation (clearing escalation
+    /// grants), and records
     /// `session.profile_changed`. Jobs started with the sandbox off keep
     /// running and are listed at exit. Refused while a run is active.
     pub fn change_execution_profile(
@@ -1965,8 +1967,9 @@ impl<D> Session<D> {
             return Err(SessionError::ProfileChangeDuringRun);
         }
         self.persist_new_events()?;
-        // Jobs started under a sandboxed profile end before the boundary
-        // changes; host jobs keep running (ADR 0026 resolved question 12).
+        // Jobs started under a sandboxed profile, escalated ones included,
+        // end before the boundary changes; jobs started with the sandbox off
+        // keep running (ADR 0026 resolved question 12).
         self.tools.end_sandboxed_jobs();
         self.config.set_execution_profile(profile);
         self.tools.set_subprocess_sandbox(
@@ -1976,6 +1979,8 @@ impl<D> Session<D> {
         self.tools.set_writes_outside_workspace(
             self.config.execution_profile.fields.sandbox == SandboxSetting::Off,
         );
+        self.tools
+            .set_execution_profile(&self.config.execution_profile);
         self.permissions.set_execution_profile(
             self.config.execution_profile.fields.clone(),
             matches!(self.tools.sandbox_status(), SandboxStatus::Enforced(_)),
@@ -6179,6 +6184,7 @@ fn profile_tool_registry(config: &SessionConfig) -> ToolRegistry {
     tools.set_writes_outside_workspace(
         config.execution_profile.fields.sandbox == SandboxSetting::Off,
     );
+    tools.set_execution_profile(&config.execution_profile);
     tools
 }
 

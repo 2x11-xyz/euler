@@ -169,6 +169,93 @@ impl CommandSegment {
         (is_shell && is_command_flag).then_some(script.as_str())
     }
 
+    /// Whether this segment runs code its words do not show, so a session
+    /// grant on its first token would approve whatever that code becomes
+    /// (ADR 0026 resolved question 8): shells (`ssh` included),
+    /// interpreters, privilege, command, and tracing wrappers, a program
+    /// named by path, container runs, task and test runners, package managers
+    /// that run project scripts or install a local path, and git, cargo, go,
+    /// gh, or rsync told on its command line which programs to run. A
+    /// subcommand tool whose first argument is an option fails closed, since
+    /// a global option can hide the subcommand (`cargo +nightly run`,
+    /// `docker -H host run`).
+    pub fn runs_arbitrary_code(&self) -> bool {
+        #[rustfmt::skip]
+        const RUNNERS: &[&str] = &[
+            // Shells and interpreters.
+            "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash", "ssh", "node",
+            "nodejs", "deno", "bun", "tsx", "ts-node", "ruby", "irb", "perl", "php", "lua",
+            "luajit", "R", "Rscript", "julia", "osascript", "pwsh", "awk", "gawk", "mawk", "nawk",
+            "tclsh", "expect", "source", ".", "pypy", "pypy3", "pytest",
+            // Privilege, command, and tracing wrappers.
+            "pkexec", "runuser", "strace", "ltrace", "gdb", "lldb", "valgrind",
+            // Task runners and package managers that run project scripts.
+            "npm", "npx", "pnpm", "pnpx", "yarn", "bunx", "uvx", "make", "gmake", "just",
+            "rake", "gradle", "mvn", "sbt", "ant", "tox", "nox",
+        ];
+        let name = self.first_token();
+        if name.contains('/') || name.starts_with("python") || RUNNERS.contains(&name) {
+            return true;
+        }
+        if wrapper_spec(name).is_some() {
+            return true;
+        }
+        let args = &self.words[1..];
+        let subcommand = args.first().map(String::as_str);
+        let leading_option = subcommand.is_some_and(|arg| arg.starts_with(['-', '+']));
+        match name {
+            "uv" | "cargo" | "go" | "pipx" | "poetry" | "pdm" | "hatch" | "conda" | "docker"
+            | "podman" | "pip" | "pip3" | "gh"
+                if leading_option =>
+            {
+                true
+            }
+            "uv" => match subcommand {
+                Some("run" | "tool") => true,
+                Some("pip") => installs_local_path(&args[1..]),
+                _ => false,
+            },
+            // `--config` and `-Z` can name a wrapper or linker cargo runs,
+            // and `rustc` passes flags such as `-C linker=` through.
+            "cargo" => {
+                matches!(
+                    subcommand,
+                    Some("run" | "r" | "test" | "t" | "bench" | "rustc")
+                ) || args
+                    .iter()
+                    .any(|arg| arg.starts_with("--config") || arg.starts_with("-Z"))
+            }
+            "go" => {
+                matches!(subcommand, Some("run" | "test" | "generate" | "tool"))
+                    || args.iter().any(|arg| {
+                        let flag = arg.trim_start_matches('-');
+                        arg.starts_with('-')
+                            && ["toolexec", "exec", "vettool"]
+                                .iter()
+                                .any(|name| flag == *name || flag.starts_with(&format!("{name}=")))
+                    })
+            }
+            "pipx" | "poetry" | "pdm" | "hatch" | "conda" => subcommand == Some("run"),
+            "git" => git_runs_named_program(args),
+            // An alias or extension can be any program.
+            "gh" => matches!(
+                subcommand,
+                Some("alias" | "extension" | "ext" | "extensions")
+            ),
+            "rsync" => args.iter().any(|arg| {
+                is_short_cluster_with(arg, "e")
+                    || is_long_abbreviation(arg, &["--rsh", "--rsync-path"])
+            }),
+            // A container run or exec can mount the host and run anything.
+            "docker" | "podman" => matches!(
+                subcommand,
+                Some("run" | "exec" | "compose" | "create" | "start" | "container")
+            ),
+            "pip" | "pip3" => installs_local_path(args),
+            _ => false,
+        }
+    }
+
     /// Words that must pass confinement (operands and option values), or
     /// `None` when the binary is not read-only or an option is not on its
     /// allowlist.
@@ -180,6 +267,68 @@ impl CommandSegment {
             name => scan_args(binary_rule(name)?, args),
         }
     }
+}
+
+/// Whether a git command line names a program for git to run: through
+/// configuration (`-c`, `--config-env`, `--exec-path`, or a `config` write
+/// that later git commands honor), a subcommand that runs a given command
+/// (`submodule foreach`, `bisect run`, `difftool -x`; none is on the
+/// built-in list below), an option naming a program (`--upload-pack`,
+/// `rebase --exec`, `grep -O`, `clone --template` hooks), or a subcommand
+/// that is not a known built-in, which may be an alias for a shell command.
+fn git_runs_named_program(args: &[String]) -> bool {
+    #[rustfmt::skip]
+    const BUILT_INS: &[&str] = &[
+        "add", "am", "annotate", "apply", "archive", "blame", "branch", "bundle", "cat-file",
+        "checkout", "cherry", "cherry-pick", "clean", "clone", "commit", "count-objects",
+        "describe", "diff", "fetch", "for-each-ref", "format-patch", "fsck", "gc", "grep",
+        "hash-object", "help", "init", "log", "ls-files", "ls-remote", "ls-tree", "maintenance",
+        "merge", "merge-base", "mv", "notes", "pull", "push", "range-diff", "rebase", "reflog",
+        "remote", "reset", "restore", "rev-list", "rev-parse", "revert", "rm", "shortlog",
+        "show", "show-ref", "sparse-checkout", "stash", "status", "switch", "symbolic-ref",
+        "tag", "update-ref", "verify-commit", "verify-tag", "version", "whatchanged", "worktree",
+    ];
+    if args
+        .iter()
+        .any(|arg| arg == "-c" || arg.starts_with("--config") || arg.starts_with("--exec-path"))
+    {
+        return true;
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let after_globals = skip_git_global_options(&args);
+    let Some((&subcommand, rest)) = after_globals.split_first() else {
+        return false;
+    };
+    let names_program = |letters: &str, longs: &[&str]| {
+        rest.iter()
+            .any(|arg| is_short_cluster_with(arg, letters) || is_long_abbreviation(arg, longs))
+    };
+    match subcommand {
+        _ if !BUILT_INS.contains(&subcommand) => true,
+        "clone" => names_program("u", &["--upload-pack", "--template"]),
+        "init" => names_program("", &["--template"]),
+        "fetch" | "pull" | "ls-remote" => names_program("", &["--upload-pack"]),
+        "push" => names_program("", &["--receive-pack", "--exec"]),
+        "archive" => names_program("", &["--exec"]),
+        "grep" => names_program("O", &["--open-files-in-pager"]),
+        "rebase" => names_program("x", &["--exec"]),
+        _ => false,
+    }
+}
+
+/// Whether `pip install` arguments name a local path, an editable install,
+/// or a requirements file (which can name either), whose build scripts run
+/// as part of the install.
+fn installs_local_path(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("install")
+        && args[1..].iter().any(|arg| {
+            (arg.starts_with("-e") || arg.starts_with("-r"))
+                || arg.starts_with("--editable")
+                || arg.starts_with("--requirement")
+                || arg.starts_with(['.', '/', '~'])
+                || arg.starts_with("file:")
+                || (arg.contains('/') && !arg.contains("://"))
+        })
 }
 
 /// Decompose a command line into simple commands. Returns `None` when the

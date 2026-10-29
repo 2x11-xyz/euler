@@ -68,6 +68,14 @@ pub enum ToolError {
     MissingField(&'static str),
     #[error("invalid field `{0}`")]
     InvalidField(&'static str),
+    #[error(
+        "escalate is not available under execution profile `{profile}`: commands run only \
+inside its sandbox. Run the command without escalate, or report the sandbox limit and give \
+the user the exact command to run outside Euler"
+    )]
+    EscalationNotAllowed { profile: String },
+    #[error("invalid field `escalate`: {0}")]
+    InvalidEscalation(&'static str),
     #[error("path `{path}` is outside the workspace root ({reason}); paths must be relative and stay inside the workspace root")]
     PathOutsideWorkspace { path: String, reason: &'static str },
     #[error("invalid patch: {0}")]
@@ -122,6 +130,9 @@ pub struct ToolExecution {
     /// Execution boundary for process-backed shell and Git tools. Structured
     /// tools omit it because no subprocess boundary ran.
     pub sandbox_backend: Option<SandboxBackend>,
+    /// The model's reason when `run_shell` ran this command on the host
+    /// through an approved escalation (ADR 0026 section 3).
+    pub escalation_reason: Option<String>,
     pub exit_code: Option<i32>,
     pub patch: Option<PatchEvents>,
     pub file_changes: Vec<ObservedFileChange>,
@@ -284,6 +295,11 @@ pub struct ToolRegistry {
     /// (the Euler home, the auth file). A structured write under one is a
     /// privileged secret and config edit (`secrets.md`).
     privileged_config_paths: Vec<PathBuf>,
+    /// The execution profile whose `escalation` field governs `run_shell`'s
+    /// `escalate` object (ADR 0026 section 3): its name for messages, and
+    /// whether it allows escalation.
+    profile_name: String,
+    escalation_allowed: bool,
 }
 
 /// Euler's own credentials, withheld from host commands (ADR 0026 resolved
@@ -415,6 +431,8 @@ impl ToolRegistry {
             background_jobs: Default::default(),
             euler_credentials: EulerCredentials::default(),
             privileged_config_paths: Vec::new(),
+            profile_name: crate::ExecutionProfile::default().name,
+            escalation_allowed: false,
         }
     }
 
@@ -497,6 +515,57 @@ impl ToolRegistry {
     /// write is recorded but no checkpoint covers it.
     pub fn set_writes_outside_workspace(&mut self, allowed: bool) {
         self.writes_outside_workspace = allowed;
+    }
+
+    /// Advertise and accept `run_shell`'s `escalate` object exactly when
+    /// `profile` allows escalation.
+    pub fn set_execution_profile(&mut self, profile: &crate::ExecutionProfile) {
+        self.profile_name = profile.name.clone();
+        self.escalation_allowed =
+            profile.fields.escalation == crate::execution_profile::EscalationSetting::Allowed;
+    }
+
+    /// The reason of a well-formed `escalate` object on a `run_shell` call,
+    /// `None` when the call does not escalate, or the error that refuses it
+    /// before any prompt: the profile does not allow escalation, the object
+    /// is malformed, or the command is an intercepted `apply_patch`, which
+    /// never runs a shell.
+    pub fn requested_escalation<'a>(
+        &self,
+        name: &str,
+        input: &'a Value,
+    ) -> Result<Option<&'a str>, ToolError> {
+        let escalate = match input.get("escalate") {
+            Some(escalate) if name == "run_shell" && !escalate.is_null() => escalate,
+            _ => return Ok(None),
+        };
+        if !self.escalation_allowed {
+            return Err(ToolError::EscalationNotAllowed {
+                profile: self.profile_name.clone(),
+            });
+        }
+        let Some(object) = escalate.as_object() else {
+            return Err(ToolError::InvalidEscalation(
+                "expected an object with a reason",
+            ));
+        };
+        if object.keys().any(|key| key != "reason") {
+            return Err(ToolError::InvalidEscalation("only `reason` is accepted"));
+        }
+        let reason = object
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+            .ok_or(ToolError::InvalidEscalation(
+                "`reason` must say why the command needs to run outside the sandbox",
+            ))?;
+        if is_shell_apply_patch_request(name, input) {
+            return Err(ToolError::InvalidEscalation(
+                "an apply_patch heredoc is a workspace write and never runs outside the sandbox",
+            ));
+        }
+        Ok(Some(reason))
     }
 
     /// Override the workspace-observation entry bound (ADR 0021 row E). The
@@ -605,7 +674,7 @@ impl ToolRegistry {
     /// for a session's prompt cache and follows the registry's real backend.
     fn model_execution_boundary(&self) -> String {
         match &self.workspace_sandbox {
-            Some(sandbox) => sandbox.model_boundary(),
+            Some(sandbox) => sandbox.model_boundary(self.escalation_allowed),
             None if self.writes_outside_workspace => {
                 "Commands run directly on the host with the user's authority, outside Euler's \
 sandbox; background jobs must redirect their output and keep running after Euler exits. \
@@ -835,7 +904,8 @@ those writes cannot be rolled back."
     }
 
     pub fn model_tools(&self) -> Vec<ToolDefinition> {
-        let mut tools = coding_tool_definitions(&self.model_execution_boundary());
+        let mut tools =
+            coding_tool_definitions(&self.model_execution_boundary(), self.escalation_allowed);
         tools.push(tool_result_get_definition());
         if !self.skills.is_empty() {
             tools.push(skill_read_definition());
@@ -848,7 +918,8 @@ those writes cannot be rolled back."
     /// reach them; only the root driver (or an `inherit` child, once that
     /// lands) is eligible (docs/contracts/project-context.md).
     pub fn child_model_tools(&self) -> Vec<ToolDefinition> {
-        let mut tools = coding_tool_definitions(&self.model_execution_boundary());
+        let mut tools =
+            coding_tool_definitions(&self.model_execution_boundary(), self.escalation_allowed);
         tools.push(tool_result_get_definition());
         tools
     }
@@ -871,6 +942,7 @@ those writes cannot be rolled back."
             output_preview_budget: None,
             project_context_snapshot_digest: Some(skill.snapshot_digest.clone()),
             sandbox_backend: None,
+            escalation_reason: None,
             exit_code: None,
             patch: None,
             file_changes: Vec::new(),
@@ -891,6 +963,7 @@ those writes cannot be rolled back."
             output_preview_budget: None,
             project_context_snapshot_digest: None,
             sandbox_backend: None,
+            escalation_reason: None,
             exit_code: None,
             patch: None,
             file_changes: Vec::new(),
@@ -921,6 +994,7 @@ those writes cannot be rolled back."
             output_preview_budget: None,
             project_context_snapshot_digest: None,
             sandbox_backend: None,
+            escalation_reason: None,
             exit_code: None,
             patch: Some(PatchEvents {
                 path: path.recorded_path(relative),
@@ -968,6 +1042,7 @@ those writes cannot be rolled back."
             output_preview_budget: None,
             project_context_snapshot_digest: None,
             sandbox_backend: None,
+            escalation_reason: None,
             exit_code: None,
             patch: Some(PatchEvents {
                 path: path.recorded_path(relative),
@@ -1014,6 +1089,7 @@ those writes cannot be rolled back."
                     output_preview_budget: None,
                     project_context_snapshot_digest: None,
                     sandbox_backend: None,
+                    escalation_reason: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
                         path: target.recorded_path(&path),
@@ -1043,6 +1119,7 @@ those writes cannot be rolled back."
                     output_preview_budget: None,
                     project_context_snapshot_digest: None,
                     sandbox_backend: None,
+                    escalation_reason: None,
                     exit_code: None,
                     patch: Some(PatchEvents {
                         path: target.recorded_path(&path),
@@ -1131,6 +1208,7 @@ those writes cannot be rolled back."
     ) -> Result<ToolExecutionOutcome, ToolError> {
         let command = required_str(input, "command")?;
         let max_bytes = optional_positive_usize(input, "max_bytes")?.unwrap_or(DEFAULT_MAX_BYTES);
+        let escalation = self.requested_escalation("run_shell", input)?;
         if command_begins_apply_patch(command) {
             // Strict apply_patch interception must return before spawning a shell.
             return self
@@ -1141,24 +1219,16 @@ those writes cannot be rolled back."
                 )
                 .map(ToolExecutionOutcome::Completed);
         }
-        let timeout_ms = match optional_positive_usize(input, "timeout_ms")? {
-            None => DEFAULT_SHELL_TIMEOUT_MS,
-            Some(value) => {
-                let value = value as u64;
-                if value > MAX_SHELL_TIMEOUT_MS {
-                    return Err(ToolError::InvalidField("timeout_ms"));
-                }
-                value
-            }
-        };
+        let timeout_ms = shell_timeout_ms(input)?;
         let before = self.observe_workspace();
-        let child = self.agent_subprocess("sh", &["-c", command], &[])?;
+        let child = self.shell_subprocess(command, escalation.is_some())?;
         let sandboxed = child.sandboxed;
         let sandbox_backend = child.backend;
         let mut outcome = run_process(child.command, Some(timeout_ms), cancellation, true)
             .map_err(|error| normalize_sandbox_subprocess_error(sandboxed, error))?;
         if let Some(leader) = outcome.live_group.take() {
-            self.keep_background_jobs(leader, sandboxed, command);
+            // Escalated jobs end with the session too (ADR 0026 section 1).
+            self.keep_background_jobs(leader, sandboxed || escalation.is_some(), command);
         }
         let text = collected_agent_output(
             outcome.stdout,
@@ -1202,6 +1272,7 @@ those writes cannot be rolled back."
             }),
             project_context_snapshot_digest: None,
             sandbox_backend: Some(sandbox_backend),
+            escalation_reason: escalation.map(str::to_owned),
             exit_code: Some(status),
             patch: None,
             file_changes,
@@ -1258,6 +1329,7 @@ those writes cannot be rolled back."
             }),
             project_context_snapshot_digest: None,
             sandbox_backend: Some(sandbox_backend),
+            escalation_reason: None,
             exit_code: Some(status),
             patch: None,
             file_changes: Vec::new(),
@@ -1368,39 +1440,57 @@ see them.\n"
         args: &[&str],
         env: &[(OsString, OsString)],
     ) -> Result<AgentSubprocess, ToolError> {
-        let sandboxed = self.workspace_sandbox.is_some();
-        let mut child = match &self.workspace_sandbox {
-            Some(sandbox) => sandbox
-                .command(program, args, env)
-                .map_err(sandbox_unavailable)?,
-            None => {
-                let mut command = Command::new(program);
-                command
-                    .args(args)
-                    .current_dir(&self.root)
-                    .envs(env.to_vec());
-                command
-            }
+        let Some(sandbox) = &self.workspace_sandbox else {
+            return self.host_subprocess(program, args, env);
         };
+        let mut child = sandbox
+            .command(program, args, env)
+            .map_err(sandbox_unavailable)?;
         // Defense in depth: both launchers clear this environment too. A
-        // sandbox under `credentials: "pass"` passes secrets on purpose; host
-        // execution passes the environment through except Euler's own
-        // credentials (ADR 0026 resolved question 7).
-        match &self.workspace_sandbox {
-            Some(sandbox) => scrub_agent_subprocess_env(&mut child, sandbox.passes_credentials()),
-            None => withhold_euler_credentials(&mut child, &self.euler_credentials),
-        }
-        if !sandboxed {
-            child.env("EULER_HOME", self.agent_euler_home()?);
-        }
+        // sandbox under `credentials: "pass"` passes secrets on purpose.
+        scrub_agent_subprocess_env(&mut child, sandbox.passes_credentials());
         Ok(AgentSubprocess {
             command: child,
-            sandboxed,
-            backend: self
-                .workspace_sandbox
-                .as_ref()
-                .map_or(SandboxBackend::Host, WorkspaceSandbox::backend),
+            sandboxed: true,
+            backend: sandbox.backend(),
         })
+    }
+
+    /// The child process for a command run on the host: under a sandbox-off
+    /// profile, on an unsupported platform, or for an approved escalation.
+    /// The environment passes through except Euler's own credentials (ADR
+    /// 0026 resolved question 7), and `EULER_HOME` points at a private
+    /// directory.
+    fn host_subprocess(
+        &self,
+        program: &str,
+        args: &[&str],
+        env: &[(OsString, OsString)],
+    ) -> Result<AgentSubprocess, ToolError> {
+        let mut child = Command::new(program);
+        child.args(args).current_dir(&self.root).envs(env.to_vec());
+        withhold_euler_credentials(&mut child, &self.euler_credentials);
+        child.env("EULER_HOME", self.agent_euler_home()?);
+        Ok(AgentSubprocess {
+            command: child,
+            sandboxed: false,
+            backend: SandboxBackend::Host,
+        })
+    }
+
+    /// `sh -c <command>` in the boundary, or on the host with the user's own
+    /// `HOME` and the environment a `full` host command gets when
+    /// `escalated` (ADR 0026 section 3).
+    fn shell_subprocess(
+        &self,
+        command: &str,
+        escalated: bool,
+    ) -> Result<AgentSubprocess, ToolError> {
+        if escalated {
+            self.host_subprocess("sh", &["-c", command], &[])
+        } else {
+            self.agent_subprocess("sh", &["-c", command], &[])
+        }
     }
 
     /// Walk the workspace under the configured observation bound.
@@ -1736,6 +1826,17 @@ pub(crate) fn display_path(path: &str) -> String {
         sanitized.push('\u{2026}');
     }
     sanitized
+}
+
+/// `run_shell`'s `timeout_ms`, defaulted and bounded.
+fn shell_timeout_ms(input: &Value) -> Result<u64, ToolError> {
+    match optional_positive_usize(input, "timeout_ms")? {
+        None => Ok(DEFAULT_SHELL_TIMEOUT_MS),
+        Some(value) if value as u64 > MAX_SHELL_TIMEOUT_MS => {
+            Err(ToolError::InvalidField("timeout_ms"))
+        }
+        Some(value) => Ok(value as u64),
+    }
 }
 
 /// Remove inherited variables that would configure the child behind the
@@ -2479,7 +2580,45 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
     index
 }
 
-fn coding_tool_definitions(execution_boundary: &str) -> Vec<ToolDefinition> {
+/// `run_shell`, with the optional `escalate` object only when the execution
+/// profile allows escalation (ADR 0026 section 3).
+fn run_shell_definition(execution_boundary: &str, escalation: bool) -> ToolDefinition {
+    let mut parameters = json!({
+        "type": "object",
+        "properties": {
+            "command": {"type": "string"},
+            "max_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum command-output bytes retained across the active head/tail preview. Complete output remains recoverable by result event id."
+            },
+            "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS}
+        },
+        "required": ["command"],
+        "additionalProperties": false
+    });
+    if escalation {
+        parameters["properties"]["escalate"] = json!({
+            "type": "object",
+            "description": "Run this one command on the host, outside the sandbox, after the user approves. Use only when the sandbox blocks what the task needs.",
+            "properties": {
+                "reason": {"type": "string", "description": "Why the command needs to run outside the sandbox; the user reads it."}
+            },
+            "required": ["reason"],
+            "additionalProperties": false
+        });
+    }
+    ToolDefinition {
+        name: "run_shell".to_owned(),
+        description: format!(
+            "Run a shell command in the workspace root. Commands time out after 120000 ms \
+by default; pass timeout_ms (up to 600000) for longer runs. {execution_boundary}"
+        ),
+        parameters,
+    }
+}
+
+fn coding_tool_definitions(execution_boundary: &str, escalation: bool) -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "read_file".to_owned(),
@@ -2523,27 +2662,7 @@ fn coding_tool_definitions(execution_boundary: &str) -> Vec<ToolDefinition> {
                 "additionalProperties": false
             }),
         },
-        ToolDefinition {
-            name: "run_shell".to_owned(),
-            description: format!(
-                "Run a shell command in the workspace root. Commands time out after 120000 ms \
-by default; pass timeout_ms (up to 600000) for longer runs. {execution_boundary}"
-            ),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "max_bytes": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "Maximum command-output bytes retained across the active head/tail preview. Complete output remains recoverable by result event id."
-                    },
-                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_SHELL_TIMEOUT_MS}
-                },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-        },
+        run_shell_definition(execution_boundary, escalation),
         ToolDefinition {
             name: "git_status".to_owned(),
             description: "Return short git status for the workspace.".to_owned(),
@@ -2669,6 +2788,7 @@ fn tool_result_get(
         output_preview_budget: None,
         project_context_snapshot_digest: project_context_snapshot_digest.map(str::to_owned),
         sandbox_backend: None,
+        escalation_reason: None,
         exit_code: None,
         patch: None,
         file_changes: Vec::new(),

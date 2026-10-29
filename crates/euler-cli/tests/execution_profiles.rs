@@ -1,6 +1,6 @@
 //! Execution profile selection, validation, and recording through the CLI
-//! (ADR 0026 rollout steps 3 to 5: profile plumbing and the `locked`,
-//! `full`, and `workspace` presets).
+//! (ADR 0026 rollout steps 3 to 6: profile plumbing, the `locked`, `full`,
+//! and `workspace` presets, and escalation).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -332,6 +332,88 @@ fn the_workspace_profile_runs_commands_in_a_private_home_without_a_prompt() {
         .expect("homes directory");
     assert!(home.starts_with(&homes), "{}", home.display());
     assert!(!home.exists(), "the fallback HOME outlived its session");
+}
+
+/// Headless `exec` cannot answer an escalation, so under `--profile
+/// workspace` it denies one with a tool error naming the profile and the
+/// flag that would allow it (ADR 0026 section 7), and the command does not
+/// run.
+#[test]
+fn headless_exec_denies_an_escalation_naming_the_profile_and_flag() {
+    let workspace = workspace();
+    let log = workspace.log.to_str().expect("utf8 log");
+    let script = workspace.root.join("script.json");
+    fs::write(
+        &script,
+        serde_json::json!({
+            "version": 1,
+            "responses": [
+                {"events": [
+                    {"tool_call": {
+                        "id": "call-host",
+                        "name": "run_shell",
+                        "input": {
+                            "command": "touch escalated.txt",
+                            "escalate": {"reason": "needs the host"}
+                        }
+                    }},
+                    {"finished": {"stop_reason": "tool_use"}}
+                ]},
+                {"events": [
+                    {"text_delta": "done"},
+                    {"finished": {"stop_reason": "completed"}}
+                ]}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write script");
+    let event_script = format!("event-script={}", script.display());
+    let output = exec(
+        &workspace,
+        &[
+            "--provider-option",
+            &event_script,
+            "--provenance",
+            log,
+            "--profile",
+            "workspace",
+            "--extensions",
+            "none",
+            "--project-context",
+            "off",
+            "work",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!workspace.root.join("escalated.txt").exists());
+
+    let events: Vec<serde_json::Value> = fs::read_to_string(&workspace.log)
+        .expect("read log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json line"))
+        .collect();
+    let start = events
+        .iter()
+        .find(|event| event["kind"] == "session.start")
+        .expect("session.start");
+    if start["payload"]["sandbox_backend"] == "unavailable" {
+        // No backend on this host: the read-only tier keeps shell-exec
+        // denied outright, before the profile could route the ask.
+        return;
+    }
+    let result = events
+        .iter()
+        .find(|event| event["kind"] == "tool.result")
+        .expect("tool.result");
+    let error = result["payload"]["error"].as_str().expect("error");
+    assert!(
+        error.contains(
+            "execution profile `workspace` asks before running a command outside the sandbox"
+        ),
+        "{error}"
+    );
+    assert!(error.contains("--permission-reviewer guardian"), "{error}");
 }
 
 /// With the Euler home's session store, the `workspace` profile's private

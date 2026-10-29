@@ -438,6 +438,9 @@ extension error does not consume the later result.
   boundary that ran that command. Structured tools omit it because they did
   not launch a subprocess. It is per-command provenance; readers must not
   substitute the session-start backend when an older result omits it.
+  A `run_shell` command that ran through an approved escalation (ADR 0026)
+  adds `escalated: true` and `escalation_reason`, the model's stated reason
+  after redaction, beside `sandbox_backend: "host"`.
   Optional `project_context_snapshot_digest` is the candidate digest of the
   immutable project-context snapshot from which this result derived bytes.
   It classifies `skill_read` and every `tool_result_get` rehydration of a
@@ -502,7 +505,9 @@ extension error does not consume the later result.
   only when the originating call and result also carry the same nonempty
   provider call `id`; provenance retains the complete braid and failures or
   malformed/mismatched results remain visible.
-- `permission.prompt`: `capability`, `reason`. An operation-level extension
+- `permission.prompt`: `capability`, `reason`. A `run_shell` ask to run
+  the command outside the sandbox adds `escalated: true`; its reason is on
+  the `tool.call` input. An operation-level extension
   prompt retains that primary capability for compatibility and adds
   `capabilities` (the complete, ordered, distinct capability list),
   `operation`, `batch: true`, `extension_id`, and `command`. A batch is

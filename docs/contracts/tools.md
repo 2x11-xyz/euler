@@ -105,7 +105,7 @@ Semantics:
 | `edit_file` | FsWrite | Single exact replacement. The prepared pre-image must still match at apply time (see “Structured file confinement”). |
 | `write_file` | FsWrite | Create a new file from plain `{path, content}` — no patch dialect. Create-only: fails if the file exists (use `edit_file`/`apply_patch` to modify) or the parent directory is missing. Emits the same `patch.proposed`/`patch.applied`/`file.change`/`file.diff` provenance as the add path of `apply_patch`. |
 | `apply_patch` | FsWrite | Structured single-file patch |
-| `run_shell` | ShellExec | Workspace root; timeout bounds. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
+| `run_shell` | ShellExec | Workspace root; timeout bounds. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. Under a profile with `escalation: allowed`, an optional `escalate: {"reason": ...}` runs the one command on the host after an ask (see "Escalation" below). |
 | `git_status` / `git_diff` | FsRead | Workspace git views. Canonical output is complete; the active canvas receives a bounded, recoverable head/tail preview when needed. |
 | `tool_result_get` | FsRead | Rehydrate a demoted, compacted, or previewed tool result from the **current session** by `event_id` (required); optional `offset_bytes` (default `0`) and `max_bytes` (default 64 KiB) select a byte window. Session-local and project-context-policy-aware for children. |
 
@@ -345,7 +345,9 @@ persist for the session, while `.git` and `/tmp` are not writable; under
 whether credentials are available and that background jobs must redirect
 their output and when they end), and that
 a blocked action is reported as a sandbox limit with the exact command the
-user can run outside Euler. A host registry says commands run on the host;
+user can run outside Euler, or, under a profile that allows escalation, that
+setting `escalate` with a reason runs that one command outside the sandbox
+after the user approves. A host registry says commands run on the host;
 under a sandbox-off execution profile it adds that they run with the user's
 authority, that background jobs must redirect their output and keep running
 after Euler exits, and that the write tools accept absolute paths outside
@@ -354,6 +356,23 @@ unavailable sandbox says commands are refused and points at
 `euler --check-sandbox`. The facts live in the tool description rather than
 the system instructions, so `SYSTEM_INSTRUCTIONS_VERSION` is unchanged and the
 description is stable for a session's prompt cache.
+
+### Escalation
+
+Under a profile with `escalation: allowed` (ADR 0026 section 3), the
+`run_shell` schema gains an optional `escalate` object whose one required
+field is a non-empty `reason`; otherwise the schema omits it. A call that
+sets `escalate` (a JSON `null` counts as unset) is checked before any
+prompt: under a profile that does not allow escalation it fails with a tool
+error naming the profile; an object that is not `{"reason": "<text>"}`, or
+an intercepted `apply_patch` heredoc, fails as an invalid `escalate`. An
+approved escalation runs `sh -c <command>` in the workspace root on the
+host, with the user's `HOME` and the environment a `full` host command
+gets (Euler's own credentials and parent-control variables removed,
+`EULER_HOME` set to a private directory). Its result records
+`sandbox_backend: "host"`, `escalated: true`, and the redacted
+`escalation_reason`, and the workspace is observed before and after as for
+any `run_shell`. The approval rules are in the capabilities contract.
 
 When a sandboxed `run_shell` command whose profile disables network exits
 nonzero and its output reads like a network denial (a DNS resolution failure,

@@ -89,9 +89,8 @@ or grant-covered asks. Its fields are `sandbox: on`, `network: off`,
 `reviewer: user`.
 
 `workspace` is sandboxed with the friction removed. Its fields are
-`locked`'s except `network: on`, `tmp: host`, `caches: writable`, and
-`approvals: escalation-only`; `escalation` stays `not-allowed` until
-escalation ships.
+`locked`'s except `network: on`, `tmp: host`, `caches: writable`,
+`approvals: escalation-only`, and `escalation: allowed`.
 
 - **Network.** Bubblewrap shares the host network namespace; the Seatbelt
   profile allows outbound IP connections, DNS, and binding and accepting on
@@ -178,13 +177,79 @@ escalation ships.
   sandboxed profile Euler ends the jobs its commands left running when the
   session ends and on a profile change, without signalling a reused process
   group.
+- **Escalation.** Under `escalation: allowed`, `run_shell` advertises an
+  optional `escalate` object with a required `reason` (tools contract). The
+  command then runs once on the host, outside the sandbox, with the user's
+  own `HOME` and the environment `full` gives host commands (everything
+  except Euler's own credentials and parent-control variables; see "The
+  `full` preset"), after an ask:
+  - An escalation always asks: no profile lifts it, static safety does not
+    skip it, and the danger walk still runs first, so a flagged command
+    offers no grant. Under a profile with `escalation: not-allowed`,
+    `escalate` is a tool error naming the profile, before any prompt; a
+    configured `always-deny` for `shell-exec` denies it as any command.
+  - The ask offers allow once, or for the session for commands with the
+    same first token, derived as a sandboxed command's session scope (the
+    one token shared by every segment that is not statically safe). No
+    session grant is offered or installed when any segment is a shell, an
+    interpreter (`ssh` included; `python*`, `node`, `ruby`, `perl`, `awk`,
+    ...), a command, privilege, or tracing wrapper (`sudo`, `env`, `xargs`,
+    `timeout`, `strace`, ...), a container `run`, `exec`, `compose`,
+    `create`, `start`, or `container` (`docker`, `podman`), a program named
+    by path (`./deploy.sh`), a task or test runner or package manager that
+    runs project code (`npm`, `npx`, `pnpm`, `yarn`, `make`, `just`,
+    `gradle`, `mvn`, `pytest`, `uv run`, `uvx`, `cargo run`/`r`/`test`/`t`/
+    `bench`/`rustc`, `go run`/`test`/`generate`/`tool`, `poetry run`, ...),
+    a `pip install` of a local path, editable install, or requirements
+    file, or `git` told to run a program. `cargo` given `--config` or `-Z`,
+    `go` given `-toolexec`, `-exec`, or `-vettool`, and any of `uv`,
+    `cargo`, `go`, `gh`, `pip`, `pip3`, `pipx`, `poetry`, `pdm`, `hatch`,
+    `conda`, `docker`, or `podman` whose first argument is an option
+    (which can hide the subcommand) also count. `git` counts when given
+    `-c`, `--config*`, or `--exec-path`, for a subcommand that is not a
+    known built-in (an alias, or `submodule`, `bisect`, `config`,
+    `difftool`, `mergetool`, `filter-branch`, ...), and for an option
+    naming a program
+    (`--upload-pack`, `--receive-pack`, `push`/`archive --exec`,
+    `clone -u`/`--template`, `init --template`, `grep -O`,
+    `rebase -x`/`--exec`). `gh alias`, `gh extension`, and `rsync` given
+    `-e`, `--rsh`, or `--rsync-path` count too. The panel then offers allow
+    once and deny. An allow at any other scope (unscoped, project, user)
+    covers the one request.
+  - Escalation grants live in their own session store: an escalated grant
+    never covers the sandboxed form and a sandboxed or durable grant never
+    covers an escalation. They are not listed in `/permissions`, not
+    persisted or resumed, and end when the session's profile is set.
+  - The `permission.prompt` carries `escalated: true`; the `tool.result`
+    records `sandbox_backend: "host"`, `escalated: true`, and the redacted
+    `escalation_reason`. An unanswered or cancelled escalation follows the
+    ordinary ask cancellation rule.
+  - With `reviewer: guardian` an escalation is an ordinary ask: the
+    guardian's brief says the command runs on the host and gives the
+    reason, its allows stay once-scoped, and a reason longer than its
+    field bound goes to a person.
+  - An escalated command's background jobs end with the session and on a
+    profile change, as sandboxed ones do.
+- **Never-prompt denials.** When a decider that cannot ask anyone
+  (headless `euler exec`) denies an ask in the root session, the tool error
+  names the execution profile and what would allow the request instead of
+  "denied by the user": `--permission-reviewer guardian` (unless the
+  guardian is the reviewer, when it says whether the guardian abstained or
+  could not review the request), and then a profile with
+  `credentials: "pass"` for an escalation, since no profile runs one
+  unasked, or `--profile` for another ask. For a dangerous command it says
+  that only a person can approve it. Requests a configured `always-deny`
+  refuses keep their message.
 
-With the sandbox on, only these two boundaries are enforced: a profile with
-`network: on` must keep `workspace`'s `tmp`, `caches`, `escalation`, and
-`background_jobs`, and one with `network: off` must keep `locked`'s, with no
-`writable_paths` and private credentials. `approvals` may be `escalation-only` or `always` with
-either boundary, so `{"extends": "locked", "approvals": "escalation-only"}`
-runs commands without a prompt inside the no-network sandbox.
+With the sandbox on, only these two boundaries are enforced: a profile
+with `network: on` must keep `workspace`'s `tmp`, `caches`, and
+`background_jobs`, and one with `network: off` must keep `locked`'s, with
+no `writable_paths` and private credentials. `escalation` and `approvals`
+are not part of either boundary: `escalation` may be `allowed` or
+`not-allowed` with either, and `approvals` may be `escalation-only` or
+`always` with either boundary, so
+`{"extends": "locked", "approvals": "escalation-only"}` runs commands
+without a prompt inside the no-network sandbox.
 `approvals: never` belongs to the `full` preset and is refused with the
 sandbox on. Changing `network` alone moves a profile to the other boundary
 with the wrong `tmp` and `caches`, so the startup error names `network`.
@@ -256,8 +321,10 @@ not ask under `approvals: never`.
 
 **Approval override.** A profile's `approvals` acts per request through one
 function, `execution_profile::profile_mode_override`, which the permission
-gate applies after `always-deny` and the danger veto and before the
-structured sensitive-path escalation, for tool calls, companion loops,
+gate applies after `always-deny`, the escalation rule (an escalated
+`run_shell` asks where the profile allows escalation and is denied
+otherwise), and the danger veto, and before the structured sensitive-path
+escalation, for tool calls, companion loops,
 extension capability approval, and idle contributors. `never` returns allow
 for every request that reaches it, sensitive paths included.
 `escalation-only` asks for a `run_shell` sensitive-path request and, while
@@ -268,12 +335,13 @@ otherwise returns nothing, so the configured modes apply as before.
 
 **Background jobs.** Each `run_shell` command runs in its own process group.
 When its shell exits while other members of the group still run, Euler
-keeps the leader exited but unreaped, which pins the group id. Jobs a host
-command started keep running, are only reaped at session end (or carried
-to the next session on `/new`), and are listed on stderr at exit (`euler`,
-`euler tui`, `euler exec`). Jobs a sandboxed command started are ended when
-the session ends and on a profile change (Bubblewrap already ends them with
-their command). A descendant that moves itself into another process group
+keeps the leader exited but unreaped, which pins the group id. Jobs a
+command started with the sandbox off keep running, are only reaped at
+session end (or carried to the next session on `/new`), and are listed on
+stderr at exit (`euler`, `euler tui`, `euler exec`). Jobs a sandboxed or
+escalated command started are ended when the session ends and on a
+profile change (Bubblewrap already ends sandboxed ones with their
+command). A descendant that moves itself into another process group
 is not tracked.
 
 - **Presets.** `full`, `workspace`, and `locked` are reserved names.
@@ -313,9 +381,11 @@ is not tracked.
   profile. The implicit read-only tier never tightens a profile.
 - **Profile change.** `/profile <name>` (or the `/profile` picker) switches
   the session between turns: it rebuilds the subprocess boundary and the
-  structured-write scope, applies the new profile's approval override, and
-  records `session.profile_changed`. Jobs started under a sandboxed profile
-  are ended first; host background jobs keep running.
+  structured-write scope, applies the new profile's approval override and
+  escalation setting, clears escalation grants, and records
+  `session.profile_changed`. Jobs started under a sandboxed profile,
+  escalated ones included, are ended first; jobs started with the sandbox
+  off keep running.
   `/profile default <name>` writes `defaults.interactive` for new sessions.
 - **Project overlay.** A repository may hold `.euler/profile-overlay.json`
   with any profile field except `reviewer` and `extends`. It applies to
