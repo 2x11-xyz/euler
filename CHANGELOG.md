@@ -6,6 +6,17 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Preferences: `preferences.json` follows `EULER_HOME`
+
+- The saved `/model`, theme, timestamp, and notification preferences are now
+  read from and written to `$EULER_HOME/preferences.json` when `EULER_HOME`
+  is set, like `providers.json`, auth, sessions, extensions, and
+  `profiles.json`. Before, they always used `$HOME/.euler/preferences.json`.
+  An existing file under `$HOME/.euler` is not read or migrated when
+  `EULER_HOME` points elsewhere: the new location starts empty, so pick the
+  model again with `/model` (or copy the file). With `EULER_HOME` unset the
+  location is unchanged.
+
 ### Execution profiles: withhold every providers.json credential reference
 
 - A variable that any `providers.json` provider entry references as `$NAME`
