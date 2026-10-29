@@ -312,7 +312,7 @@ sandbox for this session, so this failure may be the sandbox rather than the
 host's connection.` The note is a heuristic. The command output before it is
 unchanged, and successful, host, and `git_*` results are never annotated.
 This amends the last sentence of ADR 0021 row B (no attribution to network
-denial from stderr) as rollout step 1 of ADR 0026 (Proposed): the note is
+denial from stderr) as rollout step 1 of ADR 0026 (accepted 2026-10-28): the note is
 hedged text that names the boundary, and it offers no retry or grant.
 
 Euler's own Git invocations are neutralized before they run (ADR 0021 row G).
