@@ -1,7 +1,7 @@
 //! Custom provider config parsing for `~/.euler/providers.json`.
 
 use crate::catalog::canonical_provider_id;
-use serde::de::{Deserializer, Error, MapAccess, Visitor};
+use serde::de::{Deserializer, Error, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,18 +65,17 @@ impl ProviderConfigRegistry {
 /// `${NAME}` in a provider's `api_key` or header values: Euler's own
 /// credentials, which no command Euler runs inherits (ADR 0026 sections 1
 /// and 2). Every provider entry counts, including one
-/// [`ProviderConfigRegistry::with_json`] ignores as malformed, so a broken
-/// entry's secret is withheld too.
+/// [`ProviderConfigRegistry::with_json`] ignores as malformed and each entry
+/// of a repeated provider id or `providers` key, so a broken entry's secret
+/// is withheld too. A file that is not valid JSON names none.
 pub fn referenced_env_names(contents: &str) -> BTreeSet<String> {
-    let Ok(Value::Object(root)) = serde_json::from_str(contents.trim_start_matches('\u{feff}'))
+    let Ok(ProviderEntries(entries)) =
+        serde_json::from_str::<ProviderEntries>(contents.trim_start_matches('\u{feff}'))
     else {
         return BTreeSet::new();
     };
-    let Some(Value::Object(providers)) = root.get("providers") else {
-        return BTreeSet::new();
-    };
-    providers
-        .values()
+    entries
+        .iter()
         .filter_map(Value::as_object)
         .flat_map(|provider| {
             let headers = provider
@@ -90,6 +89,94 @@ pub fn referenced_env_names(contents: &str) -> BTreeSet<String> {
         .filter_map(crate::custom_provider::secret_spec_env_name)
         .map(str::to_owned)
         .collect()
+}
+
+/// Every provider entry of a `providers.json` root object, in file order.
+/// Unlike a map, it keeps each entry of a repeated provider id and of a
+/// repeated `providers` key; a `providers` value that is not an object adds
+/// no entries.
+struct ProviderEntries(Vec<Value>);
+
+impl<'de> Deserialize<'de> for ProviderEntries {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RootVisitor;
+        impl<'de> Visitor<'de> for RootVisitor {
+            type Value = ProviderEntries;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a providers.json object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(key) = access.next_key::<String>()? {
+                    if key == "providers" {
+                        entries.extend(access.next_value::<ProvidersValue>()?.0);
+                    } else {
+                        access.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(ProviderEntries(entries))
+            }
+        }
+        deserializer.deserialize_map(RootVisitor)
+    }
+}
+
+/// The entries of one `providers` value: every value of an object, repeated
+/// keys included, and none for any other JSON value, which must not fail the
+/// parse and discard the entries of another `providers` key.
+struct ProvidersValue(Vec<Value>);
+
+impl<'de> Deserialize<'de> for ProvidersValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ProvidersVisitor;
+        impl<'de> Visitor<'de> for ProvidersVisitor {
+            type Value = ProvidersValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("any JSON value")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some((_, value)) = access.next_entry::<IgnoredAny, Value>()? {
+                    entries.push(value);
+                }
+                Ok(ProvidersValue(entries))
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+                while access.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(ProvidersValue(Vec::new()))
+            }
+
+            fn visit_unit<E: Error>(self) -> Result<Self::Value, E> {
+                Ok(ProvidersValue(Vec::new()))
+            }
+
+            fn visit_bool<E: Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(ProvidersValue(Vec::new()))
+            }
+
+            fn visit_i64<E: Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(ProvidersValue(Vec::new()))
+            }
+
+            fn visit_u64<E: Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(ProvidersValue(Vec::new()))
+            }
+
+            fn visit_f64<E: Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(ProvidersValue(Vec::new()))
+            }
+
+            fn visit_str<E: Error>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(ProvidersValue(Vec::new()))
+            }
+        }
+        deserializer.deserialize_any(ProvidersVisitor)
+    }
 }
 
 #[derive(Clone, PartialEq)]

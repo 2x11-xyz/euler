@@ -955,3 +955,40 @@ fn referenced_env_names_includes_provider_entries_load_ignores() {
     );
     assert!(referenced_env_names("not json").is_empty());
 }
+
+#[test]
+fn referenced_env_names_includes_every_entry_of_a_repeated_provider_id() {
+    let contents = r#"{
+      "version": 1,
+      "providers": {
+        "proxy": {"api_key": "$FIRST_PROXY_KEY"},
+        "proxy": {"api_key": "$SECOND_PROXY_KEY"}
+      }
+    }"#;
+    let (registry, warnings) = ProviderConfigRegistry::with_json(contents);
+    assert!(registry.providers.is_empty(), "{registry:?}");
+    assert!(
+        warnings.iter().any(|warning| warning.contains("duplicate")),
+        "{warnings:?}"
+    );
+    assert_eq!(
+        referenced_env_names(contents)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["FIRST_PROXY_KEY", "SECOND_PROXY_KEY"]
+    );
+    let repeated_providers_key = r#"{
+      "providers": {"proxy": {"api_key": "$FIRST_PROXY_KEY"}},
+      "providers": "not an object",
+      "providers": [{"api_key": "$IN_AN_ARRAY"}],
+      "providers": null,
+      "providers": {"other": {"headers": {"x-team": "${TEAM_TOKEN}"}}}
+    }"#;
+    assert_eq!(
+        referenced_env_names(repeated_providers_key)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["FIRST_PROXY_KEY", "TEAM_TOKEN"]
+    );
+    assert!(referenced_env_names(r#"[{"proxy": {"api_key": "$KEY"}}]"#).is_empty());
+}

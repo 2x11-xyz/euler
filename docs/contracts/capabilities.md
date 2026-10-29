@@ -131,10 +131,11 @@ or grant-covered asks. Its fields are `sandbox: on`, `network: off`,
   `GIT_SSH_COMMAND`, which only Euler sets), Euler's parent-control
   variables, Euler's own credentials (the built-in provider keys and the
   variables any provider entry in the Euler home's `providers.json`
-  references in `api_key` or a header, including an entry loading ignores
-  as malformed), secret-shaped variables, and the credential-agent variables
-  `SSH_AUTH_SOCK` and `GPG_AGENT_INFO`. `HOME`, `TMPDIR`, `PATH`, the
-  toolchain and cache variables, and `PAGER=cat GIT_PAGER=cat TERM=dumb
+  references in `api_key` or a header, including an entry loading ignores as
+  malformed and each entry of a repeated provider id; a file that is not
+  valid JSON names none), secret-shaped variables, and the credential-agent
+  variables `SSH_AUTH_SOCK` and `GPG_AGENT_INFO`. `HOME`, `TMPDIR`, `PATH`,
+  the toolchain and cache variables, and `PAGER=cat GIT_PAGER=cat TERM=dumb
   NO_COLOR=1` are set.
 - **Credential reads on macOS.** Seatbelt denies reads of `~/.ssh`,
   `~/.gnupg`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.config/gh`,
@@ -147,18 +148,18 @@ or grant-covered asks. Its fields are `sandbox: on`, `network: off`,
   its real path on Linux and allowed on macOS. A missing path is a startup
   error naming the field.
 - **`credentials: "pass"`.** For a user profile extending `workspace`:
-  secret-shaped variables, `SSH_AUTH_SOCK`, and `GPG_AGENT_INFO` pass
-  except Euler's own credentials (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-  `OPENROUTER_API_KEY`, `XAI_API_KEY`, and the variables any `providers.json`
-  provider entry references, valid or malformed) and parent-control variables; row C's denylist still
-  applies. On macOS the SSH agent socket `SSH_AUTH_SOCK` names is
-  reachable. Each listed credential store that exists, except the keychains,
-  browser profiles, and the Euler home, plus `~/.gitconfig` and
-  `~/.config/git`, appears at the same path under the private `HOME`: a
-  read-only bind on Linux (writable when `writable_paths` covers its real
-  path), and on macOS a symlink to the real path with its read deny lifted.
-  Cargo's credential mask is lifted too. The macOS keychain is never
-  passed.
+  secret-shaped variables, `SSH_AUTH_SOCK`, and `GPG_AGENT_INFO` pass except
+  Euler's own credentials (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+  `OPENROUTER_API_KEY`, `XAI_API_KEY`, and the variables any
+  `providers.json` provider entry references, valid, malformed, or repeated)
+  and parent-control variables; row C's denylist still applies. On macOS the
+  SSH agent socket `SSH_AUTH_SOCK` names is reachable. Each listed
+  credential store that exists, except the keychains, browser profiles, and
+  the Euler home, plus `~/.gitconfig` and `~/.config/git`, appears at the
+  same path under the private `HOME`: a read-only bind on Linux (writable
+  when `writable_paths` covers its real path), and on macOS a symlink to the
+  real path with its read deny lifted. Cargo's credential mask is lifted
+  too. The macOS keychain is never passed.
 - **Approvals (row P).** Inside the sandbox, an `ask` for `fs-write` or
   `shell-exec` becomes `session-allow`, so `run_shell`, the `git_*` tools,
   and workspace-confined structured writes run without a prompt. This holds
@@ -277,14 +278,13 @@ and `reviewer: user`. Under `full`:
   credentials and parent-control variables (ADR 0026 resolved question 7).
   Euler's own credentials are the built-in provider variables
   (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
-  `XAI_API_KEY`), the variables any `providers.json` provider entry, valid
-  or malformed, references in `api_key` or a header (`$NAME`, `${NAME}`),
-  and any variable whose value is a credential Euler holds (the
-  auth file's values and secrets its providers resolve). Other
-  secret-shaped variables (`GITHUB_TOKEN`, cloud keys) reach commands and
-  stay registered with the redactor; row C's denylist is not applied. This
-  rule applies to every host-backend command, including an unsupported
-  platform's.
+  `XAI_API_KEY`), the variables any `providers.json` provider entry, valid,
+  malformed, or repeated, references in `api_key` or a header (`$NAME`,
+  `${NAME}`), and any variable whose value is a credential Euler holds (the
+  auth file's values and secrets its providers resolve). Other secret-shaped
+  variables (`GITHUB_TOKEN`, cloud keys) reach commands and stay registered
+  with the redactor; row C's denylist is not applied. This rule applies to
+  every host-backend command, including an unsupported platform's.
 - `write_file`, `edit_file`, and `apply_patch` accept a path outside the
   workspace (absolute, or relative and leaving it). The write is recorded
   with its canonical absolute path; no checkpoint covers it and `/rollback`
