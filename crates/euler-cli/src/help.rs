@@ -16,7 +16,10 @@ const SESSION_OPTIONS: &str = "  \
   --observe-cadence <n>      Observer cadence in driver rounds
                              (default: extension-defined)
   --permission-reviewer <r>  user or guardian: who reviews permission asks
-                             (default: user)
+                             (default: the profile's reviewer, else user)
+  --profile <name>           Execution profile: locked or a profile in
+                             profiles.json (default: the defaults entry for
+                             interactive or exec, else locked)
   --project-context <p>      auto, on, or off: load this project's EULER.md
                              guidance (default: auto)
   --accept-relocation        On resume, move the session to the current folder

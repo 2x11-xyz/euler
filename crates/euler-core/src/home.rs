@@ -63,6 +63,11 @@ impl EulerHome {
         self.root.join(SESSIONS_DIR)
     }
 
+    /// User execution profiles and per-context defaults (ADR 0026).
+    pub fn profiles_path(&self) -> PathBuf {
+        self.root.join(crate::execution_profile::PROFILES_FILE)
+    }
+
     pub fn extensions_dir(&self) -> PathBuf {
         self.root.join(EXTENSIONS_DIR)
     }

@@ -399,7 +399,8 @@ pub enum PermissionPosture {
     ReadOnly,
     /// Require an explicit decision for every capability.
     AskEveryTime,
-    /// Allow every capability for this session without a sandbox boundary.
+    /// Allow every capability for this session. The execution profile's
+    /// sandbox is unchanged (ADR 0026).
     FullAccess,
 }
 
@@ -415,7 +416,7 @@ impl PermissionPosture {
         match self {
             Self::ReadOnly => "Read only",
             Self::AskEveryTime => "Ask every time",
-            Self::FullAccess => "Full access (unsandboxed)",
+            Self::FullAccess => "Full access (sandbox unchanged)",
         }
     }
 
@@ -427,7 +428,10 @@ impl PermissionPosture {
             Self::AskEveryTime => {
                 "clear session approvals; ask before each operation not covered by a durable rule"
             }
-            Self::FullAccess => "allow every capability for this session; no OS sandbox is active",
+            Self::FullAccess => {
+                "allow every capability for this session; the execution profile's sandbox still \
+                 applies"
+            }
         }
     }
 
@@ -464,7 +468,9 @@ impl PermissionPosture {
                 "Ask every time · uncovered operations ask · durable grants and \
                  statically-safe commands run without one"
             }
-            Self::FullAccess => "Full access · unsandboxed · every capability allowed this session",
+            Self::FullAccess => {
+                "Full access · sandbox unchanged · every capability allowed this session"
+            }
         }
     }
 
@@ -1472,9 +1478,17 @@ mod tests {
                 ApprovalMode::SessionAllow
             );
         }
+        // ADR 0026: a posture changes approvals, never the execution
+        // profile, so no posture text may claim the sandbox is off.
         assert!(PermissionPosture::FullAccess
             .detail()
-            .contains("no OS sandbox"));
+            .contains("the execution profile's sandbox still applies"));
+        for posture in PermissionPosture::ALL {
+            for text in [posture.label(), posture.detail(), posture.envelope()] {
+                assert!(!text.contains("unsandboxed"), "{text}");
+                assert!(!text.contains("no OS sandbox"), "{text}");
+            }
+        }
     }
 
     #[test]

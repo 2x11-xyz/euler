@@ -12,6 +12,7 @@ pub mod command_safety;
 pub mod compaction;
 mod diagnostics;
 mod durability;
+pub mod execution_profile;
 mod extension_config;
 pub mod extension_registry;
 pub mod extensions;
@@ -74,6 +75,10 @@ pub use euler_sdk::{
     SessionEventWake, StaticCommandDescriptor, StaticExtensionDescriptor, EXTENSION_MANIFEST_FILE,
     MAX_EVENT_WAKE_RECEIVERS, MAX_EXTENSION_MANIFEST_BYTES,
 };
+pub use execution_profile::{
+    ExecutionProfile, ProfileContext, ProfileError, ProfilesConfig, ProjectOverlay, ResumeProfile,
+    ResumeProfileBasis,
+};
 pub use extension_registry::{
     ExtensionAuditEntry, ExtensionAuditError, ExtensionAuditErrorCode, ExtensionAuditErrorReport,
     ExtensionAuditIssueCode, ExtensionAuditReport, ExtensionEnablement, ExtensionRegistry,
@@ -114,8 +119,9 @@ pub use provider_runtime::{
     ProviderRuntimeEvent, ProviderRuntimeObserver, ProviderRuntimeScope, ProviderRuntimeTarget,
 };
 pub use resume::{
-    check_run_continuation, fold_session, plan_relocation, read_resume_prefix, resume_session,
-    resume_session_continuing_run, resume_session_from_folded_prefix, resume_session_from_prefix,
+    check_run_continuation, fold_session, plan_relocation, read_resume_prefix,
+    recorded_execution_profile, resume_session, resume_session_continuing_run,
+    resume_session_from_folded_prefix, resume_session_from_prefix,
     resume_session_from_prefix_with_outcome, resume_session_with_outcome, ContinuationRefusal,
     DecidedRunOutcome, FoldedSession, RelocationRequired, ResumeError, ResumeOutcome,
     ResumeWarning, RunContinuation, RUN_RESTART_LIMIT,

@@ -838,6 +838,20 @@ extension error does not consume the later result.
   in older streams means `user`. It is config projection for visibility, not
   resume authority; per-decision truth is `permission.decision`
   `decision_source`.
+  `execution_profile` records the resolved execution profile (ADR 0026):
+  `{ "name", "fields", "fields_sha256" }`. `fields` holds every profile
+  field after any project overlay (`sandbox`, `network`, `writable_paths`,
+  `tmp`, `caches`, `credentials`, `approvals`, `escalation`,
+  `background_jobs`, `reviewer`, the values of the capabilities contract,
+  "Execution profiles"); `reviewer` is the reviewer the session uses, so it
+  matches `permission_reviewer`. `fields_sha256` is SHA-256 over the
+  compact JSON of `fields` with keys sorted (no whitespace), so a reader
+  recomputes it from the logged object. Current writers always emit it;
+  streams written before this release omit it, which means not recorded:
+  resume resolves such a session as a new one and infers nothing. Resume
+  compares against it (the resume rule in the capabilities contract); a
+  record with unknown keys or values, or a digest that does not match,
+  fails resume closed.
   Optional `context_limit` is either `null` (unknown/legacy window) or an
   object `{ "limit_tokens": <u64>, "source": "catalog" }` recording the
   catalog-derived context window used for token-threshold compaction and
@@ -914,6 +928,9 @@ extension error does not consume the later result.
   the live root the session resumed in, so it governs later resume verdicts;
   a marker without it (an older binary, or an unreadable root) resets the
   governing identity to unknown.
+  `execution_profile` has the `session.start` shape and records the profile
+  the resumed lifetime runs under; the latest one recorded governs the next
+  resume's comparison. Markers from older binaries omit it.
 - `session.renamed`: `name`. Records the latest user-visible session name;
   sidecars and indexes are projections of this event, not naming authority.
   For sessions created by current new-Euler builds before this event existed,

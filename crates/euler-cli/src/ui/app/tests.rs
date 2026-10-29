@@ -5669,6 +5669,42 @@ fn resume_cancels_old_queue_then_rehydrates_target_rows_on_binding() {
     );
 }
 
+/// The in-app `/resume` resolves the profile from the app's Euler home,
+/// installs it on the resumed session, and shows the change from the
+/// recorded profile.
+#[test]
+fn resume_installs_the_execution_profile_it_resolves() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let home = EulerHome::from_root(temp.path().join(".euler")).expect("home");
+    std::fs::write(
+        home.profiles_path(),
+        r#"{"defaults": {"interactive": "ci"},
+            "profiles": {"ci": {"extends": "locked", "reviewer": "guardian"}}}"#,
+    )
+    .expect("write profiles.json");
+    let store = SessionStore::new(home).expect("store");
+    let workspace = std::env::current_dir().expect("workspace");
+    let (mut core, _old_session_id, _old_events_path, _queue_id) =
+        stored_core_with_pending_follow_up(&workspace, &store, "before resume");
+    let (target_session_id, _) = create_stored_resume_target(&workspace, &store, None);
+
+    assert_eq!(
+        core.resume_session_from_picker(target_session_id),
+        CoreEffect::ReplayHistoryWithScrollbackPurge
+    );
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("execution profile: ci (recorded: locked; changed reviewer user -> guardian)")
+    );
+    let AppState::Idle { session } = &core.state else {
+        panic!("resumed session must be idle");
+    };
+    assert_eq!(
+        session.permission_reviewer(),
+        euler_core::PermissionReviewer::Guardian
+    );
+}
+
 #[test]
 fn resume_rehydrates_terminal_cancelled_steering_as_a_recovery_decision() {
     let temp = tempfile::tempdir().expect("temp dir");

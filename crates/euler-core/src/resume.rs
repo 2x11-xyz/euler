@@ -1,4 +1,5 @@
 use crate::canvas::{AutoCompactionPolicy, CompactionTier};
+use crate::execution_profile::ExecutionProfile;
 use crate::permissions::{permission_prompt_capabilities, ApprovalMode};
 use crate::provenance::{
     event_advances_parent_frontier, nul_offset_in_line, numbered_accepted_prefix_lines,
@@ -158,6 +159,8 @@ pub enum ResumeError {
     RunLifecycle(Box<crate::session::RunLifecycleError>),
     #[error("cannot continue: {0}")]
     ContinuationRefused(#[from] ContinuationRefusal),
+    #[error("resume incompatible: the recorded execution_profile on {kind} is invalid: {reason}")]
+    ExecutionProfile { kind: String, reason: String },
 }
 
 impl From<crate::session::RunLifecycleError> for ResumeError {
@@ -274,6 +277,36 @@ pub fn fold_session(
         session_allowed_capabilities,
         warnings,
     })
+}
+
+/// The latest execution profile a log recorded, on the first
+/// `session.start` or a later `session.resumed` (ADR 0026 section 9). `None`
+/// means not recorded: the log predates profiles, so the session resolves
+/// its profile as a new one and none is inferred. A malformed record fails
+/// resume closed rather than reading as not recorded, which could loosen
+/// the session.
+pub fn recorded_execution_profile(
+    events: &[EventEnvelope],
+) -> Result<Option<ExecutionProfile>, ResumeError> {
+    let start = events
+        .iter()
+        .find(|event| event.kind.as_str() == EventKind::SESSION_START);
+    let resumed = events
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::SESSION_RESUMED);
+    let mut latest = None;
+    for event in start.into_iter().chain(resumed) {
+        if let Some(record) = event.payload.get("execution_profile") {
+            let profile = ExecutionProfile::from_record(record).map_err(|reason| {
+                ResumeError::ExecutionProfile {
+                    kind: event.kind.as_str().to_owned(),
+                    reason,
+                }
+            })?;
+            latest = Some(profile);
+        }
+    }
+    Ok(latest)
 }
 
 fn preflight_session(
@@ -756,8 +789,7 @@ fn resume_from_folded_prefix<D>(
     // Built now because it needs the config ids and the accepted tail, before
     // `config` is moved into the session. Never carries user or model content.
     let mut resume_marker = session_resumed_marker(
-        &config.session_id,
-        &config.agent_id,
+        &config,
         &active_target,
         logical_parent_frontier(&folded.events),
         events_folded,
@@ -1012,18 +1044,21 @@ fn verify_and_rehydrate_blobs(
 }
 
 /// Build the durable `session.resumed` marker for a resume boundary (issue
-/// #6). Payload is audit metadata only — provider/model, the count of folded
-/// events, the tail event id continued from, and the execution boundary this
-/// resume got — never user or model content.
+/// #6). Payload is audit metadata only (provider/model, the count of folded
+/// events, the tail event id continued from, and the execution boundary and
+/// profile this resume got), never user or model content.
 fn session_resumed_marker(
-    session_id: &str,
-    agent_id: &str,
+    config: &SessionConfig,
     target: &ModelTarget,
     resumed_from_event_id: Option<String>,
     events_folded: usize,
     sandbox: crate::SandboxStatus,
 ) -> EventEnvelope {
     let mut payload = euler_event::JsonObject::new();
+    payload.insert(
+        "execution_profile".to_owned(),
+        config.execution_profile_record(),
+    );
     payload.insert("provider".to_owned(), target.provider.clone().into());
     payload.insert("model".to_owned(), target.model.clone().into());
     payload.insert("events_folded".to_owned(), events_folded.into());
@@ -1038,8 +1073,8 @@ fn session_resumed_marker(
         payload.insert("resumed_from_event_id".to_owned(), from.clone().into());
     }
     EventEnvelope::new(
-        session_id.to_owned(),
-        agent_id.to_owned(),
+        config.session_id.clone(),
+        config.agent_id.clone(),
         resumed_from_event_id,
         EventKind::SESSION_RESUMED,
         payload,

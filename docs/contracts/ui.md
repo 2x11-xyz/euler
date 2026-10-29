@@ -777,9 +777,10 @@ session to the current folder.
 `/permissions` offers session-local postures before its advanced
 per-capability controls: **Read only** permits `fs-read`, `provenance-read`,
 and `diagnostics-read`; **Ask every time** puts every capability in `ask`; and
-**Full access (unsandboxed)** permits every capability for the current
-session. **Auto in workspace sandbox** stays visibly unavailable until an
-enforced Linux workspace-sandbox backend exists. A permission posture is not
+**Full access (sandbox unchanged)** permits every capability for the current
+session without changing the execution profile's sandbox. **Auto in
+workspace sandbox** stays visibly unavailable until an enforced Linux
+workspace-sandbox backend exists. A permission posture is not
 a sandbox claim and does not override secret/config guardrails. Applying a
 posture clears transient session grants, so a prior session approval cannot
 silently survive a switch to **Ask every time**; explicit project/user rules
