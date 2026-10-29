@@ -35,6 +35,15 @@ pull requests that landed them; deeper design rationale lives in
   `warning: ignored model preference with unknown provider <id>`. The warning
   now appears only when no built-in or custom provider has that id.
 
+### Execution profiles: the model is told about a change
+
+- After `/profile` changes the execution profile, the next turn carries one
+  host note naming the new profile and its boundary (the text the
+  `run_shell` description states), so the model no longer guesses why
+  network or writes behave differently. Several changes before one turn
+  yield one note for the latest; none when the profile ends where it was.
+  `session.profile_changed` records the note as `model_note`.
+
 ### Execution profiles: headless default (ADR 0026 step 7)
 
 - **Behavior change**: `euler exec` now runs under the `workspace` profile

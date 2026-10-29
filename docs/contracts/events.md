@@ -944,10 +944,15 @@ extension error does not consume the later result.
   `session.start`, `session.resumed`, or `session.profile_changed`) governs
   the next resume's comparison. Markers from older binaries omit it.
 - `session.profile_changed`: `execution_profile` (the `session.start`
-  shape), `command_approvals`, `sandbox_backend`, and
-  `sandbox_unavailable_reason`. Records a `/profile` switch between turns
-  (ADR 0026 section 5); the latest recorded profile governs the next
-  resume's comparison.
+  shape), `command_approvals`, `sandbox_backend`,
+  `sandbox_unavailable_reason`, and `model_note`. Records a `/profile` switch
+  between turns (ADR 0026 section 5); the latest recorded profile governs the
+  next resume's comparison. `model_note` is the exact host note the model
+  sees at the next turn, unless the profile ends where the model last saw it:
+  `[host note] Execution profile changed to <name>;
+  earlier commands ran under the previous profile.` followed by the boundary
+  the new `run_shell` description states (canvas contract, "Execution
+  Profile Notes"). Events from older binaries omit it and project no note.
 - `session.renamed`: `name`. Records the latest user-visible session name;
   sidecars and indexes are projections of this event, not naming authority.
   For sessions created by current new-Euler builds before this event existed,

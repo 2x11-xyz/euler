@@ -8494,6 +8494,126 @@ fn profile_change_switches_the_boundary_and_is_recorded() {
     );
 }
 
+fn preset_profile(name: &str) -> crate::ExecutionProfile {
+    crate::ProfilesConfig::default()
+        .resolve(Some(name), crate::ProfileContext::Interactive, None)
+        .expect("preset resolves")
+}
+
+fn execution_profile_notes(request: &ModelRequest) -> Vec<String> {
+    request
+        .input
+        .iter()
+        .filter_map(|item| match item {
+            ModelInputItem::Message { content, .. } if content.starts_with("[host note]") => {
+                Some(content.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The model is told about a profile change at the next turn (ADR 0026
+/// section 6): one note for the latest of several changes, naming the
+/// profile and the boundary `run_shell` states, recorded on the change.
+#[test]
+fn profile_change_tells_the_model_once_at_the_next_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = CapturingScriptedProvider::new(
+        vec![
+            FixtureResponse::Assistant("one".to_owned()),
+            FixtureResponse::Assistant("two".to_owned()),
+            FixtureResponse::Assistant("three".to_owned()),
+        ],
+        Arc::clone(&requests),
+    );
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session.run_turn("first").expect("turn");
+    session
+        .change_execution_profile(preset_profile("full"))
+        .expect("profile change");
+    session
+        .change_execution_profile(preset_profile("workspace"))
+        .expect("profile change");
+    session.run_turn("second").expect("turn");
+    session.run_turn("third").expect("turn");
+
+    let changes = events_of_kind(session.events(), EventKind::SESSION_PROFILE_CHANGED);
+    let recorded = changes[1].payload["model_note"]
+        .as_str()
+        .expect("model_note recorded");
+    let boundary = session.tools.model_execution_boundary();
+    assert!(recorded.starts_with("[host note] Execution profile changed to workspace;"));
+    assert!(recorded.ends_with(&boundary));
+    let requests = requests.lock().expect("requests");
+    assert!(execution_profile_notes(&requests[0]).is_empty());
+    for request in &requests[1..] {
+        assert_eq!(execution_profile_notes(request), vec![recorded.to_owned()]);
+    }
+    let run_shell = requests[1]
+        .tools
+        .iter()
+        .find(|tool| tool.name == "run_shell")
+        .expect("run_shell offered");
+    assert!(run_shell.description.ends_with(&boundary));
+}
+
+/// A child may run under a tighter profile, so the parent's notes stay out of
+/// an inherited canvas.
+#[test]
+fn child_canvas_boundary_drops_execution_profile_notes() {
+    let user = CanvasItem::Message {
+        event_id: "user".to_owned(),
+        role: CanvasRole::User,
+        content: "go".to_owned(),
+    };
+    let canvas = child_canvas_boundary(vec![
+        CanvasItem::ExecutionProfileNote {
+            event_id: "note".to_owned(),
+            content: "[host note] Execution profile changed to full".to_owned(),
+        },
+        user.clone(),
+    ]);
+
+    assert_eq!(canvas, vec![user]);
+}
+
+/// Changes that end on the profile the model last saw add no note.
+#[test]
+fn profile_change_back_to_the_seen_profile_adds_no_note() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = CapturingScriptedProvider::new(
+        vec![FixtureResponse::Assistant("done".to_owned())],
+        Arc::clone(&requests),
+    );
+    let mut session = Session::new(
+        SessionConfig::new(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+
+    session
+        .change_execution_profile(preset_profile("locked"))
+        .expect("profile change");
+    session
+        .change_execution_profile(preset_profile("full"))
+        .expect("profile change");
+    session
+        .change_execution_profile(preset_profile("locked"))
+        .expect("profile change");
+    session.run_turn("go").expect("turn");
+
+    let requests = requests.lock().expect("requests");
+    assert!(execution_profile_notes(&requests[0]).is_empty());
+}
+
 /// A profile change ends the jobs a sandboxed command left running before
 /// the boundary changes, while the session goes on (ADR 0026 resolved
 /// question 12). Seatbelt has no PID namespace, so the job outlives its

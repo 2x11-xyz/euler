@@ -173,6 +173,11 @@ pub enum CanvasItem {
         point: String,
         content: String,
     },
+    /// The host note a `session.profile_changed` recorded (ADR 0026 section
+    /// 6): its exact `model_note` text, maps to a user-role input. At most
+    /// one per turn boundary, for the latest change, and none when the
+    /// profile ends where the model last saw it.
+    ExecutionProfileNote { event_id: String, content: String },
     Reasoning {
         event_id: String,
         provider: String,
@@ -215,6 +220,7 @@ impl CanvasItem {
             | Self::Projection { event_id, .. }
             | Self::Slot { event_id, .. }
             | Self::ExtensionContribution { event_id, .. }
+            | Self::ExecutionProfileNote { event_id, .. }
             | Self::Reasoning { event_id, .. }
             | Self::ToolCall { event_id, .. }
             | Self::ToolOutput { event_id, .. } => event_id,
@@ -339,8 +345,12 @@ fn collect_canvas_items(
         active_slots,
         &pending_contributions,
     );
+    let mut profile_notes = ExecutionProfileNotes::new(active_swap.as_ref());
 
     for (index, event) in events.iter().enumerate() {
+        // Before the frontier skip so the start and changes there still set
+        // what the model saw; a change there never yields a note.
+        items.extend(profile_notes.observe(index, event));
         if let Some(swap) = &active_swap {
             if let Some((frontier_start_index, _, _)) = &swap.projection {
                 if index < *frontier_start_index || event.kind.as_str() == EventKind::CANVAS_SWAP {
@@ -392,8 +402,91 @@ fn collect_canvas_items(
             _ => {}
         }
     }
+    // A request assembled before its `model.call` is recorded (a continuation
+    // with no new input) still gets the note, at the tail.
+    items.extend(profile_notes.next_turn());
 
     items
+}
+
+/// Folds `session.start` and `session.profile_changed` records into the
+/// execution-profile notes the model sees. Changes are refused during a run,
+/// so the changes before a turn coalesce: the turn gets one note, for the
+/// latest change, and none when the profile ends where the model last saw
+/// it. A record without `model_note` (an older binary) yields no note.
+struct ExecutionProfileNotes {
+    frontier_start_index: Option<usize>,
+    /// The `execution_profile` record the model last saw: the start, or the
+    /// last change a turn followed.
+    seen: Option<Value>,
+    pending: Option<PendingExecutionProfileNote>,
+}
+
+struct PendingExecutionProfileNote {
+    record: Value,
+    note: Option<CanvasItem>,
+    before_frontier: bool,
+}
+
+impl ExecutionProfileNotes {
+    fn new(active_swap: Option<&ActiveSwap>) -> Self {
+        Self {
+            frontier_start_index: active_swap
+                .and_then(|swap| swap.projection.as_ref())
+                .map(|(frontier_start_index, _, _)| *frontier_start_index),
+            seen: None,
+            pending: None,
+        }
+    }
+
+    /// The note to place before `event`, if it starts the turn after a change.
+    fn observe(&mut self, index: usize, event: &EventEnvelope) -> Option<CanvasItem> {
+        match event.kind.as_str() {
+            EventKind::SESSION_START => {
+                self.seen = event.payload.get("execution_profile").cloned();
+                None
+            }
+            EventKind::SESSION_PROFILE_CHANGED => {
+                let before_frontier = self.frontier_start_index.is_some_and(|start| index < start);
+                self.change(event, before_frontier);
+                None
+            }
+            EventKind::USER_MESSAGE | EventKind::EXTENSION_CONTRIBUTION | EventKind::MODEL_CALL => {
+                self.next_turn()
+            }
+            _ => None,
+        }
+    }
+
+    fn change(&mut self, event: &EventEnvelope, before_frontier: bool) {
+        let Some(record) = event.payload.get("execution_profile") else {
+            return;
+        };
+        let note = event
+            .payload
+            .get("model_note")
+            .and_then(Value::as_str)
+            .map(|content| CanvasItem::ExecutionProfileNote {
+                event_id: event.id.clone(),
+                content: content.to_owned(),
+            });
+        self.pending = Some(PendingExecutionProfileNote {
+            record: record.clone(),
+            note,
+            before_frontier,
+        });
+    }
+
+    /// The note for a turn boundary. A change before the active compaction
+    /// frontier was already summarized, so it yields none.
+    fn next_turn(&mut self) -> Option<CanvasItem> {
+        let pending = self.pending.take()?;
+        if self.seen.as_ref() == Some(&pending.record) {
+            return None;
+        }
+        self.seen = Some(pending.record);
+        pending.note.filter(|_| !pending.before_frontier)
+    }
 }
 
 /// Assemble full-log folds that precede ordered event replay. The active
@@ -1394,6 +1487,7 @@ fn render_canvas_item(item: &CanvasItem) -> String {
             content,
             ..
         } => render_extension_contribution(extension_id, command, point, content),
+        CanvasItem::ExecutionProfileNote { content, .. } => format!("user: {content}"),
         CanvasItem::Reasoning {
             fidelity, content, ..
         } => format!("reasoning.{fidelity}: {content}"),

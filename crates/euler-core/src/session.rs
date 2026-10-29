@@ -1987,6 +1987,18 @@ impl<D> Session<D> {
         );
         let mut payload = sandbox_start_fields(self.tools.sandbox_status());
         payload.extend(execution_profile_fields(&self.config));
+        // The model's next turn sees this note (ADR 0026 section 6), so it
+        // does not guess why commands behave differently.
+        payload.insert(
+            "model_note".to_owned(),
+            format!(
+                "[host note] Execution profile changed to {}; earlier commands ran under the \
+previous profile. {}",
+                self.config.execution_profile.name,
+                self.tools.model_execution_boundary()
+            )
+            .into(),
+        );
         let event = EventEnvelope::new(
             self.config.session_id.clone(),
             self.config.agent_id.clone(),
@@ -6265,9 +6277,16 @@ fn push_session_bootstrap(
 /// Enforce the root/child data-flow boundary on an inherited request canvas.
 /// Accepted terminal-idle contributions are committed one-shot inputs for the
 /// root driver only; inheriting children must not observe, select, or spend
-/// their context budget on them.
+/// their context budget on them. Execution-profile notes describe the root's
+/// boundary; a child may run under a tighter profile, and its own `run_shell`
+/// description states its boundary.
 fn child_canvas_boundary(mut canvas: Vec<CanvasItem>) -> Vec<CanvasItem> {
-    canvas.retain(|item| !matches!(item, CanvasItem::ExtensionContribution { .. }));
+    canvas.retain(|item| {
+        !matches!(
+            item,
+            CanvasItem::ExtensionContribution { .. } | CanvasItem::ExecutionProfileNote { .. }
+        )
+    });
     canvas
 }
 
@@ -6286,7 +6305,8 @@ fn redact_child_canvas_for_egress(
         CanvasItem::Message { content, .. }
         | CanvasItem::Projection { content, .. }
         | CanvasItem::Slot { content, .. }
-        | CanvasItem::ExtensionContribution { content, .. } => {
+        | CanvasItem::ExtensionContribution { content, .. }
+        | CanvasItem::ExecutionProfileNote { content, .. } => {
             *content = redactor.redact(content);
             true
         }
@@ -6415,11 +6435,9 @@ fn model_input_item(item: &CanvasItem) -> ModelInputItem {
             },
             content: content.clone(),
         },
-        CanvasItem::SkillActivation { content, .. } => ModelInputItem::Message {
-            role: ModelRole::User,
-            content: content.clone(),
-        },
-        CanvasItem::Projection { content, .. } => ModelInputItem::Message {
+        CanvasItem::SkillActivation { content, .. }
+        | CanvasItem::Projection { content, .. }
+        | CanvasItem::ExecutionProfileNote { content, .. } => ModelInputItem::Message {
             role: ModelRole::User,
             content: content.clone(),
         },
