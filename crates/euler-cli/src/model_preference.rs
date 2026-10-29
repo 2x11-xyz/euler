@@ -1,6 +1,8 @@
 use crate::theme_catalog::ThemeChoice;
 use anyhow::{anyhow, Result};
+use euler_core::{EulerHome, EulerHomeError};
 use serde_json::{Map, Value};
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -27,10 +29,23 @@ pub enum ThemePreferenceLoad {
     Ignored(String),
 }
 
+/// `preferences.json` lives in the Euler home, so `EULER_HOME` relocates it
+/// with the rest of the user state.
+fn resolve_model_preference_path() -> Result<PathBuf, EulerHomeError> {
+    model_preference_path_from_env(std::env::var_os("HOME"), std::env::var_os("EULER_HOME"))
+}
+
+/// Startup reads: an unresolvable Euler home loads no preferences. Argument
+/// parsing already warns about it through the provider config path.
 pub fn default_model_preference_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(".euler").join(PREFERENCE_FILE))
+    resolve_model_preference_path().ok()
+}
+
+fn model_preference_path_from_env(
+    home: Option<OsString>,
+    euler_home: Option<OsString>,
+) -> Result<PathBuf, EulerHomeError> {
+    EulerHome::resolve_from_env(home, euler_home).map(|euler_home| euler_home.preferences_path())
 }
 
 pub fn load_model_preference(path: &Path) -> PreferenceLoad {
@@ -52,8 +67,7 @@ pub fn save_model_preference(path: &Path, provider: &str, model: &str) -> Result
 }
 
 pub fn save_model_preference_to_default(provider: &str, model: &str) -> Result<()> {
-    let path = default_model_preference_path()
-        .ok_or_else(|| anyhow!("HOME is not set; model preference path is unavailable"))?;
+    let path = resolve_model_preference_path()?;
     save_model_preference(&path, provider, model)
 }
 
@@ -288,6 +302,67 @@ fn temporary_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_preference_path_uses_euler_home_when_set() {
+        let home = tempfile::tempdir().expect("home dir");
+        let euler_home = tempfile::tempdir().expect("euler home dir");
+
+        let path = model_preference_path_from_env(
+            Some(home.path().into()),
+            Some(euler_home.path().into()),
+        );
+
+        let canonical_euler_home = fs::canonicalize(euler_home.path()).expect("canonical");
+        assert_eq!(
+            path.expect("resolved path"),
+            canonical_euler_home.join("preferences.json")
+        );
+    }
+
+    #[test]
+    fn model_preference_path_defaults_to_dot_euler_under_home() {
+        let home = tempfile::tempdir().expect("home dir");
+
+        let path = model_preference_path_from_env(Some(home.path().into()), None);
+
+        let canonical_home = fs::canonicalize(home.path()).expect("canonical");
+        assert_eq!(
+            path.expect("resolved path"),
+            canonical_home.join(".euler").join("preferences.json")
+        );
+    }
+
+    #[test]
+    fn model_preference_path_reports_relative_euler_home() {
+        let home = tempfile::tempdir().expect("home dir");
+
+        let path = model_preference_path_from_env(
+            Some(home.path().into()),
+            Some("relative-euler-home".into()),
+        );
+
+        let error = path.expect_err("relative EULER_HOME must not resolve");
+        assert!(error
+            .to_string()
+            .contains("EULER_HOME must be an absolute path"));
+    }
+
+    #[test]
+    fn model_preference_under_home_is_not_read_when_euler_home_is_set() {
+        let home = tempfile::tempdir().expect("home dir");
+        let euler_home = tempfile::tempdir().expect("euler home dir");
+        let old_path = home.path().join(".euler").join("preferences.json");
+        save_model_preference(&old_path, "openrouter", "glm-5.2").expect("save old");
+
+        let path = model_preference_path_from_env(
+            Some(home.path().into()),
+            Some(euler_home.path().into()),
+        )
+        .expect("resolved path");
+
+        assert_eq!(load_model_preference(&path), PreferenceLoad::Missing);
+    }
 
     #[test]
     fn model_and_theme_saves_preserve_each_other() {
