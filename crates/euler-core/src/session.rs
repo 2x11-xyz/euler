@@ -1391,7 +1391,10 @@ impl<D> Session<D> {
             .map(|bootstrap| bootstrap.redactor().clone())
             .unwrap_or_else(SecretRedactor::from_env);
         let mut permissions = PermissionGate::new(decider);
-        permissions.set_execution_profile(config.execution_profile.fields.clone());
+        permissions.set_execution_profile(
+            config.execution_profile.fields.clone(),
+            matches!(tools.sandbox_status(), SandboxStatus::Enforced(_)),
+        );
         // Project grants are best-effort at open: missing file is empty; corrupt
         // files leave the store unloaded so project writes fail closed.
         let _ = permissions
@@ -2871,6 +2874,7 @@ impl<D> Session<D> {
                     &self.config.execution_profile.fields,
                     &crate::permissions::PermissionRequest::new(capability, String::new()),
                     ApprovalMode::Ask,
+                    self.permissions.sandbox_enforced(),
                 ) == Some(ApprovalMode::SessionAllow)
             })
     }
@@ -3025,7 +3029,10 @@ impl<D> Session<D> {
         }
         let persisted_events = events.len();
         let mut permissions = PermissionGate::new(decider);
-        permissions.set_execution_profile(config.execution_profile.fields.clone());
+        permissions.set_execution_profile(
+            config.execution_profile.fields.clone(),
+            matches!(tools.sandbox_status(), SandboxStatus::Enforced(_)),
+        );
         let _ = permissions
             .load_project_grants(&config.root, config.project_grant_consent_dir.as_deref());
         let _ = permissions.load_user_grants(config.user_grant_dir.as_deref());

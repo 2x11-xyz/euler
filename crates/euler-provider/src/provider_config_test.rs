@@ -890,3 +890,35 @@ fn model_api_family_entries_that_cannot_be_routed_are_ignored_with_warnings() {
         );
     }
 }
+
+#[test]
+fn referenced_env_names_lists_env_references_in_api_keys_and_headers() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{
+          "version": 1,
+          "providers": {
+            "proxy": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://litellm.example.com/v1",
+              "api_key": "$LITELLM_API_KEY",
+              "auth_header": true,
+              "headers": {
+                "x-team": "${PROXY_TEAM}",
+                "x-command": "!op read 'op://vault/item/token'",
+                "x-literal": "$$NOT_A_REFERENCE"
+              },
+              "default_model": "m",
+              "models": [{"id": "m"}]
+            }
+          }
+        }"#,
+    );
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        registry
+            .referenced_env_names()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["LITELLM_API_KEY", "PROXY_TEAM"]
+    );
+}

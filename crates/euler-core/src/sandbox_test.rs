@@ -442,6 +442,41 @@ fn macos_seatbelt_workspace_boundary_opens_network_tmp_and_a_private_home() {
     let network = run(format!("/usr/bin/nc -z -w 1 127.0.0.1 {port}"));
     assert_eq!(network.exit_code, Some(0), "{}", network.output);
 
+    // A local service on a Unix socket under /tmp stays reachable; a
+    // launchd agent socket (where macOS puts the SSH agent) does not, under
+    // the default `credentials: "private"`.
+    let service_dir = tempfile::Builder::new()
+        .prefix("euler-socket-")
+        .tempdir_in("/tmp")
+        .expect("socket dir");
+    let service = service_dir.path().join("s");
+    let _service = std::os::unix::net::UnixListener::bind(&service).expect("service socket");
+    let reached = run(format!(
+        "/usr/bin/nc -U -w 1 {} </dev/null",
+        shell_quote(&service)
+    ));
+    assert_eq!(reached.exit_code, Some(0), "{}", reached.output);
+    let agent_dir = tempfile::Builder::new()
+        .prefix("com.apple.launchd.euler-test-")
+        .tempdir_in("/tmp")
+        .expect("agent dir");
+    let agent = agent_dir.path().join("Listeners");
+    let _agent = std::os::unix::net::UnixListener::bind(&agent).expect("agent socket");
+    // Nor does a socket outside those directories, as a Docker socket is.
+    let outside_dir = tempfile::Builder::new()
+        .prefix("euler-socket-")
+        .tempdir_in("/var/tmp")
+        .expect("socket dir outside /tmp");
+    let outside = outside_dir.path().join("s");
+    let _outside = std::os::unix::net::UnixListener::bind(&outside).expect("outside socket");
+    for socket in [&agent, &outside] {
+        let refused = run(format!(
+            "/usr/bin/nc -U -w 1 {} </dev/null",
+            shell_quote(socket)
+        ));
+        assert_ne!(refused.exit_code, Some(0), "{}", refused.output);
+    }
+
     let shared = tempfile::Builder::new()
         .prefix("euler-workspace-tmp-")
         .tempdir_in("/tmp")
@@ -472,9 +507,18 @@ fn macos_seatbelt_workspace_boundary_opens_network_tmp_and_a_private_home() {
         .tempdir()
         .expect("another session's scratch");
     let other_file = other_scratch.path().join("planted");
+    let moved = other_scratch
+        .path()
+        .with_file_name(format!("euler-moved-{}", std::process::id()));
     let mut denied = vec![
         "printf forbidden > .git/euler-denied".to_owned(),
         format!("printf planted > {}", shell_quote(&other_file)),
+        // Renaming the tree away must not lift the deny on its contents.
+        format!(
+            "mv {scratch} {moved} && printf planted > {moved}/planted && mv {moved} {scratch}",
+            scratch = shell_quote(other_scratch.path()),
+            moved = shell_quote(&moved),
+        ),
     ];
     if let Some(keychains) = std::env::var_os("HOME")
         .map(|home| std::path::PathBuf::from(home).join("Library/Keychains"))
@@ -488,6 +532,7 @@ fn macos_seatbelt_workspace_boundary_opens_network_tmp_and_a_private_home() {
     }
     assert!(!workspace.join(".git/euler-denied").exists());
     assert!(!other_file.exists());
+    assert!(!moved.exists());
 }
 
 /// A sandboxed background job that redirects its output outlives its

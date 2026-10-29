@@ -3,6 +3,7 @@
 //! caches, the profile's `writable_paths`, the credential stores, and the
 //! inherited environment under ADR 0021 row C.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -57,6 +58,10 @@ const EULER_PROVIDER_KEYS: &[&str] = &[
     "XAI_API_KEY",
 ];
 
+/// Variables that point a command at a credential-bearing agent. They pass
+/// only under `credentials: "pass"`.
+const CREDENTIAL_AGENT_VARIABLES: &[&str] = &["SSH_AUTH_SOCK", "GPG_AGENT_INFO"];
+
 /// ADR 0021 row C's hard denylist for sandboxed commands: loader and
 /// injection variables with no legitimate user use, plus `GIT_SSH_COMMAND`,
 /// which only Euler may set. Applied under every `credentials` value.
@@ -79,6 +84,20 @@ fn denied_by_row_c(name: &str) -> bool {
 /// Inherited variables that point into the real home, which the private
 /// `HOME` replaces. Their defaults then follow `HOME`.
 const REAL_HOME_XDG: &[&str] = &["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME"];
+
+/// Inherited variables that point a toolchain at a cache. They are dropped
+/// and set again only for the caches the boundary makes writable, so a
+/// variable naming a missing or unbound cache falls back to the private
+/// `HOME`.
+const CACHE_VARIABLES: &[&str] = &[
+    "PIP_CACHE_DIR",
+    "UV_CACHE_DIR",
+    "npm_config_cache",
+    "NPM_CONFIG_CACHE",
+    "GOMODCACHE",
+    "HF_HUB_CACHE",
+    "HF_HOME",
+];
 
 /// Set for every sandboxed command so pagers and color never wait on a TTY.
 const PAGER_ENVIRONMENT: &[(&str, &str)] = &[
@@ -117,6 +136,12 @@ pub(super) struct NetworkBoundary {
     pub(super) denied_reads: Vec<PathBuf>,
     /// The host temporary directory, exported as `TMPDIR` on macOS.
     pub(super) host_tmpdir: PathBuf,
+    /// The variables the active `providers.json` references: Euler's own
+    /// credentials, withheld under every `credentials` value.
+    pub(super) provider_credentials: BTreeSet<String>,
+    /// The SSH agent socket Seatbelt lets a command reach under
+    /// `credentials: "pass"`, canonical.
+    pub(super) ssh_agent_socket: Option<PathBuf>,
 }
 
 impl NetworkBoundary {
@@ -157,6 +182,15 @@ impl NetworkBoundary {
             .map(PathBuf::from)
             .and_then(|real| real.canonicalize().ok());
         let host_tmpdir = std::env::temp_dir().canonicalize().map_err(cannot)?;
+        let provider_credentials = euler_home
+            .as_deref()
+            .and_then(|euler_home| std::fs::read_to_string(euler_home.join("providers.json")).ok())
+            .map(|contents| {
+                euler_provider::provider_config::ProviderConfigRegistry::with_json(&contents)
+                    .0
+                    .referenced_env_names()
+            })
+            .unwrap_or_default();
         Ok(Self::from_host(
             access,
             home,
@@ -165,6 +199,7 @@ impl NetworkBoundary {
                 real_home: real_home.as_deref(),
                 euler_home: euler_home.as_deref(),
                 host_tmpdir,
+                provider_credentials,
                 variable: &|name| std::env::var_os(name),
             },
         ))
@@ -212,6 +247,11 @@ impl NetworkBoundary {
             path.canonicalize().unwrap_or(path)
         }));
         denied_reads.extend(host.euler_home.map(Path::to_path_buf));
+        let ssh_agent_socket = access
+            .pass_credentials
+            .then(|| (host.variable)("SSH_AUTH_SOCK"))
+            .flatten()
+            .and_then(|socket| PathBuf::from(socket).canonicalize().ok());
         Self {
             caches: named_caches(host.variable, host.real_home),
             home,
@@ -221,13 +261,15 @@ impl NetworkBoundary {
             passed_credentials,
             denied_reads,
             host_tmpdir: host.host_tmpdir,
+            provider_credentials: host.provider_credentials,
+            ssh_agent_socket,
         }
     }
 
     /// The environment of a sandboxed command: the parent environment
-    /// minus row C's denylist, Euler's parent-control variables, and
-    /// secret-shaped variables (only Euler's own provider keys under
-    /// `credentials: "pass"`); then the toolchain variables, the private
+    /// minus row C's denylist, Euler's parent-control variables, Euler's own
+    /// credentials, and secret-shaped and credential-agent variables (only
+    /// Euler's own credentials under `credentials: "pass"`); then the toolchain variables, the private
     /// `HOME`, `TMPDIR`, `PATH`, the cache variables, the pager variables,
     /// and the caller's `extra`. Later entries win.
     pub(super) fn environment(
@@ -266,19 +308,21 @@ impl NetworkBoundary {
         if crate::tools::is_parent_control_env_name(name) {
             return false;
         }
-        let secret = if self.pass_credentials {
-            name.to_str().is_some_and(|name| {
-                EULER_PROVIDER_KEYS.contains(&name.to_ascii_uppercase().as_str())
-            })
-        } else {
-            crate::redaction::is_secret_env_name(name)
-        };
         // A name that is not UTF-8 cannot be checked against the denylist,
         // so it does not pass.
         let Some(text) = name.to_str() else {
             return false;
         };
-        !secret && !denied_by_row_c(text) && !REAL_HOME_XDG.contains(&text)
+        let euler_credential = EULER_PROVIDER_KEYS.contains(&text.to_ascii_uppercase().as_str())
+            || self.provider_credentials.contains(text);
+        let private_credential = !self.pass_credentials
+            && (crate::redaction::is_secret_env_name(name)
+                || CREDENTIAL_AGENT_VARIABLES.contains(&text));
+        !euler_credential
+            && !private_credential
+            && !denied_by_row_c(text)
+            && !REAL_HOME_XDG.contains(&text)
+            && !CACHE_VARIABLES.contains(&text)
     }
 
     /// Every host path a command may write besides the workspace, `/tmp`,
@@ -311,6 +355,7 @@ struct HostView<'a> {
     real_home: Option<&'a Path>,
     euler_home: Option<&'a Path>,
     host_tmpdir: PathBuf,
+    provider_credentials: BTreeSet<String>,
     variable: &'a dyn Fn(&str) -> Option<OsString>,
 }
 
@@ -390,6 +435,10 @@ mod tests {
             real_home: Some(real_home),
             euler_home: None,
             host_tmpdir: PathBuf::from("/tmp"),
+            provider_credentials: BTreeSet::from([
+                "LITELLM_API_KEY".to_owned(),
+                "PROXY_TEAM".to_owned(),
+            ]),
             variable,
         }
     }
@@ -481,6 +530,10 @@ mod tests {
             ("XDG_CONFIG_HOME", "/home/user/.config"),
             ("HOME", "/home/user"),
             ("PAGER", "less"),
+            ("SSH_AUTH_SOCK", "/tmp/ssh-agent.sock"),
+            ("GPG_AGENT_INFO", "/home/user/.gnupg/S.gpg-agent"),
+            ("LITELLM_API_KEY", "sk-proxy-example"),
+            ("PROXY_TEAM", "team-example"),
         ]
         .map(|(name, value)| (OsString::from(name), OsString::from(value)));
         let environment = names(&boundary.environment(
@@ -517,12 +570,18 @@ mod tests {
             "ANTHROPIC_API_KEY",
             "EULER_HOME",
             "XDG_CONFIG_HOME",
+            "SSH_AUTH_SOCK",
+            "GPG_AGENT_INFO",
+            "LITELLM_API_KEY",
+            "PROXY_TEAM",
         ] {
             assert!(!environment.contains_key(denied), "{denied} passed");
         }
 
-        // `credentials: "pass"` passes secret-shaped variables, except
-        // Euler's own provider keys; row C's denylist still applies.
+        // `credentials: "pass"` passes secret-shaped and credential-agent
+        // variables, except Euler's own credentials (the built-in provider
+        // keys and the variables `providers.json` references); row C's
+        // denylist still applies.
         let passing = NetworkBoundary::from_host(
             &WorkspaceNetworkAccess {
                 writable_paths: Vec::new(),
@@ -536,13 +595,66 @@ mod tests {
             names(&passing.environment(parent, [], Path::new("/tmp"), OsString::from("/bin"), &[]));
         assert_eq!(environment["GITHUB_TOKEN"], "ghp_example");
         assert_eq!(environment["AWS_SECRET_ACCESS_KEY"], "example");
+        assert_eq!(environment["SSH_AUTH_SOCK"], "/tmp/ssh-agent.sock");
+        assert_eq!(
+            environment["GPG_AGENT_INFO"],
+            "/home/user/.gnupg/S.gpg-agent"
+        );
         for denied in [
             "ANTHROPIC_API_KEY",
+            "LITELLM_API_KEY",
+            "PROXY_TEAM",
             "EULER_HOME",
             "LD_PRELOAD",
             "GIT_SSH_COMMAND",
         ] {
             assert!(!environment.contains_key(denied), "{denied} passed");
+        }
+    }
+
+    /// An inherited cache variable reaches a command only when it names a
+    /// cache the boundary binds; one naming a missing path is dropped, so
+    /// the toolchain falls back to the private `HOME`.
+    #[test]
+    fn cache_variables_pass_only_for_bound_caches() {
+        let temp = tempfile::tempdir().expect("temp");
+        let home = temp.path().canonicalize().expect("canonical");
+        let uv = home.join("uv-cache");
+        fs::create_dir(&uv).expect("uv cache");
+        let parent = [
+            ("UV_CACHE_DIR", uv.to_string_lossy().into_owned()),
+            ("PIP_CACHE_DIR", "/nonexistent/pip".to_owned()),
+            ("HF_HOME", "/nonexistent/huggingface".to_owned()),
+            ("NPM_CONFIG_CACHE", "/nonexistent/npm".to_owned()),
+        ]
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)));
+        let variable = |name: &str| {
+            parent
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, value)| value.clone())
+        };
+        let boundary = NetworkBoundary::from_host(
+            &WorkspaceNetworkAccess::default(),
+            home.join("private"),
+            None,
+            host(&home, &variable),
+        );
+        let environment = names(&boundary.environment(
+            parent.clone(),
+            [],
+            Path::new("/tmp"),
+            OsString::from("/bin"),
+            &[],
+        ));
+        assert_eq!(environment["UV_CACHE_DIR"], uv.to_string_lossy());
+        for dropped in [
+            "PIP_CACHE_DIR",
+            "HF_HOME",
+            "NPM_CONFIG_CACHE",
+            "npm_config_cache",
+        ] {
+            assert!(!environment.contains_key(dropped), "{dropped} passed");
         }
     }
 
@@ -555,15 +667,21 @@ mod tests {
         fs::create_dir_all(real_home.join(".aws")).expect("aws");
         fs::write(real_home.join(".gitconfig"), "[user]\n").expect("gitconfig");
         let private = temp.path().join("private");
-        let none = |_: &str| None;
+        let agent = real_home.join("agent.sock");
+        fs::write(&agent, "").expect("agent socket stand-in");
+        let host_variable = {
+            let agent = agent.clone();
+            move |name: &str| (name == "SSH_AUTH_SOCK").then(|| agent.clone().into_os_string())
+        };
 
         let denying = NetworkBoundary::from_host(
             &WorkspaceNetworkAccess::default(),
             private.clone(),
             None,
-            host(&real_home, &none),
+            host(&real_home, &host_variable),
         );
         assert!(denying.passed_credentials.is_empty());
+        assert_eq!(denying.ssh_agent_socket, None);
         for store in [".ssh", ".aws", ".netrc", ".config/gh", "Library/Keychains"] {
             assert!(
                 denying.denied_reads.contains(&real_home.join(store)),
@@ -578,8 +696,9 @@ mod tests {
             },
             private.clone(),
             None,
-            host(&real_home, &none),
+            host(&real_home, &host_variable),
         );
+        assert_eq!(passing.ssh_agent_socket, Some(agent));
         assert!(!passing.denied_reads.contains(&real_home.join(".ssh")));
         assert!(passing
             .denied_reads

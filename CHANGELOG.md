@@ -12,16 +12,21 @@ pull requests that landed them; deeper design rationale lives in
   host `/tmp`, a private per-session `HOME`, and the pip, uv, npm, Cargo,
   Go, and Hugging Face caches writable at their real paths. The inherited
   environment follows ADR 0021 row C (loader and injection variables
-  denied, secrets dropped, pagers off). On macOS, reads of common
-  credential stores, the keychains, browser profiles, and the Euler home
-  are denied. `run_shell`, `git_*`, and workspace writes run without a
-  prompt; dangerous commands and sensitive paths still ask. Escalation is
-  not available yet. Built-in defaults stay `locked`.
+  denied, secrets, SSH and GPG agent variables, and the variables
+  `providers.json` references dropped, pagers off). On macOS, reads of
+  common credential stores, the keychains, browser profiles, and the Euler
+  home are denied, and Unix sockets are reachable only under the
+  workspace, `HOME`, `/tmp`, and `TMPDIR` (not the SSH agent or Docker).
+  With an enforced sandbox backend, `run_shell`, `git_*`, and workspace
+  writes run without a prompt; dangerous commands and sensitive paths still
+  ask. Escalation is not available yet. Built-in defaults stay `locked`.
 - A user profile extending `workspace` can add existing `writable_paths`
-  and set `credentials: "pass"` to hand secret-shaped variables and the
-  named credential stores to sandboxed commands, for headless runs.
+  and set `credentials: "pass"` to hand secret-shaped variables, the SSH
+  agent, and the named credential stores to sandboxed commands, for
+  headless runs. Euler's own provider credentials never pass.
 - **New prompt** under `workspace`: a `run_shell` command whose text names a
-  sensitive path (`curl -d @.env ...`) asks, grant-coverable.
+  sensitive path (`curl -d @.env ...`) asks, grant-coverable. Bare words
+  such as `gh secret list` do not.
 - **Behavior change** on macOS: background jobs a sandboxed command leaves
   running now end when the session ends, under `locked` too (Linux already
   ended them with their command).

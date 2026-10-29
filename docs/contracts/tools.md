@@ -280,8 +280,10 @@ The `workspace` execution profile (ADR 0026; capabilities contract,
 network namespace and binds the host `/tmp`, the private per-session `HOME`,
 the existing named toolchain caches, and the profile's `writable_paths` at
 their real paths before the read-only remount of their holding directory;
-Seatbelt adds outbound network and loopback bind, read denies for the
-credential stores, and write allowances for `/private/tmp`, the host
+Seatbelt adds outbound IP network, DNS, loopback bind, Unix-socket connects
+under the workspace, the private `HOME`, `/private/tmp`, and the host
+`TMPDIR` (not the launchd SSH agent socket unless credentials pass), read
+denies for the credential stores, and write allowances for `/private/tmp`, the host
 `TMPDIR`, the private `HOME`, the caches, and `writable_paths`, inserted
 before the closing Git denies and naming only `-D` parameters. Both inherit
 the parent environment under ADR 0021 row C instead of clearing it.

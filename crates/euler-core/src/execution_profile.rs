@@ -350,15 +350,18 @@ impl ExecutionProfile {
 /// - A `run_shell` command whose operands mention a sensitive path asks
 ///   under `escalation-only` (resolved question 14) and keeps `mode` under
 ///   `always`, as before profiles.
-/// - Under `escalation-only` with the sandbox on, an unflagged `ask` for
-///   `fs-write` or `shell-exec` becomes `session-allow`: commands run inside
-///   the boundary and structured writes stay workspace-confined.
+/// - Under `escalation-only` with the sandbox on and its backend enforced
+///   (`sandbox_enforced`), an unflagged `ask` for `fs-write` or `shell-exec`
+///   becomes `session-allow`: commands run inside the boundary and
+///   structured writes stay workspace-confined. Without an enforced backend
+///   the request keeps its mode (ADR 0021 row D).
 ///
 /// `never` is the `full` preset's rule and is not enforced yet.
 pub fn profile_mode_override(
     fields: &ProfileFields,
     request: &PermissionRequest,
     mode: ApprovalMode,
+    sandbox_enforced: bool,
 ) -> Option<ApprovalMode> {
     let escalation_only = fields.approvals == ApprovalsSetting::EscalationOnly;
     if request.sensitive_path {
@@ -371,6 +374,7 @@ pub fn profile_mode_override(
     }
     let lifts = escalation_only
         && fields.sandbox != SandboxSetting::Off
+        && sandbox_enforced
         && matches!(
             request.capability,
             Capability::FsWrite | Capability::ShellExec

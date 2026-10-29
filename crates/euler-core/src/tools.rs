@@ -234,10 +234,12 @@ impl ReteachTracker {
 #[derive(Debug)]
 pub struct ToolRegistry {
     root: PathBuf,
-    workspace_sandbox: Option<WorkspaceSandbox>,
     /// Background jobs sandboxed commands left running, ended when the
-    /// registry, and so the session, ends.
+    /// registry, and so the session, ends. Declared before
+    /// `workspace_sandbox` so it drops first: the jobs end before the
+    /// private `HOME` and scratch they may still be writing are removed.
     sandboxed_jobs: SandboxedJobs,
+    workspace_sandbox: Option<WorkspaceSandbox>,
     agent_euler_home: OnceLock<tempfile::TempDir>,
     skills: BTreeMap<String, FrozenSkill>,
     observation_bound: usize,

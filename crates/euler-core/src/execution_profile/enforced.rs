@@ -31,22 +31,31 @@ pub(super) fn subprocess_sandbox(
     if fields.approvals == ApprovalsSetting::Never {
         return Err("approvals");
     }
-    let shape = if fields.network == NetworkSetting::On {
-        workspace::fields()
+    let (shape, other_shape) = if fields.network == NetworkSetting::On {
+        (workspace::fields(), locked::fields())
     } else {
-        locked::fields()
+        (locked::fields(), workspace::fields())
     };
-    let fixed = [
-        ("tmp", fields.tmp == shape.tmp),
-        ("caches", fields.caches == shape.caches),
-        ("escalation", fields.escalation == shape.escalation),
-        (
-            "background_jobs",
-            fields.background_jobs == shape.background_jobs,
-        ),
-    ];
-    if let Some((field, _)) = fixed.into_iter().find(|(_, enforced)| !enforced) {
-        return Err(field);
+    let fixed = |shape: &ProfileFields| {
+        [
+            ("tmp", fields.tmp == shape.tmp),
+            ("caches", fields.caches == shape.caches),
+            ("escalation", fields.escalation == shape.escalation),
+            (
+                "background_jobs",
+                fields.background_jobs == shape.background_jobs,
+            ),
+        ]
+    };
+    if let Some(index) = fixed(&shape).iter().position(|(_, enforced)| !enforced) {
+        // A field the other boundary would deliver means `network` picked
+        // the wrong boundary (`{"extends": "locked", "network": "on"}`), so
+        // name the field the user changed.
+        return Err(if fixed(&other_shape)[index].1 {
+            "network"
+        } else {
+            fixed(&shape)[index].0
+        });
     }
     if fields.network == NetworkSetting::Off {
         if !fields.writable_paths.is_empty() {

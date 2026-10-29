@@ -406,6 +406,9 @@ pub struct PermissionGate<D> {
     /// The session's execution profile fields, whose `approvals` can lift a
     /// request's mode ([`crate::execution_profile::profile_mode_override`]).
     profile: ProfileFields,
+    /// Whether the session's sandbox backend is enforced. The profile lifts
+    /// command and write asks only then.
+    sandbox_enforced: bool,
     decider: D,
 }
 
@@ -429,6 +432,7 @@ impl<D> PermissionGate<D> {
             user_grants: GrantList::new(),
             user_store: None,
             profile: ExecutionProfile::default().fields,
+            sandbox_enforced: false,
             decider,
         }
     }
@@ -443,6 +447,7 @@ impl<D> PermissionGate<D> {
             user_grants: GrantList::new(),
             user_store: None,
             profile: ExecutionProfile::default().fields,
+            sandbox_enforced: false,
             decider,
         }
     }
@@ -451,13 +456,19 @@ impl<D> PermissionGate<D> {
         self.modes.insert(capability, mode);
     }
 
-    /// Install the session's execution profile fields.
-    pub fn set_execution_profile(&mut self, fields: ProfileFields) {
+    /// Install the session's execution profile fields and whether its
+    /// sandbox backend is enforced.
+    pub fn set_execution_profile(&mut self, fields: ProfileFields, sandbox_enforced: bool) {
         self.profile = fields;
+        self.sandbox_enforced = sandbox_enforced;
     }
 
     pub fn execution_profile(&self) -> &ProfileFields {
         &self.profile
+    }
+
+    pub fn sandbox_enforced(&self) -> bool {
+        self.sandbox_enforced
     }
 
     /// Explicitly configured mode, if any. Unconfigured capabilities read as
@@ -495,9 +506,12 @@ impl<D> PermissionGate<D> {
         if request.dangerous_command {
             return ApprovalMode::Ask;
         }
-        if let Some(mode) =
-            crate::execution_profile::profile_mode_override(&self.profile, request, mode)
-        {
+        if let Some(mode) = crate::execution_profile::profile_mode_override(
+            &self.profile,
+            request,
+            mode,
+            self.sandbox_enforced,
+        ) {
             return mode;
         }
         if request.sensitive_path {
@@ -1480,7 +1494,7 @@ mod tests {
             .expect("workspace ships")
             .fields;
         let mut gate = PermissionGate::new(PanicDecider);
-        gate.set_execution_profile(workspace);
+        gate.set_execution_profile(workspace.clone(), true);
         let shell = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
             .with_command("cargo test");
         let write =
@@ -1504,6 +1518,12 @@ mod tests {
         assert_eq!(gate.mode_for_request(&secret_write), ApprovalMode::Ask);
         gate.set_mode(Capability::ShellExec, ApprovalMode::AlwaysDeny);
         assert_eq!(gate.mode_for_request(&shell), ApprovalMode::AlwaysDeny);
+
+        // Without an enforced backend nothing is lifted (ADR 0021 row D).
+        let mut unenforced = PermissionGate::new(PanicDecider);
+        unenforced.set_execution_profile(workspace, false);
+        assert_eq!(unenforced.mode_for_request(&shell), ApprovalMode::Ask);
+        assert_eq!(unenforced.mode_for_request(&write), ApprovalMode::Ask);
 
         let mut locked = PermissionGate::new(PanicDecider);
         assert_eq!(locked.mode_for_request(&shell), ApprovalMode::Ask);

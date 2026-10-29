@@ -211,13 +211,9 @@ fn presets_not_shipped_yet_and_unknown_names_are_startup_errors() {
     }
 }
 
-/// `--profile workspace` runs a command without a prompt even under exec's
-/// default read-only tier (ADR 0026 row P), in a private `HOME` that, with
-/// no session store behind `--provenance`, lives under the Euler home's
-/// `state/homes` and is removed when the session ends.
-#[test]
-fn the_workspace_profile_runs_commands_in_a_private_home_without_a_prompt() {
-    let workspace = workspace();
+/// A scripted provider turn whose one command writes its `HOME` to
+/// `home.txt`, as the `--provider-option` that selects it.
+fn home_probe_script(workspace: &Workspace) -> String {
     let script = workspace.root.join("script.json");
     fs::write(
         &script,
@@ -241,8 +237,18 @@ fn the_workspace_profile_runs_commands_in_a_private_home_without_a_prompt() {
         .to_string(),
     )
     .expect("write script");
+    format!("event-script={}", script.display())
+}
+
+/// `--profile workspace` runs a command without a prompt even under exec's
+/// default read-only tier (ADR 0026 row P), in a private `HOME` that, with
+/// no session store behind `--provenance`, lives under the Euler home's
+/// `state/homes` and is removed when the session ends.
+#[test]
+fn the_workspace_profile_runs_commands_in_a_private_home_without_a_prompt() {
+    let workspace = workspace();
     let log = workspace.log.to_str().expect("utf8 log");
-    let event_script = format!("event-script={}", script.display());
+    let event_script = home_probe_script(&workspace);
     let output = exec(
         &workspace,
         &[
@@ -296,6 +302,51 @@ fn the_workspace_profile_runs_commands_in_a_private_home_without_a_prompt() {
         .expect("homes directory");
     assert!(home.starts_with(&homes), "{}", home.display());
     assert!(!home.exists(), "the fallback HOME outlived its session");
+}
+
+/// With the Euler home's session store, the `workspace` profile's private
+/// `HOME` is `<euler home>/sessions/<id>/home` and outlives the process, so
+/// a `pip install --user` persists across a resume.
+#[test]
+fn the_workspace_profile_keeps_its_home_in_the_session_store() {
+    let workspace = workspace();
+    let event_script = home_probe_script(&workspace);
+    let output = exec(
+        &workspace,
+        &[
+            "--provider-option",
+            &event_script,
+            "--profile",
+            "workspace",
+            "--extensions",
+            "none",
+            "--project-context",
+            "off",
+            "work",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let Ok(home) = fs::read_to_string(workspace.root.join("home.txt")) else {
+        // No backend on this host: the command failed closed.
+        return;
+    };
+    let home = PathBuf::from(home);
+    let sessions = workspace
+        .home
+        .join(".euler/sessions")
+        .canonicalize()
+        .expect("session store");
+    assert_eq!(
+        home.file_name().and_then(|name| name.to_str()),
+        Some("home")
+    );
+    assert_eq!(
+        home.parent().and_then(Path::parent),
+        Some(sessions.as_path()),
+        "{}",
+        home.display()
+    );
+    assert!(home.is_dir(), "the session HOME was removed at exit");
 }
 
 #[test]

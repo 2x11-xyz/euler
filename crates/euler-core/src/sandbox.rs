@@ -1561,7 +1561,7 @@ fn probe_seatbelt_profile(launcher: &SandboxLauncher, launch: SandboxLaunch<'_>)
         OsStr::new("/bin/sh"),
         [
             "-c",
-            "probe=\"$TMPDIR/euler-seatbelt-probe-$$\"; printf ready >\"$probe\" && rm -f \"$probe\" \
+            "probe=\"$TMPDIR/euler-probe-$$\"; printf ready >\"$probe\" && rm -f \"$probe\" \
              && test -w \"$HOME\"",
         ],
     );
@@ -1834,23 +1834,45 @@ const SEATBELT_CLOSING_DENIES: &str = "; Explicit denies stay last";
 
 /// The Seatbelt policy for a `workspace` boundary and its `-D` definitions.
 /// The rules name only parameters, so no path becomes policy source text:
-/// outbound network and loopback bind, read denies for the credential
-/// stores, the private `HOME`, writes to `/tmp`, the host `TMPDIR`, the
-/// caches, and `writable_paths`, and no writes into another session's
-/// Seatbelt scratch tree in the shared temporary directories (ADR 0026
-/// resolved question 4).
+/// outbound IP network and loopback bind, Unix-socket connects only under
+/// the workspace, the private `HOME`, `/tmp`, and the host `TMPDIR` (never
+/// the launchd SSH agent socket unless credentials pass), read denies for
+/// the credential stores, the private `HOME`, writes to `/tmp`, the host
+/// `TMPDIR`, the caches, and `writable_paths`, and no writes into another
+/// session's Seatbelt scratch tree in the shared temporary directories (ADR
+/// 0026 resolved question 4).
 fn seatbelt_network_policy(network: &NetworkBoundary) -> (String, Vec<OsString>) {
     let (allows, denies) = SEATBELT_PROFILE
         .split_once(SEATBELT_CLOSING_DENIES)
         .expect("the Seatbelt profile marks its closing denies");
+    // A bare `network-outbound` would also reach every Unix socket the
+    // command can name, including credential agents and the Docker socket.
     let mut rules = String::from(
         "; ADR 0026 workspace boundary.\n\
-         (allow network-outbound)\n\
+         (allow network-outbound (remote ip))\n\
+         (allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n\
+         (allow network-outbound (remote unix-socket (subpath (param \"WORKSPACE\"))))\n\
+         (allow network-outbound (remote unix-socket (subpath (param \"HOME\"))))\n\
+         (allow network-outbound (remote unix-socket (subpath (param \"HOST_TMP\"))))\n\
+         (allow network-outbound (remote unix-socket (subpath (param \"HOST_TMPDIR\"))))\n\
          (allow network-bind (local ip \"localhost:*\"))\n\
          (allow network-inbound (local ip \"localhost:*\"))\n\
          (allow system-socket)\n",
     );
     let mut definitions = Vec::new();
+    match &network.ssh_agent_socket {
+        Some(socket) => {
+            rules.push_str(
+                "(allow network-outbound (remote unix-socket (path-literal (param \"SSH_AGENT\"))))\n",
+            );
+            definitions.push(seatbelt_definition("SSH_AGENT", socket));
+        }
+        None if !network.pass_credentials => rules.push_str(
+            "(deny network-outbound (remote unix-socket \
+             (regex #\"^/private/(tmp|var/run)/com\\.apple\\.launchd\\.[^/]+/\")))\n",
+        ),
+        None => {}
+    }
     for (index, path) in network.denied_reads.iter().enumerate() {
         let name = format!("DENY_READ_{index}");
         rules.push_str(&format!("(deny file-read* (subpath (param \"{name}\")))\n"));
@@ -1872,7 +1894,7 @@ fn seatbelt_network_policy(network: &NetworkBoundary) -> (String, Vec<OsString>)
     }
     rules.push_str(
         "(deny file-write*\n  (require-all\n    (require-any (subpath (param \"HOST_TMP\")) \
-         (subpath (param \"HOST_TMPDIR\")))\n    (regex #\"/euler-seatbelt-[^/]+/\")))\n",
+         (subpath (param \"HOST_TMPDIR\")))\n    (regex #\"/euler-seatbelt-[^/]+(/|$)\")))\n",
     );
     (
         format!("{allows}{rules}\n{SEATBELT_CLOSING_DENIES}{denies}"),
@@ -2376,6 +2398,8 @@ mod tests {
             }],
             denied_reads: vec![root.join("real/Library/Keychains")],
             host_tmpdir: root.join("tmpdir"),
+            provider_credentials: std::collections::BTreeSet::new(),
+            ssh_agent_socket: Some(root.join("agent.sock")),
         }
     }
 
@@ -2441,14 +2465,19 @@ mod tests {
         let git_denies = policy
             .find(SEATBELT_CLOSING_DENIES)
             .expect("closing denies kept");
+        // Outbound network is IP only, so no rule lets a command reach an
+        // arbitrary Unix socket such as a credential agent or Docker.
+        assert!(!policy.contains("(allow network-outbound)"));
         for rule in [
-            "(allow network-outbound)",
+            "(allow network-outbound (remote ip))",
+            "(remote unix-socket (subpath (param \"HOME\")))",
+            "(allow network-outbound (remote unix-socket (path-literal (param \"SSH_AGENT\"))))",
             "(allow network-bind (local ip \"localhost:*\"))",
             "(deny file-read* (subpath (param \"DENY_READ_0\")))",
             "(allow file-read* file-write* (subpath (param \"HOME\")))",
             "(allow file-write* (subpath (param \"WRITABLE_0\")))",
             "(allow file-write* (subpath (param \"WRITABLE_1\")))",
-            "(regex #\"/euler-seatbelt-[^/]+/\")",
+            "(regex #\"/euler-seatbelt-[^/]+(/|$)\")",
         ] {
             let at = policy
                 .find(rule)
@@ -2466,12 +2495,33 @@ mod tests {
             format!("-DHOST_TMPDIR={}", root.join("tmpdir").display()),
             format!("-DWRITABLE_0={}", root.join("cache/uv").display()),
             format!("-DWRITABLE_1={}", root.join("data").display()),
+            format!("-DSSH_AGENT={}", root.join("agent.sock").display()),
         ] {
             assert!(
                 definitions.contains(&OsString::from(&definition)),
                 "{definition} missing"
             );
         }
+
+        // Under `credentials: "private"` the agent stays unreachable.
+        let mut private = network_boundary(&root);
+        private.pass_credentials = false;
+        private.ssh_agent_socket = None;
+        let (policy, definitions) = seatbelt_network_policy(&private);
+        assert!(!policy.contains("SSH_AGENT"));
+        assert!(!definitions
+            .iter()
+            .any(|definition| definition.to_string_lossy().starts_with("-DSSH_AGENT=")));
+        let launchd_deny = policy
+            .find("(deny network-outbound (remote unix-socket")
+            .expect("launchd agent socket denied");
+        let socket_allow = policy
+            .find("(remote unix-socket (subpath (param \"HOST_TMP\")))")
+            .expect("tmp sockets allowed");
+        assert!(
+            socket_allow < launchd_deny,
+            "the deny must follow the allow"
+        );
     }
 
     #[test]

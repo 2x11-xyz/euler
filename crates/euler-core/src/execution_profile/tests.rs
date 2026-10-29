@@ -288,10 +288,10 @@ fn a_user_profile_no_enforced_boundary_delivers_is_refused() {
     )
     .expect("loads");
     for (name, field) in [
-        ("net", "tmp"),
+        ("net", "network"),
         ("data", "writable_paths"),
         ("keys", "credentials"),
-        ("offline", "tmp"),
+        ("offline", "network"),
         ("missing", "writable_paths"),
         ("escalate", "escalation"),
         ("quiet", "approvals"),
@@ -305,6 +305,34 @@ fn a_user_profile_no_enforced_boundary_delivers_is_refused() {
             "{name}"
         );
     }
+}
+
+/// `approvals` is not part of either boundary: `escalation-only` and
+/// `always` resolve with both.
+#[test]
+fn approvals_resolve_with_either_enforced_boundary() {
+    let config = parse(
+        r#"{"profiles": {
+            "quick": {"extends": "locked", "approvals": "escalation-only"},
+            "careful": {"extends": "workspace", "approvals": "always"}
+        }}"#,
+    )
+    .expect("loads");
+    let quick = config
+        .resolve(Some("quick"), ProfileContext::Headless, None)
+        .expect("resolves");
+    assert_eq!(quick.fields.approvals, ApprovalsSetting::EscalationOnly);
+    assert_eq!(quick.subprocess_sandbox(), Ok(SubprocessSandbox::default()));
+    let careful = config
+        .resolve(Some("careful"), ProfileContext::Headless, None)
+        .expect("resolves");
+    assert_eq!(careful.fields.approvals, ApprovalsSetting::Always);
+    assert!(matches!(
+        careful.subprocess_sandbox(),
+        Ok(SubprocessSandbox::Enforce(
+            crate::sandbox::SandboxProfile::WorkspaceNetwork(_)
+        ))
+    ));
 }
 
 #[test]

@@ -271,8 +271,9 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         // A child runs under the parent's execution profile (ADR 0026
         // section 7, `inherit`).
         let profile = session.permissions.execution_profile().clone();
+        let sandbox_enforced = session.permissions.sandbox_enforced();
         let mut permissions = PermissionGate::new_deny_all(session.permissions.decider_mut());
-        permissions.set_execution_profile(profile);
+        permissions.set_execution_profile(profile, sandbox_enforced);
         for (capability, mode) in modes {
             permissions.set_mode(capability, mode);
         }
