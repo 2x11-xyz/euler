@@ -25,10 +25,10 @@ pub const PROJECT_OVERLAY_PATH: &str = ".euler/profile-overlay.json";
 
 /// `defaults.subagent` value meaning the parent's resolved profile.
 const INHERIT: &str = "inherit";
-/// Built-in `defaults.interactive` is `full`; `defaults.headless` is
-/// `workspace` (ADR 0026 resolved question 11).
+/// Built-in `defaults.interactive` and `defaults.headless` are both `full`
+/// (ADR 0026 resolved question 11, amended 2026-10-29).
 const BUILT_IN_INTERACTIVE: Preset = Preset::Full;
-const BUILT_IN_HEADLESS: Preset = Preset::Workspace;
+const BUILT_IN_HEADLESS: Preset = Preset::Full;
 
 const PROFILE_FIELDS: &str = "sandbox, network, writable_paths, tmp, caches, credentials, \
                               approvals, escalation, background_jobs, reviewer";

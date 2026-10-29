@@ -375,7 +375,7 @@ is not tracked.
   Euler home reads no file and says so on stderr.
 - **Selection.** `--profile <name>` on `euler` and `euler exec`, then
   `/profile` in the TUI, then the context default in `profiles.json`, then
-  the built-in default: `full` interactive, `workspace` headless. An unknown
+  the built-in default: `full` for both interactive and headless. An unknown
   name is a startup error listing the defined profiles.
   `--permission-reviewer` overrides the profile's `reviewer`.
 - **Child agents.** A companion or parallel reviewer runs under

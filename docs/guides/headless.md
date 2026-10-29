@@ -23,14 +23,16 @@ Flags:
 - `--provider <id>` / `--model <id>` choose the route.
 - `--reasoning-effort xsmall|small|medium|large|xlarge|max` sets Euler's reasoning knob. `max` is available on GPT-5.6 Luna, Sol, and Terra. Codex's `ultra` mode is not a provider effort: it combines wire-level `max` with proactive multi-agent delegation, which Euler does not yet expose as a driver workflow.
 - `--profile <name>` selects the execution profile. The default for `exec` is
-  `workspace` (or `defaults.headless` in `~/.euler/profiles.json`): shell
-  commands and workspace writes run without a prompt inside a sandbox with
-  network. `--profile locked` restores the earlier read-only default: no
-  network, and the `--auto-approve` tier decides writes and shell.
+  `full` (or `defaults.headless` in `~/.euler/profiles.json`): commands run
+  on the host without a sandbox or a prompt, with your `HOME`, credentials,
+  and network. For CI or untrusted repositories, `--profile workspace` runs
+  shell commands and workspace writes inside a sandbox with network, and
+  `--profile locked` runs read-only without network, with the
+  `--auto-approve` tier deciding writes and shell.
 - `--auto-approve read-only|trusted-local` controls headless permissions under
-  a profile that asks for every command (`locked`). Under `workspace` it has
-  no effect and Euler prints a one-line notice.
-  - `read-only` is the default: file reads are allowed; writes and shell are denied.
+  a profile that asks for every command (`locked`). Under `full` or
+  `workspace` it has no effect and Euler prints a one-line notice.
+  - `read-only` is the default tier (it applies only under a profile that asks for every command, such as `locked`): file reads are allowed; writes and shell are denied.
   - `trusted-local`: file reads, file writes, and shell are session-allowed.
 - `--extensions <ids>` enables a comma-separated list. Use `--extensions none`
   for no extensions.
