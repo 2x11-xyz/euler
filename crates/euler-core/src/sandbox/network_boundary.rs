@@ -185,11 +185,7 @@ impl NetworkBoundary {
         let provider_credentials = euler_home
             .as_deref()
             .and_then(|euler_home| std::fs::read_to_string(euler_home.join("providers.json")).ok())
-            .map(|contents| {
-                euler_provider::provider_config::ProviderConfigRegistry::with_json(&contents)
-                    .0
-                    .referenced_env_names()
-            })
+            .map(|contents| euler_provider::provider_config::referenced_env_names(&contents))
             .unwrap_or_default();
         Ok(Self::from_host(
             access,

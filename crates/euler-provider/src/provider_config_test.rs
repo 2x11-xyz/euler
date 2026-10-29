@@ -1,4 +1,6 @@
-use crate::provider_config::{ApiFamily, CustomModelConfig, ProviderConfigRegistry};
+use crate::provider_config::{
+    referenced_env_names, ApiFamily, CustomModelConfig, ProviderConfigRegistry,
+};
 
 #[test]
 fn parses_custom_provider_without_resolving_secret_references() {
@@ -893,32 +895,63 @@ fn model_api_family_entries_that_cannot_be_routed_are_ignored_with_warnings() {
 
 #[test]
 fn referenced_env_names_lists_env_references_in_api_keys_and_headers() {
-    let (registry, warnings) = ProviderConfigRegistry::with_json(
-        r#"{
-          "version": 1,
-          "providers": {
-            "proxy": {
-              "api_family": "openai_chat_completions",
-              "base_url": "https://litellm.example.com/v1",
-              "api_key": "$LITELLM_API_KEY",
-              "auth_header": true,
-              "headers": {
-                "x-team": "${PROXY_TEAM}",
-                "x-command": "!op read 'op://vault/item/token'",
-                "x-literal": "$$NOT_A_REFERENCE"
-              },
-              "default_model": "m",
-              "models": [{"id": "m"}]
-            }
-          }
-        }"#,
-    );
+    let contents = r#"{
+      "version": 1,
+      "providers": {
+        "proxy": {
+          "api_family": "openai_chat_completions",
+          "base_url": "https://litellm.example.com/v1",
+          "api_key": "$LITELLM_API_KEY",
+          "auth_header": true,
+          "headers": {
+            "x-team": "${PROXY_TEAM}",
+            "x-command": "!op read 'op://vault/item/token'",
+            "x-literal": "$$NOT_A_REFERENCE"
+          },
+          "default_model": "m",
+          "models": [{"id": "m"}]
+        }
+      }
+    }"#;
+    let (_, warnings) = ProviderConfigRegistry::with_json(contents);
     assert!(warnings.is_empty(), "{warnings:?}");
     assert_eq!(
-        registry
-            .referenced_env_names()
+        referenced_env_names(contents)
             .into_iter()
             .collect::<Vec<_>>(),
         ["LITELLM_API_KEY", "PROXY_TEAM"]
     );
+    assert_eq!(
+        referenced_env_names(&format!("\u{feff}{contents}")),
+        referenced_env_names(contents)
+    );
+}
+
+#[test]
+fn referenced_env_names_includes_provider_entries_load_ignores() {
+    let contents = r#"{
+      "version": 1,
+      "providers": {
+        "no_family": {
+          "base_url": "https://litellm.example.com/v1",
+          "api_key": "$NO_FAMILY_KEY"
+        },
+        "bad_header": {
+          "api_family": "openai_chat_completions",
+          "base_url": "https://litellm.example.com/v1",
+          "headers": {"bad header": "${BAD_HEADER_TOKEN}"},
+          "models": [{"id": "m"}]
+        },
+        "not_an_object": "$NOT_A_PROVIDER"
+      }
+    }"#;
+    let (registry, _) = ProviderConfigRegistry::with_json(contents);
+    assert!(registry.providers.is_empty(), "{registry:?}");
+    assert_eq!(
+        referenced_env_names(contents)
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["BAD_HEADER_TOKEN", "NO_FAMILY_KEY"]
+    );
+    assert!(referenced_env_names("not json").is_empty());
 }

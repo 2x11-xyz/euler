@@ -130,8 +130,9 @@ or grant-covered asks. Its fields are `sandbox: on`, `network: off`,
   `GIT_CONFIG_KEY_*`, `GIT_CONFIG_VALUE_*`, `GIT_CONFIG_GLOBAL`, and
   `GIT_SSH_COMMAND`, which only Euler sets), Euler's parent-control
   variables, Euler's own credentials (the built-in provider keys and the
-  variables the Euler home's `providers.json` references in `api_key` or a
-  header), secret-shaped variables, and the credential-agent variables
+  variables any provider entry in the Euler home's `providers.json`
+  references in `api_key` or a header, including an entry loading ignores
+  as malformed), secret-shaped variables, and the credential-agent variables
   `SSH_AUTH_SOCK` and `GPG_AGENT_INFO`. `HOME`, `TMPDIR`, `PATH`, the
   toolchain and cache variables, and `PAGER=cat GIT_PAGER=cat TERM=dumb
   NO_COLOR=1` are set.
@@ -148,8 +149,8 @@ or grant-covered asks. Its fields are `sandbox: on`, `network: off`,
 - **`credentials: "pass"`.** For a user profile extending `workspace`:
   secret-shaped variables, `SSH_AUTH_SOCK`, and `GPG_AGENT_INFO` pass
   except Euler's own credentials (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
-  `OPENROUTER_API_KEY`, `XAI_API_KEY`, and the variables `providers.json`
-  references) and parent-control variables; row C's denylist still
+  `OPENROUTER_API_KEY`, `XAI_API_KEY`, and the variables any `providers.json`
+  provider entry references, valid or malformed) and parent-control variables; row C's denylist still
   applies. On macOS the SSH agent socket `SSH_AUTH_SOCK` names is
   reachable. Each listed credential store that exists, except the keychains,
   browser profiles, and the Euler home, plus `~/.gitconfig` and
@@ -276,8 +277,9 @@ and `reviewer: user`. Under `full`:
   credentials and parent-control variables (ADR 0026 resolved question 7).
   Euler's own credentials are the built-in provider variables
   (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`,
-  `XAI_API_KEY`), the variables `providers.json` references in `api_key` or
-  a header (`$NAME`, `${NAME}`), and any variable whose value is a credential Euler holds (the
+  `XAI_API_KEY`), the variables any `providers.json` provider entry, valid
+  or malformed, references in `api_key` or a header (`$NAME`, `${NAME}`),
+  and any variable whose value is a credential Euler holds (the
   auth file's values and secrets its providers resolve). Other
   secret-shaped variables (`GITHUB_TOKEN`, cloud keys) reach commands and
   stay registered with the redactor; row C's denylist is not applied. This

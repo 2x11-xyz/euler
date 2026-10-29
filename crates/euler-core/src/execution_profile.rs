@@ -2,9 +2,7 @@
 //! approval policy as one named profile.
 //!
 //! Each built-in preset owns a module (`full.rs`, `locked.rs`,
-//! `workspace.rs`) that defines its fields. [`Preset::shipped_fields`] lists
-//! the presets that have shipped; naming any other preset is refused, never
-//! substituted, until its rollout step adds a module and an arm there.
+//! `workspace.rs`) that defines its fields.
 //! `enforced.rs` is the one place that decides whether this build can
 //! deliver a resolved profile and which subprocess sandbox it becomes.
 
@@ -269,12 +267,11 @@ impl Preset {
         Self::ALL.into_iter().find(|preset| preset.name() == name)
     }
 
-    /// The preset's fields when this build ships it; `None` refuses it.
-    fn shipped_fields(self) -> Option<ProfileFields> {
+    fn fields(self) -> ProfileFields {
         match self {
-            Self::Full => Some(full::fields()),
-            Self::Locked => Some(locked::fields()),
-            Self::Workspace => Some(workspace::fields()),
+            Self::Full => full::fields(),
+            Self::Locked => locked::fields(),
+            Self::Workspace => workspace::fields(),
         }
     }
 }
@@ -533,8 +530,6 @@ pub enum ProfileError {
     Write { file: PathBuf, message: String },
     #[error("unknown execution profile \"{name}\"; defined profiles: {}", defined.join(", "))]
     UnknownProfile { name: String, defined: Vec<String> },
-    #[error("{}", preset_not_shipped_message(requested, *preset))]
-    PresetNotShipped { requested: String, preset: Preset },
     #[error(
         "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; the full, workspace, and locked presets' boundaries are available, and writable_paths must name existing paths"
     )]
@@ -556,20 +551,4 @@ pub enum ProfileError {
         profile: String,
         field: &'static str,
     },
-}
-
-fn preset_not_shipped_message(requested: &str, preset: Preset) -> String {
-    let preset = preset.name();
-    if requested == preset {
-        format!(
-            "the {preset} preset is not available in this version yet; use --profile full, \
-             --profile workspace, \
-             --profile locked, or a profile that extends one of them"
-        )
-    } else {
-        format!(
-            "profile \"{requested}\" extends the {preset} preset, which is not available in this \
-             version yet; extend full, workspace, or locked instead"
-        )
-    }
 }

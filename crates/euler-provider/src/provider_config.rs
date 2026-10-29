@@ -56,20 +56,40 @@ impl ProviderConfigRegistry {
         self.providers.values()
     }
 
-    /// The environment variables the providers' `api_key` and header values
-    /// reference: Euler's own credentials, which no sandboxed command
-    /// inherits (ADR 0026 sections 1 and 2).
-    pub fn referenced_env_names(&self) -> BTreeSet<String> {
-        self.providers()
-            .flat_map(|provider| provider.api_key.iter().chain(provider.headers.values()))
-            .filter_map(|raw| crate::custom_provider::secret_spec_env_name(raw))
-            .map(str::to_owned)
-            .collect()
-    }
-
     pub fn provider(&self, id: &str) -> Option<&CustomProviderConfig> {
         self.providers.get(id)
     }
+}
+
+/// The environment variables `providers.json` references as `$NAME` or
+/// `${NAME}` in a provider's `api_key` or header values: Euler's own
+/// credentials, which no command Euler runs inherits (ADR 0026 sections 1
+/// and 2). Every provider entry counts, including one
+/// [`ProviderConfigRegistry::with_json`] ignores as malformed, so a broken
+/// entry's secret is withheld too.
+pub fn referenced_env_names(contents: &str) -> BTreeSet<String> {
+    let Ok(Value::Object(root)) = serde_json::from_str(contents.trim_start_matches('\u{feff}'))
+    else {
+        return BTreeSet::new();
+    };
+    let Some(Value::Object(providers)) = root.get("providers") else {
+        return BTreeSet::new();
+    };
+    providers
+        .values()
+        .filter_map(Value::as_object)
+        .flat_map(|provider| {
+            let headers = provider
+                .get("headers")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flat_map(Map::values);
+            provider.get("api_key").into_iter().chain(headers)
+        })
+        .filter_map(Value::as_str)
+        .filter_map(crate::custom_provider::secret_spec_env_name)
+        .map(str::to_owned)
+        .collect()
 }
 
 #[derive(Clone, PartialEq)]

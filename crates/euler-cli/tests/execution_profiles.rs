@@ -943,6 +943,50 @@ fn full_asks_before_writing(workspace: &Workspace, target: &Path) -> bool {
 }
 
 #[test]
+fn exec_under_full_withholds_variables_a_malformed_provider_entry_references() {
+    let workspace = workspace();
+    // No api_family: loading ignores this entry, but its key is still
+    // Euler's and stays out of host commands.
+    fs::write(
+        workspace.home.join(".euler").join("providers.json"),
+        r#"{"version": 1, "providers": {"proxy": {
+            "base_url": "https://litellm.example.com/v1",
+            "api_key": "$MY_PROXY_KEY",
+            "headers": {"x-team": "${MY_TEAM_TOKEN}"}
+        }}}"#,
+    )
+    .expect("write providers.json");
+    let script = shell_script(
+        &workspace,
+        "printf '[%s][%s][%s]' \"$MY_PROXY_KEY\" \"$MY_TEAM_TOKEN\" \"$UNRELATED_SETTING\" > out.txt",
+    );
+    let log = workspace.log.to_str().expect("utf8 log");
+    let output = exec_with_env(
+        &workspace,
+        &workspace.root,
+        &[
+            ("MY_PROXY_KEY", "proxy-key-value"),
+            ("MY_TEAM_TOKEN", "team-token-value"),
+            ("UNRELATED_SETTING", "kept"),
+        ],
+        &[
+            "--provenance",
+            log,
+            "--profile",
+            "full",
+            "--provider-option",
+            &script,
+            "hello",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(workspace.root.join("out.txt")).expect("written"),
+        "[][][kept]"
+    );
+}
+
+#[test]
 fn exec_under_full_asks_before_writing_euler_secrets_and_trust_records() {
     let unguarded: Vec<&str> = [
         "providers.json",

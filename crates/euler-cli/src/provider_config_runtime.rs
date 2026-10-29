@@ -1,5 +1,5 @@
 use euler_core::{EulerHome, EulerHomeError};
-use euler_provider::provider_config::ProviderConfigRegistry;
+use euler_provider::provider_config::{referenced_env_names, ProviderConfigRegistry};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
@@ -64,12 +64,13 @@ pub(crate) fn load_provider_config(path: Option<&Path>) -> ProviderConfigLoad {
 }
 
 /// Environment variables `providers.json` references as `$NAME` or
-/// `${NAME}` in an `api_key` or a header value
-/// ([`ProviderConfigRegistry::referenced_env_names`], the rule the
-/// `workspace` sandbox withholds too). A missing or unreadable file names
-/// none.
+/// `${NAME}` in an `api_key` or a header value of any provider entry, valid
+/// or not ([`referenced_env_names`], the rule the `workspace` sandbox
+/// withholds too). A missing or unreadable file names none.
 pub(crate) fn referenced_env_variables(path: Option<&Path>) -> BTreeSet<String> {
-    load_provider_config(path).registry.referenced_env_names()
+    path.and_then(|path| fs::read_to_string(path).ok())
+        .map(|contents| referenced_env_names(&contents))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
