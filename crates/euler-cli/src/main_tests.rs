@@ -1056,6 +1056,43 @@ fn model_preference_malformed_or_unknown_provider_falls_back() {
 }
 
 #[test]
+fn model_preference_accepts_custom_provider_from_provider_config() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let providers = write_custom_provider_config(
+        temp.path(),
+        r#"{
+          "version": 1,
+          "providers": {
+            "litellm": {
+              "api_family": "openai_chat_completions",
+              "base_url": "https://litellm.example.com/v1",
+              "api_key": "$LITELLM_API_KEY",
+              "auth_header": true,
+              "models": [{ "id": "listed-model" }]
+            }
+          }
+        }"#,
+    );
+    let preference_path = temp.path().join("preferences.json");
+    model_preference::save_model_preference(&preference_path, "litellm", "listed-model")
+        .expect("save preference");
+
+    let mut args = std::iter::empty::<String>();
+    let run = unwrap_run(
+        Args::parse_with_env_preference_catalog_and_provider_config(
+            &mut args,
+            EnvArgs::default(),
+            Some(&preference_path),
+            None,
+            Some(&providers),
+        )
+        .expect("args"),
+    );
+    assert_eq!(run.provider_id, "litellm");
+    assert_eq!(run.model, "listed-model");
+}
+
+#[test]
 fn theme_preference_loader_returns_known_theme_only() {
     let temp = tempfile::tempdir().expect("temp dir");
     let preference_path = temp.path().join(".euler").join("preferences.json");

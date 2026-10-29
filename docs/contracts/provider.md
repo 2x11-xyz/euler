@@ -195,6 +195,11 @@ relative `EULER_HOME`), no custom providers load and line-oriented commands
 print the resolution error as a `warning: ignored provider config:` line on
 stderr.
 
+A saved model preference (`$HOME/.euler/preferences.json`, written by
+`/model`; it does not follow `EULER_HOME` yet) may name a custom provider. Startup resolves it against built-in providers and the
+loaded `providers.json`, and prints `warning: ignored model preference with
+unknown provider <id>` only when neither defines that id.
+
 Each provider lists its models in a non-empty `models` array of objects with
 an `id`. A provider may omit `models` when it sets `default_model`; the parser
 then records one model with that id and no declared metadata (context window,

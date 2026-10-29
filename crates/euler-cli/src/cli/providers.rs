@@ -217,10 +217,13 @@ pub(super) fn invocation_target(run: &RunArgs) -> ModelTarget {
 
 pub(super) fn load_known_model_preference(
     preference_path: Option<&Path>,
+    custom_providers: &ProviderConfigRegistry,
 ) -> Option<ModelPreference> {
     let path = preference_path?;
     match model_preference::load_model_preference(path) {
-        PreferenceLoad::Loaded(preference) => canonical_model_preference(preference),
+        PreferenceLoad::Loaded(preference) => {
+            canonical_model_preference(preference, custom_providers)
+        }
         PreferenceLoad::Missing => None,
         PreferenceLoad::Ignored(message) => {
             eprintln!("warning: ignored model preference: {message}");
