@@ -54,5 +54,6 @@ rather than being backfilled or reused.
 | [0024](0024-materialized-projections.md) | Materialized projections next to the event log | Accepted 2026-10-27 |
 | 0025 | Gateway provider discovery | Reserved by draft PR #260 |
 | [0026](0026-execution-profiles.md) | Execution profiles: full, workspace, locked | Accepted 2026-10-28 |
+| [0027](0027-permission-rules-in-profiles.md) | Permission rules in profiles | Proposed 2026-10-29 |
 
-Next number: **0027**.
+Next number: **0028**.
