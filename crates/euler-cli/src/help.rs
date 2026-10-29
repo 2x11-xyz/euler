@@ -19,8 +19,7 @@ const SESSION_OPTIONS: &str = "  \
                              (default: the profile's reviewer, else user)
   --profile <name>           Execution profile: full, workspace, locked, or a
                              profile in profiles.json (default: the defaults
-                             entry for interactive or exec, else full
-                             interactive and workspace for exec)
+                             entry for interactive or exec, else full)
   --project-context <p>      auto, on, or off: load this project's EULER.md
                              guidance (default: auto)
   --accept-relocation        On resume, move the session to the current folder

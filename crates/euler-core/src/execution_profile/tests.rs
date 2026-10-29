@@ -46,7 +46,7 @@ fn unenforced_fields() -> ProfileFields {
 }
 
 #[test]
-fn built_in_defaults_are_full_interactive_and_workspace_headless() {
+fn built_in_defaults_are_full_interactive_and_full_headless() {
     let config = ProfilesConfig::default();
     let interactive = config
         .resolve(None, ProfileContext::Interactive, None)
@@ -56,8 +56,8 @@ fn built_in_defaults_are_full_interactive_and_workspace_headless() {
     let headless = config
         .resolve(None, ProfileContext::Headless, None)
         .expect("resolves");
-    assert_eq!(headless.name, "workspace");
-    assert_eq!(headless.fields, workspace::fields());
+    assert_eq!(headless.name, "full");
+    assert_eq!(headless.fields, full::fields());
 }
 
 #[test]

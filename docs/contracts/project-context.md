@@ -166,7 +166,7 @@ prompt: without a matching acknowledgment they run with project context
 disabled and say so in the startup summary. Under `auto`, `exec --auto-approve
 trusted-local` disables admission regardless of acknowledgment when the
 execution profile has `approvals: always` (`locked`); under any other profile
-(`workspace`, the `exec` default) an acknowledged digest is admitted as
+(`full`, which is the `exec` default, or `workspace`) an acknowledged digest is admitted as
 without the flag (ADR 0026 resolved question 10). Explicit
 `--project-context on` supplied by the current invocation is a separate,
 session-only dual opt-in and may override that automatic resolution; the
