@@ -81,7 +81,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.session_kind = SessionKind::Interactive;
-    live_session.config.set_execution_profile(profile);
+    profile.install(&mut live_session.config);
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
@@ -271,7 +271,7 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     let mut live_session =
         live_session_config(root, run.provider_id.clone(), run.model.clone(), provenance)?;
     live_session.config.session_kind = SessionKind::Interactive;
-    live_session.config.set_execution_profile(profile);
+    profile.install(&mut live_session.config);
     apply_catalog_context_limit(&mut live_session.config, &run.model_catalog);
     live_session.config.extensions_enabled =
         resolve_session_extensions(&live_session.config.root, &run.extensions)?;
@@ -412,14 +412,14 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
     })?;
     let prompt = read_exec_prompt(exec.prompt)?;
     let root = std::env::current_dir()?;
-    let profile = launch_profile(
+    let launch = launch_profile(
         run_profile_request(&exec.run, ProfileContext::Headless),
         &root,
     )?;
     // ADR 0026 resolved question 10: `trusted-local` disables `auto`
     // admission only under a profile that asks for every command.
     let trusted_local_disables_project_context = exec.auto_approve == AutoApproveTier::TrustedLocal
-        && profile.fields.approvals == ApprovalsSetting::Always;
+        && launch.profile.fields.approvals == ApprovalsSetting::Always;
     let mut live_session = live_session_config(
         root,
         exec.run.provider_id.clone(),
@@ -427,7 +427,7 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
         provenance,
     )?;
     live_session.config.session_kind = SessionKind::NonInteractive;
-    live_session.config.set_execution_profile(profile);
+    launch.install(&mut live_session.config);
     apply_catalog_context_limit(&mut live_session.config, &exec.run.model_catalog);
     apply_exec_config(
         &mut live_session.config,

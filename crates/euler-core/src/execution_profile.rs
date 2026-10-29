@@ -178,6 +178,37 @@ impl ProfileFields {
             })
     }
 
+    /// These fields tightened to be no looser than `parent`, field by field:
+    /// a field looser than the parent's takes the parent's value (ADR 0026
+    /// section 7). Uses the order [`Self::first_looser_field`] compares with,
+    /// so the result is never looser than `parent`. `reviewer` has no order
+    /// and is kept.
+    fn tightened_to(mut self, parent: &Self) -> Self {
+        fn at_least<T: Tightness>(slot: &mut T, parent: T) {
+            if slot.rank() < parent.rank() {
+                *slot = parent;
+            }
+        }
+        at_least(&mut self.sandbox, parent.sandbox);
+        if parent.sandbox != SandboxSetting::Off {
+            at_least(&mut self.network, parent.network);
+            if !self
+                .writable_paths
+                .iter()
+                .all(|path| parent.writable_paths.contains(path))
+            {
+                self.writable_paths.clone_from(&parent.writable_paths);
+            }
+            at_least(&mut self.tmp, parent.tmp);
+            at_least(&mut self.caches, parent.caches);
+            at_least(&mut self.credentials, parent.credentials);
+        }
+        at_least(&mut self.approvals, parent.approvals);
+        at_least(&mut self.escalation, parent.escalation);
+        at_least(&mut self.background_jobs, parent.background_jobs);
+        self
+    }
+
     /// Contradictory combinations (ADR 0026 section 5, "Validation").
     /// `credentials_set` says whether the profile or overlay wrote
     /// `credentials` itself, because only setting it on a sandbox-off
@@ -307,6 +338,23 @@ impl ExecutionProfile {
             profile: self.name.clone(),
             field,
         })
+    }
+
+    /// The profile a child agent of a session running under `self` gets
+    /// (ADR 0026 section 7): `self` when `subagent` is `None`
+    /// (`defaults.subagent` unset or `inherit`), otherwise `subagent`
+    /// tightened field by field to be no looser than `self`. A child's asks
+    /// go to the session's reviewer, so it keeps `self`'s `reviewer`.
+    pub fn child_profile(&self, subagent: Option<&ExecutionProfile>) -> ExecutionProfile {
+        let Some(subagent) = subagent else {
+            return self.clone();
+        };
+        let mut fields = subagent.fields.clone().tightened_to(&self.fields);
+        fields.reviewer = self.fields.reviewer;
+        ExecutionProfile {
+            name: subagent.name.clone(),
+            fields,
+        }
     }
 
     /// The `execution_profile` provenance object: name, effective fields,

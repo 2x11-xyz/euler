@@ -206,7 +206,8 @@ impl<D: PermissionDecider> Session<D> {
         project_context: &crate::project_context::ProjectContextFold,
     ) -> Result<PreparedReviewer, SessionError> {
         let target = self.resolve_companion_target(&task)?;
-        let spawned = self.record_companion_spawn(&task, &target, writer)?;
+        let profile = self.config.child_execution_profile();
+        let spawned = self.record_companion_spawn(&task, &target, &profile, writer)?;
         let child_agent_id = spawned.child_agent_id().to_owned();
         let mut task_canvas: Vec<crate::CanvasItem> = if task.includes_parent_canvas() {
             canvas.to_vec()

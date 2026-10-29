@@ -172,6 +172,11 @@ fn batch_returns_outcomes_in_task_order_with_ordered_events() {
             result.payload["child_agent_id"],
             spawn.payload["child_agent_id"]
         );
+        // Without `defaults.subagent`, each reviewer records the session's profile.
+        assert_eq!(
+            spawn.payload["execution_profile"],
+            session.config.execution_profile_record()
+        );
     }
 }
 

@@ -202,27 +202,37 @@ fn profile_reviewer_applies_and_the_reviewer_flag_overrides_it() {
 }
 
 #[test]
-fn subagent_default_naming_a_profile_warns_that_it_is_not_applied() {
+fn subagent_default_is_resolved_at_startup_without_a_warning() {
     let workspace = workspace();
     write_profiles(&workspace, r#"{"defaults": {"subagent": "locked"}}"#);
     let output = exec_new(&workspace, &["--profile", "full"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains(
-            "warning: defaults.subagent \"locked\" is not applied yet; child agents run under \
-             the session's execution profile"
-        ),
+        !stderr(&output).contains("defaults.subagent"),
         "{}",
         stderr(&output)
     );
 
-    write_profiles(&workspace, r#"{"defaults": {"subagent": "inherit"}}"#);
+    // A default child agents cannot run under is a startup error.
+    let missing = workspace.root.join("missing");
+    write_profiles(
+        &workspace,
+        &format!(
+            r#"{{"defaults": {{"subagent": "data"}},
+                "profiles": {{"data": {{"extends": "workspace", "writable_paths": [{}]}}}}}}"#,
+            serde_json::to_string(missing.to_str().expect("utf8 path")).expect("json path")
+        ),
+    );
     let output = exec_resume(&workspace, &["--profile", "full"]);
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!output.status.success());
+    let error = stderr(&output);
     assert!(
-        !stderr(&output).contains("defaults.subagent"),
-        "{}",
-        stderr(&output)
+        error.contains("defaults.subagent in profiles.json cannot be applied to child agents"),
+        "{error}"
+    );
+    assert!(
+        error.contains("profile \"data\" sets writable_paths"),
+        "{error}"
     );
 }
 

@@ -277,6 +277,16 @@ tool-free review briefs, and any capability-holding child's own tool calls
 remain gated by the parent's tier-configured modes, so allowing spawn
 cannot escalate beyond the tier.
 
+## Child execution profile (ADR 0026)
+
+A companion or parallel reviewer runs under `defaults.subagent` tightened
+field by field to be no looser than the session's current execution
+profile, or the session's profile when it is unset or `inherit`
+(capabilities contract, "Selection"). Capability attenuation is unchanged:
+the profile decides how a granted tool runs and when it asks, never which
+capabilities a child holds. `agent.spawn` records the child's
+`execution_profile`.
+
 ## Guardian permission reviewer (ADR 0011)
 
 The guardian is a **core permissions feature that reuses the companion

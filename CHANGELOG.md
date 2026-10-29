@@ -18,6 +18,16 @@ pull requests that landed them; deeper design rationale lives in
 - Removed the unreachable "preset is not available in this version" error.
   The `full`, `workspace`, and `locked` presets all ship.
 
+### Execution profiles: `defaults.subagent` applies to child agents
+
+- **Behavior change**: `defaults.subagent` in `profiles.json` now sets the
+  execution profile of companions and parallel reviewers, tightened field by
+  field so a child never runs looser than its session: a field looser than
+  the session's takes the session's value. Unset or `inherit` keeps the
+  session's profile. The startup warning that the setting was not applied is
+  gone, and a `defaults.subagent` this host cannot enforce is a startup
+  error. `agent.spawn` records the child's `execution_profile`.
+
 ### TUI: pasted slash commands run as commands
 
 - A one-line composer draft that starts with a known slash command now runs
@@ -119,8 +129,6 @@ pull requests that landed them; deeper design rationale lives in
   accept paths outside the workspace, recorded but not covered by
   `/rollback` (an absolute path to a workspace file is checkpointed as
   usual); and background jobs keep running and are listed at exit.
-- `defaults.subagent` naming a profile is not applied yet; startup warns
-  that child agents run under the session's profile.
 - **Under every profile:** `write_file`, `edit_file`, and `apply_patch` on
   interpreter-honored configuration (`.git/...`, `.gitconfig`,
   `.config/git/config`, `.npmrc`, shell startup files,
