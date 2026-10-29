@@ -796,10 +796,7 @@ fn resume_from_folded_prefix<D>(
         // A resumed session may be on a different host than the one that
         // wrote `session.start`, so the boundary records the backend it
         // actually got rather than letting a reader assume the original.
-        match config.subprocess_sandbox {
-            crate::SubprocessSandbox::Host => crate::SandboxStatus::Host,
-            crate::SubprocessSandbox::Enforce(_) => crate::probe_workspace_sandbox(&config.root),
-        },
+        config.probe_subprocess_sandbox(),
     );
     crate::root_identity::insert_root_object_identity(&mut resume_marker.payload, &config.root);
     writer

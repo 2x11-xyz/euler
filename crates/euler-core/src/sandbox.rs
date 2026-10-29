@@ -23,23 +23,45 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// The first Linux profile Euler intends to advertise to users.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+mod network_boundary;
+use network_boundary::NetworkBoundary;
+
+/// The sandbox boundaries Euler enforces, one per execution profile shape
+/// (ADR 0026).
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SandboxProfile {
-    /// A writable workspace with no host home or network namespace access.
+    /// The `locked` boundary: a writable workspace with no host home or
+    /// network namespace access, and a private `/tmp`.
     WorkspaceNoNetwork,
+    /// The `workspace` boundary: network, the host `/tmp`, writable named
+    /// toolchain caches, a private per-session `HOME`, and the inherited
+    /// environment under ADR 0021 row C.
+    WorkspaceNetwork(WorkspaceNetworkAccess),
+}
+
+/// What a `workspace` boundary adds beyond the preset, from the profile's
+/// `writable_paths` and `credentials` fields.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorkspaceNetworkAccess {
+    /// Existing canonical host paths that are also writable.
+    pub writable_paths: Vec<PathBuf>,
+    /// `credentials: "pass"`: secret-shaped variables and the named
+    /// credential stores reach the command.
+    pub pass_credentials: bool,
 }
 
 impl SandboxProfile {
-    pub const fn label(self) -> &'static str {
+    pub const fn label(&self) -> &'static str {
         match self {
             Self::WorkspaceNoNetwork => "sandboxed workspace (network disabled)",
+            Self::WorkspaceNetwork(_) => "sandboxed workspace (network enabled)",
         }
     }
 
-    pub(crate) const fn network_enabled(self) -> bool {
+    pub(crate) const fn network_enabled(&self) -> bool {
         match self {
             Self::WorkspaceNoNetwork => false,
+            Self::WorkspaceNetwork(_) => true,
         }
     }
 }
@@ -73,7 +95,7 @@ impl SandboxBackend {
 /// This is a core execution choice, intentionally separate from the
 /// capability gate and its approval modes. Linux and macOS default to the
 /// enforced no-network profile; unsupported platforms run on the host.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubprocessSandbox {
     /// Agent subprocesses run directly on the host. This is not "no
     /// confinement chosen": it is the honest state of a platform with no
@@ -379,13 +401,13 @@ fallback to host execution. {retry}",
 /// The result of probing the profile rather than merely locating a binary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SandboxAvailability {
-    Enforced(SandboxProfile),
+    Enforced,
     Unavailable(SandboxUnavailableReason),
 }
 
 impl SandboxAvailability {
     pub const fn is_enforced(self) -> bool {
-        matches!(self, Self::Enforced(_))
+        matches!(self, Self::Enforced)
     }
 }
 
@@ -418,30 +440,63 @@ pub(crate) struct WorkspaceSandbox {
     workspace: Option<PathBuf>,
     runtime: RuntimeRoots,
     backend: SandboxBackend,
+    profile: SandboxProfile,
+    /// The host paths a `workspace` boundary reaches; `None` for `locked`.
+    network: Option<NetworkBoundary>,
     launcher: Option<SandboxLauncher>,
     availability: SandboxAvailability,
+}
+
+/// The backend this platform enforces, or the host where none exists.
+fn platform_backend() -> SandboxBackend {
+    if cfg!(target_os = "linux") {
+        SandboxBackend::Bwrap
+    } else if cfg!(target_os = "macos") {
+        SandboxBackend::Seatbelt
+    } else {
+        SandboxBackend::Host
+    }
 }
 
 impl WorkspaceSandbox {
     /// Build and probe a profile for one workspace. Construction itself never
     /// falls back to host execution: callers must inspect or propagate the
-    /// resulting [`SandboxAvailability`].
-    pub(crate) fn new(workspace: impl AsRef<Path>, profile: SandboxProfile) -> Self {
-        Self::with_runtime_roots(workspace, profile, RuntimeRoots::detect())
+    /// resulting [`SandboxAvailability`]. `home` is the private per-session
+    /// `HOME` a `workspace` boundary uses (see
+    /// [`crate::SessionConfig::session_store_dir`]).
+    pub(crate) fn new(
+        workspace: impl AsRef<Path>,
+        profile: SandboxProfile,
+        home: Option<PathBuf>,
+    ) -> Self {
+        let network = match &profile {
+            SandboxProfile::WorkspaceNoNetwork => None,
+            SandboxProfile::WorkspaceNetwork(access) => {
+                match NetworkBoundary::resolve(access, home) {
+                    Ok(network) => Some(network),
+                    Err(reason) => {
+                        let mut sandbox = Self::unavailable(
+                            None,
+                            RuntimeRoots::default(),
+                            platform_backend(),
+                            reason,
+                        );
+                        sandbox.profile = profile;
+                        return sandbox;
+                    }
+                }
+            }
+        };
+        Self::with_runtime_roots(workspace, profile, network, RuntimeRoots::detect())
     }
 
     fn with_runtime_roots(
         workspace: impl AsRef<Path>,
         profile: SandboxProfile,
+        network: Option<NetworkBoundary>,
         runtime: RuntimeRoots,
     ) -> Self {
-        let backend = if cfg!(target_os = "linux") {
-            SandboxBackend::Bwrap
-        } else if cfg!(target_os = "macos") {
-            SandboxBackend::Seatbelt
-        } else {
-            SandboxBackend::Host
-        };
+        let backend = platform_backend();
         if backend == SandboxBackend::Host {
             return Self::unavailable(
                 None,
@@ -459,55 +514,51 @@ impl WorkspaceSandbox {
             );
         };
         let runtime = runtime.excluding(&workspace);
-        match backend {
-            SandboxBackend::Bwrap => Self::with_bwrap(workspace, runtime, profile),
-            SandboxBackend::Seatbelt => Self::with_seatbelt(workspace, runtime, profile),
-            SandboxBackend::Host => unreachable!("host returned above"),
-        }
-    }
-
-    fn with_bwrap(workspace: PathBuf, runtime: RuntimeRoots, profile: SandboxProfile) -> Self {
-        let backend = SandboxBackend::Bwrap;
-        let Some(bwrap) = bwrap_path() else {
-            return Self::unavailable(
-                Some(workspace),
-                runtime,
-                backend,
-                SandboxUnavailableReason::BubblewrapMissing,
-            );
-        };
-        let availability = probe_bwrap_profile(&bwrap, &workspace, &runtime, profile);
-        Self {
-            workspace: Some(workspace),
+        let mut sandbox = Self::unavailable(
+            Some(workspace),
             runtime,
             backend,
-            launcher: Some(SandboxLauncher::Bubblewrap(bwrap)),
-            availability,
+            SandboxUnavailableReason::CannotEnforce,
+        );
+        sandbox.profile = profile;
+        sandbox.network = network;
+        match backend {
+            SandboxBackend::Bwrap => sandbox.probe_bwrap(),
+            SandboxBackend::Seatbelt => sandbox.probe_seatbelt(),
+            SandboxBackend::Host => unreachable!("host returned above"),
         }
+        sandbox
     }
 
-    fn with_seatbelt(workspace: PathBuf, runtime: RuntimeRoots, profile: SandboxProfile) -> Self {
-        let backend = SandboxBackend::Seatbelt;
+    fn probe_bwrap(&mut self) {
+        let Some(bwrap) = bwrap_path() else {
+            self.availability =
+                SandboxAvailability::Unavailable(SandboxUnavailableReason::BubblewrapMissing);
+            return;
+        };
+        let workspace = self.workspace.as_deref().expect("probed with a workspace");
+        self.availability = probe_bwrap_profile(&bwrap, self.launch(workspace, &[]));
+        self.launcher = Some(SandboxLauncher::Bubblewrap(bwrap));
+    }
+
+    fn probe_seatbelt(&mut self) {
+        let unavailable = |reason| SandboxAvailability::Unavailable(reason);
         let Some(executable) = seatbelt_path() else {
-            return Self::unavailable(
-                Some(workspace),
-                runtime,
-                backend,
-                SandboxUnavailableReason::SeatbeltMissing,
-            );
+            self.availability = unavailable(SandboxUnavailableReason::SeatbeltMissing);
+            return;
         };
         let Some((scratch, scratch_path)) = seatbelt_scratch() else {
-            return Self::unavailable(
-                Some(workspace),
-                runtime,
-                backend,
-                SandboxUnavailableReason::CannotEnforce,
-            );
+            self.availability = unavailable(SandboxUnavailableReason::CannotEnforce);
+            return;
         };
+        let workspace = self.workspace.as_deref().expect("probed with a workspace");
         let git_metadata = workspace.join(".git");
         let git_metadata_resolved = match seatbelt_git_metadata_path(&git_metadata) {
             Ok(path) => path,
-            Err(reason) => return Self::unavailable(Some(workspace), runtime, backend, reason),
+            Err(reason) => {
+                self.availability = unavailable(reason);
+                return;
+            }
         };
         let launcher = SandboxLauncher::Seatbelt {
             executable,
@@ -516,14 +567,23 @@ impl WorkspaceSandbox {
             git_metadata,
             git_metadata_resolved,
         };
-        let availability =
-            probe_seatbelt_profile(&launcher, &workspace, &runtime, profile).availability(profile);
-        Self {
-            workspace: Some(workspace),
-            runtime,
-            backend,
-            launcher: Some(launcher),
-            availability,
+        self.availability =
+            probe_seatbelt_profile(&launcher, self.launch(workspace, &[])).availability();
+        self.launcher = Some(launcher);
+    }
+
+    /// Everything one launch mounts and exports.
+    fn launch<'a>(
+        &'a self,
+        workspace: &'a Path,
+        env: &'a [(OsString, OsString)],
+    ) -> SandboxLaunch<'a> {
+        SandboxLaunch {
+            profile: &self.profile,
+            network: self.network.as_ref(),
+            workspace,
+            runtime: &self.runtime,
+            env,
         }
     }
 
@@ -537,6 +597,8 @@ impl WorkspaceSandbox {
             workspace,
             runtime,
             backend,
+            profile: SandboxProfile::WorkspaceNoNetwork,
+            network: None,
             launcher: None,
             availability: SandboxAvailability::Unavailable(reason),
         }
@@ -552,7 +614,13 @@ impl WorkspaceSandbox {
 
     /// Whether the probed profile cuts commands off from the network.
     pub(crate) const fn network_disabled(&self) -> bool {
-        matches!(self.availability, SandboxAvailability::Enforced(profile) if !profile.network_enabled())
+        self.availability.is_enforced() && !self.profile.network_enabled()
+    }
+
+    /// Whether secret-shaped variables pass into the command
+    /// (`credentials: "pass"`).
+    pub(crate) const fn passes_credentials(&self) -> bool {
+        matches!(&self.profile, SandboxProfile::WorkspaceNetwork(access) if access.pass_credentials)
     }
 
     /// The execution boundary in the words the model reads in the `run_shell`
@@ -561,28 +629,60 @@ impl WorkspaceSandbox {
     /// mounts (`bwrap_command`) or profile (`seatbelt_profile.sbpl`) for one
     /// profile, so a new profile must state its own.
     pub(crate) fn model_boundary(&self) -> String {
-        let (SandboxAvailability::Enforced(profile), Some(launcher)) =
-            (self.availability, &self.launcher)
+        let (SandboxAvailability::Enforced, Some(launcher)) = (self.availability, &self.launcher)
         else {
             return "Euler's sandbox could not start in this session, so commands are refused; \
 the user can run `euler --check-sandbox` to see why."
                 .to_owned();
         };
-        let network = if profile.network_enabled() {
+        let network = if self.profile.network_enabled() {
             "network is available"
         } else {
             "network is disabled, so DNS lookups and downloads fail even when the host is online, \
 and services on the host's localhost are not reachable"
         };
+        let profile = &self.profile;
         let writes = match (launcher, profile) {
             (SandboxLauncher::Bubblewrap(_), SandboxProfile::WorkspaceNoNetwork) => {
                 "writes persist only in the workspace; /tmp (which holds $HOME) is writable but \
 private and discarded after each command"
+                    .to_owned()
             }
             (SandboxLauncher::Seatbelt { .. }, SandboxProfile::WorkspaceNoNetwork) => {
                 "writes are allowed only in the workspace and in $TMPDIR and $HOME, which persist \
 between commands in this session; .git and /tmp are not writable, so git commands that write \
 the repository fail"
+                    .to_owned()
+            }
+            (launcher, SandboxProfile::WorkspaceNetwork(access)) => {
+                let (tmp, git, jobs) = match launcher {
+                    SandboxLauncher::Bubblewrap(_) => (
+                        "/tmp (shared with the host)",
+                        "",
+                        "they end when their command ends",
+                    ),
+                    SandboxLauncher::Seatbelt { .. } => (
+                        "/tmp and $TMPDIR (shared with the host)",
+                        "; .git is not writable, so git commands that write the repository fail",
+                        "they keep running after their command and end when the session ends",
+                    ),
+                };
+                let extra = access
+                    .writable_paths
+                    .iter()
+                    .map(|path| format!(", {}", path.display()))
+                    .collect::<String>();
+                let credentials = if access.pass_credentials {
+                    "secret environment variables and credential files under $HOME are available"
+                } else {
+                    "secret environment variables and the user's credential files are not \
+available"
+                };
+                format!(
+                    "writes are allowed in the workspace, {tmp}, the toolchain caches{extra}, and \
+$HOME, a private directory that persists for this session{git}; {credentials}. Background jobs \
+must redirect their output; {jobs}"
+                )
             }
         };
         format!(
@@ -652,9 +752,10 @@ registry and build settings a build needs. Move the token to `credentials.toml` 
     /// the caller an unsandboxed command.
     ///
     /// `env` is the single seam through which a caller adds variables to the
-    /// otherwise cleared sandbox environment. Environment *policy* (an
-    /// inheritance model and a hard denylist) is a later PR; today the profile
-    /// clears everything and sets only what the profile itself needs.
+    /// sandbox environment. The `locked` boundary clears everything else and
+    /// sets only what the profile itself needs; the `workspace` boundary
+    /// inherits the parent environment under ADR 0021 row C
+    /// ([`network_environment`]).
     pub(crate) fn command<I, S>(
         &self,
         program: impl AsRef<OsStr>,
@@ -665,12 +766,9 @@ registry and build settings a build needs. Move the token to `credentials.toml` 
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let SandboxAvailability::Enforced(profile) = self.availability else {
-            let SandboxAvailability::Unavailable(reason) = self.availability else {
-                unreachable!("availability is either enforced or unavailable");
-            };
+        if let SandboxAvailability::Unavailable(reason) = self.availability {
             return Err(reason);
-        };
+        }
         let workspace = self
             .workspace
             .as_deref()
@@ -680,12 +778,7 @@ registry and build settings a build needs. Move the token to `credentials.toml` 
             .as_ref()
             .ok_or(SandboxUnavailableReason::CannotEnforce)?;
         debug_assert_eq!(launcher.backend(), self.backend);
-        let launch = SandboxLaunch {
-            profile,
-            workspace,
-            runtime: &self.runtime,
-            env,
-        };
+        let launch = self.launch(workspace, env);
         Ok(match launcher {
             SandboxLauncher::Bubblewrap(bwrap) => {
                 bwrap_command(bwrap, launch, program.as_ref(), args)
@@ -1217,7 +1310,7 @@ fn names_a_profile_mount_point(path: &Path) -> bool {
 /// diagnostics may expose host details and are not suitable for model-facing
 /// or transcript output.
 pub fn probe_workspace_sandbox(workspace: &Path) -> SandboxStatus {
-    WorkspaceSandbox::new(workspace, SandboxProfile::WorkspaceNoNetwork).status()
+    WorkspaceSandbox::new(workspace, SandboxProfile::WorkspaceNoNetwork, None).status()
 }
 
 /// Probe the execution boundary itself, independent of any workspace.
@@ -1403,12 +1496,8 @@ pub(crate) fn strip_sandbox_ready_marker(stdout: &str) -> Result<&str, SandboxUn
         .ok_or(SandboxUnavailableReason::CannotEnforce)
 }
 
-fn probe_bwrap_profile(
-    bwrap: &Path,
-    workspace: &Path,
-    runtime: &RuntimeRoots,
-    profile: SandboxProfile,
-) -> SandboxAvailability {
+fn probe_bwrap_profile(bwrap: &Path, launch: SandboxLaunch<'_>) -> SandboxAvailability {
+    let runtime = launch.runtime;
     // `test -d` for the workspace, not `test -w`: the mount is what the probe
     // is checking, and a read-only checkout is a workspace Euler can still
     // read. `/tmp` must be writable, because the sandbox home, cache and
@@ -1419,22 +1508,27 @@ fn probe_bwrap_profile(
     // and a home that is itself a profile mount point (`HOME=/tmp`) is
     // deliberately left writable, so asserting either would fail a working
     // sandbox and send the user to the user-namespace diagnostic.
+    // A `workspace` boundary's private home must be writable, and a
+    // writable path that covers the real home keeps it writable.
     let read_only_parents = runtime.read_only_parents();
+    let covered = |home: &Path| {
+        launch
+            .network
+            .is_some_and(|network| network.writable().any(|path| home.starts_with(path)))
+    };
     if let Some(home) = runtime
         .home
         .as_ref()
-        .filter(|home| read_only_parents.contains(home))
+        .filter(|home| read_only_parents.contains(home) && !covered(home))
     {
         script.push_str(&format!(" && test ! -w {}", shell_quote(home)));
     }
+    if launch.network.is_some() {
+        script.push_str(" && test -w \"$HOME\"");
+    }
     let mut command = bwrap_command(
         bwrap,
-        SandboxLaunch {
-            profile,
-            workspace,
-            runtime,
-            env: &[],
-        },
+        launch,
         OsStr::new("/bin/sh"),
         ["-c", script.as_str()],
     );
@@ -1442,15 +1536,10 @@ fn probe_bwrap_profile(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    run_probe_to_completion(command).availability(profile)
+    run_probe_to_completion(command).availability()
 }
 
-fn probe_seatbelt_profile(
-    launcher: &SandboxLauncher,
-    workspace: &Path,
-    runtime: &RuntimeRoots,
-    profile: SandboxProfile,
-) -> ProbeOutcome {
+fn probe_seatbelt_profile(launcher: &SandboxLauncher, launch: SandboxLaunch<'_>) -> ProbeOutcome {
     let SandboxLauncher::Seatbelt {
         executable,
         _scratch: _,
@@ -1468,16 +1557,12 @@ fn probe_seatbelt_profile(
             git_metadata,
             git_metadata_resolved,
         },
-        SandboxLaunch {
-            profile,
-            workspace,
-            runtime,
-            env: &[],
-        },
+        launch,
         OsStr::new("/bin/sh"),
         [
             "-c",
-            "probe=\"$TMPDIR/euler-seatbelt-probe-$$\"; printf ready >\"$probe\" && rm -f \"$probe\"",
+            "probe=\"$TMPDIR/euler-probe-$$\"; printf ready >\"$probe\" && rm -f \"$probe\" \
+             && test -w \"$HOME\"",
         ],
     );
     run_probe_to_completion(command)
@@ -1529,9 +1614,9 @@ enum ProbeOutcome {
 
 impl ProbeOutcome {
     /// What a profile probe that ended this way means for the session.
-    const fn availability(self, profile: SandboxProfile) -> SandboxAvailability {
+    const fn availability(self) -> SandboxAvailability {
         match self {
-            Self::Succeeded => SandboxAvailability::Enforced(profile),
+            Self::Succeeded => SandboxAvailability::Enforced,
             Self::Refused => {
                 SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
             }
@@ -1585,7 +1670,9 @@ fn canonical_workspace(workspace: &Path) -> Result<PathBuf, std::io::Error> {
 
 /// Everything the profile mounts and exports for one launch.
 struct SandboxLaunch<'a> {
-    profile: SandboxProfile,
+    profile: &'a SandboxProfile,
+    /// The host paths a `workspace` boundary reaches; `None` for `locked`.
+    network: Option<&'a NetworkBoundary>,
     workspace: &'a Path,
     runtime: &'a RuntimeRoots,
     env: &'a [(OsString, OsString)],
@@ -1606,6 +1693,7 @@ where
 {
     let SandboxLaunch {
         profile,
+        network,
         workspace,
         runtime,
         env,
@@ -1618,37 +1706,48 @@ where
     mark_inherited_fds_close_on_exec(&mut command);
     command.args(PROFILE_ISOLATION_FLAGS);
     command.args(["--die-with-parent", "--new-session", "--clearenv"]);
-    for (name, value) in sandbox_environment(runtime, env) {
+    let environment = match network {
+        None => sandbox_environment(runtime, env),
+        Some(network) => network.environment(
+            std::env::vars_os(),
+            sandbox_toolchain_variables(runtime),
+            Path::new("/tmp"),
+            runtime.sandbox_path(),
+            env,
+        ),
+    };
+    for (name, value) in environment {
         command.arg("--setenv").arg(name).arg(value);
     }
     command.args(["--tmpfs", "/"]);
-    match profile {
-        SandboxProfile::WorkspaceNoNetwork => command.arg("--unshare-net"),
-    };
+    if !profile.network_enabled() {
+        command.arg("--unshare-net");
+    }
     for mount in RUNTIME_MOUNTS {
         if Path::new(mount).exists() {
             command.args(["--dir", mount, "--ro-bind", mount, mount]);
         }
     }
     command.args([
-        "--dir",
-        "/proc",
-        "--proc",
-        "/proc",
-        "--dir",
-        "/dev",
-        "--dev",
-        "/dev",
-        "--dir",
-        "/tmp",
-        "--tmpfs",
-        "/tmp",
-        "--dir",
-        SANDBOX_HOME,
-        "--dir",
-        SANDBOX_CACHE,
+        "--dir", "/proc", "--proc", "/proc", "--dir", "/dev", "--dev", "/dev",
     ]);
-    add_runtime_root_mounts(&mut command, runtime);
+    if network.is_some() {
+        // The host `/tmp`, so a path the model reports exists outside too
+        // (ADR 0026 resolved question 4).
+        command.args(["--bind", "/tmp", "/tmp"]);
+    } else {
+        command.args([
+            "--dir",
+            "/tmp",
+            "--tmpfs",
+            "/tmp",
+            "--dir",
+            SANDBOX_HOME,
+            "--dir",
+            SANDBOX_CACHE,
+        ]);
+    }
+    add_runtime_root_mounts(&mut command, runtime, network);
     command
         .args(["--dir", SANDBOX_WORKSPACE, "--bind"])
         .arg(workspace)
@@ -1678,20 +1777,22 @@ where
         git_metadata_resolved,
     } = seatbelt;
     let SandboxLaunch {
-        profile,
+        profile: _,
+        network,
         workspace,
         runtime,
         env,
     } = launch;
-    match profile {
-        SandboxProfile::WorkspaceNoNetwork => {}
-    }
+    let (policy, network_definitions) = match network {
+        None => (SEATBELT_PROFILE.to_owned(), Vec::new()),
+        Some(network) => seatbelt_network_policy(network),
+    };
     let mut command = Command::new(executable);
     command
         .env_clear()
         .current_dir(workspace)
         .arg("-p")
-        .arg(SEATBELT_PROFILE)
+        .arg(policy)
         .arg(seatbelt_definition("WORKSPACE", workspace))
         .arg(seatbelt_definition("GIT_METADATA", git_metadata))
         .arg(seatbelt_definition(
@@ -1699,6 +1800,7 @@ where
             git_metadata_resolved,
         ))
         .arg(seatbelt_definition("SCRATCH", scratch))
+        .args(network_definitions)
         .arg("--")
         .arg("/bin/sh")
         .arg("-c")
@@ -1706,11 +1808,98 @@ where
         .arg("euler-sandbox")
         .arg(program)
         .args(args);
-    for (name, value) in seatbelt_environment(runtime, scratch, env) {
+    let environment = match network {
+        None => seatbelt_environment(runtime, scratch, env),
+        Some(network) => {
+            network.link_passed_credentials();
+            network.environment(
+                std::env::vars_os(),
+                runtime.variables.iter().cloned(),
+                &network.host_tmpdir,
+                runtime.seatbelt_path(),
+                env,
+            )
+        }
+    };
+    for (name, value) in environment {
         command.env(name, value);
     }
     mark_inherited_fds_close_on_exec(&mut command);
     command
+}
+
+/// Where the `workspace` rules go: before the profile's closing denies, so
+/// no writable path can reopen Git metadata.
+const SEATBELT_CLOSING_DENIES: &str = "; Explicit denies stay last";
+
+/// The Seatbelt policy for a `workspace` boundary and its `-D` definitions.
+/// The rules name only parameters, so no path becomes policy source text:
+/// outbound IP network and loopback bind, Unix-socket connects only under
+/// the workspace, the private `HOME`, `/tmp`, and the host `TMPDIR` (never
+/// the launchd SSH agent socket unless credentials pass), read denies for
+/// the credential stores, the private `HOME`, writes to `/tmp`, the host
+/// `TMPDIR`, the caches, and `writable_paths`, and no writes into another
+/// session's Seatbelt scratch tree in the shared temporary directories (ADR
+/// 0026 resolved question 4).
+fn seatbelt_network_policy(network: &NetworkBoundary) -> (String, Vec<OsString>) {
+    let (allows, denies) = SEATBELT_PROFILE
+        .split_once(SEATBELT_CLOSING_DENIES)
+        .expect("the Seatbelt profile marks its closing denies");
+    // A bare `network-outbound` would also reach every Unix socket the
+    // command can name, including credential agents and the Docker socket.
+    let mut rules = String::from(
+        "; ADR 0026 workspace boundary.\n\
+         (allow network-outbound (remote ip))\n\
+         (allow network-outbound (remote unix-socket (path-literal \"/private/var/run/mDNSResponder\")))\n\
+         (allow network-outbound (remote unix-socket (subpath (param \"WORKSPACE\"))))\n\
+         (allow network-outbound (remote unix-socket (subpath (param \"HOME\"))))\n\
+         (allow network-outbound (remote unix-socket (subpath (param \"HOST_TMP\"))))\n\
+         (allow network-outbound (remote unix-socket (subpath (param \"HOST_TMPDIR\"))))\n\
+         (allow network-bind (local ip \"localhost:*\"))\n\
+         (allow network-inbound (local ip \"localhost:*\"))\n\
+         (allow system-socket)\n",
+    );
+    let mut definitions = Vec::new();
+    match &network.ssh_agent_socket {
+        Some(socket) => {
+            rules.push_str(
+                "(allow network-outbound (remote unix-socket (path-literal (param \"SSH_AGENT\"))))\n",
+            );
+            definitions.push(seatbelt_definition("SSH_AGENT", socket));
+        }
+        None if !network.pass_credentials => rules.push_str(
+            "(deny network-outbound (remote unix-socket \
+             (regex #\"^/private/(tmp|var/run)/com\\.apple\\.launchd\\.[^/]+/\")))\n",
+        ),
+        None => {}
+    }
+    for (index, path) in network.denied_reads.iter().enumerate() {
+        let name = format!("DENY_READ_{index}");
+        rules.push_str(&format!("(deny file-read* (subpath (param \"{name}\")))\n"));
+        definitions.push(seatbelt_definition(&name, path));
+    }
+    rules.push_str("(allow file-read* file-write* (subpath (param \"HOME\")))\n");
+    definitions.push(seatbelt_definition("HOME", &network.home));
+    rules.push_str(
+        "(allow file-write* (subpath (param \"HOST_TMP\")) (subpath (param \"HOST_TMPDIR\")))\n",
+    );
+    definitions.push(seatbelt_definition("HOST_TMP", Path::new("/private/tmp")));
+    definitions.push(seatbelt_definition("HOST_TMPDIR", &network.host_tmpdir));
+    for (index, path) in network.writable().enumerate() {
+        let name = format!("WRITABLE_{index}");
+        rules.push_str(&format!(
+            "(allow file-write* (subpath (param \"{name}\")))\n"
+        ));
+        definitions.push(seatbelt_definition(&name, path));
+    }
+    rules.push_str(
+        "(deny file-write*\n  (require-all\n    (require-any (subpath (param \"HOST_TMP\")) \
+         (subpath (param \"HOST_TMPDIR\")))\n    (regex #\"/euler-seatbelt-[^/]+(/|$)\")))\n",
+    );
+    (
+        format!("{allows}{rules}\n{SEATBELT_CLOSING_DENIES}{denies}"),
+        definitions,
+    )
 }
 
 fn seatbelt_definition(name: &str, path: &Path) -> OsString {
@@ -1727,7 +1916,17 @@ fn seatbelt_definition(name: &str, path: &Path) -> OsString {
 /// read-only last. Without the remount the holding directory would be an
 /// ordinary writable directory in the sandbox's private root tmpfs, so a write
 /// under the real home would appear to succeed and be silently discarded.
-fn add_runtime_root_mounts(command: &mut Command, runtime: &RuntimeRoots) {
+///
+/// A `workspace` boundary binds its writable host paths (caches,
+/// `writable_paths`, the private `HOME`) and passed credential stores at
+/// their real paths before that remount, so they stay writable or
+/// read-only on their own. A holding directory a writable path covers is
+/// not remounted, since the remount would land on the writable bind.
+fn add_runtime_root_mounts(
+    command: &mut Command,
+    runtime: &RuntimeRoots,
+    network: Option<&NetworkBoundary>,
+) {
     let parents = runtime.read_only_parents();
     for parent in &parents {
         command.arg("--tmpfs").arg(parent);
@@ -1735,15 +1934,40 @@ fn add_runtime_root_mounts(command: &mut Command, runtime: &RuntimeRoots) {
     for root in &runtime.roots {
         command.arg("--ro-bind").arg(root).arg(root);
     }
+    if let Some(network) = network {
+        for path in network.writable().chain([network.home.as_path()]) {
+            command.arg("--bind").arg(path).arg(path);
+        }
+        for store in &network.passed_credentials {
+            command
+                .arg(if store.writable {
+                    "--bind"
+                } else {
+                    "--ro-bind"
+                })
+                .arg(&store.real)
+                .arg(&store.under_home);
+        }
+    }
     // The Cargo home the sandbox can reach, not only one Euler mounts itself:
     // `CARGO_HOME=/usr/local/cargo` in the official Rust images is carried by
     // the wholesale `/usr` bind, so masking only mounted roots would leave its
-    // token readable in exactly the common containerized case.
+    // token readable in exactly the common containerized case. Under
+    // `credentials: "pass"` the token is meant to reach the command.
     if let Some(home) = runtime.cargo_home() {
-        mask_cargo_credentials(command, &home);
+        if !network.is_some_and(|network| network.pass_credentials) {
+            mask_cargo_credentials(command, &home);
+        }
     }
     for parent in &parents {
-        command.arg("--remount-ro").arg(parent);
+        let covered = network.is_some_and(|network| {
+            network
+                .writable()
+                .any(|writable| parent.starts_with(writable))
+        });
+        if !covered {
+            command.arg("--remount-ro").arg(parent);
+        }
     }
 }
 
@@ -1810,11 +2034,9 @@ fn mask_cargo_credentials(command: &mut Command, home: &Path) {
     }
 }
 
-/// The complete sandbox environment, in one place.
-///
-/// ADR 0021 row C replaces this with an inheritance model and a tiered
-/// denylist in a later PR; until then the profile clears the environment and
-/// sets exactly what it mounts, so there is one seam to change.
+/// The complete `locked` sandbox environment, in one place: the profile
+/// clears the environment and sets exactly what it mounts. The `workspace`
+/// boundary inherits instead ([`NetworkBoundary::environment`]).
 fn sandbox_environment(
     runtime: &RuntimeRoots,
     extra: &[(OsString, OsString)],
@@ -1828,14 +2050,23 @@ fn sandbox_environment(
         (OsString::from("TMPDIR"), OsString::from("/tmp")),
         (OsString::from("PATH"), runtime.sandbox_path()),
     ];
-    environment.extend(runtime.variables.iter().map(|(name, value)| {
-        (
-            name.clone(),
-            runtime.sandbox_view(Path::new(value)).into_os_string(),
-        )
-    }));
+    environment.extend(sandbox_toolchain_variables(runtime));
     environment.extend(extra.iter().cloned());
     environment
+}
+
+/// The toolchain variables as Bubblewrap's mount namespace sees them.
+fn sandbox_toolchain_variables(runtime: &RuntimeRoots) -> Vec<(OsString, OsString)> {
+    runtime
+        .variables
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                runtime.sandbox_view(Path::new(value)).into_os_string(),
+            )
+        })
+        .collect()
 }
 
 fn seatbelt_environment(
@@ -2088,7 +2319,8 @@ mod tests {
                 git_metadata_resolved: &git_metadata,
             },
             SandboxLaunch {
-                profile: SandboxProfile::WorkspaceNoNetwork,
+                profile: &SandboxProfile::WorkspaceNoNetwork,
+                network: None,
                 workspace: &workspace,
                 runtime: &RuntimeRoots::default(),
                 env: &[],
@@ -2152,6 +2384,146 @@ mod tests {
         );
     }
 
+    fn network_boundary(root: &Path) -> NetworkBoundary {
+        NetworkBoundary {
+            home: root.join("sessions/s1/home"),
+            _home_guard: None,
+            caches: vec![(Some("UV_CACHE_DIR"), root.join("cache/uv"))],
+            writable_paths: vec![root.join("data")],
+            pass_credentials: true,
+            passed_credentials: vec![network_boundary::PassedCredential {
+                real: root.join("real/.ssh"),
+                under_home: root.join("sessions/s1/home/.ssh"),
+                writable: false,
+            }],
+            denied_reads: vec![root.join("real/Library/Keychains")],
+            host_tmpdir: root.join("tmpdir"),
+            provider_credentials: std::collections::BTreeSet::new(),
+            ssh_agent_socket: Some(root.join("agent.sock")),
+        }
+    }
+
+    /// The `workspace` boundary on Bubblewrap: the host network namespace,
+    /// the host `/tmp`, and writable caches, `writable_paths`, and private
+    /// `HOME` bound at their real paths, with passed stores read-only under
+    /// that `HOME`.
+    #[test]
+    fn workspace_boundary_shares_network_and_binds_tmp_caches_and_home() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().canonicalize().expect("canonical");
+        let network = network_boundary(&root);
+        let command = bwrap_command(
+            Path::new("/usr/bin/bwrap"),
+            SandboxLaunch {
+                profile: &SandboxProfile::WorkspaceNetwork(WorkspaceNetworkAccess::default()),
+                network: Some(&network),
+                workspace: &root,
+                runtime: &RuntimeRoots::default(),
+                env: &[],
+            },
+            OsStr::new("/bin/sh"),
+            ["-c", "true"],
+        );
+        let arguments = command_arguments(&command);
+        let has = |triple: [&str; 3]| arguments.windows(3).any(|window| window == triple);
+        let text = |path: PathBuf| path.to_string_lossy().into_owned();
+
+        assert!(!arguments.iter().any(|argument| argument == "--unshare-net"));
+        assert!(has(["--bind", "/tmp", "/tmp"]));
+        assert!(!arguments.windows(2).any(|pair| pair == ["--tmpfs", "/tmp"]));
+        for path in [
+            text(root.join("cache/uv")),
+            text(root.join("data")),
+            text(root.join("sessions/s1/home")),
+        ] {
+            assert!(has(["--bind", &path, &path]), "{path} not bound");
+        }
+        assert!(has([
+            "--ro-bind",
+            &text(root.join("real/.ssh")),
+            &text(root.join("sessions/s1/home/.ssh")),
+        ]));
+        let home = text(root.join("sessions/s1/home"));
+        assert!(has(["--setenv", "HOME", &home]));
+        assert!(has([
+            "--setenv",
+            "UV_CACHE_DIR",
+            &text(root.join("cache/uv"))
+        ]));
+        assert!(has(["--setenv", "TMPDIR", "/tmp"]));
+        assert!(has(["--setenv", "PAGER", "cat"]));
+    }
+
+    /// The `workspace` rules on Seatbelt name only parameters and sit
+    /// before the closing Git denies, so no writable path can reopen Git
+    /// metadata.
+    #[test]
+    fn workspace_seatbelt_rules_precede_the_git_denies_and_name_only_parameters() {
+        let temp = tempfile::tempdir().expect("temp");
+        let root = temp.path().canonicalize().expect("canonical");
+        let (policy, definitions) = seatbelt_network_policy(&network_boundary(&root));
+        let git_denies = policy
+            .find(SEATBELT_CLOSING_DENIES)
+            .expect("closing denies kept");
+        // Outbound network is IP only, so no rule lets a command reach an
+        // arbitrary Unix socket such as a credential agent or Docker.
+        assert!(!policy.contains("(allow network-outbound)"));
+        for rule in [
+            "(allow network-outbound (remote ip))",
+            "(remote unix-socket (subpath (param \"HOME\")))",
+            "(allow network-outbound (remote unix-socket (path-literal (param \"SSH_AGENT\"))))",
+            "(allow network-bind (local ip \"localhost:*\"))",
+            "(deny file-read* (subpath (param \"DENY_READ_0\")))",
+            "(allow file-read* file-write* (subpath (param \"HOME\")))",
+            "(allow file-write* (subpath (param \"WRITABLE_0\")))",
+            "(allow file-write* (subpath (param \"WRITABLE_1\")))",
+            "(regex #\"/euler-seatbelt-[^/]+(/|$)\")",
+        ] {
+            let at = policy
+                .find(rule)
+                .unwrap_or_else(|| panic!("{rule} missing"));
+            assert!(at < git_denies, "{rule} after the Git denies");
+        }
+        assert!(!policy.contains(root.to_string_lossy().as_ref()));
+        for definition in [
+            format!(
+                "-DDENY_READ_0={}",
+                root.join("real/Library/Keychains").display()
+            ),
+            format!("-DHOME={}", root.join("sessions/s1/home").display()),
+            "-DHOST_TMP=/private/tmp".to_owned(),
+            format!("-DHOST_TMPDIR={}", root.join("tmpdir").display()),
+            format!("-DWRITABLE_0={}", root.join("cache/uv").display()),
+            format!("-DWRITABLE_1={}", root.join("data").display()),
+            format!("-DSSH_AGENT={}", root.join("agent.sock").display()),
+        ] {
+            assert!(
+                definitions.contains(&OsString::from(&definition)),
+                "{definition} missing"
+            );
+        }
+
+        // Under `credentials: "private"` the agent stays unreachable.
+        let mut private = network_boundary(&root);
+        private.pass_credentials = false;
+        private.ssh_agent_socket = None;
+        let (policy, definitions) = seatbelt_network_policy(&private);
+        assert!(!policy.contains("SSH_AGENT"));
+        assert!(!definitions
+            .iter()
+            .any(|definition| definition.to_string_lossy().starts_with("-DSSH_AGENT=")));
+        let launchd_deny = policy
+            .find("(deny network-outbound (remote unix-socket")
+            .expect("launchd agent socket denied");
+        let socket_allow = policy
+            .find("(remote unix-socket (subpath (param \"HOST_TMP\")))")
+            .expect("tmp sockets allowed");
+        assert!(
+            socket_allow < launchd_deny,
+            "the deny must follow the allow"
+        );
+    }
+
     #[test]
     fn profile_uses_private_root_workspace_bind_and_network_namespace() {
         let temp = tempfile::tempdir().expect("temp workspace");
@@ -2159,7 +2531,8 @@ mod tests {
         let command = bwrap_command(
             Path::new("/usr/bin/bwrap"),
             SandboxLaunch {
-                profile: SandboxProfile::WorkspaceNoNetwork,
+                profile: &SandboxProfile::WorkspaceNoNetwork,
+                network: None,
                 workspace: &workspace,
                 runtime: &RuntimeRoots::default(),
                 env: &[],
@@ -2470,7 +2843,7 @@ token = \"secret\"\n",
         assert!(reported[0].ends_with("config.toml"), "{reported:?}");
 
         let mut command = Command::new("/usr/bin/bwrap");
-        add_runtime_root_mounts(&mut command, &runtime);
+        add_runtime_root_mounts(&mut command, &runtime, None);
         let arguments = command_arguments(&command);
         let config = reported[0].to_string_lossy().into_owned();
         // Reported, never masked: masking it would take the registry sources
@@ -2776,7 +3149,7 @@ token = \"secret\"\n",
             None,
         );
         let mut command = Command::new("/usr/bin/bwrap");
-        add_runtime_root_mounts(&mut command, &runtime);
+        add_runtime_root_mounts(&mut command, &runtime, None);
         let arguments = command_arguments(&command);
         let cargo = cargo.canonicalize().expect("canonical cargo home");
         let credentials = cargo
@@ -2818,7 +3191,8 @@ token = \"secret\"\n",
         let command = bwrap_command(
             Path::new("/usr/bin/bwrap"),
             SandboxLaunch {
-                profile: SandboxProfile::WorkspaceNoNetwork,
+                profile: &SandboxProfile::WorkspaceNoNetwork,
+                network: None,
                 workspace: &workspace,
                 runtime: &RuntimeRoots::default(),
                 env: &[],
@@ -2931,15 +3305,13 @@ token = \"secret\"\n",
     /// profile: the next session probes again and may well succeed.
     #[test]
     fn a_timed_out_profile_probe_is_reported_as_a_timeout() {
-        let profile = SandboxProfile::WorkspaceNoNetwork;
-        let SandboxAvailability::Unavailable(reason) = ProbeOutcome::TimedOut.availability(profile)
-        else {
+        let SandboxAvailability::Unavailable(reason) = ProbeOutcome::TimedOut.availability() else {
             panic!("a timed-out probe must fail closed");
         };
         assert_eq!(reason.as_str(), "probe_timed_out");
         assert!(reason.message().contains("timed out"), "{reason}");
         assert_eq!(
-            ProbeOutcome::Refused.availability(profile),
+            ProbeOutcome::Refused.availability(),
             SandboxAvailability::Unavailable(SandboxUnavailableReason::CannotEnforce)
         );
 
@@ -2996,7 +3368,8 @@ token = \"secret\"\n",
         let command = bwrap_command(
             Path::new("/usr/bin/bwrap"),
             SandboxLaunch {
-                profile: SandboxProfile::WorkspaceNoNetwork,
+                profile: &SandboxProfile::WorkspaceNoNetwork,
+                network: None,
                 workspace: &workspace.canonicalize().expect("canonical workspace"),
                 runtime: &runtime,
                 env: &[],
@@ -3102,6 +3475,7 @@ token = \"secret\"\n",
         let sandbox = WorkspaceSandbox::with_runtime_roots(
             &workspace,
             SandboxProfile::WorkspaceNoNetwork,
+            None,
             runtime.clone(),
         );
         if !sandbox.availability().is_enforced() {
@@ -3147,7 +3521,7 @@ token = \"secret\"\n",
     fn invalid_workspace_fails_closed_before_bubblewrap_is_invoked() {
         let temp = tempfile::tempdir().expect("temp dir");
         let missing = temp.path().join("missing");
-        let sandbox = WorkspaceSandbox::new(&missing, SandboxProfile::WorkspaceNoNetwork);
+        let sandbox = WorkspaceSandbox::new(&missing, SandboxProfile::WorkspaceNoNetwork, None);
 
         // Fails closed on every platform; that is the guarantee under test.
         // The reason is platform-specific: a platform with a backend
@@ -3179,7 +3553,7 @@ token = \"secret\"\n",
         let secret = outside.join("secret");
         fs::write(&secret, "do-not-expose").expect("plant secret");
         let escape = outside.join("escape");
-        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork);
+        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork, None);
         if !sandbox.availability().is_enforced() {
             return;
         }
@@ -3226,7 +3600,7 @@ token = \"secret\"\n",
         let temp = tempfile::tempdir().expect("temp dir");
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace).expect("workspace");
-        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork);
+        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork, None);
         if !sandbox.availability().is_enforced() {
             eprintln!("skipped: the sandbox is unavailable on this host");
             return;
@@ -3273,7 +3647,7 @@ token = \"secret\"\n",
         let temp = tempfile::tempdir().expect("temp dir");
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace).expect("workspace");
-        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork);
+        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork, None);
         if !sandbox.availability().is_enforced() {
             eprintln!("skipped: the sandbox is unavailable on this host");
             return;
@@ -3312,7 +3686,7 @@ token = \"secret\"\n",
         let temp = tempfile::tempdir().expect("temp dir");
         let workspace = temp.path().join("workspace");
         fs::create_dir(&workspace).expect("workspace");
-        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork);
+        let sandbox = WorkspaceSandbox::new(&workspace, SandboxProfile::WorkspaceNoNetwork, None);
         if !sandbox.availability().is_enforced() {
             return;
         }

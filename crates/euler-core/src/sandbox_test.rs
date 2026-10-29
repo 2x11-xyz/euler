@@ -120,7 +120,7 @@ fn selected_workspace_profile_routes_shell_and_git_or_fails_closed() {
     let git = registry.execute("git_status", &json!({}));
 
     match availability {
-        SandboxAvailability::Enforced(_) => {
+        SandboxAvailability::Enforced => {
             let shell = shell.expect("sandboxed shell");
             assert_eq!(shell.sandbox_backend, Some(SandboxBackend::Bwrap));
             assert_eq!(shell.exit_code, Some(0));
@@ -143,6 +143,78 @@ fn selected_workspace_profile_routes_shell_and_git_or_fails_closed() {
             ));
         }
     }
+}
+
+/// The `workspace` boundary (ADR 0026 section 3) on Bubblewrap: the host
+/// network namespace, the host `/tmp`, and a private `HOME` that persists
+/// between commands, while the rest of the real home stays out.
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_workspace_boundary_shares_network_tmp_and_a_private_home() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace).expect("workspace");
+    // A session directory lives under the Euler home, inside the real home,
+    // whose holding directory the profile remounts read-only.
+    let real_home = env::var_os("HOME").map(std::path::PathBuf::from);
+    let session_dir = match real_home.filter(|home| home.is_dir() && !home.starts_with("/tmp")) {
+        Some(real_home) => tempfile::tempdir_in(real_home).expect("session dir"),
+        None => tempfile::tempdir().expect("session dir"),
+    };
+    let home = session_dir.path().join("home");
+    let registry = ToolRegistry::with_sandbox_home(
+        &workspace,
+        SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNetwork(
+            WorkspaceNetworkAccess::default(),
+        )),
+        Some(home.clone()),
+    );
+    if !registry
+        .sandbox_availability()
+        .expect("sandbox was requested")
+        .is_enforced()
+    {
+        return;
+    }
+    let run = |command: String| {
+        registry
+            .execute("run_shell", &json!({ "command": command }))
+            .expect("completed shell result")
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let network = run(format!("bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}'"));
+    assert_eq!(network.exit_code, Some(0), "{}", network.output);
+
+    let shared = tempfile::Builder::new()
+        .prefix("euler-workspace-tmp-")
+        .tempdir_in("/tmp")
+        .expect("host /tmp");
+    let tmp_file = shared.path().join("plot.png");
+    let tmp_write = run(format!("printf png > {}", shell_quote(&tmp_file)));
+    assert_eq!(tmp_write.exit_code, Some(0), "{}", tmp_write.output);
+    assert_eq!(
+        fs::read_to_string(&tmp_file).expect("host /tmp file"),
+        "png"
+    );
+
+    let canonical_home = home.canonicalize().expect("private home");
+    let home_write = run("printf kept > \"$HOME/marker\" && printf %s \"$HOME\"".to_owned());
+    assert_eq!(home_write.exit_code, Some(0), "{}", home_write.output);
+    assert!(
+        home_write
+            .output
+            .ends_with(&canonical_home.display().to_string()),
+        "{}",
+        home_write.output
+    );
+    assert_eq!(
+        fs::read_to_string(canonical_home.join("marker")).expect("home on the host"),
+        "kept"
+    );
+    let home_read = run("cat \"$HOME/marker\"".to_owned());
+    assert!(home_read.output.ends_with("kept"), "{}", home_read.output);
 }
 
 #[cfg(target_os = "macos")]
@@ -324,6 +396,192 @@ fn macos_seatbelt_fails_closed_for_an_in_workspace_gitdir_target() {
     ));
 }
 
+/// The `workspace` boundary (ADR 0026 section 3) on Seatbelt: loopback
+/// network, the host `/tmp`, a private `HOME` that persists between
+/// commands, Git metadata still protected, the keychains unreadable, and no
+/// writes into another session's Seatbelt scratch tree.
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_seatbelt_workspace_boundary_opens_network_tmp_and_a_private_home() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let workspace = temp.path().join("workspace");
+    let home = temp.path().join("session").join("home");
+    fs::create_dir_all(&workspace).expect("workspace");
+    let initialized = std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&workspace)
+        .status()
+        .expect("git available");
+    assert!(initialized.success(), "initialize workspace repository");
+    let registry = ToolRegistry::with_sandbox_home(
+        &workspace,
+        SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNetwork(
+            WorkspaceNetworkAccess::default(),
+        )),
+        Some(home.clone()),
+    );
+    if !registry
+        .sandbox_availability()
+        .expect("sandbox was requested")
+        .is_enforced()
+    {
+        assert!(
+            running_inside_nested_seatbelt(&workspace),
+            "macOS CI must enforce Seatbelt; only an explicit nested-Seatbelt refusal may skip"
+        );
+        return;
+    }
+    let run = |command: String| {
+        registry
+            .execute("run_shell", &json!({ "command": command }))
+            .expect("completed shell result")
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+    let port = listener.local_addr().expect("listener address").port();
+    let network = run(format!("/usr/bin/nc -z -w 1 127.0.0.1 {port}"));
+    assert_eq!(network.exit_code, Some(0), "{}", network.output);
+
+    // A local service on a Unix socket under /tmp stays reachable; a
+    // launchd agent socket (where macOS puts the SSH agent) does not, under
+    // the default `credentials: "private"`.
+    let service_dir = tempfile::Builder::new()
+        .prefix("euler-socket-")
+        .tempdir_in("/tmp")
+        .expect("socket dir");
+    let service = service_dir.path().join("s");
+    let _service = std::os::unix::net::UnixListener::bind(&service).expect("service socket");
+    let reached = run(format!(
+        "/usr/bin/nc -U -w 1 {} </dev/null",
+        shell_quote(&service)
+    ));
+    assert_eq!(reached.exit_code, Some(0), "{}", reached.output);
+    let agent_dir = tempfile::Builder::new()
+        .prefix("com.apple.launchd.euler-test-")
+        .tempdir_in("/tmp")
+        .expect("agent dir");
+    let agent = agent_dir.path().join("Listeners");
+    let _agent = std::os::unix::net::UnixListener::bind(&agent).expect("agent socket");
+    // Nor does a socket outside those directories, as a Docker socket is.
+    let outside_dir = tempfile::Builder::new()
+        .prefix("euler-socket-")
+        .tempdir_in("/var/tmp")
+        .expect("socket dir outside /tmp");
+    let outside = outside_dir.path().join("s");
+    let _outside = std::os::unix::net::UnixListener::bind(&outside).expect("outside socket");
+    for socket in [&agent, &outside] {
+        let refused = run(format!(
+            "/usr/bin/nc -U -w 1 {} </dev/null",
+            shell_quote(socket)
+        ));
+        assert_ne!(refused.exit_code, Some(0), "{}", refused.output);
+    }
+
+    let shared = tempfile::Builder::new()
+        .prefix("euler-workspace-tmp-")
+        .tempdir_in("/tmp")
+        .expect("host /tmp");
+    let tmp_file = shared.path().join("plot.png");
+    let tmp_write = run(format!("printf png > {}", shell_quote(&tmp_file)));
+    assert_eq!(tmp_write.exit_code, Some(0), "{}", tmp_write.output);
+    assert_eq!(
+        fs::read_to_string(&tmp_file).expect("host /tmp file"),
+        "png"
+    );
+
+    let canonical_home = home.canonicalize().expect("private home");
+    let home_write = run("printf kept > \"$HOME/marker\" && printf %s \"$HOME\"".to_owned());
+    assert_eq!(home_write.exit_code, Some(0), "{}", home_write.output);
+    assert!(
+        home_write
+            .output
+            .ends_with(&canonical_home.display().to_string()),
+        "{}",
+        home_write.output
+    );
+    let home_read = run("cat \"$HOME/marker\"".to_owned());
+    assert!(home_read.output.ends_with("kept"), "{}", home_read.output);
+
+    let other_scratch = tempfile::Builder::new()
+        .prefix("euler-seatbelt-")
+        .tempdir()
+        .expect("another session's scratch");
+    let other_file = other_scratch.path().join("planted");
+    let moved = other_scratch
+        .path()
+        .with_file_name(format!("euler-moved-{}", std::process::id()));
+    let mut denied = vec![
+        "printf forbidden > .git/euler-denied".to_owned(),
+        format!("printf planted > {}", shell_quote(&other_file)),
+        // Renaming the tree away must not lift the deny on its contents.
+        format!(
+            "mv {scratch} {moved} && printf planted > {moved}/planted && mv {moved} {scratch}",
+            scratch = shell_quote(other_scratch.path()),
+            moved = shell_quote(&moved),
+        ),
+    ];
+    if let Some(keychains) = std::env::var_os("HOME")
+        .map(|home| std::path::PathBuf::from(home).join("Library/Keychains"))
+        .filter(|keychains| keychains.is_dir())
+    {
+        denied.push(format!("ls {}", shell_quote(&keychains)));
+    }
+    for command in denied {
+        let result = run(command.clone());
+        assert_ne!(result.exit_code, Some(0), "{command}: {}", result.output);
+    }
+    assert!(!workspace.join(".git/euler-denied").exists());
+    assert!(!other_file.exists());
+    assert!(!moved.exists());
+}
+
+/// A sandboxed background job that redirects its output outlives its
+/// command on Seatbelt, which has no PID namespace, and ends with the
+/// session (ADR 0026 resolved questions 6 and 12).
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_seatbelt_background_jobs_end_with_the_session() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let registry = ToolRegistry::with_subprocess_sandbox(
+        temp.path(),
+        SubprocessSandbox::Enforce(SandboxProfile::WorkspaceNoNetwork),
+    );
+    if !registry
+        .sandbox_availability()
+        .expect("sandbox was requested")
+        .is_enforced()
+    {
+        assert!(running_inside_nested_seatbelt(temp.path()));
+        return;
+    }
+    let started = registry
+        .execute(
+            "run_shell",
+            &json!({"command": "sleep 30 >/dev/null 2>&1 & echo $!"}),
+        )
+        .expect("background job");
+    assert_eq!(started.exit_code, Some(0), "{}", started.output);
+    let job: libc::pid_t = started
+        .output
+        .lines()
+        .last()
+        .and_then(|line| line.trim().parse().ok())
+        .expect("job pid");
+    // SAFETY: signal 0 only probes for existence.
+    let alive = || unsafe { libc::kill(job, 0) == 0 };
+    assert!(alive(), "the job outlives its command");
+
+    drop(registry);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while alive() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the job survived the session"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn running_inside_nested_seatbelt(workspace: &std::path::Path) -> bool {
     let workspace = workspace.canonicalize().expect("canonical workspace");
@@ -344,7 +602,8 @@ fn running_inside_nested_seatbelt(workspace: &std::path::Path) -> bool {
             git_metadata_resolved: &git_metadata_resolved,
         },
         SandboxLaunch {
-            profile: SandboxProfile::WorkspaceNoNetwork,
+            profile: &SandboxProfile::WorkspaceNoNetwork,
+            network: None,
             workspace: &workspace,
             runtime: &RuntimeRoots::default(),
             env: &[],
@@ -381,7 +640,7 @@ fn sandboxed_shell_uses_only_the_profile_environment() {
     );
 
     match availability {
-        SandboxAvailability::Enforced(_) => {
+        SandboxAvailability::Enforced => {
             let execution = result.expect("sandboxed shell");
             assert_eq!(execution.exit_code, Some(0));
             assert!(execution.output.contains("|/tmp/home|/tmp"));
@@ -428,7 +687,7 @@ fn sandboxed_shell_cannot_read_an_inherited_host_descriptor() {
     );
 
     match availability {
-        SandboxAvailability::Enforced(_) => {
+        SandboxAvailability::Enforced => {
             let execution = result.expect("sandboxed shell");
             assert_eq!(
                 execution.exit_code,
@@ -505,7 +764,7 @@ fn sandboxed_agent_git_cannot_read_an_inherited_host_descriptor() {
     let result = registry.execute("run_shell", &json!({"command": "git status --short"}));
 
     match availability {
-        SandboxAvailability::Enforced(_) => {
+        SandboxAvailability::Enforced => {
             let execution = result.expect("sandboxed agent git");
             assert_eq!(execution.exit_code, Some(0), "{}", execution.output);
             assert_eq!(
@@ -670,7 +929,7 @@ fn sandboxed_shell_timeout_kills_the_bubblewrap_process_group() {
     );
 
     match availability {
-        SandboxAvailability::Enforced(_) => {
+        SandboxAvailability::Enforced => {
             let execution = result.expect("timeout is a tool result");
             assert_eq!(execution.exit_code, Some(-1));
             assert!(execution.output.contains("sandbox-phase-one"));

@@ -162,6 +162,7 @@ impl AppCore {
             original.model.clone(),
             session_id.to_owned(),
         );
+        config.session_store_dir = Some(extension_home.sessions_dir());
         config.extensions_enabled = seed_config.extensions_enabled;
         config.round_observer = seed_config.round_observer;
         // Compaction window follows the active model after fold (post-switch).

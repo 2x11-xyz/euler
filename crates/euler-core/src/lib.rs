@@ -30,6 +30,7 @@ pub mod resume;
 mod root_identity;
 pub mod runtime_identity;
 pub mod sandbox;
+mod sandboxed_jobs;
 pub mod scrub;
 pub mod session;
 pub mod session_kind;
@@ -134,7 +135,7 @@ pub use runtime_identity::{
 pub use sandbox::{
     probe_sandbox_backend, probe_workspace_sandbox, SandboxAvailability, SandboxBackend,
     SandboxFailureCause, SandboxProfile, SandboxStatus, SandboxUnavailableReason,
-    SubprocessSandbox,
+    SubprocessSandbox, WorkspaceNetworkAccess,
 };
 pub use session::{
     fold_model_target, fold_reasoning_effort, system_instruction_bytes, AgentReporter,

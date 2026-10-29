@@ -1,23 +1,28 @@
 //! Execution profiles (ADR 0026): the execution boundary and the default
 //! approval policy as one named profile.
 //!
-//! Each built-in preset owns a module (`locked.rs`) that defines its fields
-//! and the boundary this build can enforce for it. [`Preset::shipped_fields`]
-//! lists the presets that have shipped; naming any other preset is refused,
-//! never substituted, until its rollout step adds a module and an arm there.
-//! [`ExecutionProfile::check_enforced`] is the one place that decides whether
-//! this build can deliver a resolved profile.
+//! Each built-in preset owns a module (`locked.rs`, `workspace.rs`) that
+//! defines its fields. [`Preset::shipped_fields`] lists the presets that have
+//! shipped; naming any other preset is refused, never substituted, until its
+//! rollout step adds a module and an arm there. `enforced.rs` is the one
+//! place that decides whether this build can deliver a resolved profile and
+//! which subprocess sandbox it becomes.
 
 mod config;
+mod enforced;
 mod locked;
 #[cfg(test)]
 mod tests;
+mod workspace;
 
 pub use config::{
     ProfileContext, ProfilesConfig, ProjectOverlay, PROFILES_FILE, PROJECT_OVERLAY_PATH,
 };
 
 use crate::guardian::PermissionReviewer;
+use crate::permissions::{ApprovalMode, PermissionRequest};
+use crate::sandbox::SubprocessSandbox;
+use euler_sdk::Capability;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -266,7 +271,8 @@ impl Preset {
     fn shipped_fields(self) -> Option<ProfileFields> {
         match self {
             Self::Locked => Some(locked::fields()),
-            Self::Full | Self::Workspace => None,
+            Self::Workspace => Some(workspace::fields()),
+            Self::Full => None,
         }
     }
 }
@@ -291,15 +297,17 @@ impl Default for ExecutionProfile {
 
 impl ExecutionProfile {
     /// Refuse a profile this build cannot deliver, naming the first field it
-    /// cannot enforce. Only the `locked` boundary is enforced so far.
+    /// cannot enforce.
     pub fn check_enforced(&self) -> Result<(), ProfileError> {
-        match locked::unenforced_field(&self.fields) {
-            None => Ok(()),
-            Some(field) => Err(ProfileError::Unenforced {
-                profile: self.name.clone(),
-                field,
-            }),
-        }
+        self.subprocess_sandbox().map(drop)
+    }
+
+    /// The subprocess sandbox that delivers this profile's boundary.
+    pub fn subprocess_sandbox(&self) -> Result<SubprocessSandbox, ProfileError> {
+        enforced::subprocess_sandbox(&self.fields).map_err(|field| ProfileError::Unenforced {
+            profile: self.name.clone(),
+            field,
+        })
     }
 
     /// The `execution_profile` provenance object: name, effective fields,
@@ -331,6 +339,48 @@ impl ExecutionProfile {
             fields: record.fields,
         })
     }
+}
+
+/// The approval mode a profile's `approvals` gives one request in place of
+/// the capability's configured `mode` (ADR 0026 row P), or `None` for the
+/// gate's ordinary rule (a sensitive path asks, anything else keeps
+/// `mode`). The gate has already denied `always-deny` and sent dangerous
+/// commands to a prompt.
+///
+/// - A `run_shell` command whose operands mention a sensitive path asks
+///   under `escalation-only` (resolved question 14) and keeps `mode` under
+///   `always`, as before profiles.
+/// - Under `escalation-only` with the sandbox on and its backend enforced
+///   (`sandbox_enforced`), an unflagged `ask` for `fs-write` or `shell-exec`
+///   becomes `session-allow`: commands run inside the boundary and
+///   structured writes stay workspace-confined. Without an enforced backend
+///   the request keeps its mode (ADR 0021 row D).
+///
+/// `never` is the `full` preset's rule and is not enforced yet.
+pub fn profile_mode_override(
+    fields: &ProfileFields,
+    request: &PermissionRequest,
+    mode: ApprovalMode,
+    sandbox_enforced: bool,
+) -> Option<ApprovalMode> {
+    let escalation_only = fields.approvals == ApprovalsSetting::EscalationOnly;
+    if request.sensitive_path {
+        let shell = request.capability == Capability::ShellExec;
+        return match (shell, escalation_only) {
+            (true, true) => Some(ApprovalMode::Ask),
+            (true, false) => Some(mode),
+            (false, _) => None,
+        };
+    }
+    let lifts = escalation_only
+        && fields.sandbox != SandboxSetting::Off
+        && sandbox_enforced
+        && matches!(
+            request.capability,
+            Capability::FsWrite | Capability::ShellExec
+        )
+        && mode == ApprovalMode::Ask;
+    lifts.then_some(ApprovalMode::SessionAllow)
 }
 
 /// Why a resumed session runs under the profile it got (ADR 0026 section 9).
@@ -476,7 +526,7 @@ pub enum ProfileError {
     #[error("{}", preset_not_shipped_message(requested, *preset))]
     PresetNotShipped { requested: String, preset: Preset },
     #[error(
-        "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; only the locked preset's boundary is available"
+        "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; the locked and workspace presets' boundaries are available, and writable_paths must name existing paths"
     )]
     Unenforced {
         profile: String,
@@ -495,13 +545,13 @@ fn preset_not_shipped_message(requested: &str, preset: Preset) -> String {
     let preset = preset.name();
     if requested == preset {
         format!(
-            "the {preset} preset is not available in this version yet; use --profile locked or \
-             a profile that extends locked"
+            "the {preset} preset is not available in this version yet; use --profile workspace, \
+             --profile locked, or a profile that extends one of them"
         )
     } else {
         format!(
             "profile \"{requested}\" extends the {preset} preset, which is not available in this \
-             version yet; extend locked instead"
+             version yet; extend workspace or locked instead"
         )
     }
 }

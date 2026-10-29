@@ -4,7 +4,7 @@ use crate::catalog::canonical_provider_id;
 use serde::de::{Deserializer, Error, MapAccess, Visitor};
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::Ipv6Addr;
 use url::{Host, Url};
@@ -54,6 +54,17 @@ impl ProviderConfigRegistry {
 
     pub fn providers(&self) -> impl Iterator<Item = &CustomProviderConfig> {
         self.providers.values()
+    }
+
+    /// The environment variables the providers' `api_key` and header values
+    /// reference: Euler's own credentials, which no sandboxed command
+    /// inherits (ADR 0026 sections 1 and 2).
+    pub fn referenced_env_names(&self) -> BTreeSet<String> {
+        self.providers()
+            .flat_map(|provider| provider.api_key.iter().chain(provider.headers.values()))
+            .filter_map(|raw| crate::custom_provider::secret_spec_env_name(raw))
+            .map(str::to_owned)
+            .collect()
     }
 
     pub fn provider(&self, id: &str) -> Option<&CustomProviderConfig> {

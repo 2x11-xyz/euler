@@ -28,35 +28,3 @@ pub(super) fn fields() -> ProfileFields {
         reviewer: PermissionReviewer::User,
     }
 }
-
-/// The first field of `candidate` this build cannot deliver on the locked
-/// boundary. Every field must equal the preset's, except `reviewer` (either
-/// reviewer works) and `sandbox`, which may also name this host's backend.
-pub(super) fn unenforced_field(candidate: &ProfileFields) -> Option<&'static str> {
-    let preset = fields();
-    let sandbox_enforced = match candidate.sandbox {
-        SandboxSetting::On => true,
-        SandboxSetting::Bubblewrap => cfg!(target_os = "linux"),
-        SandboxSetting::Seatbelt => cfg!(target_os = "macos"),
-        SandboxSetting::Off => false,
-    };
-    [
-        ("sandbox", sandbox_enforced),
-        ("network", candidate.network == preset.network),
-        (
-            "writable_paths",
-            candidate.writable_paths == preset.writable_paths,
-        ),
-        ("tmp", candidate.tmp == preset.tmp),
-        ("caches", candidate.caches == preset.caches),
-        ("credentials", candidate.credentials == preset.credentials),
-        ("approvals", candidate.approvals == preset.approvals),
-        ("escalation", candidate.escalation == preset.escalation),
-        (
-            "background_jobs",
-            candidate.background_jobs == preset.background_jobs,
-        ),
-    ]
-    .into_iter()
-    .find_map(|(field, enforced)| (!enforced).then_some(field))
-}

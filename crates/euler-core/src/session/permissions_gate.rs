@@ -260,6 +260,11 @@ pub(crate) fn permission_request_for_tool(
         "run_shell" => {
             if let Some(command) = input.get("command").and_then(Value::as_str) {
                 request = request.with_command(command);
+                // Read from the full command, as the danger walk is; the
+                // profile decides whether it asks
+                // (`execution_profile::profile_mode_override`).
+                request.sensitive_path =
+                    crate::command_safety::command_mentions_sensitive_path(command);
             }
         }
         "edit_file" | "write_file" | "read_file" | "apply_patch" => {
@@ -284,7 +289,8 @@ pub(crate) fn permission_request_for_tool(
     // list, mirroring the resolved-path check statically-safe shell analysis
     // applies. Living HERE means every permission gate — root session AND
     // companion loop — gets the same classification.
-    request.sensitive_path = request
+    // `|=` keeps the shell flag `with_command` set.
+    request.sensitive_path |= request
         .path
         .as_deref()
         .is_some_and(crate::command_safety::sensitive_basename)

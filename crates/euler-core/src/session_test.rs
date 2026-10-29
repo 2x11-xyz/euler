@@ -7228,6 +7228,112 @@ fn sensitive_basename_read_asks_instead_of_riding_session_allow() {
         .contains("plain-canary-value"));
 }
 
+fn workspace_profile_turn(temp: &std::path::Path) -> ScriptedProvider {
+    std::fs::write(temp.join(".env"), "API_KEY=workspace-canary").expect(".env");
+    ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![
+            euler_provider::ToolCall {
+                id: "call-shell".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": "printf ok > out.txt"}),
+            },
+            euler_provider::ToolCall {
+                id: "call-write".to_owned(),
+                name: "write_file".to_owned(),
+                input: json!({"path": "notes.txt", "content": "x"}),
+            },
+            euler_provider::ToolCall {
+                id: "call-secret".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": "cat .env"}),
+            },
+        ]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ])
+}
+
+fn workspace_profile_config(temp: &std::path::Path) -> SessionConfig {
+    let mut config = SessionConfig::new(temp);
+    config.set_execution_profile(
+        crate::ProfilesConfig::default()
+            .resolve(Some("workspace"), crate::ProfileContext::Headless, None)
+            .expect("workspace ships"),
+    );
+    config.session_store_dir = Some(temp.join("sessions"));
+    config
+}
+
+fn tool_result_ok(session_events: &[EventEnvelope], id: &str) -> Option<Value> {
+    events_of_kind(session_events, EventKind::TOOL_RESULT)
+        .iter()
+        .find(|result| result.payload["id"] == json!(id))
+        .map(|result| result.payload["ok"].clone())
+}
+
+/// ADR 0026 row P: under the `workspace` profile with an enforced backend a
+/// command and a structured write run without a prompt, and a command
+/// naming a sensitive path still asks (resolved question 14), so `cat .env`
+/// is denied by a decider that denies every ask.
+#[test]
+fn the_workspace_profile_asks_only_for_a_command_naming_a_sensitive_path() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = workspace_profile_turn(temp.path());
+    let mut session = Session::new(
+        workspace_profile_config(temp.path()),
+        provider,
+        ScriptedDecider::new(Vec::new()),
+    );
+    if !matches!(session.sandbox_status(), SandboxStatus::Enforced(_)) {
+        // No backend on this host; the host case below covers the rule.
+        return;
+    }
+
+    session.run_turn("work").expect("turn");
+
+    assert_eq!(
+        tool_result_ok(session.events(), "call-shell"),
+        Some(json!(true))
+    );
+    assert_eq!(
+        tool_result_ok(session.events(), "call-write"),
+        Some(json!(true))
+    );
+    assert_eq!(
+        tool_result_ok(session.events(), "call-secret"),
+        Some(json!(false))
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("out.txt")).expect("shell ran"),
+        "ok"
+    );
+    assert!(temp.path().join("notes.txt").is_file());
+}
+
+/// Without an enforced backend the `workspace` profile does not lift
+/// command and write asks (ADR 0021 row D): a decider that denies every ask
+/// keeps them from running on the host.
+#[test]
+fn the_workspace_profile_asks_for_commands_without_an_enforced_backend() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let provider = workspace_profile_turn(temp.path());
+    let mut config = workspace_profile_config(temp.path());
+    config.subprocess_sandbox = SubprocessSandbox::Host;
+    let mut session = Session::new(config, provider, ScriptedDecider::new(Vec::new()));
+    assert!(!session.profile_lifts_command_approvals());
+
+    session.run_turn("work").expect("turn");
+
+    for id in ["call-shell", "call-write", "call-secret"] {
+        assert_eq!(
+            tool_result_ok(session.events(), id),
+            Some(json!(false)),
+            "{id}"
+        );
+    }
+    assert!(!temp.path().join("out.txt").exists());
+    assert!(!temp.path().join("notes.txt").exists());
+}
+
 #[test]
 fn sensitive_basename_read_denial_blocks_the_tool() {
     let temp = tempfile::tempdir().expect("temp dir");

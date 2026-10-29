@@ -342,6 +342,15 @@ fn resolve_secret_spec(
     }
 }
 
+/// The environment variable a secret spec (`api_key` or a header value)
+/// reads, if it is an env reference (`$NAME` or `${NAME}`).
+pub(crate) fn secret_spec_env_name(raw: &str) -> Option<&str> {
+    match SecretSpec::parse(raw) {
+        SecretSpec::Env(name) => Some(name),
+        SecretSpec::Command(_) | SecretSpec::Literal(_) => None,
+    }
+}
+
 enum SecretSpec<'a> {
     Env(&'a str),
     Command(&'a str),

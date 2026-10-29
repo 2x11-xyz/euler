@@ -1,5 +1,6 @@
 //! Execution profile selection, validation, and recording through the CLI
-//! (ADR 0026 rollout step 3: profile plumbing and the `locked` preset).
+//! (ADR 0026 rollout steps 3 and 5: profile plumbing, the `locked` preset,
+//! and the `workspace` preset).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -199,10 +200,6 @@ fn presets_not_shipped_yet_and_unknown_names_are_startup_errors() {
             "the full preset is not available in this version yet",
         ),
         (
-            "workspace",
-            "the workspace preset is not available in this version yet",
-        ),
-        (
             "fulll",
             "unknown execution profile \"fulll\"; defined profiles: full, workspace, locked",
         ),
@@ -212,6 +209,144 @@ fn presets_not_shipped_yet_and_unknown_names_are_startup_errors() {
         assert!(stderr(&output).contains(expected), "{}", stderr(&output));
         assert!(!workspace.log.exists(), "no session starts");
     }
+}
+
+/// A scripted provider turn whose one command writes its `HOME` to
+/// `home.txt`, as the `--provider-option` that selects it.
+fn home_probe_script(workspace: &Workspace) -> String {
+    let script = workspace.root.join("script.json");
+    fs::write(
+        &script,
+        serde_json::json!({
+            "version": 1,
+            "responses": [
+                {"events": [
+                    {"tool_call": {
+                        "id": "call-home",
+                        "name": "run_shell",
+                        "input": {"command": "printf %s \"$HOME\" > home.txt"}
+                    }},
+                    {"finished": {"stop_reason": "tool_use"}}
+                ]},
+                {"events": [
+                    {"text_delta": "done"},
+                    {"finished": {"stop_reason": "completed"}}
+                ]}
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write script");
+    format!("event-script={}", script.display())
+}
+
+/// `--profile workspace` runs a command without a prompt even under exec's
+/// default read-only tier (ADR 0026 row P), in a private `HOME` that, with
+/// no session store behind `--provenance`, lives under the Euler home's
+/// `state/homes` and is removed when the session ends.
+#[test]
+fn the_workspace_profile_runs_commands_in_a_private_home_without_a_prompt() {
+    let workspace = workspace();
+    let log = workspace.log.to_str().expect("utf8 log");
+    let event_script = home_probe_script(&workspace);
+    let output = exec(
+        &workspace,
+        &[
+            "--provider-option",
+            &event_script,
+            "--provenance",
+            log,
+            "--profile",
+            "workspace",
+            "--extensions",
+            "none",
+            "--project-context",
+            "off",
+            "work",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let events: Vec<serde_json::Value> = fs::read_to_string(&workspace.log)
+        .expect("read log")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json line"))
+        .collect();
+    let start = events
+        .iter()
+        .find(|event| event["kind"] == "session.start")
+        .expect("session.start");
+    assert_eq!(start["payload"]["execution_profile"]["name"], "workspace");
+    assert_eq!(
+        start["payload"]["execution_profile"]["fields"]["network"],
+        "on"
+    );
+    let result = events
+        .iter()
+        .find(|event| event["kind"] == "tool.result")
+        .expect("tool.result");
+    let error = result["payload"]["error"].as_str().unwrap_or_default();
+    assert!(!error.contains("permission denied"), "{error}");
+    if start["payload"]["sandbox_backend"] == "unavailable" || result["payload"]["ok"] != true {
+        // No backend on this host: the command failed closed, which the
+        // approvals rule above does not depend on.
+        return;
+    }
+    let home = PathBuf::from(
+        fs::read_to_string(workspace.root.join("home.txt")).expect("command wrote its HOME"),
+    );
+    let homes = workspace
+        .home
+        .join(".euler/state/homes")
+        .canonicalize()
+        .expect("homes directory");
+    assert!(home.starts_with(&homes), "{}", home.display());
+    assert!(!home.exists(), "the fallback HOME outlived its session");
+}
+
+/// With the Euler home's session store, the `workspace` profile's private
+/// `HOME` is `<euler home>/sessions/<id>/home` and outlives the process, so
+/// a `pip install --user` persists across a resume.
+#[test]
+fn the_workspace_profile_keeps_its_home_in_the_session_store() {
+    let workspace = workspace();
+    let event_script = home_probe_script(&workspace);
+    let output = exec(
+        &workspace,
+        &[
+            "--provider-option",
+            &event_script,
+            "--profile",
+            "workspace",
+            "--extensions",
+            "none",
+            "--project-context",
+            "off",
+            "work",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let Ok(home) = fs::read_to_string(workspace.root.join("home.txt")) else {
+        // No backend on this host: the command failed closed.
+        return;
+    };
+    let home = PathBuf::from(home);
+    let sessions = workspace
+        .home
+        .join(".euler/sessions")
+        .canonicalize()
+        .expect("session store");
+    assert_eq!(
+        home.file_name().and_then(|name| name.to_str()),
+        Some("home")
+    );
+    assert_eq!(
+        home.parent().and_then(Path::parent),
+        Some(sessions.as_path()),
+        "{}",
+        home.display()
+    );
+    assert!(home.is_dir(), "the session HOME was removed at exit");
 }
 
 #[test]

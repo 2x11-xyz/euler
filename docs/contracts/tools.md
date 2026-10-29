@@ -275,6 +275,27 @@ The profile contains no network allowance. It preserves broad filesystem reads
 for tool compatibility; Unit 3 owns a narrower read surface and conformance
 parity with Linux.
 
+The `workspace` execution profile (ADR 0026; capabilities contract,
+"Execution profiles") changes both launchers: Bubblewrap keeps the host
+network namespace and binds the host `/tmp`, the private per-session `HOME`,
+the existing named toolchain caches, and the profile's `writable_paths` at
+their real paths before the read-only remount of their holding directory;
+Seatbelt adds outbound IP network, DNS, loopback bind, Unix-socket connects
+under the workspace, the private `HOME`, `/private/tmp`, and the host
+`TMPDIR` (not the launchd SSH agent socket unless credentials pass), read
+denies for the credential stores, and write allowances for `/private/tmp`, the host
+`TMPDIR`, the private `HOME`, the caches, and `writable_paths`, inserted
+before the closing Git denies and naming only `-D` parameters. Both inherit
+the parent environment under ADR 0021 row C instead of clearing it.
+
+A sandboxed `run_shell` command whose process-group leader exits while
+another process of its group still runs (on macOS, a background job that
+redirected its output) leaves that leader unreaped and tracked; the session
+kills each tracked group and reaps its leader when it ends, so the group id
+cannot have been reused. Bubblewrap's PID namespace already ends every job
+with its command, so nothing is tracked on Linux. A job that moves itself to
+another process group is outside this, as it is for cancellation.
+
 Availability is probed at session start by running a trivial sandboxed
 command, because an installed launcher is not evidence that its profile can be
 applied. The outcome is recorded on `session.start` as `sandbox_backend`
@@ -295,7 +316,11 @@ which backend, whether network is available (when it is not, the host's
 localhost services are not reachable either), where writes persist, whether
 temporary files persist between commands (Bubblewrap's `/tmp`, which holds
 `$HOME`, is discarded after each command; Seatbelt's `$TMPDIR` and `$HOME`
-persist for the session, while `.git` and `/tmp` are not writable), and that
+persist for the session, while `.git` and `/tmp` are not writable; under
+`workspace`, the workspace, the shared `/tmp`, the caches, any
+`writable_paths`, and a private `$HOME` that persists for the session, with
+whether credentials are available and that background jobs must redirect
+their output and when they end), and that
 a blocked action is reported as a sandbox limit with the exact command the
 user can run outside Euler. A host registry says commands run on the host; an
 unavailable sandbox says commands are refused and points at
