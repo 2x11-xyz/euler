@@ -1,7 +1,7 @@
 use super::commands::{
-    dispatch_command, filter_palette_entries, CheckpointItem, CommandAction, CommandContext,
-    CommandEffect, CompactionSettings, EffortChoice, ExtensionManagerItem, ModelChoice,
-    ModelTargetsConfirm, PaletteEntry, PaletteEntryKind, PermissionChoice, PickerSpec,
+    dispatch_command, filter_palette_entries, is_known_command, CheckpointItem, CommandAction,
+    CommandContext, CommandEffect, CompactionSettings, EffortChoice, ExtensionManagerItem,
+    ModelChoice, ModelTargetsConfirm, PaletteEntry, PaletteEntryKind, PermissionChoice, PickerSpec,
     ProfileChoice, ResumeItem, ThemeChoiceItem,
 };
 use super::composer::ComposerDraft;
@@ -649,6 +649,30 @@ impl BottomSurface {
                 SurfaceEvent::None
             }
         }
+    }
+
+    /// Runs a one-line composer draft that starts with a known slash command,
+    /// the same as confirming it from the palette, so a pasted command works
+    /// like a typed one. Returns `None` for anything else (multi-line drafts,
+    /// unknown first tokens) so the draft submits as a message. A command
+    /// error keeps the draft so the user can fix it.
+    pub fn submit_composer_command(&mut self) -> Option<SurfaceEvent> {
+        let input = self.composer.submit_text();
+        let line = input.trim();
+        if line.contains('\n') || !is_known_command(line, &self.context) {
+            return None;
+        }
+        self.history.detach();
+        Some(match dispatch_command(line, &self.context) {
+            CommandEffect::Action(action) => self.apply_action(action),
+            CommandEffect::Message(message) => SurfaceEvent::Message(message),
+            CommandEffect::Notice(message) => SurfaceEvent::Notice(message),
+            CommandEffect::OpenPicker(spec) => {
+                self.composer = ComposerDraft::new();
+                self.open_picker_from_spec(spec, ComposerDraft::new());
+                SurfaceEvent::None
+            }
+        })
     }
 
     fn apply_action(&mut self, action: CommandAction) -> SurfaceEvent {

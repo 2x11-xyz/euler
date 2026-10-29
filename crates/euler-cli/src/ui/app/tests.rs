@@ -3446,6 +3446,64 @@ fn patch_modal_ctrl_x_does_not_launch_editor_or_close_modal() {
     assert!(matches!(core.modal, Some(Modal::PatchApproval(_))));
 }
 
+fn user_message_count(core: &AppCore) -> usize {
+    core.transcript
+        .events()
+        .iter()
+        .filter(|event| event.kind.as_str() == EventKind::USER_MESSAGE)
+        .count()
+}
+
+/// A slash command that arrives as a bracketed paste runs like a typed one
+/// instead of going to the model as a chat message.
+#[test]
+fn pasted_slash_command_runs_as_command_not_message() {
+    let mut core = core();
+
+    core.handle_input(InputEvent::Paste("/profile".to_owned()));
+    assert_eq!(core.bottom.composer().submit_text(), "/profile");
+    core.handle_input(key(KeyCode::Enter));
+
+    assert!(!core.turn_in_flight());
+    assert_eq!(user_message_count(&core), 0);
+    assert!(matches!(core.bottom.owner(), BottomOwner::Picker(_)));
+    core.handle_input(key(KeyCode::Esc));
+    assert_eq!(core.bottom.composer().submit_text(), "");
+
+    // A command error is shown and the draft stays for fixing.
+    core.handle_input(InputEvent::Paste("/name".to_owned()));
+    core.handle_input(key(KeyCode::Enter));
+
+    assert!(!core.turn_in_flight());
+    assert_eq!(user_message_count(&core), 0);
+    assert_eq!(
+        core.visual_canvas.finalized_items().last(),
+        Some(&TranscriptItem::Notice("usage: /name <name>".to_owned()))
+    );
+    assert_eq!(core.bottom.composer().submit_text(), "/name");
+}
+
+/// A pasted line whose first token is not a known command, or a multi-line
+/// paste, stays a chat message.
+#[test]
+fn pasted_path_or_multiline_command_text_submits_as_message() {
+    for payload in ["/tmp/foo is broken", "/profile\nwhy did this fail?"] {
+        let mut core = core();
+        core.handle_input(InputEvent::Paste(payload.to_owned()));
+        core.handle_input(key(KeyCode::Enter));
+        assert!(core.turn_in_flight(), "{payload:?} must start a turn");
+        wait_for_idle(&mut core);
+        assert!(core.transcript.events().iter().any(|event| {
+            event.kind.as_str() == EventKind::USER_MESSAGE
+                && event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(payload)
+        }));
+    }
+}
+
 #[test]
 fn multiline_bracketed_paste_inserts_paste_token_and_waits_for_enter() {
     let mut core = core();

@@ -3165,6 +3165,9 @@ impl AppCore {
         if self.recovery_edit.is_some() {
             return self.start_edited_recovery_requeue(prompt);
         }
+        if let Some(event) = self.bottom.submit_composer_command() {
+            return self.surface_event(event);
+        }
         let AppState::Idle { .. } = self.state else {
             return self.queue_composer_input();
         };
