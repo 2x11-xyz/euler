@@ -4,6 +4,23 @@ All notable changes to Euler are documented here. Entries reference the
 pull requests that landed them; deeper design rationale lives in
 `docs/contracts/` and the GitHub issue ledger.
 
+## Unreleased
+
+### TUI: the first-run profile choice opens inside the app
+
+- **Behavior change**: the first `euler` / `euler tui` launch (or resume)
+  without a saved `defaults.interactive` no longer prints a plain prompt
+  before the TUI starts. The TUI starts and shows the profile picker under
+  the banner, `full` preselected. Enter saves the choice as your default and
+  applies it; Esc uses `full` for this session without saving (a resume keeps
+  its resumed profile) and asks again next launch. Until you choose, typing
+  and submitting do nothing and the status bar reads
+  `choose a profile to start`; Ctrl+C quits without saving.
+- The line-oriented `euler run` keeps its stderr prompt; `euler exec` never
+  asks.
+- The `full` profile's boundary now reads `runs on this machine with your
+  permissions` in `/profile` and its notices.
+
 ## 0.1.6 (2026-10-29)
 
 ### Preferences: `preferences.json` follows `EULER_HOME`
