@@ -416,6 +416,10 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
         run_profile_request(&exec.run, ProfileContext::Headless),
         &root,
     )?;
+    // ADR 0026 resolved question 10: `trusted-local` disables `auto`
+    // admission only under a profile that asks for every command.
+    let trusted_local_disables_project_context = exec.auto_approve == AutoApproveTier::TrustedLocal
+        && profile.fields.approvals == ApprovalsSetting::Always;
     let mut live_session = live_session_config(
         root,
         exec.run.provider_id.clone(),
@@ -442,7 +446,7 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
         &live_session.config,
         exec.run.auth_file.as_deref(),
         exec.run.project_context,
-        exec.auto_approve == AutoApproveTier::TrustedLocal,
+        trusted_local_disables_project_context,
     )?;
     let bootstrap = crate::session_lifecycle::finalize_project_context_headless(resolution)?;
     live_session.config.project_context = Some(bootstrap);

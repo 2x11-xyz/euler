@@ -6,6 +6,21 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: headless default (ADR 0026 step 7)
+
+- **Behavior change**: `euler exec` now runs under the `workspace` profile
+  by default instead of `locked`, so shell commands and workspace writes run
+  without a prompt inside the sandbox, with network. Scripts that relied on
+  the read-only default pass `--profile locked`, or set
+  `defaults.headless` in `~/.euler/profiles.json`. On a host without a
+  sandbox backend, commands fail closed. Resuming a session recorded under
+  `locked` keeps `locked` unless `--profile` is passed. Under the new
+  default `--auto-approve` is a no-op with the step 4 notice; under
+  `--profile locked` its tiers apply as before.
+- `--auto-approve trusted-local` disables `auto` project context admission
+  only under a profile with `approvals: always` (`locked`); under
+  `workspace` an acknowledged `EULER.md` is admitted headless.
+
 ### Execution profiles: escalation (ADR 0026 step 6)
 
 - **`workspace` allows escalation**: `run_shell` gains an optional

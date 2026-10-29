@@ -10,7 +10,6 @@ euler exec \
   --provider openrouter \
   --model anthropic/claude-sonnet-5 \
   --reasoning-effort large \
-  --auto-approve trusted-local \
   --extensions none \
   --max-tool-rounds 100 \
   --provenance ./runs/job-001.jsonl \
@@ -23,7 +22,14 @@ Flags:
 
 - `--provider <id>` / `--model <id>` choose the route.
 - `--reasoning-effort xsmall|small|medium|large|xlarge|max` sets Euler's reasoning knob. `max` is available on GPT-5.6 Luna, Sol, and Terra. Codex's `ultra` mode is not a provider effort: it combines wire-level `max` with proactive multi-agent delegation, which Euler does not yet expose as a driver workflow.
-- `--auto-approve read-only|trusted-local` controls headless permissions.
+- `--profile <name>` selects the execution profile. The default for `exec` is
+  `workspace` (or `defaults.headless` in `~/.euler/profiles.json`): shell
+  commands and workspace writes run without a prompt inside a sandbox with
+  network. `--profile locked` restores the earlier read-only default: no
+  network, and the `--auto-approve` tier decides writes and shell.
+- `--auto-approve read-only|trusted-local` controls headless permissions under
+  a profile that asks for every command (`locked`). Under `workspace` it has
+  no effect and Euler prints a one-line notice.
   - `read-only` is the default: file reads are allowed; writes and shell are denied.
   - `trusted-local`: file reads, file writes, and shell are session-allowed.
 - `--extensions <ids>` enables a comma-separated list. Use `--extensions none`
@@ -66,7 +72,6 @@ EOF
 euler exec \
   --provider openrouter \
   --model anthropic/claude-sonnet-5 \
-  --auto-approve trusted-local \
   --extensions none \
   --provenance ./research.jsonl \
   'Read BRIEF.md and complete it.'
@@ -258,7 +263,6 @@ timeout 12h setsid -f sh -c '
   nohup euler exec \
     --provider openrouter \
     --model anthropic/claude-sonnet-5 \
-    --auto-approve trusted-local \
     --extensions none \
     --provenance ./runs/job-001.jsonl \
     "Read BRIEF.md and complete it." \
@@ -296,6 +300,7 @@ timeout 6h setsid -f sh -c '
     --provider openrouter \
     --model anthropic/claude-sonnet-5 \
     --reasoning-effort large \
+    --profile locked \
     --auto-approve trusted-local \
     --extensions none \
     --max-tool-rounds 100 \
@@ -305,6 +310,9 @@ timeout 6h setsid -f sh -c '
     > ./stdout.log 2> ./stderr.log
 '
 ```
+
+`--profile locked --auto-approve trusted-local` keeps the run off the network,
+as the brief asks, while still allowing writes and shell.
 
 Monitor:
 

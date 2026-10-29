@@ -1,6 +1,6 @@
 //! Execution profile selection, validation, and recording through the CLI
-//! (ADR 0026 rollout steps 3 to 6: profile plumbing, the `locked`, `full`,
-//! and `workspace` presets, and escalation).
+//! (ADR 0026 rollout steps 3 to 7: profile plumbing, the `locked`, `full`,
+//! and `workspace` presets, escalation, and the headless default).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -112,17 +112,17 @@ fn recorded_profiles(log: &Path, kind: &str) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn built_in_default_records_the_locked_preset() {
+fn built_in_headless_default_records_the_workspace_preset() {
     let workspace = workspace();
     let output = exec_new(&workspace, &[]);
     assert!(output.status.success(), "{}", stderr(&output));
 
     let profiles = recorded_profiles(&workspace.log, "session.start");
     assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0]["name"], "locked");
+    assert_eq!(profiles[0]["name"], "workspace");
     assert_eq!(profiles[0]["fields"]["sandbox"], "on");
-    assert_eq!(profiles[0]["fields"]["network"], "off");
-    assert_eq!(profiles[0]["fields"]["approvals"], "always");
+    assert_eq!(profiles[0]["fields"]["network"], "on");
+    assert_eq!(profiles[0]["fields"]["approvals"], "escalation-only");
     assert_eq!(profiles[0]["fields"]["reviewer"], "user");
     assert!(profiles[0]["fields_sha256"].is_string());
 }
@@ -334,6 +334,147 @@ fn the_workspace_profile_runs_commands_in_a_private_home_without_a_prompt() {
     assert!(!home.exists(), "the fallback HOME outlived its session");
 }
 
+/// The first `tool.result` payload of the log.
+fn first_tool_result(log: &Path) -> serde_json::Value {
+    fs::read_to_string(log)
+        .expect("read log")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .find(|event| event["kind"] == "tool.result")
+        .expect("tool.result")["payload"]
+        .clone()
+}
+
+/// The built-in headless default is `workspace` (ADR 0026 step 7), so plain
+/// `euler exec` runs a command without a prompt, and `--profile locked`
+/// restores the read-only tier's denial (resolved question 11).
+#[test]
+fn headless_default_runs_commands_and_the_locked_profile_restores_read_only() {
+    let workspace = workspace();
+    let log = workspace.log.to_str().expect("utf8 log");
+    let event_script = home_probe_script(&workspace);
+    let run = |extra: &[&str]| {
+        let _ = fs::remove_file(&workspace.log);
+        let mut args = vec![
+            "--provider-option",
+            &event_script,
+            "--provenance",
+            log,
+            "--extensions",
+            "none",
+            "--project-context",
+            "off",
+        ];
+        args.extend_from_slice(extra);
+        args.push("work");
+        let output = exec(&workspace, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        (
+            session_start(&workspace.log),
+            first_tool_result(&workspace.log),
+        )
+    };
+
+    let (start, result) = run(&[]);
+    assert_eq!(start["execution_profile"]["name"], "workspace");
+    // Without a backend the profile lifts no approval and the command fails
+    // closed.
+    let backend_enforced = start["sandbox_backend"] != "unavailable";
+    assert_eq!(result["ok"], backend_enforced, "{result}");
+
+    let (start, result) = run(&["--profile", "locked"]);
+    assert_eq!(start["execution_profile"]["name"], "locked");
+    assert_eq!(result["ok"], false, "{result}");
+    let error = result["error"].as_str().unwrap_or_default();
+    assert!(error.contains("denied"), "{error}");
+}
+
+/// `--auto-approve` under a profile that already runs commands and writes
+/// is a no-op with a one-line notice naming the profile (ADR 0026 resolved
+/// question 2); without the flag, or under `locked`, there is no notice.
+#[test]
+fn auto_approve_under_a_profile_that_covers_it_prints_a_notice() {
+    let workspace = workspace();
+    let notice = "note: --auto-approve has no effect: execution profile workspace already \
+                  allows what it asks for";
+
+    let output = exec_new(&workspace, &["--auto-approve", "read-only"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains(notice), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output).matches("--auto-approve").count(),
+        1,
+        "{}",
+        stderr(&output)
+    );
+
+    fs::remove_file(&workspace.log).expect("remove log");
+    let output = exec_new(&workspace, &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("--auto-approve"),
+        "{}",
+        stderr(&output)
+    );
+
+    fs::remove_file(&workspace.log).expect("remove log");
+    let output = exec_new(
+        &workspace,
+        &["--profile", "locked", "--auto-approve", "read-only"],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        !stderr(&output).contains("--auto-approve"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// `--auto-approve trusted-local` disables `auto` project context admission
+/// only under a profile with `approvals: always` (ADR 0026 resolved
+/// question 10); under `workspace` the acknowledgment rule decides, so an
+/// acknowledged digest is admitted.
+#[test]
+fn trusted_local_disables_project_context_only_under_approvals_always() {
+    let workspace = workspace();
+    fs::write(workspace.root.join("EULER.md"), "# Guidance\n").expect("write EULER.md");
+    let reason = |extra: &[&str]| {
+        let _ = fs::remove_file(&workspace.log);
+        let mut args = vec!["--auto-approve", "trusted-local"];
+        args.extend_from_slice(extra);
+        let output = exec_new(&workspace, &args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        session_start(&workspace.log)["project_context"]["resolution_reason"].clone()
+    };
+
+    assert_eq!(reason(&[]), "no_acknowledgment");
+    assert_eq!(reason(&["--profile", "locked"]), "trusted_local_auto_off");
+
+    // Record the acknowledgment the interactive surface would write for the
+    // digest the last run observed.
+    let snapshot = fs::read_to_string(&workspace.log)
+        .expect("read log")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .find(|event| event["kind"] == "project.context.snapshot")
+        .expect("project.context.snapshot")["payload"]
+        .clone();
+    euler_core::AcknowledgmentStore::new(workspace.home.join(".euler"))
+        .record(
+            &workspace.root.canonicalize().expect("canonical root"),
+            snapshot["workspace_identity"]["digest"]
+                .as_str()
+                .expect("identity digest"),
+            snapshot["candidate_digest"]
+                .as_str()
+                .expect("candidate digest"),
+        )
+        .expect("record acknowledgment");
+
+    assert_eq!(reason(&[]), "acknowledged");
+    assert_eq!(reason(&["--profile", "locked"]), "trusted_local_auto_off");
+}
+
 /// Headless `exec` cannot answer an escalation, so under `--profile
 /// workspace` it denies one with a tool error naming the profile and the
 /// flag that would allow it (ADR 0026 section 7), and the command does not
@@ -486,7 +627,7 @@ fn project_overlay_can_tighten_but_never_loosen() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
         stderr(&output)
-            .contains("execution profile: locked, tightened by .euler/profile-overlay.json"),
+            .contains("execution profile: workspace, tightened by .euler/profile-overlay.json"),
         "{}",
         stderr(&output)
     );
@@ -529,11 +670,38 @@ fn resume_records_the_profile_it_runs_under_and_shows_a_change() {
 
     // Same fields under another name: not looser, so the resolved profile
     // applies, and the change is shown and recorded.
-    write_profiles(&workspace, "{}");
+    write_profiles(&workspace, r#"{"defaults": {"headless": "locked"}}"#);
     let output = exec_resume(&workspace, &[]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
         stderr(&output).contains("execution profile: locked (recorded: ci)"),
+        "{}",
+        stderr(&output)
+    );
+    let resumed = recorded_profiles(&workspace.log, "session.resumed");
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0]["name"], "locked");
+}
+
+/// A session started under `locked` (the headless default before ADR 0026
+/// step 7) resumes under `locked`: the `workspace` default is looser, so the
+/// recorded profile is kept and named on stderr, and `--auto-approve` applies
+/// its tier without the profile notice.
+#[test]
+fn resume_of_a_locked_session_keeps_locked_under_the_workspace_default() {
+    let workspace = workspace();
+    let output = exec_new(&workspace, &["--profile", "locked"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let output = exec_resume(&workspace, &["--auto-approve", "trusted-local"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("kept the recorded profile locked"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        !stderr(&output).contains("--auto-approve"),
         "{}",
         stderr(&output)
     );
@@ -564,7 +732,7 @@ fn resume_with_the_same_reviewer_flag_shows_no_profile_change() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
         stderr(&output).contains(
-            "execution profile: locked (recorded: locked; changed reviewer guardian -> user)"
+            "execution profile: workspace (recorded: workspace; changed reviewer guardian -> user)"
         ),
         "{}",
         stderr(&output)
@@ -634,7 +802,7 @@ fn resume_of_a_log_without_a_profile_resolves_as_a_new_session() {
     let output = exec_resume(&workspace, &[]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("execution profile: locked (this session recorded no profile)"),
+        stderr(&output).contains("execution profile: workspace (this session recorded no profile)"),
         "{}",
         stderr(&output)
     );
