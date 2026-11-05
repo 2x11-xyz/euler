@@ -718,12 +718,104 @@ fn resume_keeps_recorded_layers_and_joins_added_ask_and_deny_rules() {
             field: "rules",
         })
     );
-    // A resolved profile without rules still keeps the recorded ones.
+    // A resolved profile without rules still keeps the recorded ones, and
+    // the refusal names the recording rather than asking the user to remove
+    // rules their profile does not set.
+    let error = ResumeProfile::choose(Some(recorded), with_rules("dev", Vec::new()), false, None)
+        .expect_err("recorded rules are refused");
     assert_eq!(
-        ResumeProfile::choose(Some(recorded), with_rules("dev", Vec::new()), false, None),
+        error,
+        ProfileError::RecordedUnenforced {
+            profile: "dev".to_owned(),
+            field: "rules",
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "this session recorded profile \"dev\" with rules, which this version parses and \
+         records but does not enforce yet, and resume keeps the recorded rules; pass --profile \
+         to resume under a profile without it"
+    );
+}
+
+#[test]
+fn resume_that_keeps_the_recorded_profile_joins_policy_fields() {
+    let locked_with = |rules: Vec<RuleLayer>, ask_timeout: Option<u32>| ExecutionProfile {
+        name: "careful".to_owned(),
+        fields: ProfileFields {
+            rules,
+            ask_timeout,
+            ..locked::fields()
+        },
+    };
+    let temp = tempfile::tempdir().expect("temp");
+    let lower_timeout = overlay(temp.path(), r#"{"ask_timeout": 120}"#);
+
+    // `full` is looser than the recorded `locked` fields, so the recorded
+    // profile applies, and its rules stay even though the resolved profile
+    // has none and the overlay sets only a timeout.
+    let recorded = locked_with(
+        vec![shell_layer(
+            RuleLayerLabel::Profile,
+            vec![rule("rm *", RuleState::Deny)],
+        )],
+        None,
+    );
+    let resolved = ExecutionProfile {
+        name: "dev".to_owned(),
+        fields: ProfileFields {
+            ask_timeout: Some(120),
+            ..full::fields()
+        },
+    };
+    assert_eq!(
+        ResumeProfile::choose(
+            Some(recorded),
+            resolved.clone(),
+            false,
+            Some(&lower_timeout)
+        ),
+        Err(ProfileError::RecordedUnenforced {
+            profile: "careful".to_owned(),
+            field: "rules",
+        })
+    );
+
+    // A deny rule added to the resolved profile joins the kept recorded
+    // profile, so the refusal names rules (not only the timeout) and the
+    // resolved profile that set them, not the recording.
+    let with_deny = ExecutionProfile {
+        fields: ProfileFields {
+            rules: vec![shell_layer(
+                RuleLayerLabel::Profile,
+                vec![rule("curl *", RuleState::Deny)],
+            )],
+            ..resolved.fields.clone()
+        },
+        ..resolved.clone()
+    };
+    assert_eq!(
+        ResumeProfile::choose(
+            Some(locked_with(Vec::new(), None)),
+            with_deny,
+            false,
+            Some(&lower_timeout)
+        ),
         Err(ProfileError::Unenforced {
             profile: "dev".to_owned(),
             field: "rules",
+        })
+    );
+
+    // `resolved` stands for a profile whose timeout the overlay already
+    // lowered to 120. A recorded 60 does not make the overlay's 120 an
+    // error, and the join keeps the recorded 60, which the refusal names.
+    let recorded = locked_with(Vec::new(), Some(60));
+    assert_eq!(
+        ResumeProfile::choose(Some(recorded), resolved, false, Some(&lower_timeout)),
+        Err(ProfileError::RecordedUnenforced {
+            profile: "careful".to_owned(),
+            field: "ask_timeout",
         })
     );
 }
@@ -759,12 +851,26 @@ fn resume_summary_names_joined_fields_and_counts_rule_layers() {
     two_layers.fields.ask_timeout = Some(30);
     let changed = ResumeProfile {
         profile: two_layers,
-        recorded: Some(recorded),
+        recorded: Some(recorded.clone()),
         basis: ResumeProfileBasis::Resolved,
         joined_fields: Vec::new(),
     };
     assert_eq!(
         changed.summary().as_deref(),
         Some("execution profile: dev (recorded: dev; changed ask_timeout unset -> 30, rules 1 layer -> 2 layers)")
+    );
+
+    // A changed rule with the same layer count still reads as a change.
+    let mut edited = recorded.clone();
+    edited.fields.rules[0].rules.shell[0].state = RuleState::Ask;
+    let same_count = ResumeProfile {
+        profile: edited,
+        recorded: Some(recorded),
+        basis: ResumeProfileBasis::Resolved,
+        joined_fields: Vec::new(),
+    };
+    assert_eq!(
+        same_count.summary().as_deref(),
+        Some("execution profile: dev (recorded: dev; changed rules edited (1 layer))")
     );
 }
