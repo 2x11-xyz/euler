@@ -413,8 +413,8 @@ is not tracked.
   that matches an extension's model-visible tool name, the notice for an
   extension id that is not installed, and the error for an
   `extension_reviewers` entry that is not enabled or has no reviewer
-  descriptor) are not implemented; the first two land with the overlay and
-  child rollout step, so until then a `tools` rule naming an extension id
+  descriptor) are not implemented yet, and no ADR 0027 rollout step names
+  the first two; until they land, a `tools` rule naming an extension id
   that is not installed matches nothing without notice.
 - **Permission rules in the gate (ADR 0027 section 3).** The gate decides
   a request in this order: a configured `always-deny`; a `deny` rule
@@ -433,18 +433,26 @@ is not tracked.
   run of characters, and a trailing ` *` also matches nothing. A command
   is `deny` if any command in it is, else `ask` if any is, else `allow`
   only if every command is. A command with a dynamic word, an unknown
-  wrapper option, a stdin script, or a parse error is unresolved: its
-  source text is matched and no `allow` rule applies to it, so a catch-all
-  `deny` still covers it. `tools` rules match the core tool name or
-  `<extension-id>.<command>`. Within a surface of one layer the last
+  wrapper option, a stdin script, or a parse error is unresolved, as is a
+  declaration (`export`, `declare`, `unset`) and a statement with no
+  command (`> out.txt`, `PATH=./bin`): its source text is matched and no
+  `allow` rule applies to it, so a catch-all `deny` still covers it.
+  `tools` rules match the core tool name or `<extension-id>.<command>`; an
+  `apply_patch` heredoc sent through `run_shell` is matched as
+  `apply_patch`, the tool core runs it as. A `tools` `allow` does not apply
+  to a shell command (`run_shell` or an extension's) with an unresolved
+  command either. Within a surface of one layer the last
   matching rule wins; surfaces and layers combine by most restrictive. A
   `deny` rule refuses the request without asking anyone and covers that
   request only: the capability is not denied for the rest of the turn, and
   the tool error names the rule and its `reason` and tells the model not to
   work around it. An `ask` rule prompts under every profile, `full`
   included; neither static-safe analysis nor a grant settles it, its prompt
-  is once-only (allow once or deny), and an allow installs no grant. A
-  guardian may review it as any ask. Rules apply to root and child tool
+  is once-only (allow once or deny) and names the rule and its `reason`,
+  and an allow installs no grant. A guardian may review it as any ask. An
+  escalated command that matches an `ask` rule takes the escalation ask
+  (section 3 puts escalation first), so an escalation session grant for
+  its first token may cover it later. Rules apply to root and child tool
   calls, extension model tools and commands (an operation takes its
   strictest request: one `deny` refuses it before the extension runs, and
   `ask` requests share one once-only prompt), and lifecycle work, where a
@@ -455,7 +463,8 @@ is not tracked.
   once-only, so answering it installs no grant and changes no mode, and a
   person's deny of it does not deny that capability for the rest of the
   turn. An extension operation records an `allow` rule's decisions only
-  when no request of it is denied.
+  when it is authorized to run: after the person allows its other
+  requests, if any ask.
 - **Selection.** `--profile <name>` on `euler` and `euler exec`, then
   `/profile` in the TUI, then the context default in `profiles.json`, then
   the built-in default: `full` for both interactive and headless. An unknown

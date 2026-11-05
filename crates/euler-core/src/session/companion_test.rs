@@ -134,12 +134,12 @@ fn companion_runs_under_the_subagent_default_no_looser_than_the_session() {
 
 /// A session whose profile is `preset` with one `profile` layer of shell
 /// `rules`, under `defaults.subagent` `subagent`, with a child that makes
-/// `call` (ADR 0027).
+/// `calls` (ADR 0027).
 fn ruled_session_with_child(
     preset: &str,
     rules: Vec<crate::execution_profile::PermissionRule>,
     subagent: Option<ExecutionProfile>,
-    call: ToolCall,
+    calls: Vec<ToolCall>,
     verdicts: Vec<DeciderVerdict>,
 ) -> (tempfile::TempDir, Session<ScriptedDecider>) {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -157,7 +157,7 @@ fn ruled_session_with_child(
     config.set_execution_profile(profile);
     config.subagent_profile = subagent;
     let provider = ScriptedProvider::new(vec![
-        FixtureResponse::ToolCalls(vec![call]),
+        FixtureResponse::ToolCalls(calls),
         FixtureResponse::Assistant("done".to_owned()),
     ]);
     let writer = ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer");
@@ -190,7 +190,7 @@ fn a_deny_rule_refuses_a_child_tool_call_and_records_the_rule() {
             crate::execution_profile::RuleState::Deny,
         )],
         None,
-        child_shell_call(),
+        vec![child_shell_call()],
         Vec::new(),
     );
 
@@ -220,8 +220,13 @@ fn a_child_keeps_allow_rules_only_under_inherit() {
             crate::execution_profile::RuleState::Allow,
         )]
     };
-    let (_temp, mut inherited) =
-        ruled_session_with_child("locked", allow(), None, child_shell_call(), Vec::new());
+    let (_temp, mut inherited) = ruled_session_with_child(
+        "locked",
+        allow(),
+        None,
+        vec![child_shell_call()],
+        Vec::new(),
+    );
     inherited
         .spawn_companion(task_with_caps([Capability::ShellExec]))
         .expect("companion");
@@ -236,7 +241,7 @@ fn a_child_keeps_allow_rules_only_under_inherit() {
         "locked",
         allow(),
         Some(ExecutionProfile::default()),
-        child_shell_call(),
+        vec![child_shell_call()],
         vec![DeciderVerdict::Deny],
     );
     named
@@ -245,6 +250,48 @@ fn a_child_keeps_allow_rules_only_under_inherit() {
     only_event(named.events(), EventKind::PERMISSION_PROMPT);
     let decision = only_event(named.events(), EventKind::PERMISSION_DECISION);
     assert_eq!(decision.payload.get("rule"), None);
+}
+
+/// ADR 0027 resolved question 6 on the child route: a session grant the
+/// child installed for one command never settles a later rule-caused ask,
+/// and that prompt names the rule.
+#[test]
+fn a_session_grant_never_settles_a_child_rule_ask() {
+    let (_temp, mut session) = ruled_session_with_child(
+        "locked",
+        vec![shell_rule(
+            "git push *",
+            crate::execution_profile::RuleState::Ask,
+        )],
+        None,
+        vec![
+            ToolCall {
+                id: "call-init".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": "git init -q"}),
+            },
+            ToolCall {
+                id: "call-push".to_owned(),
+                name: "run_shell".to_owned(),
+                input: json!({"command": "git push origin main"}),
+            },
+        ],
+        vec![DeciderVerdict::AllowSession, DeciderVerdict::Deny],
+    );
+
+    session
+        .spawn_companion(task_with_caps([Capability::ShellExec]))
+        .expect("companion");
+
+    let prompts = events_of_kind(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(prompts.len(), 2, "the push asks despite the session grant");
+    assert_eq!(prompts[0].payload.get("rule"), None);
+    assert_eq!(prompts[1].payload["rule"]["pattern"], json!("git push *"));
+    let decisions = events_of_kind(session.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0].payload["grant_scope"], json!("session"));
+    assert_eq!(decisions[1].payload["rule"]["pattern"], json!("git push *"));
+    assert_eq!(decisions[1].payload["allowed"], json!(false));
 }
 
 #[test]

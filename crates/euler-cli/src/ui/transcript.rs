@@ -148,6 +148,9 @@ pub enum TranscriptItem {
         user_rule_prefix: Option<String>,
         /// Why no grant is offered; `None` when grants are offered.
         no_grant_reason: Option<&'static str>,
+        /// The permission rule that caused the ask and its reason (ADR 0027
+        /// section 1); `None` when no rule did.
+        ask_rule_note: Option<String>,
         /// The model's reason when the command asks to run outside the
         /// sandbox (ADR 0026 escalation); the panel then offers no project
         /// or durable rule.
@@ -164,6 +167,9 @@ pub enum TranscriptItem {
     PermissionBatchAsk {
         operation: String,
         capabilities: Vec<String>,
+        /// The permission rules that caused the batch's asks, with their
+        /// reasons (ADR 0027 section 1).
+        ask_rule_notes: Vec<String>,
         selected_option: ApprovalOption,
     },
     /// The project-context acknowledgment card shown for an in-app `/new`

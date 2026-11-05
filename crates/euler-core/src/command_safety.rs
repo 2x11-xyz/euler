@@ -2184,6 +2184,7 @@ fn collect_rule_segments(script: &str, depth: usize, segments: &mut Vec<RuleSegm
         segments.push(unresolved_segment(script));
         return;
     };
+    let found_before = segments.len();
     let mut stack = vec![tree.root_node()];
     let mut visits = 0usize;
     while let Some(node) = stack.pop() {
@@ -2192,19 +2193,46 @@ fn collect_rule_segments(script: &str, depth: usize, segments: &mut Vec<RuleSegm
             segments.push(unresolved_segment(script));
             return;
         }
-        if node.kind() == "command" {
-            let words = rule_words(node, script);
-            match words.into_iter().collect::<Option<Vec<String>>>() {
-                Some(words) => push_rule_words(&words, depth, segments),
-                None => segments.push(unresolved_segment(
-                    node.utf8_text(script.as_bytes()).unwrap_or(script),
-                )),
+        let source = || node.utf8_text(script.as_bytes()).unwrap_or(script);
+        match node.kind() {
+            "command" => {
+                let words = rule_words(node, script);
+                match words.into_iter().collect::<Option<Vec<String>>>() {
+                    Some(words) => push_rule_words(&words, depth, segments),
+                    None => segments.push(unresolved_segment(source())),
+                }
             }
+            // Statements that change the shell or a file without a
+            // `command` node (`export`, `unset`, `PATH=./bin`, `> out.txt`)
+            // are unresolved segments, so a catch-all `deny` still covers
+            // them and no `allow` does (section 10 `ci`).
+            "declaration_command" | "unset_command" => {
+                segments.push(unresolved_segment(source()));
+            }
+            "variable_assignment" | "variable_assignments"
+                if node.parent().is_none_or(|parent| {
+                    !matches!(
+                        parent.kind(),
+                        "command" | "declaration_command" | "variable_assignments"
+                    )
+                }) =>
+            {
+                segments.push(unresolved_segment(source()));
+            }
+            "redirected_statement" if node.child_by_field_name("body").is_none() => {
+                segments.push(unresolved_segment(source()));
+            }
+            _ => {}
         }
         let mut cursor = node.walk();
         let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
         // Reversed so segments come out in source order.
         stack.extend(children.into_iter().rev());
+    }
+    // A line with no command at all (`> out.txt`, `PATH=./bin`) is still
+    // something to run: one unresolved segment.
+    if segments.len() == found_before && !script.trim().is_empty() {
+        segments.push(unresolved_segment(script));
     }
 }
 
@@ -3783,6 +3811,30 @@ mod tests {
         );
         assert_eq!(segments("bash -s"), vec![unresolved("bash -s")]);
         assert_eq!(segments("   "), Vec::new());
+        // Lines without a `command` node still yield a segment.
+        assert_eq!(
+            segments("export PATH=./bin:$PATH && cargo test"),
+            vec![
+                unresolved("export PATH=./bin:$PATH"),
+                resolved("cargo test")
+            ]
+        );
+        assert_eq!(segments("unset HOME"), vec![unresolved("unset HOME")]);
+        assert_eq!(segments("> out.txt"), vec![unresolved("> out.txt")]);
+        assert_eq!(segments("PATH=./bin"), vec![unresolved("PATH=./bin")]);
+        assert_eq!(
+            segments("echo hi && > out.txt; FOO=1 BAR=2"),
+            vec![
+                resolved("echo hi"),
+                unresolved("> out.txt"),
+                unresolved("FOO=1 BAR=2"),
+            ]
+        );
+        assert_eq!(
+            segments("FOO=1 cargo test > log"),
+            vec![resolved("cargo test")]
+        );
+        assert_eq!(segments("local x=1"), vec![unresolved("local x=1")]);
         assert_eq!(
             segments("git push 'unterminated"),
             vec![unresolved("git push 'unterminated")]

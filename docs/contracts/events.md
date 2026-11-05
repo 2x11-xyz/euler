@@ -516,6 +516,10 @@ extension error does not consume the later result.
   answer. The per-write ask for a project-tier extension config write started
   by a model tool (ADR 0022) carries `operation`, `extension_id`, and
   `command` without `batch`, and is parented to that model's `tool.call`.
+  An ask a permission rule caused (ADR 0027) adds `rule`, the same object
+  its `permission.decision` carries; an operation-level prompt with any
+  rule-caused request adds `rules`, the distinct objects of those rules in
+  request order.
 - `permission.decision`: `capability`, `mode`, `allowed`, `decision`.
   `mode` is the approval mode label (`ask` | `session-allow` |
   `always-deny`), or `static-grant` for extension registration grants, or
@@ -557,7 +561,10 @@ extension error does not consume the later result.
     a `deny` rule (`mode: "always-deny"`, `allowed: false`) or an `allow`
     rule lifting an ask (`mode: "ask"`, `allowed: true`,
     `grant_scope: "once"`). Such a decision has no `permission.prompt` and
-    parents its `tool.call`, or has no parent on an extension operation.
+    parents its `tool.call`, or has no parent on an extension operation. An
+    extension operation's `allow` rule decisions are recorded only when the
+    operation is authorized to run (after its prompt, if any, is allowed)
+    and carry its `operation`, `extension_id`, and `command`.
   - `rule`: `{ "surface": "shell" | "tools", "index", "pattern", "state",
     "layer": "profile" | "overlay" | "subagent" }`, the rule that set the
     state; `index` is its position in that layer's array for that surface.

@@ -79,11 +79,11 @@ impl<D: PermissionDecider> Session<D> {
                 tool_call_event_id,
             );
         }
-        // A rule-caused ask offers allow once and deny only (ADR 0027
-        // resolved question 6).
-        let request = &PermissionRequest {
-            once_only: request.once_only || ruling.rule_ask(),
-            ..request.clone()
+        // A rule-caused ask offers allow once and deny only, and names its
+        // rule (ADR 0027 resolved question 6).
+        let request = &match ruling.rule.as_ref().filter(|_| ruling.rule_ask()) {
+            Some(rule) => request.clone().with_ask_rule(rule.clone()),
+            None => request.clone(),
         };
         let needs_prompt = mode == ApprovalMode::Ask;
         let prompt_id = if needs_prompt {
@@ -351,6 +351,9 @@ pub(crate) fn permission_prompt_payload(request: &PermissionRequest) -> JsonObje
     if request.escalation.is_some() {
         payload.insert("escalated".to_owned(), true.into());
     }
+    if let Some(rule) = &request.ask_rule {
+        payload.insert("rule".to_owned(), rule.record());
+    }
     payload
 }
 
@@ -371,7 +374,7 @@ fn never_prompt_denial(
         return format!(
             "permission denied: this run cannot ask anyone, and execution profile `{profile}` \
              asks before this request ({}). Do not retry it this turn",
-            describe_rule(rule)
+            rule.describe()
         );
     }
     if request.dangerous_command {
@@ -410,21 +413,6 @@ fn never_prompt_denial(
     )
 }
 
-/// `the shell rule "git push *" (reason)` for a tool error.
-fn describe_rule(rule: &RuleMatch) -> String {
-    let reason = rule
-        .rule
-        .reason
-        .as_deref()
-        .map(|reason| format!(": {reason}"))
-        .unwrap_or_default();
-    format!(
-        "the {} rule \"{}\"{reason}",
-        rule.surface.as_str(),
-        rule.rule.pattern
-    )
-}
-
 /// The tool error for a request a `deny` rule refused (ADR 0027 section 2).
 /// It covers that request only, so the model may carry on with other work.
 pub(crate) fn rule_denial(rule: &RuleMatch) -> String {
@@ -432,7 +420,7 @@ pub(crate) fn rule_denial(rule: &RuleMatch) -> String {
         "permission denied by {} of the execution profile. Do not work around it with another \
          command or tool; this denial covers this request only, so carry on with other work or \
          ask the user",
-        describe_rule(rule)
+        rule.describe()
     )
 }
 
@@ -496,9 +484,11 @@ pub(crate) fn permission_request_for_tool(
     input: &Value,
     tools: &crate::tools::ToolRegistry,
 ) -> PermissionRequest {
+    // An `apply_patch` heredoc sent through `run_shell` is run by core as
+    // `apply_patch`, so `tools` rules name it that way, as its reason does.
     let mut request = PermissionRequest::new(capability, reason.to_owned())
         .with_workspace_root(tools.root())
-        .with_tool(tool_name);
+        .with_tool(tools.reteach_identity(tool_name, input));
     match tool_name {
         "run_shell" => {
             // A refused `escalate` still marks the request an escalation, so

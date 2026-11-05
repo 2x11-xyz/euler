@@ -92,6 +92,11 @@ pub struct PermissionRequest {
     /// read them ([`crate::command_safety::rule_segments`]), split once in
     /// [`Self::with_command`]. Empty for a request without a command.
     pub rule_segments: Vec<RuleSegment>,
+    /// The permission rule whose `ask` this request is (ADR 0027 resolved
+    /// question 6). Set with [`Self::with_ask_rule`], which also makes the
+    /// request once-only; approval surfaces show the rule and its reason
+    /// (section 1).
+    pub ask_rule: Option<RuleMatch>,
 }
 
 /// The mode a request gets and the permission rule that set it, if one did
@@ -137,6 +142,7 @@ impl PermissionRequest {
             tool: None,
             capability_is_label: false,
             rule_segments: Vec::new(),
+            ask_rule: None,
         }
     }
 
@@ -158,6 +164,21 @@ impl PermissionRequest {
     pub fn with_once_only(mut self) -> Self {
         self.once_only = true;
         self
+    }
+
+    /// Mark the request as the ask of `rule`: once-only, with the rule
+    /// carried for the prompt. No grant settles it (ADR 0027 resolved
+    /// question 6).
+    pub fn with_ask_rule(mut self, rule: RuleMatch) -> Self {
+        self.once_only = true;
+        self.ask_rule = Some(rule);
+        self
+    }
+
+    /// `Asked by the shell rule "git push *": reason` for an approval
+    /// surface, when a rule caused this ask.
+    pub fn ask_rule_note(&self) -> Option<String> {
+        self.ask_rule.as_ref().map(RuleMatch::ask_note)
     }
 
     /// Whether an approval surface may offer a session or project grant for
@@ -286,6 +307,18 @@ impl PermissionRequestBatch {
             operation,
             requests,
         }
+    }
+
+    /// The distinct rules whose asks this batch carries, in request order
+    /// (one `tools` rule often asks for every request of an operation).
+    pub fn ask_rules(&self) -> Vec<&RuleMatch> {
+        let mut rules: Vec<&RuleMatch> = Vec::new();
+        for rule in self.requests.iter().filter_map(|r| r.ask_rule.as_ref()) {
+            if !rules.contains(&rule) {
+                rules.push(rule);
+            }
+        }
+        rules
     }
 
     pub fn operation(&self) -> &str {

@@ -162,6 +162,9 @@ fn a_catch_all_deny_with_allow_carve_outs_allows_only_listed_commands() {
         ("$CARGO build", deny),
         ("cargo build 'unterminated", deny),
         ("ls", deny),
+        ("export PATH=./bin:$PATH && cargo build", deny),
+        ("> out.txt", deny),
+        ("cargo build && > Cargo.lock", deny),
     ] {
         assert_eq!(ruled(&gate, &shell(command)), expected, "{command}");
     }
@@ -192,11 +195,19 @@ fn last_match_wins_within_a_layer_and_layers_and_surfaces_take_the_strictest() {
         ruled(&single, &shell("kubectl delete pod web")),
         (ApprovalMode::AlwaysDeny, Some((0, RuleState::Deny)))
     );
-    // The `tools` allow covers a command no shell rule names.
+    // The `tools` allow covers a command no shell rule names, but not one
+    // Euler cannot resolve (section 3).
     assert_eq!(
         ruled(&single, &shell("make")),
         (ApprovalMode::SessionAllow, Some((0, RuleState::Allow)))
     );
+    for unresolved in ["cat \"$file\"", "echo $HOME"] {
+        assert_eq!(
+            ruled(&single, &shell(unresolved)),
+            (ApprovalMode::Ask, None),
+            "{unresolved}"
+        );
+    }
 
     profile.fields.rules.push(RuleLayer {
         layer: RuleLayerLabel::Overlay,
@@ -469,6 +480,66 @@ fn an_ask_rule_prompts_for_a_statically_safe_command_and_installs_no_grant() {
     }
 }
 
+/// Resolved question 6: a grant never settles a rule-caused ask. With an
+/// unscoped session grant (which also sets the mode to `session-allow`) or
+/// a `git` scoped one, `git init` rides the grant, but `git push` still
+/// prompts once-only, and the prompt names the rule and its reason
+/// (section 1).
+#[test]
+fn a_grant_never_settles_a_rule_caused_ask() {
+    use crate::grants::{GrantScope, ScopePattern};
+    for scope in [
+        ScopePattern::unscoped(),
+        ScopePattern::new("git").expect("scope"),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut push = rule("git push *", RuleState::Ask);
+        push.reason = Some("Pushes need review.".to_owned());
+        let mut session = ruled_session(
+            temp.path(),
+            preset_with("locked", shell_rules(vec![push])),
+            vec![
+                shell_call("call-init", "git init -q"),
+                shell_call("call-push", "git push origin main"),
+            ],
+            vec![DeciderVerdict::Deny],
+        );
+        let unscoped = scope.is_unscoped();
+        session
+            .permissions
+            .install_grant(Capability::ShellExec, GrantScope::Session(scope))
+            .expect("grant");
+        session.run_turn("push").expect("turn");
+
+        let label = if unscoped { "unscoped" } else { "git" };
+        let events = session.events();
+        let prompts = of_kind(events, EventKind::PERMISSION_PROMPT);
+        assert_eq!(prompts.len(), 1, "{label}: only the push prompts");
+        assert_eq!(prompts[0].payload["reason"], json!("tool run_shell"));
+        assert_eq!(
+            prompts[0].payload["rule"],
+            json!({"surface": "shell", "index": 0, "pattern": "git push *", "state": "ask", "layer": "profile"}),
+            "{label}"
+        );
+        // `git init` rode the grant (or the mode it set) unasked.
+        let ruled = of_kind(events, EventKind::PERMISSION_DECISION)
+            .into_iter()
+            .filter(|decision| decision.payload.get("rule").is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(ruled.len(), 1, "{label}");
+        assert_eq!(ruled[0].payload["allowed"], json!(false), "{label}");
+        assert_eq!(ruled[0].parent.as_deref(), Some(prompts[0].id.as_str()));
+        let seen = &session.permissions.decider_mut().seen;
+        assert_eq!(seen.len(), 1, "{label}");
+        assert!(seen[0].once_only, "{label}");
+        assert_eq!(
+            seen[0].ask_rule_note().as_deref(),
+            Some("Asked by the shell rule \"git push *\": Pushes need review."),
+            "{label}"
+        );
+    }
+}
+
 /// Sections 2 and 4: a `deny` rule refuses one request without asking,
 /// names the rule and its reason, and does not deny the capability for the
 /// rest of the turn, so the next command is decided again and runs.
@@ -721,9 +792,12 @@ fn extension_operations_take_the_strictest_rule_state_of_their_requests() {
         vec![DeciderVerdict::AllowSession],
     );
     outcome.expect("allowed once");
+    let prompts = of_kind(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(prompts.len(), 1);
+    // One rule asked for both requests: the prompt names it once.
     assert_eq!(
-        of_kind(session.events(), EventKind::PERMISSION_PROMPT).len(),
-        1
+        prompts[0].payload["rules"],
+        json!([{"surface": "tools", "index": 0, "pattern": "ext.*", "state": "ask", "layer": "profile"}])
     );
     let decisions = of_kind(session.events(), EventKind::PERMISSION_DECISION);
     assert_eq!(decisions.len(), 2);
@@ -766,4 +840,121 @@ fn extension_operations_take_the_strictest_rule_state_of_their_requests() {
         session.permissions.mode(Capability::ExtensionState),
         ApprovalMode::SessionAllow
     );
+}
+
+/// Resolved question 6 on the extension route: a grant that covers the
+/// operation's request never settles a rule-caused ask, and the batch
+/// prompt names the rule.
+#[test]
+fn a_grant_never_settles_an_extension_rule_ask() {
+    use crate::grants::{GrantScope, ScopePattern};
+    let temp = tempfile::tempdir().expect("temp");
+    let mut session = ruled_session(
+        temp.path(),
+        preset_with("locked", tools_rules(vec![rule("ext.*", RuleState::Ask)])),
+        Vec::new(),
+        vec![DeciderVerdict::Deny],
+    );
+    session
+        .permissions
+        .install_grant(
+            Capability::ShellExec,
+            GrantScope::Session(ScopePattern::unscoped()),
+        )
+        .expect("grant");
+    session.set_permission_mode(Capability::ShellExec, ApprovalMode::Ask);
+    let outcome = session.approve_extension_capabilities_cancellable(
+        "ext",
+        "run",
+        &[Capability::ShellExec],
+        Some("printf ok"),
+        &CancellationToken::new(),
+    );
+    assert!(
+        matches!(
+            outcome,
+            Err(ExtensionExecutionError::CapabilityDenied { .. })
+        ),
+        "{outcome:?}"
+    );
+    let prompts = of_kind(session.events(), EventKind::PERMISSION_PROMPT);
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].payload["rules"][0]["pattern"], json!("ext.*"));
+    let seen = &session.permissions.decider_mut().seen;
+    assert!(seen[0].once_only);
+    assert!(seen[0].ask_rule.is_some());
+}
+
+/// Section 3 "Routes": an `allow` rule's decision for one request of an
+/// extension operation is recorded only when the operation goes ahead,
+/// after the person allows its other requests, with the operation fields
+/// the batch decisions carry.
+#[test]
+fn an_extension_allow_rule_is_recorded_only_when_the_operation_runs() {
+    for verdict in [DeciderVerdict::Deny, DeciderVerdict::Allow] {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut session = ruled_session(
+            temp.path(),
+            preset_with(
+                "locked",
+                shell_rules(vec![rule("printf *", RuleState::Allow)]),
+            ),
+            Vec::new(),
+            vec![verdict.clone()],
+        );
+        let outcome = session.approve_extension_capabilities_cancellable(
+            "ext",
+            "run",
+            &[Capability::FsWrite, Capability::ShellExec],
+            Some("printf ok"),
+            &CancellationToken::new(),
+        );
+        let ruled = of_kind(session.events(), EventKind::PERMISSION_DECISION)
+            .into_iter()
+            .filter(|decision| decision.payload.get("rule").is_some())
+            .collect::<Vec<_>>();
+        if verdict == DeciderVerdict::Deny {
+            assert!(outcome.is_err(), "{outcome:?}");
+            assert!(ruled.is_empty(), "{ruled:?}");
+            continue;
+        }
+        outcome.expect("allowed");
+        assert_eq!(ruled.len(), 1);
+        let decision = &ruled[0].payload;
+        assert_eq!(decision["capability"], json!("shell-exec"));
+        assert_eq!(decision["allowed"], json!(true));
+        assert_eq!(decision["decision_source"], json!("rule"));
+        assert_eq!(decision["operation"], json!("extension ext.run"));
+        assert_eq!(decision["extension_id"], json!("ext"));
+        assert_eq!(decision["command"], json!("run"));
+    }
+}
+
+/// An `apply_patch` heredoc sent through `run_shell` is run by core as
+/// `apply_patch`, so a `tools` rule naming `apply_patch` covers it.
+#[test]
+fn a_tools_rule_on_apply_patch_covers_the_shell_heredoc_form() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut session = ruled_session(
+        temp.path(),
+        preset_with(
+            "full",
+            tools_rules(vec![rule("apply_patch", RuleState::Deny)]),
+        ),
+        vec![shell_call(
+            "call-patch",
+            "apply_patch <<'PATCH'\n*** Begin Patch\n*** Add File: note.txt\n+hi\n*** End Patch\nPATCH",
+        )],
+        Vec::new(),
+    );
+    session.run_turn("patch").expect("turn");
+    let events = session.events();
+    let error = result_for(events, "call-patch").payload["error"]
+        .as_str()
+        .expect("error")
+        .to_owned();
+    assert!(error.contains("the tools rule \"apply_patch\""), "{error}");
+    let decision = &of_kind(events, EventKind::PERMISSION_DECISION)[0].payload;
+    assert_eq!(decision["tool"], json!("apply_patch"));
+    assert!(!temp.path().join("note.txt").exists());
 }

@@ -384,6 +384,28 @@ impl RuleMatch {
         self.rule.state
     }
 
+    /// `the shell rule "git push *": reason`, for a tool error or a prompt
+    /// (ADR 0027 section 1: the reason is shown with a denial or a prompt).
+    pub fn describe(&self) -> String {
+        let reason = self
+            .rule
+            .reason
+            .as_deref()
+            .map(|reason| format!(": {reason}"))
+            .unwrap_or_default();
+        format!(
+            "the {} rule \"{}\"{reason}",
+            self.surface.as_str(),
+            self.rule.pattern
+        )
+    }
+
+    /// `Asked by the shell rule "git push *": reason`, the line an approval
+    /// surface shows for this rule's ask.
+    pub fn ask_note(&self) -> String {
+        format!("Asked by {}", self.describe())
+    }
+
     /// The `rule` object of a `permission.decision` (ADR 0027 section 9).
     pub fn record(&self) -> Value {
         json!({
@@ -408,11 +430,14 @@ pub fn rule_match(
     segments: Option<&[RuleSegment]>,
     tool: Option<&str>,
 ) -> Option<RuleMatch> {
+    // An `allow` never applies to a command Euler cannot resolve, on the
+    // `tools` surface either (section 3).
+    let unresolved = segments.is_some_and(|segments| segments.iter().any(|s| !s.resolved));
     let mut found: Option<RuleMatch> = None;
     for layer in layers {
         let shell = segments.and_then(|segments| shell_match(layer, segments));
         let tools = tool.and_then(|tool| {
-            last_match(&layer.rules.tools, false, |pattern| {
+            last_match(&layer.rules.tools, unresolved, |pattern| {
                 glob_matches(pattern, tool)
             })
             .map(|index| RuleMatch {

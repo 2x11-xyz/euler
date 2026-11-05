@@ -452,8 +452,11 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 let decided = (&request, rule, mode == ApprovalMode::SessionAllow);
                 return self.run_rule_decided_call(call, tool_call_event_id, decided, cancellation);
             }
-            // A rule-caused ask is once-only (ADR 0027 resolved question 6).
-            request.once_only |= ruling.rule_ask();
+            // A rule-caused ask is once-only and names its rule (ADR 0027
+            // resolved question 6).
+            if let Some(rule) = ruling.rule.as_ref().filter(|_| ruling.rule_ask()) {
+                request = request.with_ask_rule(rule.clone());
+            }
             let needs_prompt = mode == ApprovalMode::Ask && !self.permissions.is_granted(&request);
             let prompt_id = if needs_prompt {
                 Some(
