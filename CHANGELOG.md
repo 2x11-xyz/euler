@@ -6,6 +6,24 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: `tools` rules are checked against installed extensions
+
+- **New**: a `tools` rule pattern without `.` that names an installed
+  extension's model tool (such as `code_swarm_review`) instead of a core
+  tool is a startup error that names the `<extension-id>.<command>` form to
+  write (`code-swarm.review`), in `profiles.json` and the project overlay
+  alike (ADR 0027 section 8, rollout step 4). Before, the error only listed
+  the core tools.
+- **New**: a `tools` rule naming an extension id that is not installed
+  (such as `code_swarm.*` for `code-swarm`) prints a startup notice naming
+  the rule and listing the installed extension ids. The rule is kept and
+  the session runs, so a shared profile can deny an extension some machines
+  never install. No new prompts or blocks.
+- Project overlay rules and child agent rule layers (ADR 0027 sections 6
+  and 7) are covered end to end: an overlay `deny` refuses a command and
+  records the `overlay` layer, and a child under a named `defaults.subagent`
+  profile runs under the session's layers plus its own `subagent` layer.
+
 ### Execution profiles: `path` and `outside_workspace` permission rules are enforced
 
 - **New**: profiles may now use `path` and `outside_workspace` rules (ADR

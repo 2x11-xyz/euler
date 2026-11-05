@@ -3,11 +3,12 @@
 
 use anyhow::{Context as _, Result};
 use euler_core::execution_profile::{
-    write_interactive_default, ApprovalsSetting, Preset, SandboxSetting, PROJECT_OVERLAY_PATH,
+    write_interactive_default, ApprovalsSetting, InstalledExtensions, Preset, SandboxSetting,
+    PROJECT_OVERLAY_PATH,
 };
 use euler_core::{
-    recorded_execution_profile, EulerHome, ExecutionProfile, PermissionReviewer, ProfileContext,
-    ProfilesConfig, ProjectOverlay, ResumeProfile, SessionConfig,
+    recorded_execution_profile, EulerHome, ExecutionProfile, ExtensionRegistry, PermissionReviewer,
+    ProfileContext, ProfilesConfig, ProjectOverlay, ResumeProfile, SessionConfig,
 };
 use euler_event::EventEnvelope;
 use std::io::{IsTerminal as _, Write as _};
@@ -42,10 +43,15 @@ impl LaunchProfile {
 /// overlay. A malformed file or an unavailable profile is a startup error.
 /// Prints the startup summary to stderr.
 pub(crate) fn launch_profile(request: ProfileRequest<'_>, root: &Path) -> Result<LaunchProfile> {
-    let (profiles, overlay, mut notices) = load_profile_sources(root)?;
+    let (profiles, overlay, installed, mut notices) = load_profile_sources(root)?;
     let mut profile = profiles.resolve(request.profile, request.context, overlay.as_ref())?;
     let subagent = resolve_subagent(&profiles, overlay.as_ref())?;
     notices.extend(overlay_notice(overlay.as_ref(), &profile));
+    notices.extend(missing_extension_notices(
+        &installed,
+        &profile,
+        subagent.as_ref(),
+    ));
     print_notices(&notices);
     if let Some(reviewer) = request.reviewer {
         profile.fields.reviewer = reviewer;
@@ -61,6 +67,7 @@ pub(crate) struct ResolvedResumeProfile {
     resolved: ExecutionProfile,
     subagent: Option<ExecutionProfile>,
     overlay: Option<ProjectOverlay>,
+    installed: InstalledExtensions,
     notices: Vec<String>,
     explicit: bool,
     reviewer: Option<PermissionReviewer>,
@@ -72,13 +79,14 @@ pub(crate) fn resolve_resume_profile(
     request: ProfileRequest<'_>,
     root: &Path,
 ) -> Result<ResolvedResumeProfile> {
-    let (profiles, overlay, notices) = load_profile_sources(root)?;
-    resolve_resume_profile_from(&profiles, overlay, notices, request)
+    let (profiles, overlay, installed, notices) = load_profile_sources(root)?;
+    resolve_resume_profile_from(&profiles, overlay, installed, notices, request)
 }
 
 fn resolve_resume_profile_from(
     profiles: &ProfilesConfig,
     overlay: Option<ProjectOverlay>,
+    installed: InstalledExtensions,
     notices: Vec<String>,
     request: ProfileRequest<'_>,
 ) -> Result<ResolvedResumeProfile> {
@@ -88,6 +96,7 @@ fn resolve_resume_profile_from(
         resolved,
         subagent,
         overlay,
+        installed,
         notices,
         explicit: request.profile.is_some(),
         reviewer: request.reviewer,
@@ -108,6 +117,7 @@ impl ResolvedResumeProfile {
             resolved,
             subagent,
             overlay,
+            installed,
             mut notices,
             explicit,
             reviewer,
@@ -124,6 +134,11 @@ impl ResolvedResumeProfile {
             choice.profile.fields.reviewer = reviewer;
         }
         notices.extend(overlay_notice(overlay.as_ref(), &choice.profile));
+        notices.extend(missing_extension_notices(
+            &installed,
+            &choice.profile,
+            subagent.as_ref(),
+        ));
         notices.extend(choice.summary());
         config.set_execution_profile(choice.profile);
         config.subagent_profile = subagent;
@@ -144,9 +159,11 @@ pub(crate) fn install_in_app_resume_profile(
         reviewer: None,
         context: ProfileContext::Interactive,
     };
-    let profiles = ProfilesConfig::load(&home.profiles_path())?;
-    let overlay = ProjectOverlay::load(&config.root)?;
-    resolve_resume_profile_from(&profiles, overlay, Vec::new(), request)?.install(config, events)
+    let installed = installed_extensions(home)?;
+    let profiles = ProfilesConfig::load(&home.profiles_path(), &installed)?;
+    let overlay = ProjectOverlay::load(&config.root, &installed)?;
+    resolve_resume_profile_from(&profiles, overlay, installed, Vec::new(), request)?
+        .install(config, events)
 }
 
 /// The user's `profiles.json` when an interactive launch names no
@@ -171,7 +188,8 @@ pub(crate) fn prompt_first_run_profile_on_terminal(request: ProfileRequest<'_>) 
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Ok(());
     }
-    if ProfilesConfig::load(&file)?.has_interactive_default() {
+    if ProfilesConfig::load(&file, &installed_extensions_in_user_home()?)?.has_interactive_default()
+    {
         return Ok(());
     }
     let choice = prompt_first_run_profile(&file)?;
@@ -251,9 +269,10 @@ impl ProfileSources {
     /// Read `file` as the user's `profiles.json`, with the overlay under
     /// `root`.
     pub(crate) fn load_file(file: PathBuf, root: &Path) -> Result<Self> {
+        let installed = installed_extensions_in_user_home()?;
         Ok(Self {
-            profiles: ProfilesConfig::load(&file)?,
-            overlay: ProjectOverlay::load(root)?,
+            profiles: ProfilesConfig::load(&file, &installed)?,
+            overlay: ProjectOverlay::load(root, &installed)?,
             file,
         })
     }
@@ -319,20 +338,67 @@ fn resolve_subagent(
         .context("defaults.subagent in profiles.json cannot be applied to child agents")
 }
 
-fn load_profile_sources(
-    root: &Path,
-) -> Result<(ProfilesConfig, Option<ProjectOverlay>, Vec<String>)> {
+type ProfileSourcesAtStartup = (
+    ProfilesConfig,
+    Option<ProjectOverlay>,
+    InstalledExtensions,
+    Vec<String>,
+);
+
+fn load_profile_sources(root: &Path) -> Result<ProfileSourcesAtStartup> {
     let mut notices = Vec::new();
-    let profiles = match EulerHome::resolve() {
-        Ok(home) => ProfilesConfig::load(&home.profiles_path())?,
+    let (profiles, installed) = match EulerHome::resolve() {
+        Ok(home) => {
+            let installed = installed_extensions(&home)?;
+            (
+                ProfilesConfig::load(&home.profiles_path(), &installed)?,
+                installed,
+            )
+        }
         Err(error) => {
             notices.push(format!(
                 "warning: no profiles.json read, using built-in profiles: {error}"
             ));
-            ProfilesConfig::default()
+            (ProfilesConfig::default(), InstalledExtensions::default())
         }
     };
-    Ok((profiles, ProjectOverlay::load(root)?, notices))
+    let overlay = ProjectOverlay::load(root, &installed)?;
+    Ok((profiles, overlay, installed, notices))
+}
+
+/// The extensions installed in `home`, which `tools` rules are checked
+/// against (ADR 0027 section 8).
+fn installed_extensions(home: &EulerHome) -> Result<InstalledExtensions> {
+    let linked = ExtensionRegistry::open_read_only(home.clone()).linked_extensions()?;
+    Ok(InstalledExtensions::from_linked(&linked))
+}
+
+/// [`installed_extensions`] in the user's Euler home; none when it does not
+/// resolve.
+fn installed_extensions_in_user_home() -> Result<InstalledExtensions> {
+    match EulerHome::resolve() {
+        Ok(home) => installed_extensions(&home),
+        Err(_) => Ok(InstalledExtensions::default()),
+    }
+}
+
+/// The startup notices for `tools` rules naming an extension that is not
+/// installed, in the session's profile and in `defaults.subagent`, each once:
+/// both resolve with the same overlay, so its notices are identical lines.
+fn missing_extension_notices(
+    installed: &InstalledExtensions,
+    profile: &ExecutionProfile,
+    subagent: Option<&ExecutionProfile>,
+) -> Vec<String> {
+    let mut notices = profile.missing_extension_notices(installed);
+    for notice in subagent.map_or_else(Vec::new, |subagent| {
+        subagent.missing_extension_notices(installed)
+    }) {
+        if !notices.contains(&notice) {
+            notices.push(notice);
+        }
+    }
+    notices
 }
 
 #[cfg(test)]

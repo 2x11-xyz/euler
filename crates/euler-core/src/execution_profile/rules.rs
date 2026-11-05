@@ -5,6 +5,7 @@
 
 use crate::command_safety::{PathTarget, RuleSegment};
 use crate::tools::CORE_TOOL_NAMES;
+use euler_sdk::LinkedExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Component, Path};
@@ -84,11 +85,99 @@ pub struct RuleLayer {
     pub rules: ProfileRules,
 }
 
+/// The extensions installed in the Euler home, as `tools` rules are checked
+/// against them (ADR 0027 section 8): each extension's id, and the
+/// `<extension-id>.<command>` behind each model-visible tool name its
+/// commands declare. Installed counts enabled and disabled extensions alike.
+#[derive(Clone, Debug, Default)]
+pub struct InstalledExtensions {
+    ids: Vec<String>,
+    /// `(model-visible tool name, "<extension-id>.<command>")`.
+    model_tools: Vec<(String, String)>,
+}
+
+impl InstalledExtensions {
+    pub fn from_linked(linked: &[LinkedExtension]) -> Self {
+        let mut installed = Self::default();
+        for extension in linked {
+            installed.ids.push(extension.id.clone());
+            for command in &extension.descriptor.commands {
+                if let Some(tool) = &command.model_tool {
+                    installed.model_tools.push((
+                        tool.name.clone(),
+                        format!("{}.{}", extension.id, command.name),
+                    ));
+                }
+            }
+        }
+        installed.ids.sort();
+        installed
+            .model_tools
+            .sort_by(|left, right| left.1.cmp(&right.1));
+        installed
+    }
+
+    /// The `<extension-id>.<command>` of every installed model tool whose
+    /// name `pattern` matches.
+    fn commands_for_model_tools(&self, pattern: &str) -> Vec<&str> {
+        self.model_tools
+            .iter()
+            .filter(|(tool, _)| glob_matches(pattern, tool))
+            .map(|(_, command)| command.as_str())
+            .collect()
+    }
+
+    /// A startup notice for each `tools` rule in `layers` whose literal
+    /// extension id names no installed extension (ADR 0027 resolved question
+    /// 19). The rule is kept, since a shared profile may deny an extension
+    /// this machine never installs. `profile` names the profile the layers
+    /// belong to. A pattern whose id has a `*` names no literal id.
+    pub(super) fn missing_extension_notices(
+        &self,
+        profile: &str,
+        layers: &[RuleLayer],
+    ) -> Vec<String> {
+        let installed = if self.ids.is_empty() {
+            "no extensions are installed".to_owned()
+        } else {
+            format!("installed extensions: {}", self.ids.join(", "))
+        };
+        let mut notices = Vec::new();
+        for layer in layers {
+            let source = match layer.layer {
+                RuleLayerLabel::Overlay => super::config::PROJECT_OVERLAY_PATH.to_owned(),
+                RuleLayerLabel::Profile | RuleLayerLabel::Subagent => {
+                    format!("profile \"{profile}\"")
+                }
+            };
+            for (index, rule) in layer.rules.tools.iter().enumerate() {
+                let Some((id, _)) = rule.pattern.split_once('.') else {
+                    continue;
+                };
+                if id.contains('*') || self.ids.iter().any(|installed| installed == id) {
+                    continue;
+                }
+                notices.push(format!(
+                    "notice: {source} rules.tools[{index}] \"{}\" names extension \"{id}\", which \
+                     is not installed, so the rule matches nothing until it is; {installed}",
+                    rule.pattern
+                ));
+            }
+        }
+        notices
+    }
+}
+
 impl ProfileRules {
     /// Parse and validate a `rules` value. An empty object or one whose
     /// surfaces are all empty is unset (`None`), so the digest and the
-    /// summaries see one value for "no rules".
-    pub(super) fn parse(value: &Value) -> Result<Option<Self>, String> {
+    /// summaries see one value for "no rules". `installed` names the
+    /// extension command behind a `tools` pattern that is an extension's
+    /// model-visible tool name.
+    pub(super) fn parse(
+        value: &Value,
+        installed: &InstalledExtensions,
+    ) -> Result<Option<Self>, String> {
         let Value::Object(surfaces) = value else {
             return Err(format!("rules: expected an object with {SURFACES}"));
         };
@@ -115,7 +204,7 @@ impl ProfileRules {
                 ));
             }
             for (index, rule) in list.iter().enumerate() {
-                let rule = parse_rule(surface, rule)
+                let rule = parse_rule(surface, rule, installed)
                     .map_err(|message| format!("rules.{surface}[{index}]: {message}"))?;
                 slot.push(rule);
             }
@@ -165,7 +254,11 @@ impl ProfileRules {
     }
 }
 
-fn parse_rule(surface: &str, value: &Value) -> Result<PermissionRule, String> {
+fn parse_rule(
+    surface: &str,
+    value: &Value,
+    installed: &InstalledExtensions,
+) -> Result<PermissionRule, String> {
     let rule = PermissionRule::deserialize(value).map_err(|error| error.to_string())?;
     let directional = matches!(surface, "path" | "outside_workspace");
     if rule.access.is_some() && !directional {
@@ -194,7 +287,7 @@ fn parse_rule(surface: &str, value: &Value) -> Result<PermissionRule, String> {
     match surface {
         "path" => check_path_pattern(pattern),
         "outside_workspace" => check_outside_workspace_pattern(pattern),
-        "tools" => check_tools_pattern(pattern),
+        "tools" => check_tools_pattern(pattern, installed),
         _ => Ok(()),
     }?;
     Ok(rule)
@@ -251,8 +344,10 @@ fn check_outside_workspace_pattern(pattern: &str) -> Result<(), String> {
 
 /// A `tools` pattern: a core tool name, or `<extension-id>.<command>`, with
 /// `*` matching any run of characters. A core pattern must match a core
-/// tool, so a typo is an error rather than a rule that never applies.
-fn check_tools_pattern(pattern: &str) -> Result<(), String> {
+/// tool, so a typo is an error rather than a rule that never applies; when
+/// it is an installed extension's model-visible tool name instead, the error
+/// names the `<extension-id>.<command>` form to write.
+fn check_tools_pattern(pattern: &str, installed: &InstalledExtensions) -> Result<(), String> {
     if let Some((extension, command)) = pattern.split_once('.') {
         if extension.is_empty() || command.is_empty() {
             return Err(format!(
@@ -266,6 +361,22 @@ fn check_tools_pattern(pattern: &str) -> Result<(), String> {
         .any(|name| glob_matches(pattern, name))
     {
         return Ok(());
+    }
+    match installed.commands_for_model_tools(pattern).as_slice() {
+        [] => {}
+        [command] => {
+            return Err(format!(
+                "tools pattern \"{pattern}\" matches no core tool; it is the model tool of \
+                 extension command {command}, so write \"{command}\""
+            ))
+        }
+        commands => {
+            return Err(format!(
+                "tools pattern \"{pattern}\" matches no core tool; it matches the model tools of \
+                 extension commands \"{}\", so name each as <extension-id>.<command>",
+                commands.join("\", \"")
+            ))
+        }
     }
     Err(format!(
         "tools pattern \"{pattern}\" matches no core tool ({}); name an extension command as \
