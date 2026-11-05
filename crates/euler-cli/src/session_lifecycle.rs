@@ -164,7 +164,13 @@ fn stored_credential_values(auth_file: Option<&std::path::Path>) -> Vec<String> 
     for provider in storage.list() {
         match storage.get(&provider) {
             Some(euler_core::auth_storage::Credential::ApiKey { key }) => {
-                values.push(key.expose_secret().to_owned());
+                let stored = key.expose_secret();
+                // `euler login` stores a key starting with `$` or `!` behind a
+                // `$` escape; the literal the provider sends is the rest.
+                if stored.starts_with("$$") || stored.starts_with("$!") {
+                    values.push(stored[1..].to_owned());
+                }
+                values.push(stored.to_owned());
             }
             Some(euler_core::auth_storage::Credential::OAuth {
                 access, refresh, ..
@@ -300,4 +306,42 @@ pub(crate) fn apply_catalog_context_limit(
     };
     config.context_limit =
         ContextLimitConfig::from_catalog_model(limit_tokens, model.auto_compact_token_limit());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stored_credential_values;
+    use euler_core::auth_storage::{AuthStorage, Credential, SecretString};
+
+    #[test]
+    fn stored_credential_values_include_the_literal_behind_a_login_escape() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("auth.json");
+        let mut storage = AuthStorage::new(&path).expect("storage");
+        for (provider, key) in [
+            ("gw", "$!bang-key"),
+            ("other", "$$dollar-key"),
+            ("reference", "$GW_REFERENCE"),
+        ] {
+            storage
+                .set(
+                    provider,
+                    Credential::ApiKey {
+                        key: SecretString::new(key),
+                    },
+                )
+                .expect("set");
+        }
+
+        let values = stored_credential_values(Some(&path));
+
+        for expected in ["!bang-key", "$!bang-key", "$dollar-key", "$$dollar-key"] {
+            assert!(values.iter().any(|value| value == expected), "{values:?}");
+        }
+        // An environment reference is not an escape, so only the stored text is seeded.
+        assert!(
+            !values.iter().any(|value| value == "GW_REFERENCE"),
+            "{values:?}"
+        );
+    }
 }

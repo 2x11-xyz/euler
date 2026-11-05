@@ -2,7 +2,7 @@ use super::args::{
     ensure_no_extensions, ensure_no_provider_options, linefeed_history_flag_label, RawArgs,
 };
 use super::model_resolution::{
-    default_model_for_provider, raw_known_provider_id, resolve_live_options,
+    default_model_for_provider, raw_auth_provider_id, resolve_live_options,
 };
 use super::permission::EnvArgs;
 use super::providers::{
@@ -491,7 +491,7 @@ fn build_login_args(parsed: &RawArgs) -> Result<LoginArgs> {
     ensure_no_provider_options(parsed, "login")?;
     ensure_no_extensions(parsed, "login")?;
     if !parsed.provider_from_cli {
-        return Err(anyhow!("login requires explicit --provider chatgpt"));
+        return Err(anyhow!("login requires explicit --provider <id>"));
     }
     if parsed.model_from_cli {
         return Err(anyhow!("--model is not supported with login"));
@@ -499,14 +499,14 @@ fn build_login_args(parsed: &RawArgs) -> Result<LoginArgs> {
     if parsed.provenance_from_cli {
         return Err(anyhow!("--provenance is not supported with login"));
     }
-    login_args_for_provider(raw_known_provider_id(parsed)?, parsed.auth_file_from_cli)
+    login_args_for_provider(raw_auth_provider_id(parsed)?, parsed.auth_file_from_cli)
 }
 
 fn build_logout_args(parsed: &RawArgs) -> Result<LogoutArgs> {
     ensure_no_provider_options(parsed, "logout")?;
     ensure_no_extensions(parsed, "logout")?;
     if !parsed.provider_from_cli {
-        return Err(anyhow!("logout requires explicit --provider chatgpt"));
+        return Err(anyhow!("logout requires explicit --provider <id>"));
     }
     if parsed.model_from_cli {
         return Err(anyhow!("--model is not supported with logout"));
@@ -514,7 +514,7 @@ fn build_logout_args(parsed: &RawArgs) -> Result<LogoutArgs> {
     if parsed.provenance_from_cli {
         return Err(anyhow!("--provenance is not supported with logout"));
     }
-    logout_args_for_provider(raw_known_provider_id(parsed)?, parsed.auth_file_from_cli)
+    logout_args_for_provider(raw_auth_provider_id(parsed)?, parsed.auth_file_from_cli)
 }
 
 fn build_auth_status_args(parsed: &RawArgs) -> Result<()> {

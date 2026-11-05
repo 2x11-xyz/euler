@@ -24,7 +24,15 @@ pub struct CustomOpenAiProvider {
     /// clones; interior mutability because installation happens after the
     /// provider is boxed into a `ProviderSet`.
     secret_sink: Arc<Mutex<Option<ResolvedSecretSink>>>,
+    /// The key `euler login --provider <id>` stored, used when the entry sets
+    /// `auth_header: true` and no `api_key`.
+    stored_api_key: Option<StoredApiKeyLookup>,
 }
+
+/// Reads the stored API key for a custom provider id, or `None` when no key
+/// is stored. Called at request time, so a key stored after launch is used.
+pub type StoredApiKeyLookup =
+    Arc<dyn Fn(&str) -> Result<Option<SecretString>, ProviderError> + Send + Sync>;
 
 impl CustomOpenAiProvider {
     pub fn from_config(config: CustomProviderConfig) -> Result<Self, ProviderError> {
@@ -34,6 +42,33 @@ impl CustomOpenAiProvider {
             config,
             label,
             secret_sink: Arc::new(Mutex::new(None)),
+            stored_api_key: None,
+        })
+    }
+
+    pub fn with_stored_api_key(mut self, lookup: StoredApiKeyLookup) -> Self {
+        self.stored_api_key = Some(lookup);
+        self
+    }
+
+    /// The `api_key` spec when the entry sets one, otherwise the stored key.
+    fn resolve_api_key(&self) -> Result<SecretString, ProviderError> {
+        if let Some(api_key) = self.config.api_key.as_deref() {
+            return resolve_secret_spec(api_key, &self.config.id, "api_key");
+        }
+        self.stored_key()
+    }
+
+    fn stored_key(&self) -> Result<SecretString, ProviderError> {
+        let stored = match &self.stored_api_key {
+            Some(lookup) => lookup(&self.config.id)?,
+            None => None,
+        };
+        stored.ok_or_else(|| {
+            ProviderError::auth(format!(
+                "{} has no api_key and no stored key; run `euler login --provider {}`",
+                self.label, self.config.id
+            ))
         })
     }
 
@@ -66,10 +101,12 @@ impl ModelProvider for CustomOpenAiProvider {
 
     fn validate_auth(&self) -> Result<(), ProviderError> {
         if self.config.auth_header {
-            let api_key = self.config.api_key.as_deref().ok_or_else(|| {
-                ProviderError::auth(format!("{} api_key is required", self.label))
-            })?;
-            validate_secret_spec(api_key, &self.config.id, "api_key")?;
+            match self.config.api_key.as_deref() {
+                Some(api_key) => validate_secret_spec(api_key, &self.config.id, "api_key")?,
+                None => {
+                    self.stored_key()?;
+                }
+            }
         }
         for (name, value) in &self.config.headers {
             validate_secret_spec(value, &self.config.id, &format!("headers.{name}"))?;
@@ -266,10 +303,7 @@ impl CustomOpenAiProvider {
         let mut headers = BTreeMap::new();
         let mut secrets = Vec::new();
         if self.config.auth_header {
-            let api_key = self.config.api_key.as_deref().ok_or_else(|| {
-                ProviderError::auth(format!("{} api_key is required", self.label))
-            })?;
-            let api_key = resolve_secret_spec(api_key, &self.config.id, "api_key")?;
+            let api_key = self.resolve_api_key()?;
             // Secret-taint at resolution time: the host registers the value
             // for redaction before the request that carries it is even sent.
             self.report_resolved_secret(&api_key);

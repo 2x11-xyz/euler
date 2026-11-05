@@ -66,8 +66,16 @@ fn subcommand_help(name: &str) -> Option<String> {
         "run" => Some(run_help()),
         "tui" => Some(tui_help()),
         "exec" => Some(exec_help()),
-        "login" => Some(credential_help("Sign in and store", "login")),
-        "logout" => Some(credential_help("Remove stored", "logout")),
+        "login" => Some(credential_help(
+            "Sign in and store",
+            "login",
+            "chatgpt, or a providers.json provider with\n                             auth_header: true and no api_key",
+        )),
+        "logout" => Some(credential_help(
+            "Remove stored",
+            "logout",
+            "chatgpt, or a custom provider id",
+        )),
         "auth" => Some(AUTH_HELP.to_owned()),
         "models" => Some(MODELS_HELP.to_owned()),
         "extension" => Some(EXTENSION_HELP.to_owned()),
@@ -90,8 +98,8 @@ Subcommands:
   run             Line-oriented interactive session
   tui             Full-screen terminal UI session
   exec            Run one non-interactive turn and print the transcript
-  login           Store provider credentials (--provider chatgpt)
-  logout          Remove stored provider credentials (--provider chatgpt)
+  login           Store provider credentials (--provider <id>)
+  logout          Remove stored provider credentials (--provider <id>)
   auth status     Show stored credential status
   models          List the offline catalog; `models refresh` checks GitHub
   extension       Manage and run extensions
@@ -184,14 +192,14 @@ Options:
     )
 }
 
-fn credential_help(action: &str, verb: &str) -> String {
+fn credential_help(action: &str, verb: &str, providers: &str) -> String {
     format!(
         "{action} provider credentials.
 
-Usage: euler {verb} --provider chatgpt
+Usage: euler {verb} --provider <id>
 
 Options:
-  --provider chatgpt         Only the chatgpt provider supports {verb}
+  --provider <id>            {providers}
 {HELP_LINE}"
     )
 }

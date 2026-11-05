@@ -50,7 +50,20 @@ euler auth status
 
 Local models and other OpenAI-compatible endpoints can be wired as custom
 providers via `~/.euler/providers.json` — see the
-[headless guide](headless.md).
+[headless guide](headless.md). For a custom provider that sets
+`"auth_header": true` and no `api_key`, store its key once instead of
+exporting it:
+
+```sh
+euler login --provider my-gateway
+euler auth status
+```
+
+`euler login` asks for the key without echoing it (or reads one line from a
+pipe) and stores it in `~/.euler/auth.json` under the provider id. An
+`api_key` in the entry wins, so login refuses an entry that sets one.
+`euler logout --provider my-gateway` removes the stored key and leaves the
+entry.
 
 Check the offline model catalog:
 
@@ -183,5 +196,5 @@ extension
 scrub
 ```
 
-`login` and `logout` require `--provider chatgpt`; Anthropic and OpenRouter do
-not use those commands.
+`login` and `logout` require `--provider chatgpt` or a custom provider id;
+Anthropic, OpenAI, OpenRouter, and xAI do not use those commands.

@@ -19,6 +19,23 @@ pull requests that landed them; deeper design rationale lives in
   `permission.decision`. `path` and `outside_workspace` rules,
   `ask_timeout`, and `extension_reviewers` are still refused at startup.
 
+### Stored keys for custom providers
+
+- **New**: `euler login --provider <id>` stores an API key for a
+  `providers.json` provider that sets `"auth_header": true` and no
+  `api_key`, so the key no longer has to live in the environment or the
+  file. The key is read without echo (or from a pipe) and kept as a
+  literal (even when it starts with `$` or `!`) in
+  `~/.euler/auth.json`, which seeds the redactor like other stored
+  credentials. **New prompt (flagged)**: the hidden `API key:` prompt.
+- An `api_key` spec in the entry wins: login refuses such an entry and says
+  to remove `api_key`. It also refuses an unknown id or an entry without
+  `auth_header: true`, and stores nothing.
+- `euler logout --provider <id>` removes the stored key and leaves the
+  entry; `euler auth status` lists stored custom-provider keys. A provider
+  that needs a stored key and has none fails with an error naming
+  `euler login --provider <id>`.
+
 ### Execution profiles: permission rules parse and record
 
 - **New**: `profiles.json` profiles accept `rules`, `ask_timeout`, and
