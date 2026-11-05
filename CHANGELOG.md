@@ -6,6 +6,19 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: `shell` and `tools` permission rules are enforced
+
+- **New**: profiles may now use `shell` and `tools` rules (ADR 0027,
+  rollout step 2). A `deny` rule refuses a command or tool call without
+  asking and covers that request only, so the agent carries on with other
+  work; an `ask` rule prompts under every profile, `full` included, with
+  allow once and deny only; an `allow` rule pre-approves a command a
+  profile would otherwise ask about, never a dangerous command or a
+  sensitive file. Rules apply to root and child tool calls and to extension
+  tools and commands, and every rule decision records the rule in
+  `permission.decision`. `path` and `outside_workspace` rules,
+  `ask_timeout`, and `extension_reviewers` are still refused at startup.
+
 ### Execution profiles: permission rules parse and record
 
 - **New**: `profiles.json` profiles accept `rules`, `ask_timeout`, and

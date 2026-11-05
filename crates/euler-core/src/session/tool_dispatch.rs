@@ -89,10 +89,16 @@ impl<D: PermissionDecider> Session<D> {
         }
         let mut covered_grant_source: Option<crate::GrantSource> = None;
         let mut static_safe = false;
-        if let Some(capability) = self
+        let required_capability = self
             .tools
-            .required_capability_for_input(&call.name, &call.input)
-        {
+            .required_capability_for_input(&call.name, &call.input);
+        // The request still to decide and its ruling; a call that needs no
+        // capability has one only when a `tools` rule asks or denies it.
+        let mut uncovered = match required_capability {
+            None => self.capability_less_ruling(&call),
+            Some(_) => None,
+        };
+        if let Some(capability) = required_capability {
             if turn_state.denied(capability) {
                 self.emit_permission_denied_tool_result(
                     call,
@@ -118,13 +124,14 @@ impl<D: PermissionDecider> Session<D> {
             // blanket SessionAllow to Ask (deep review P1-b), so the grant
             // coverage and ask branches below apply to it like any other
             // uncovered request.
-            let mode = self.permissions.mode_for_request(&request);
+            let ruling = self.permissions.ruling_for_request(&request);
+            let mode = ruling.mode;
             // The permissive danger walk (the second parser of
             // `command_safety`) vetoes every auto-approval path: a command
             // containing a forced `rm` anywhere — inside control flow, a
             // substitution, or a `sudo`/`env`/`trap`/`xargs` wrapper —
             // takes an explicit permission decision no matter what else
-            // would have covered it, and `mode_for_request` escalates every
+            // would have covered it, and `ruling_for_request` escalates every
             // mode short of `always-deny` to an ask for it (ADR 0021
             // decision D). Under a never-prompt decider that path denies.
             // Walked once, when the request was built.
@@ -141,8 +148,11 @@ impl<D: PermissionDecider> Session<D> {
             // `sh -c` runs the full string (security review, #66 class) —
             // decomposing a truncated command is decomposing a lie.
             // An escalation runs on the host, so static safety, which reasons
-            // about the sandboxed run, never skips its ask.
+            // about the sandboxed run, never skips its ask, and neither it nor
+            // a grant settles an ask a permission rule caused (ADR 0027
+            // resolved question 6).
             static_safe = mode == ApprovalMode::Ask
+                && !ruling.rule_ask()
                 && capability == Capability::ShellExec
                 && request.escalation.is_none()
                 && !dangerous_command
@@ -158,38 +168,40 @@ impl<D: PermissionDecider> Session<D> {
             // event — recording "allowed once" here would misstate what the
             // user actually granted (review v2 §8). The tool result carries a
             // `grant_source` tag so the ledger can show `· session grant`.
-            covered_grant_source =
-                if mode == ApprovalMode::Ask && !static_safe && !dangerous_command {
-                    self.permissions.granted_source(&request)
-                } else {
-                    None
-                };
+            covered_grant_source = if mode == ApprovalMode::Ask
+                && !ruling.rule_ask()
+                && !static_safe
+                && !dangerous_command
+            {
+                self.permissions.granted_source(&request)
+            } else {
+                None
+            };
             if covered_grant_source.is_none() && !static_safe {
-                let ruling = self.decide_uncovered_permission(
-                    &request,
-                    &tool_call_event_id,
-                    sink,
-                    turn_state,
-                    cancellation,
-                );
-                let ruling = match ruling {
-                    Ok(ruling) => ruling,
-                    Err(SessionError::Cancelled) => {
-                        self.emit_cancelled_tool_result(call, tool_call_event_id, None, None)?;
-                        return Err(SessionError::Cancelled);
-                    }
-                    Err(error) => return Err(error),
-                };
-                match ruling {
-                    PermissionRuling::Allowed => {}
-                    PermissionRuling::Denied { message } => {
-                        self.emit_permission_denied_tool_result(
-                            call,
-                            tool_call_event_id,
-                            &message,
-                        )?;
-                        return Ok(());
-                    }
+                uncovered = Some((request, ruling));
+            }
+        }
+        if let Some((request, ruling)) = uncovered {
+            let ruling = self.decide_uncovered_permission(
+                (&request, &ruling),
+                &tool_call_event_id,
+                sink,
+                turn_state,
+                cancellation,
+            );
+            let ruling = match ruling {
+                Ok(ruling) => ruling,
+                Err(SessionError::Cancelled) => {
+                    self.emit_cancelled_tool_result(call, tool_call_event_id, None, None)?;
+                    return Err(SessionError::Cancelled);
+                }
+                Err(error) => return Err(error),
+            };
+            match ruling {
+                PermissionRuling::Allowed => {}
+                PermissionRuling::Denied { message } => {
+                    self.emit_permission_denied_tool_result(call, tool_call_event_id, &message)?;
+                    return Ok(());
                 }
             }
         }

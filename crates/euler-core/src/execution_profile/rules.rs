@@ -3,9 +3,10 @@
 //! never concatenated into another, so most restrictive across layers stays
 //! distinct from last match within one layer.
 
+use crate::command_safety::RuleSegment;
 use crate::tools::CORE_TOOL_NAMES;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Component, Path};
 
 /// At most this many rules per surface per layer (resolved question 11).
@@ -18,7 +19,8 @@ const MAX_ASK_TIMEOUT_SECONDS: u64 = 86_400;
 
 const SURFACES: &str = "shell, path, outside_workspace, tools";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Ordered from least to most restrictive, so `max` is the most restrictive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleState {
     Allow,
@@ -348,4 +350,145 @@ pub(super) fn lower_ask_timeout(left: Option<u32>, right: Option<u32>) -> Option
         (Some(left), Some(right)) => Some(left.min(right)),
         (one, None) | (None, one) => one,
     }
+}
+
+/// The rule surfaces the gate enforces in this build. `path` and
+/// `outside_workspace` rules are parsed and recorded but refused at startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuleSurface {
+    Shell,
+    Tools,
+}
+
+impl RuleSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Tools => "tools",
+        }
+    }
+}
+
+/// The rule that set a request's rule state: where it sits and what it says.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleMatch {
+    pub surface: RuleSurface,
+    pub layer: RuleLayerLabel,
+    /// The rule's position in its layer's array for its surface.
+    pub index: usize,
+    pub rule: PermissionRule,
+}
+
+impl RuleMatch {
+    pub fn state(&self) -> RuleState {
+        self.rule.state
+    }
+
+    /// The `rule` object of a `permission.decision` (ADR 0027 section 9).
+    pub fn record(&self) -> Value {
+        json!({
+            "surface": self.surface.as_str(),
+            "index": self.index,
+            "pattern": self.rule.pattern,
+            "state": self.rule.state,
+            "layer": self.layer,
+        })
+    }
+}
+
+/// The rule state of one request under `layers` (ADR 0027 section 3), from
+/// the `shell` surface over `segments` (a `run_shell` command) and the
+/// `tools` surface over `tool` (a core tool name or
+/// `<extension-id>.<command>`). Within a surface the last matching rule
+/// wins; a command is `deny` if any segment is, else `ask` if any is, else
+/// `allow` only if every segment is. Surfaces and layers combine by most
+/// restrictive. `None` means no rule state.
+pub fn rule_match(
+    layers: &[RuleLayer],
+    segments: Option<&[RuleSegment]>,
+    tool: Option<&str>,
+) -> Option<RuleMatch> {
+    let mut found: Option<RuleMatch> = None;
+    for layer in layers {
+        let shell = segments.and_then(|segments| shell_match(layer, segments));
+        let tools = tool.and_then(|tool| {
+            last_match(&layer.rules.tools, false, |pattern| {
+                glob_matches(pattern, tool)
+            })
+            .map(|index| RuleMatch {
+                surface: RuleSurface::Tools,
+                layer: layer.layer,
+                index,
+                rule: layer.rules.tools[index].clone(),
+            })
+        });
+        for candidate in [shell, tools].into_iter().flatten() {
+            if found
+                .as_ref()
+                .is_none_or(|found| candidate.state() > found.state())
+            {
+                found = Some(candidate);
+            }
+        }
+    }
+    found
+}
+
+fn shell_match(layer: &RuleLayer, segments: &[RuleSegment]) -> Option<RuleMatch> {
+    let rules = &layer.rules.shell;
+    let mut matches = Vec::with_capacity(segments.len());
+    for segment in segments {
+        // An `allow` never covers a command Euler cannot read, but a `deny`
+        // or `ask` before it still does (`*` deny, then carve-outs).
+        let index = last_match(rules, !segment.resolved, |pattern| {
+            shell_pattern_matches(pattern, &segment.text)
+        });
+        matches.push(index.map(|index| RuleMatch {
+            surface: RuleSurface::Shell,
+            layer: layer.layer,
+            index,
+            rule: rules[index].clone(),
+        }));
+    }
+    // Among matches tied for the strictest state, the first in segment
+    // order is the one recorded.
+    let strictest = matches
+        .iter()
+        .flatten()
+        .reduce(|found, next| {
+            if next.state() > found.state() {
+                next
+            } else {
+                found
+            }
+        })
+        .cloned()?;
+    if strictest.state() == RuleState::Allow && matches.iter().any(Option::is_none) {
+        return None;
+    }
+    Some(strictest)
+}
+
+/// The index of the last rule in `rules` whose pattern `matches`, skipping
+/// `allow` rules when `skip_allow`.
+fn last_match(
+    rules: &[PermissionRule],
+    skip_allow: bool,
+    matches: impl Fn(&str) -> bool,
+) -> Option<usize> {
+    rules
+        .iter()
+        .rposition(|rule| !(skip_allow && rule.state == RuleState::Allow) && matches(&rule.pattern))
+}
+
+/// A `shell` pattern against one segment: words anchored at both ends, `*`
+/// matching any run of characters, and a trailing ` *` also matching
+/// nothing (`git push *` matches `git push`). Runs of whitespace in the
+/// pattern count as one space, as they do between the segment's words.
+fn shell_pattern_matches(pattern: &str, segment: &str) -> bool {
+    let pattern = pattern.split_whitespace().collect::<Vec<_>>().join(" ");
+    glob_matches(&pattern, segment)
+        || pattern
+            .strip_suffix(" *")
+            .is_some_and(|bare| glob_matches(bare, segment))
 }

@@ -550,6 +550,23 @@ extension error does not consume the later result.
     guardian's read of user authorization, present when the verdict parsed.
   - `rationale`: short guardian rationale for the outcome (also present on
     fail-closed denials, where it names the failure instead of a verdict).
+
+  Additive optional fields for permission rules (ADR 0027, capabilities
+  contract "Permission rules in the gate"):
+  - `decision_source`: `"rule"` when a permission rule decided on its own:
+    a `deny` rule (`mode: "always-deny"`, `allowed: false`) or an `allow`
+    rule lifting an ask (`mode: "ask"`, `allowed: true`,
+    `grant_scope: "once"`). Such a decision has no `permission.prompt` and
+    parents its `tool.call`, or has no parent on an extension operation.
+  - `rule`: `{ "surface": "shell" | "tools", "index", "pattern", "state",
+    "layer": "profile" | "overlay" | "subagent" }`, the rule that set the
+    state; `index` is its position in that layer's array for that surface.
+    Present on rule decisions and on the decision that settles an `ask`
+    rule's prompt, whoever settled it (`decision_source` then says who).
+  - `tool`: the core tool name or `<extension-id>.<command>` the rule
+    matched, present with `rule`. A tool that needs no capability records
+    `capability` `fs-read` (core) or `extension-state` (extension) as a
+    label.
 - `extension.contribution`: `extension_id`, `command`, `point` (currently
   `"turn-idle"`), `action` (`"stop"` or `"continue"`), and `accepted`.
   An accepted continue additionally carries redacted `content`; an unaccepted

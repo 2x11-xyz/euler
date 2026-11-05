@@ -132,6 +132,121 @@ fn companion_runs_under_the_subagent_default_no_looser_than_the_session() {
     );
 }
 
+/// A session whose profile is `preset` with one `profile` layer of shell
+/// `rules`, under `defaults.subagent` `subagent`, with a child that makes
+/// `call` (ADR 0027).
+fn ruled_session_with_child(
+    preset: &str,
+    rules: Vec<crate::execution_profile::PermissionRule>,
+    subagent: Option<ExecutionProfile>,
+    call: ToolCall,
+    verdicts: Vec<DeciderVerdict>,
+) -> (tempfile::TempDir, Session<ScriptedDecider>) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut profile = crate::ProfilesConfig::default()
+        .resolve(Some(preset), crate::ProfileContext::Interactive, None)
+        .expect("preset");
+    profile.fields.rules = vec![crate::execution_profile::RuleLayer {
+        layer: crate::execution_profile::RuleLayerLabel::Profile,
+        rules: crate::execution_profile::ProfileRules {
+            shell: rules,
+            ..Default::default()
+        },
+    }];
+    let mut config = SessionConfig::new(temp.path());
+    config.set_execution_profile(profile);
+    config.subagent_profile = subagent;
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![call]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let writer = ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer");
+    let session =
+        Session::new(config, provider, ScriptedDecider::new(verdicts)).with_provenance(writer);
+    (temp, session)
+}
+
+fn shell_rule(
+    pattern: &str,
+    state: crate::execution_profile::RuleState,
+) -> crate::execution_profile::PermissionRule {
+    crate::execution_profile::PermissionRule {
+        pattern: pattern.to_owned(),
+        state,
+        access: None,
+        reason: None,
+    }
+}
+
+/// ADR 0027 section 3 "Routes": a child's tool calls take the session's
+/// rules. A `deny` refuses the call without a prompt, records the rule, and
+/// names it in the child's tool error.
+#[test]
+fn a_deny_rule_refuses_a_child_tool_call_and_records_the_rule() {
+    let (_temp, mut session) = ruled_session_with_child(
+        "full",
+        vec![shell_rule(
+            "printf *",
+            crate::execution_profile::RuleState::Deny,
+        )],
+        None,
+        child_shell_call(),
+        Vec::new(),
+    );
+
+    let summary = session
+        .spawn_companion(task_with_caps([Capability::ShellExec]))
+        .expect("companion");
+
+    assert!(summary.result.ok());
+    assert!(events_of_kind(session.events(), EventKind::PERMISSION_PROMPT).is_empty());
+    let decision = only_event(session.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decision.payload["decision_source"], json!("rule"));
+    assert_eq!(decision.payload["rule"]["pattern"], json!("printf *"));
+    assert_eq!(decision.payload["tool"], json!("run_shell"));
+    let result = only_event(session.events(), EventKind::TOOL_RESULT);
+    let error = result.payload["error"].as_str().expect("error");
+    assert!(error.contains("the shell rule \"printf *\""), "{error}");
+}
+
+/// ADR 0027 resolved question 9: under `inherit` a child keeps the
+/// session's `allow` rules, which lift its `locked` ask once; under a named
+/// subagent profile no `allow` rule applies, so the child asks.
+#[test]
+fn a_child_keeps_allow_rules_only_under_inherit() {
+    let allow = || {
+        vec![shell_rule(
+            "printf *",
+            crate::execution_profile::RuleState::Allow,
+        )]
+    };
+    let (_temp, mut inherited) =
+        ruled_session_with_child("locked", allow(), None, child_shell_call(), Vec::new());
+    inherited
+        .spawn_companion(task_with_caps([Capability::ShellExec]))
+        .expect("companion");
+    assert!(events_of_kind(inherited.events(), EventKind::PERMISSION_PROMPT).is_empty());
+    let decision = only_event(inherited.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decision.payload["decision_source"], json!("rule"));
+    assert_eq!(decision.payload["grant_scope"], json!("once"));
+    let result = only_event(inherited.events(), EventKind::TOOL_RESULT);
+    assert_eq!(result.payload["ok"], json!(true), "{:?}", result.payload);
+
+    let (_temp, mut named) = ruled_session_with_child(
+        "locked",
+        allow(),
+        Some(ExecutionProfile::default()),
+        child_shell_call(),
+        vec![DeciderVerdict::Deny],
+    );
+    named
+        .spawn_companion(task_with_caps([Capability::ShellExec]))
+        .expect("companion");
+    only_event(named.events(), EventKind::PERMISSION_PROMPT);
+    let decision = only_event(named.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decision.payload.get("rule"), None);
+}
+
 #[test]
 fn companion_under_a_sandboxed_subagent_default_keeps_writes_in_the_workspace() {
     let outside = tempfile::tempdir().expect("outside dir");

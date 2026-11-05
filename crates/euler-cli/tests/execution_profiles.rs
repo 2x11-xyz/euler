@@ -632,8 +632,9 @@ fn malformed_profiles_json_names_the_file_and_field() {
 /// overlay that sets them is refused at startup until the gate enforces
 /// them.
 #[test]
-fn permission_rules_are_refused_at_startup_until_enforced() {
+fn unenforced_permission_rules_are_refused_at_startup() {
     let workspace = workspace();
+    // `shell` and `tools` rules are enforced, so the profile starts.
     write_profiles(
         &workspace,
         r#"{"profiles": {"agent": {"extends": "full", "rules": {"shell": [
@@ -641,12 +642,22 @@ fn permission_rules_are_refused_at_startup_until_enforced() {
         ]}}}}"#,
     );
     let output = exec_new(&workspace, &["--profile", "agent"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    write_profiles(
+        &workspace,
+        r#"{"profiles": {"agent": {"extends": "full", "rules": {"path": [
+            {"pattern": "secrets/**", "state": "deny"}
+        ]}}}}"#,
+    );
+    std::fs::remove_file(&workspace.log).ok();
+    let output = exec_new(&workspace, &["--profile", "agent"]);
     assert!(!output.status.success());
     let message = stderr(&output);
     assert!(
         message.contains(
-            "profile \"agent\" sets rules, which this version parses and records but does not \
-             enforce yet; remove rules to run this profile"
+            "profile \"agent\" sets rules.path, which this version parses and records but does \
+             not enforce yet; remove rules.path to run this profile"
         ),
         "{message}"
     );
@@ -657,16 +668,16 @@ fn permission_rules_are_refused_at_startup_until_enforced() {
 
     write_overlay(
         &workspace,
-        r#"{"rules": {"shell": [{"pattern": "rm *", "state": "deny"}]}}"#,
+        r#"{"rules": {"outside_workspace": [{"pattern": "/tmp", "state": "deny"}]}}"#,
     );
     let output = exec_new(&workspace, &["--profile", "full"]);
     assert!(!output.status.success());
     let message = stderr(&output);
     assert!(
         message.contains(
-            "the project overlay .euler/profile-overlay.json sets rules on profile \"full\", \
-             which this version parses and records but does not enforce yet; remove rules from \
-             the overlay"
+            "the project overlay .euler/profile-overlay.json sets rules.outside_workspace on \
+             profile \"full\", which this version parses and records but does not enforce yet; \
+             remove rules.outside_workspace from the overlay"
         ),
         "{message}"
     );

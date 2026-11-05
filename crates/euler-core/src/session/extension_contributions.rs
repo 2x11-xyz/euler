@@ -906,15 +906,29 @@ impl<D: PermissionDecider> Session<D> {
         required_capabilities: &[Capability],
     ) -> bool {
         let operation = format!("extension {extension_id}.{command}");
+        let tool = format!("{extension_id}.{command}");
+        // A `tools` rule that asks or denies is never standing authority,
+        // with or without capabilities (ADR 0027 section 3).
+        let tool_request =
+            crate::permissions::PermissionRequest::new(Capability::ExtensionState, &operation)
+                .with_tool(tool.as_str());
+        if self
+            .permissions
+            .rule_match(&tool_request)
+            .is_some_and(|rule| rule.state() != crate::execution_profile::RuleState::Allow)
+        {
+            return false;
+        }
         required_capabilities.iter().all(|&capability| {
-            let request = crate::permissions::PermissionRequest::new(capability, &operation);
+            let request = crate::permissions::PermissionRequest::new(capability, &operation)
+                .with_tool(tool.as_str());
             let configured = self
                 .permissions
                 .configured_mode(capability)
                 .unwrap_or(crate::permissions::ApprovalMode::Ask);
             // The execution profile's override applies (ADR 0026: `full`
             // session-allows extension capabilities).
-            match self.permissions.effective_mode(configured, &request) {
+            match self.permissions.effective_ruling(configured, &request).mode {
                 crate::permissions::ApprovalMode::SessionAllow => true,
                 crate::permissions::ApprovalMode::AlwaysDeny => false,
                 crate::permissions::ApprovalMode::Ask => {
@@ -1119,7 +1133,8 @@ fn safe_execution_error(error: &ExtensionExecutionError) -> String {
         ExtensionExecutionError::CapabilityDenied { capability } => {
             format!("permission denied: {}", capability.as_str())
         }
-        ExtensionExecutionError::InvalidInput(message) => message.clone(),
+        ExtensionExecutionError::InvalidInput(message)
+        | ExtensionExecutionError::RuleDenied(message) => message.clone(),
         ExtensionExecutionError::RegistrationFailed => "extension registration failed".to_owned(),
         ExtensionExecutionError::RegistrationPanicked => {
             "extension registration panicked".to_owned()
@@ -1135,7 +1150,8 @@ fn safe_execution_error(error: &ExtensionExecutionError) -> String {
 fn contribution_failure(error: &ExtensionExecutionError) -> &'static str {
     match error {
         ExtensionExecutionError::Disabled { .. } => "disabled",
-        ExtensionExecutionError::CapabilityDenied { .. } => "capability-denied",
+        ExtensionExecutionError::CapabilityDenied { .. }
+        | ExtensionExecutionError::RuleDenied(_) => "capability-denied",
         ExtensionExecutionError::InvalidInput(_) => "invalid-input",
         ExtensionExecutionError::RegistrationFailed => "registration",
         ExtensionExecutionError::RegistrationPanicked => "panic",

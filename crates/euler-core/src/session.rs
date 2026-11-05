@@ -81,8 +81,8 @@ pub use background::{
 pub use companion::AgentResultSummary;
 pub use observer::RoundObserverConfig;
 pub(crate) use permissions_gate::{
-    approval_mode_str, permission_decision_payload, permission_prompt_payload,
-    permission_request_for_tool, PermissionRuling,
+    approval_mode_str, insert_rule_fields, permission_decision_payload, permission_prompt_payload,
+    permission_request_for_tool, rule_decision_payload, rule_denial, PermissionRuling,
 };
 pub(crate) use tool_dispatch::{
     file_change_payload, file_diff_payload, prepare_checkpoint, prepare_checkpoint_for,
@@ -590,6 +590,11 @@ pub enum ExtensionExecutionError {
     /// The selected command attempted a capability not granted for this call.
     #[error("extension capability denied")]
     CapabilityDenied { capability: Capability },
+    /// A permission rule of the execution profile denied the call before
+    /// the extension ran (ADR 0027). The message is host-generated and names
+    /// the rule, so it is safe to surface verbatim.
+    #[error("{0}")]
+    RuleDenied(String),
     /// Host-side validation rejected the command input before execution. The
     /// message is host-generated (never raw extension error text), so unlike
     /// the sibling variants it is safe to surface verbatim.
@@ -6821,6 +6826,9 @@ fn validate_model_target_shape(target: &ModelTarget) -> Result<(), String> {
 #[cfg(test)]
 #[path = "permission_matrix_test.rs"]
 mod permission_matrix_test;
+#[cfg(test)]
+#[path = "permission_rules_test.rs"]
+mod permission_rules_test;
 #[cfg(test)]
 #[path = "session_test.rs"]
 mod session_test;
