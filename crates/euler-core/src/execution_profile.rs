@@ -5,11 +5,15 @@
 //! `workspace.rs`) that defines its fields.
 //! `enforced.rs` is the one place that decides whether this build can
 //! deliver a resolved profile and which subprocess sandbox it becomes.
+//! `rules.rs` parses the permission rules and their layers (ADR 0027).
 
 mod config;
 mod enforced;
 mod full;
 mod locked;
+mod rules;
+#[cfg(test)]
+mod rules_tests;
 #[cfg(test)]
 mod tests;
 mod workspace;
@@ -18,6 +22,7 @@ pub use config::{
     write_interactive_default, ProfileContext, ProfilesConfig, ProjectOverlay, PROFILES_FILE,
     PROJECT_OVERLAY_PATH,
 };
+pub use rules::{PermissionRule, ProfileRules, RuleAccess, RuleLayer, RuleLayerLabel, RuleState};
 
 use crate::guardian::PermissionReviewer;
 use crate::permissions::{ApprovalMode, PermissionRequest};
@@ -103,7 +108,10 @@ profile_setting! {
 
 /// The effective fields of a profile (ADR 0026 section 1). `writable_paths`
 /// lists the paths a profile adds to its preset's writable set; the
-/// workspace is always writable and is not listed.
+/// workspace is always writable and is not listed. `rules`,
+/// `ask_timeout`, and `extension_reviewers` (ADR 0027) are omitted from the
+/// JSON when unset, so a profile without them keeps its digest. `rules` is
+/// the ordered list of layers that apply, never one merged list.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileFields {
@@ -117,6 +125,12 @@ pub struct ProfileFields {
     pub escalation: EscalationSetting,
     pub background_jobs: BackgroundJobsSetting,
     pub reviewer: PermissionReviewer,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleLayer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_timeout: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extension_reviewers: Vec<String>,
 }
 
 impl ProfileFields {
@@ -124,7 +138,9 @@ impl ProfileFields {
     /// `baseline`. A profile with the sandbox off is looser than any profile
     /// with it on; when the baseline's sandbox is off, its boundary fields
     /// (`network`, `writable_paths`, `tmp`, `caches`, `credentials`) are the
-    /// host's and are not compared. `reviewer` has no order.
+    /// host's and are not compared. `reviewer` has no order. `rules`,
+    /// `ask_timeout`, and `extension_reviewers` are not compared: resume
+    /// joins them instead ([`Self::join_resumed_policy`]).
     pub fn first_looser_field(&self, baseline: &Self) -> Option<&'static str> {
         if self.sandbox.rank() < baseline.sandbox.rank() {
             return Some("sandbox");
@@ -182,7 +198,10 @@ impl ProfileFields {
     /// a field looser than the parent's takes the parent's value (ADR 0026
     /// section 7). Uses the order [`Self::first_looser_field`] compares with,
     /// so the result is never looser than `parent`. `reviewer` has no order
-    /// and is kept.
+    /// and is kept. `ask_timeout` takes the lower of the two. The rule
+    /// layers are the parent's `ask` and `deny` rules, then these fields'
+    /// own `ask` and `deny` rules, a `profile` layer relabeled `subagent`
+    /// (ADR 0027 section 6): no `allow` rule applies.
     fn tightened_to(mut self, parent: &Self) -> Self {
         fn at_least<T: Tightness>(slot: &mut T, parent: T) {
             if slot.rank() < parent.rank() {
@@ -206,7 +225,65 @@ impl ProfileFields {
         at_least(&mut self.approvals, parent.approvals);
         at_least(&mut self.escalation, parent.escalation);
         at_least(&mut self.background_jobs, parent.background_jobs);
+        self.ask_timeout = rules::lower_ask_timeout(self.ask_timeout, parent.ask_timeout);
+        let mut layers = Vec::new();
+        for layer in &parent.rules {
+            rules::join_layer(&mut layers, layer);
+        }
+        for layer in &self.rules {
+            let label = match layer.layer {
+                RuleLayerLabel::Profile => RuleLayerLabel::Subagent,
+                other => other,
+            };
+            rules::join_layer(
+                &mut layers,
+                &RuleLayer {
+                    layer: label,
+                    rules: layer.rules.clone(),
+                },
+            );
+        }
+        self.rules = layers;
         self
+    }
+
+    /// The resume rule for `rules`, `ask_timeout`, and
+    /// `extension_reviewers` (ADR 0027 resolved question 10): the recorded
+    /// rule layers stay and `resolved`'s `ask` and `deny` rules join as
+    /// further layers; a lower resolved `ask_timeout` applies; the recorded
+    /// extension reviewers stay and added ones apply. Joined values can only
+    /// tighten, so any other change needs `--profile`.
+    fn join_resumed_policy(&mut self, recorded: &Self, resolved: &Self) {
+        let mut layers = recorded.rules.clone();
+        for layer in &resolved.rules {
+            rules::join_layer(&mut layers, layer);
+        }
+        self.rules = layers;
+        self.ask_timeout = rules::lower_ask_timeout(recorded.ask_timeout, resolved.ask_timeout);
+        let mut reviewers = recorded.extension_reviewers.clone();
+        for reviewer in &resolved.extension_reviewers {
+            if !reviewers.contains(reviewer) {
+                reviewers.push(reviewer.clone());
+            }
+        }
+        self.extension_reviewers = reviewers;
+    }
+
+    /// The ADR 0027 fields whose value in `self` differs from `resolved`'s,
+    /// in sorted order, which resume names when it did not apply them as
+    /// written.
+    fn policy_fields_differing_from(&self, resolved: &Self) -> Vec<&'static str> {
+        [
+            ("ask_timeout", self.ask_timeout != resolved.ask_timeout),
+            (
+                "extension_reviewers",
+                self.extension_reviewers != resolved.extension_reviewers,
+            ),
+            ("rules", self.rules != resolved.rules),
+        ]
+        .into_iter()
+        .filter_map(|(field, differs)| differs.then_some(field))
+        .collect()
     }
 
     /// Contradictory combinations (ADR 0026 section 5, "Validation").
@@ -237,7 +314,9 @@ impl ProfileFields {
     }
 
     /// Each field that differs from `self` in `other`, as
-    /// `field old -> new`, in sorted field order.
+    /// `field old -> new`, in sorted field order. An omitted field reads
+    /// `unset`. `rules` reads as its number of layers, or `rules edited (N
+    /// layers)` when the count is the same but the rules differ.
     fn changes_to(&self, other: &Self) -> Vec<String> {
         let (Value::Object(before), Value::Object(after)) = (
             serde_json::to_value(self).expect("profile fields serialize"),
@@ -245,17 +324,28 @@ impl ProfileFields {
         ) else {
             unreachable!("profile fields serialize as a JSON object");
         };
-        let text = |value: &Value| match value {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
+        let text = |field: &str, value: Option<&Value>| match (field, value) {
+            (_, None) => "unset".to_owned(),
+            ("rules", Some(Value::Array(layers))) => match layers.len() {
+                1 => "1 layer".to_owned(),
+                count => format!("{count} layers"),
+            },
+            (_, Some(Value::String(text))) => text.clone(),
+            (_, Some(other)) => other.to_string(),
         };
-        let before: BTreeMap<String, Value> = before.into_iter().collect();
-        before
-            .iter()
-            .filter(|(field, value)| after.get(field.as_str()) != Some(value))
-            .map(|(field, value)| {
-                let new = after.get(field.as_str()).map(text).unwrap_or_default();
-                format!("{field} {} -> {new}", text(value))
+        let fields: std::collections::BTreeSet<&String> =
+            before.keys().chain(after.keys()).collect();
+        fields
+            .into_iter()
+            .filter(|field| before.get(field.as_str()) != after.get(field.as_str()))
+            .map(|field| {
+                let before = text(field, before.get(field.as_str()));
+                let after = text(field, after.get(field.as_str()));
+                if field == "rules" && before == after {
+                    format!("rules edited ({after})")
+                } else {
+                    format!("{field} {before} -> {after}")
+                }
             })
             .collect()
     }
@@ -344,13 +434,17 @@ impl ExecutionProfile {
     /// (ADR 0026 section 7): `self` when `subagent` is `None`
     /// (`defaults.subagent` unset or `inherit`), otherwise `subagent`
     /// tightened field by field to be no looser than `self`. A child's asks
-    /// go to the session's reviewer, so it keeps `self`'s `reviewer`.
+    /// go to the session's ask path, so it keeps `self`'s `reviewer` and
+    /// `extension_reviewers`.
     pub fn child_profile(&self, subagent: Option<&ExecutionProfile>) -> ExecutionProfile {
         let Some(subagent) = subagent else {
             return self.clone();
         };
         let mut fields = subagent.fields.clone().tightened_to(&self.fields);
         fields.reviewer = self.fields.reviewer;
+        fields
+            .extension_reviewers
+            .clone_from(&self.fields.extension_reviewers);
         ExecutionProfile {
             name: subagent.name.clone(),
             fields,
@@ -461,6 +555,9 @@ pub struct ResumeProfile {
     pub profile: ExecutionProfile,
     pub recorded: Option<ExecutionProfile>,
     pub basis: ResumeProfileBasis,
+    /// The ADR 0027 fields (`rules`, `ask_timeout`, `extension_reviewers`)
+    /// that the resume rule joined instead of applying as resolved.
+    pub joined_fields: Vec<&'static str>,
 }
 
 impl ResumeProfile {
@@ -469,8 +566,11 @@ impl ResumeProfile {
     /// any field yields the recorded profile unless `--profile` was passed
     /// (`explicit`); a tighter or equal one applies as resolved. A kept
     /// recorded profile gets the project overlay too, since it can only
-    /// tighten. Whichever profile applies is refused, never substituted,
-    /// when this host cannot enforce it.
+    /// tighten. Either way `rules`, `ask_timeout`, and
+    /// `extension_reviewers` join the recorded values with the resolved
+    /// ones ([`ProfileFields::join_resumed_policy`]). Whichever profile
+    /// applies is refused, never substituted, when this host cannot enforce
+    /// it.
     pub fn choose(
         recorded: Option<ExecutionProfile>,
         resolved: ExecutionProfile,
@@ -483,6 +583,7 @@ impl ResumeProfile {
                 profile: resolved,
                 recorded: None,
                 basis: ResumeProfileBasis::NotRecorded,
+                joined_fields: Vec::new(),
             });
         };
         if explicit {
@@ -491,27 +592,73 @@ impl ResumeProfile {
                 profile: resolved,
                 recorded: Some(recorded),
                 basis: ResumeProfileBasis::Explicit,
+                joined_fields: Vec::new(),
             });
         }
         let Some(looser_field) = resolved.fields.first_looser_field(&recorded.fields) else {
             resolved.check_enforced()?;
+            let mut profile = resolved.clone();
+            profile
+                .fields
+                .join_resumed_policy(&recorded.fields, &resolved.fields);
+            // `resolved` passed, so a refusal here comes from a recorded
+            // value the join kept; name the recording, not profiles.json.
+            profile.check_enforced().map_err(|error| match error {
+                ProfileError::Unenforced { field, .. } => ProfileError::RecordedUnenforced {
+                    profile: recorded.name.clone(),
+                    field,
+                },
+                other => other,
+            })?;
             return Ok(Self {
-                profile: resolved,
+                joined_fields: profile
+                    .fields
+                    .policy_fields_differing_from(&resolved.fields),
+                profile,
                 recorded: Some(recorded),
                 basis: ResumeProfileBasis::Resolved,
             });
         };
+        // The overlay applies here for its ADR 0026 fields. Its ADR 0027
+        // fields are already in `resolved` (checked against the resolved
+        // profile), and the join below brings them in. Unsetting the
+        // recorded `ask_timeout` keeps `apply` from checking the overlay's
+        // timeout again against it, which would refuse a value the join
+        // lowers anyway.
         let mut profile = recorded.clone();
+        profile.fields.ask_timeout = None;
         if let Some(overlay) = overlay {
             overlay.apply(&mut profile)?;
         }
+        profile
+            .fields
+            .join_resumed_policy(&recorded.fields, &resolved.fields);
+        // An ADR 0027 field the recording does not set was joined from the
+        // resolved profile, so the refusal names that profile instead.
+        let recorded_refuses = |field| {
+            matches!(
+                recorded.check_enforced(),
+                Err(ProfileError::Unenforced { field: refused, .. }) if refused == field
+            )
+        };
         profile.check_enforced().map_err(|error| match error {
+            ProfileError::Unenforced { field, .. }
+                if enforced::NOT_ENFORCED_YET.contains(&field) && !recorded_refuses(field) =>
+            {
+                ProfileError::Unenforced {
+                    profile: resolved.name.clone(),
+                    field,
+                }
+            }
             ProfileError::Unenforced { profile, field } => {
                 ProfileError::RecordedUnenforced { profile, field }
             }
             other => other,
         })?;
         Ok(Self {
+            joined_fields: profile
+                .fields
+                .policy_fields_differing_from(&resolved.fields),
             profile,
             recorded: Some(recorded),
             basis: ResumeProfileBasis::KeptRecorded {
@@ -522,8 +669,26 @@ impl ResumeProfile {
     }
 
     /// The startup-summary line, when the applied profile differs from the
-    /// recorded one or the log recorded none. `None` when nothing changed.
+    /// recorded one, the log recorded none, or the resume rule joined an
+    /// ADR 0027 field instead of applying it as resolved. `None` when
+    /// nothing changed.
     pub fn summary(&self) -> Option<String> {
+        let line = self.profile_summary();
+        if self.joined_fields.is_empty() {
+            return line;
+        }
+        let joined = format!(
+            "{} kept as recorded with only tightening changes joined; pass --profile to apply \
+             the profile as written",
+            self.joined_fields.join(", ")
+        );
+        Some(match line {
+            Some(line) => format!("{line}. {joined}"),
+            None => format!("execution profile: {}: {joined}", self.profile.name),
+        })
+    }
+
+    fn profile_summary(&self) -> Option<String> {
         let applied = &self.profile.name;
         let changes = self.recorded.as_ref().map_or_else(Vec::new, |recorded| {
             recorded.fields.changes_to(&self.profile.fields)
@@ -578,25 +743,63 @@ pub enum ProfileError {
     Write { file: PathBuf, message: String },
     #[error("unknown execution profile \"{name}\"; defined profiles: {}", defined.join(", "))]
     UnknownProfile { name: String, defined: Vec<String> },
-    #[error(
-        "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; the full, workspace, and locked presets' boundaries are available, and writable_paths must name existing paths"
-    )]
+    #[error("{}", unenforced_message(profile, field))]
     Unenforced {
         profile: String,
         field: &'static str,
     },
-    #[error(
-        "the project overlay {PROJECT_OVERLAY_PATH} sets {field} on profile \"{profile}\" to a value this version cannot enforce on this host; remove that field from the overlay or pass --profile locked"
-    )]
+    #[error("{}", overlay_unenforced_message(profile, field))]
     OverlayUnenforced {
         profile: String,
         field: &'static str,
     },
-    #[error(
-        "this session recorded profile \"{profile}\", whose {field} this host cannot enforce, and the newly resolved profile is looser; pass --profile to resume under a profile this host can enforce"
-    )]
+    #[error("{}", recorded_unenforced_message(profile, field))]
     RecordedUnenforced {
         profile: String,
         field: &'static str,
     },
+}
+
+fn unenforced_message(profile: &str, field: &str) -> String {
+    if enforced::NOT_ENFORCED_YET.contains(&field) {
+        return format!(
+            "profile \"{profile}\" sets {field}, which this version parses and records but does \
+             not enforce yet; remove {field} to run this profile"
+        );
+    }
+    format!(
+        "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; \
+         the full, workspace, and locked presets' boundaries are available, and writable_paths \
+         must name existing paths"
+    )
+}
+
+fn recorded_unenforced_message(profile: &str, field: &str) -> String {
+    if enforced::NOT_ENFORCED_YET.contains(&field) {
+        return format!(
+            "this session recorded profile \"{profile}\" with {field}, which this version parses \
+             and records but does not enforce yet, and resume keeps the recorded {field}; pass \
+             --profile to resume under a profile without it"
+        );
+    }
+    format!(
+        "this session recorded profile \"{profile}\", whose {field} this host cannot enforce, and \
+         the newly resolved profile is looser; pass --profile to resume under a profile this \
+         host can enforce"
+    )
+}
+
+fn overlay_unenforced_message(profile: &str, field: &str) -> String {
+    if enforced::NOT_ENFORCED_YET.contains(&field) {
+        return format!(
+            "the project overlay {PROJECT_OVERLAY_PATH} sets {field} on profile \"{profile}\", \
+             which this version parses and records but does not enforce yet; remove {field} from \
+             the overlay"
+        );
+    }
+    format!(
+        "the project overlay {PROJECT_OVERLAY_PATH} sets {field} on profile \"{profile}\" to a \
+         value this version cannot enforce on this host; remove that field from the overlay or \
+         pass --profile locked"
+    )
 }

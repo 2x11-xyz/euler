@@ -26,5 +26,8 @@ pub(super) fn fields() -> ProfileFields {
             BackgroundJobsSetting::Outlive
         },
         reviewer: PermissionReviewer::User,
+        rules: Vec::new(),
+        ask_timeout: None,
+        extension_reviewers: Vec::new(),
     }
 }

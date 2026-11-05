@@ -4,6 +4,7 @@
 //! name the file and field, never warnings: a dropped field could leave a
 //! profile looser than written.
 
+use super::rules::{self, ProfileRules, RuleLayer, RuleLayerLabel};
 use super::{
     ApprovalsSetting, BackgroundJobsSetting, CachesSetting, CredentialsSetting, EscalationSetting,
     ExecutionProfile, NetworkSetting, Preset, ProfileError, ProfileFields, SandboxSetting,
@@ -31,7 +32,8 @@ const BUILT_IN_INTERACTIVE: Preset = Preset::Full;
 const BUILT_IN_HEADLESS: Preset = Preset::Full;
 
 const PROFILE_FIELDS: &str = "sandbox, network, writable_paths, tmp, caches, credentials, \
-                              approvals, escalation, background_jobs, reviewer";
+                              approvals, escalation, background_jobs, reviewer, rules, \
+                              ask_timeout, extension_reviewers";
 
 /// Which context default selects the profile when `--profile` is absent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,7 +50,7 @@ struct ProfilesFile {
     #[serde(default)]
     defaults: ProfileDefaults,
     #[serde(default)]
-    profiles: UniqueKeys<UniqueKeys<Value>>,
+    profiles: UniqueKeys<UniqueKeys<UniqueValue>>,
 }
 
 /// A JSON object whose duplicate keys are an error rather than last-wins,
@@ -86,6 +88,77 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for UniqueKeys<T> {
     }
 }
 
+/// A JSON value whose objects reject duplicate keys at every depth, so a
+/// repeated key inside a rule (a second `state`) cannot replace the first.
+#[derive(Debug, Default)]
+struct UniqueValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct UniqueValueVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for UniqueValueVisitor {
+            type Value = UniqueValue;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+
+            fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Bool(value)))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::from(value)))
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::from(value)))
+            }
+
+            fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::from(value)))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::String(value.to_owned())))
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(UniqueValue(Value::Null))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items = Vec::new();
+                while let Some(UniqueValue(item)) = access.next_element()? {
+                    items.push(item);
+                }
+                Ok(UniqueValue(Value::Array(items)))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let UniqueKeys(entries) = UniqueKeys::<UniqueValue>::deserialize(
+                    serde::de::value::MapAccessDeserializer::new(access),
+                )?;
+                Ok(UniqueValue(Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, UniqueValue(value))| (key, value))
+                        .collect(),
+                )))
+            }
+        }
+
+        deserializer.deserialize_any(UniqueValueVisitor)
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProfileDefaults {
@@ -108,15 +181,18 @@ pub(super) struct ProfileOverrides {
     pub(super) escalation: Option<EscalationSetting>,
     pub(super) background_jobs: Option<BackgroundJobsSetting>,
     pub(super) reviewer: Option<PermissionReviewer>,
+    pub(super) rules: Option<ProfileRules>,
+    pub(super) ask_timeout: Option<u32>,
+    pub(super) extension_reviewers: Option<Vec<String>>,
 }
 
 impl ProfileOverrides {
     /// Parse each key on its own so an error names the field it is about.
     fn from_map<'a>(
-        entries: impl IntoIterator<Item = (&'a String, &'a Value)>,
+        entries: impl IntoIterator<Item = (&'a String, &'a UniqueValue)>,
     ) -> Result<Self, String> {
         let mut overrides = Self::default();
-        for (key, value) in entries {
+        for (key, UniqueValue(value)) in entries {
             match key.as_str() {
                 "sandbox" => overrides.sandbox = Some(field_value(key, value)?),
                 "network" => overrides.network = Some(field_value(key, value)?),
@@ -139,6 +215,11 @@ impl ProfileOverrides {
                 "escalation" => overrides.escalation = Some(field_value(key, value)?),
                 "background_jobs" => overrides.background_jobs = Some(field_value(key, value)?),
                 "reviewer" => overrides.reviewer = Some(field_value(key, value)?),
+                "rules" => overrides.rules = ProfileRules::parse(value)?,
+                "ask_timeout" => overrides.ask_timeout = Some(rules::parse_ask_timeout(value)?),
+                "extension_reviewers" => {
+                    overrides.extension_reviewers = rules::parse_extension_reviewers(value)?;
+                }
                 _ => {
                     return Err(format!(
                         "unknown field `{key}`; expected one of {PROFILE_FIELDS}"
@@ -150,7 +231,8 @@ impl ProfileOverrides {
     }
 
     /// Apply as a user profile over its preset: listed `writable_paths` add
-    /// to the preset's; every other field replaces the preset's value.
+    /// to the preset's; every other field replaces the preset's value, and
+    /// `rules` becomes the one `profile` layer.
     fn extend(&self, fields: &mut ProfileFields) {
         if let Some(paths) = &self.writable_paths {
             for path in paths {
@@ -168,13 +250,49 @@ impl ProfileOverrides {
         replace(&mut fields.escalation, self.escalation);
         replace(&mut fields.background_jobs, self.background_jobs);
         replace(&mut fields.reviewer, self.reviewer);
+        if let Some(rules) = &self.rules {
+            fields.rules = vec![RuleLayer {
+                layer: RuleLayerLabel::Profile,
+                rules: rules.clone(),
+            }];
+        }
+        replace(&mut fields.ask_timeout, self.ask_timeout.map(Some));
+        replace(
+            &mut fields.extension_reviewers,
+            self.extension_reviewers.clone(),
+        );
     }
 
     /// Apply as the project overlay: each field it sets must be at least as
     /// tight as the resolved value. Returns the first field that loosens.
+    /// Its `ask` and `deny` rules join as an `overlay` layer (ADR 0027
+    /// section 7).
     pub(super) fn tighten(&self, fields: &mut ProfileFields) -> Result<(), String> {
         if self.reviewer.is_some() {
             return Err("reviewer has no order, so a project overlay cannot set it".to_owned());
+        }
+        if self.extension_reviewers.is_some() {
+            return Err(
+                "extension_reviewers would let repository content choose extension code to run, \
+                 so a project overlay cannot set it"
+                    .to_owned(),
+            );
+        }
+        if let Some(rules) = &self.rules {
+            if let Some((rule, pattern)) = rules.first_allow() {
+                return Err(format!(
+                    "rules.{rule}: \"{pattern}\" is an allow rule; a project overlay can only ask \
+                     or deny"
+                ));
+            }
+        }
+        if let (Some(timeout), Some(resolved)) = (self.ask_timeout, fields.ask_timeout) {
+            if timeout > resolved {
+                return Err(format!(
+                    "ask_timeout {timeout} is higher than the profile's {resolved}; a project \
+                     overlay can only lower it"
+                ));
+            }
         }
         if let Some(paths) = &self.writable_paths {
             if let Some(path) = paths
@@ -199,7 +317,15 @@ impl ProfileOverrides {
             "background_jobs",
             &mut fields.background_jobs,
             self.background_jobs,
-        )
+        )?;
+        replace(&mut fields.ask_timeout, self.ask_timeout.map(Some));
+        if let Some(rules) = &self.rules {
+            fields.rules.push(RuleLayer {
+                layer: RuleLayerLabel::Overlay,
+                rules: rules.clone(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -355,7 +481,7 @@ impl ProfilesConfig {
             .unwrap_or_else(|| built_in.name().to_owned())
     }
 
-    fn named(&self, name: &str) -> Result<ExecutionProfile, ProfileError> {
+    pub(super) fn named(&self, name: &str) -> Result<ExecutionProfile, ProfileError> {
         let fields = if let Some(preset) = Preset::parse(name) {
             preset.fields()
         } else if let Some(profile) = self.profiles.get(name) {
@@ -455,7 +581,7 @@ pub fn write_interactive_default(file: &Path, name: &str) -> Result<(), ProfileE
         .map_err(|error| write_error(error.error))
 }
 
-fn parse_user_profile(name: &str, body: &UniqueKeys<Value>) -> Result<UserProfile, String> {
+fn parse_user_profile(name: &str, body: &UniqueKeys<UniqueValue>) -> Result<UserProfile, String> {
     let valid_name = !name.is_empty()
         && name
             .chars()
@@ -475,7 +601,7 @@ fn parse_user_profile(name: &str, body: &UniqueKeys<Value>) -> Result<UserProfil
                 "extends is required and names a preset ({presets})"
             ))
         }
-        Some(Value::String(preset)) => Preset::parse(preset)
+        Some(UniqueValue(Value::String(preset))) => Preset::parse(preset)
             .ok_or_else(|| format!("extends: \"{preset}\" is not a preset ({presets})"))?,
         Some(_) => return Err(format!("extends must name a preset ({presets})")),
     };
@@ -516,7 +642,7 @@ impl ProjectOverlay {
             file: file.clone(),
             message,
         };
-        let body: UniqueKeys<Value> =
+        let body: UniqueKeys<UniqueValue> =
             serde_json::from_str(&text).map_err(|error| invalid(error.to_string()))?;
         let overrides = ProfileOverrides::from_map(&body.0).map_err(invalid)?;
         Ok(Some(Self { file, overrides }))

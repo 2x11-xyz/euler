@@ -3552,3 +3552,16 @@ fn writes_privileged_config_ignores_case_for_a_file_that_does_not_exist_yet() {
     let longer_name = home.path().join("PROFILES.json.bak");
     assert!(!registry.writes_privileged_config(&longer_name.to_string_lossy()));
 }
+
+#[test]
+fn core_tool_names_list_every_core_model_tool() {
+    let mut advertised: Vec<String> = coding_tool_definitions("", true)
+        .into_iter()
+        .chain([tool_result_get_definition(), skill_read_definition()])
+        .map(|definition| definition.name)
+        .collect();
+    advertised.sort();
+    let mut listed = CORE_TOOL_NAMES.map(str::to_owned).to_vec();
+    listed.sort();
+    assert_eq!(advertised, listed);
+}

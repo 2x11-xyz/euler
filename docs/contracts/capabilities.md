@@ -373,6 +373,44 @@ is not tracked.
   `escalation: allowed`, and `credentials` set on a sandbox-off profile) are
   startup errors naming the file and field. A missing file means the built-in defaults; an unresolvable
   Euler home reads no file and says so on stderr.
+- **Permission rules (ADR 0027, parsed and recorded, not enforced yet).**
+  A profile may set `rules` (an object with ordered `shell`, `path`,
+  `outside_workspace`, and `tools` arrays of `{pattern, state, access?,
+  reason?}` with `state` `allow`, `ask`, or `deny`), `ask_timeout` (whole
+  seconds, 0 to 86400), and `extension_reviewers` (distinct
+  `<extension-id>.<command>` names). Validation errors name the file,
+  profile, surface, and index: unknown keys, surfaces, states, or `access`
+  values (`read`, `write`, `any`); `access` on a `shell` or `tools` rule; an
+  empty pattern or one with a control character; a pattern or `reason`
+  over 512 bytes; more than 256 rules in a surface; a `path` pattern that is
+  not workspace-relative without `..`, absolute, or `~/`, or that uses `**`
+  inside a component; an `outside_workspace` pattern that is not an
+  absolute or `~/` directory prefix without `*` or `..`; a `tools` pattern
+  without `.` that matches no core tool name (`*` matches any run of
+  characters); and duplicate keys at any depth. An empty `rules` object,
+  empty surface, or empty `extension_reviewers` list is unset. The project
+  overlay may add `ask` and `deny` rules (an `allow` is an error naming the
+  surface, index, and pattern) and an `ask_timeout` no higher than the
+  profile's (any value when the profile sets none), and may not set
+  `extension_reviewers`. A resolved profile
+  keeps its rules as layers, never merged: `profile`, then `overlay`. A
+  named `defaults.subagent` child gets the parent's layers and its own
+  (`profile` relabeled `subagent`) with every `allow` removed, the lower
+  `ask_timeout`, and the parent's `extension_reviewers`; under `inherit` it
+  gets the parent's. On resume the recorded layers stay, and the resolved
+  profile's `ask` and `deny` rules join as further layers unless a layer
+  with the same label already holds exactly those rules; a lower
+  `ask_timeout` and added `extension_reviewers` apply, the recorded ones
+  stay, and the summary names the fields joined this way. This build
+  refuses at startup any profile, overlay, child, or resume that sets one
+  of these fields, naming the field, because the gate does not enforce
+  them yet; when only the recording sets one, the error names the recorded
+  profile and `--profile`. Validation here is syntax only: the ADR 0027
+  section 8 checks that need installed extensions (the hint for a `tools`
+  pattern that matches an extension's model-visible tool name, the notice
+  for an extension id that is not installed, and the error for an
+  `extension_reviewers` entry that is not enabled or has no reviewer
+  descriptor) are not implemented, so this refusal stays until they are.
 - **Selection.** `--profile <name>` on `euler` and `euler exec`, then
   `/profile` in the TUI, then the context default in `profiles.json`, then
   the built-in default: `full` for both interactive and headless. An unknown
