@@ -38,9 +38,9 @@ pub(crate) use permission::EnvArgs;
 use scrub::run as run_scrub;
 use session::{resume_interactive_entry, run_exec, run_interactive_entry, run_tui};
 
-use crate::auth_commands::{logout_chatgpt, print_auth_status};
+use crate::auth_commands::{print_auth_status, run_logout};
 use crate::extension_cli::run_extension_command;
-use crate::login::login_chatgpt;
+use crate::login::run_login;
 use crate::session_lifecycle::resolve_resume_target;
 use crate::ui::transcript::render_line_oriented;
 use crate::{help, model_catalog, model_catalog_refresh, provider_config_runtime};
@@ -81,8 +81,8 @@ pub(crate) fn run() -> Result<()> {
         Command::Resume { path, run, launch } => {
             resume_interactive_entry(resolve_resume_target(path)?, run, launch, args.no_tty)
         }
-        Command::Login(login) => login_chatgpt(login),
-        Command::Logout(logout) => logout_chatgpt(logout),
+        Command::Login(login) => run_login(login),
+        Command::Logout(logout) => run_logout(logout),
         Command::AuthStatus => print_auth_status(),
         Command::CheckSandbox => crate::sandbox_check::check_sandbox(io::stdout(), io::stderr()),
         Command::Models(ModelsCommand::List) => model_catalog::print_model_catalog(

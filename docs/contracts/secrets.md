@@ -34,13 +34,15 @@ x-secret = "!op read 'op://vault/item/secret'"
 - Model availability checks may use configured auth presence but must not execute shell secret commands.
 
 
-## Subscription Auth Tokens
+## Auth File: Subscription Tokens and Stored API Keys
 
-Some providers, especially the first ChatGPT subscription provider, obtain OAuth-style tokens through Euler rather than user-supplied API-key references.
+Some providers, especially the first ChatGPT subscription provider, obtain OAuth-style tokens through Euler rather than user-supplied API-key references. A custom provider's API key may also be stored there by `euler login --provider <id>`, as an API-key credential under the provider id.
 
-These tokens are stored in a dedicated local auth file, such as `~/.euler/auth.json`, with restrictive file permissions. They are secret-tainted and follow all redaction rules in this contract. Provider refresh is handled inside the provider layer.
+These credentials are stored in a dedicated local auth file, such as `~/.euler/auth.json`, with restrictive file permissions. They are secret-tainted and follow all redaction rules in this contract. Provider refresh is handled inside the provider layer.
 
-This is not a custom secret vault; it is a pragmatic local token file for a local agent.
+A custom provider with `auth_header: true` and no `api_key` uses its stored key; an `api_key` spec in `providers.json` wins, so a stored key never silently overrides configuration. `euler logout --provider <id>` removes only the stored key.
+
+This is not a custom secret vault; it is a pragmatic local credential file for a local agent.
 
 ## Config-Edit Guardrail
 
@@ -161,8 +163,10 @@ redactor the moment it exists:
   `EULER_AUTH_FILE` is excluded — its value is a path, scrubbed from
   subprocess env as a parent control, while the credentials inside the file
   register via the auth-file source below;
-- stored auth-file credentials (including a `--auth-file` override), at
-  launch, exec, CLI resume, AND in-app resume;
+- stored auth-file credentials (including a `--auth-file` override and
+  custom-provider keys stored by `euler login`), at launch, exec, CLI
+  resume, AND in-app resume; a custom provider also reports its stored key
+  through the resolved-secret sink when a request resolves it;
 - custom-provider secrets (`$ENV` / `!command` / literal api_key and header
   values), reported by the provider at request-time resolution through the
   resolved-secret sink the session installs — before the request that

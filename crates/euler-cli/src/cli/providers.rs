@@ -4,8 +4,10 @@ use super::model_resolution::{
     canonical_model_preference, parse_known_provider_id, parse_provider_id,
 };
 use anyhow::{anyhow, Result};
+use euler_core::auth_storage::AuthStorage;
 use euler_core::ModelTarget;
 use euler_provider::anthropic::AnthropicProvider;
+use euler_provider::auth::SecretString as ProviderSecretString;
 use euler_provider::catalog::{MergedModelCatalog, BUILTIN_PROVIDERS};
 use euler_provider::chatgpt::ChatGptProvider;
 use euler_provider::custom_provider::CustomOpenAiProvider;
@@ -13,8 +15,9 @@ use euler_provider::openai::OpenAiProvider;
 use euler_provider::openrouter::OpenRouterProvider;
 use euler_provider::provider_config::ProviderConfigRegistry;
 use euler_provider::xai::XaiProvider;
-use euler_provider::{EchoProvider, ModelProvider, ProviderSet};
+use euler_provider::{EchoProvider, ModelProvider, ProviderError, ProviderSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::auth_validation::{validate_provider_auth, StoredApiKeyAuth, StoredChatGptAuth};
 use crate::model_preference::{ModelPreference, PreferenceLoad, ThemePreferenceLoad};
@@ -73,11 +76,26 @@ pub(crate) fn provider_for_id(
                 "--auth-file is not supported with provider {provider_id}"
             ));
         }
-        return Ok(Box::new(CustomOpenAiProvider::from_config(
-            provider.clone(),
-        )?));
+        return Ok(Box::new(
+            CustomOpenAiProvider::from_config(provider.clone())?
+                .with_stored_api_key(Arc::new(stored_custom_api_key)),
+        ));
     }
     Err(anyhow!("unknown provider: {provider_id}"))
+}
+
+/// The key `euler login --provider <id>` stored in the default auth file.
+fn stored_custom_api_key(
+    provider_id: &str,
+) -> std::result::Result<Option<ProviderSecretString>, ProviderError> {
+    let storage = AuthStorage::new_default().map_err(|error| {
+        ProviderError::auth(format!(
+            "could not read the stored key for custom provider `{provider_id}`: {error}"
+        ))
+    })?;
+    Ok(storage
+        .resolve_api_key(provider_id, None)
+        .map(|key| ProviderSecretString::new(key.expose_secret())))
 }
 
 fn api_key_auth(auth_file: Option<PathBuf>) -> StoredApiKeyAuth {
