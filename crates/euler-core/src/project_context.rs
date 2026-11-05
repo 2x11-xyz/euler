@@ -56,6 +56,9 @@ pub const MAX_CHAIN_LEVELS: usize = 32;
 pub const MAX_EULER_MD_SOURCES: usize = 16;
 pub const MAX_EULER_MD_BYTES: usize = 32 * 1024;
 pub const MAX_COMBINED_EULER_MD_BYTES: usize = 64 * 1024;
+/// Frozen contract bound for the user-level `<euler home>/AGENTS.md`. It is
+/// separate from the `EULER.md` combined bound.
+pub const MAX_USER_INSTRUCTIONS_BYTES: usize = 32 * 1024;
 /// Implementation bounds keeping recorded identities and diagnostic lists
 /// bounded (the contract requires "bounded normalized identities" without
 /// freezing a number). Omission and advisory budgets stay independent so an
@@ -205,6 +208,16 @@ pub enum ProjectContextResolution {
     /// The admissible item does not fit the budget. Fail before any card or
     /// dispatch.
     Budget(ProjectContextBudgetError),
+}
+
+/// User-owned context under the Euler home. Neither source takes part in
+/// project acknowledgment, and a missing path or file adds nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UserContextPaths<'a> {
+    /// The user-global skills root, `<euler home>/skills`.
+    pub skills_root: Option<&'a Path>,
+    /// The user-level instructions file, `<euler home>/AGENTS.md`.
+    pub instructions_path: Option<&'a Path>,
 }
 
 /// The fresh-session inputs to policy resolution beyond the workspace root and
@@ -469,17 +482,17 @@ struct Preflight {
 
 impl Preflight {
     fn run(workspace_root: &Path, redactor: &SecretRedactor) -> Result<Self, ProjectContextError> {
-        Self::run_with_user_skills(workspace_root, None, redactor)
+        Self::run_with_user_context(workspace_root, UserContextPaths::default(), redactor)
     }
 
-    fn run_with_user_skills(
+    fn run_with_user_context(
         workspace_root: &Path,
-        user_skills_root: Option<&Path>,
+        user_context: UserContextPaths<'_>,
         redactor: &SecretRedactor,
     ) -> Result<Self, ProjectContextError> {
         let canonical =
             std::fs::canonicalize(workspace_root).map_err(ProjectContextError::Workspace)?;
-        let outcome = discovery::discover_with_user_skills(&canonical, user_skills_root, redactor);
+        let outcome = discovery::discover_with_user_context(&canonical, user_context, redactor);
         let (manifest, collapsed) = sanitize_preflight(outcome);
         // An indeterminate repository boundary (a level between the workspace
         // and the nearest determinable marker that could not be enumerated)
@@ -520,7 +533,8 @@ impl Preflight {
     }
 
     /// True when repository-authored guidance could be admitted. User-global
-    /// skills are independent and may still survive any false result here.
+    /// skills and user instructions are independent and may still survive any
+    /// false result here.
     fn project_admissible(&self) -> bool {
         !self.collapsed
             && !self.boundary_indeterminate
@@ -528,11 +542,12 @@ impl Preflight {
     }
 
     /// Exact core-framed bytes the selected admission would carry. `None`
-    /// means neither repository guidance nor user-global skills reach the
+    /// means neither repository guidance nor user-owned context reaches the
     /// model, so there is no pinned item to budget.
     fn framed_bytes(&self, admit_project: bool) -> Option<usize> {
         let admitted = self.manifest.admitted_view(admit_project);
-        (!admitted.sources.is_empty() || !admitted.skills.is_empty())
+        admitted
+            .has_model_facing_guidance()
             .then(|| render_project_context(&admitted).len())
     }
 
@@ -581,10 +596,8 @@ impl Preflight {
 
     fn into_bootstrap(self, admission: Admission) -> ProjectContextBootstrap {
         let manifest = self.manifest.admitted_view(admission.admit_manifest);
-        let manifest = (admission.admit_manifest
-            || !manifest.sources.is_empty()
-            || !manifest.skills.is_empty())
-        .then_some(manifest);
+        let manifest =
+            (admission.admit_manifest || manifest.has_model_facing_guidance()).then_some(manifest);
         let source_identities = manifest
             .as_ref()
             .map_or(self.source_identities, |manifest| {
@@ -671,12 +684,20 @@ impl ProjectContextBootstrap {
         consent_dir: Option<&Path>,
         budget: AdmissionBudget,
     ) -> Result<ProjectContextResolution, ProjectContextError> {
-        Self::resolve_with_user_skills(workspace_root, None, redactor, options, consent_dir, budget)
+        Self::resolve_with_user_context(
+            workspace_root,
+            UserContextPaths::default(),
+            redactor,
+            options,
+            consent_dir,
+            budget,
+        )
     }
 
-    pub fn resolve_with_user_skills(
+    /// [`Self::resolve`] plus the user-owned context under the Euler home.
+    pub fn resolve_with_user_context(
         workspace_root: &Path,
-        user_skills_root: Option<&Path>,
+        user_context: UserContextPaths<'_>,
         redactor: &SecretRedactor,
         options: ProjectContextResolveOptions,
         consent_dir: Option<&Path>,
@@ -687,8 +708,7 @@ impl ProjectContextBootstrap {
             session_kind,
             trusted_local,
         } = options;
-        let preflight =
-            Preflight::run_with_user_skills(workspace_root, user_skills_root, redactor)?;
+        let preflight = Preflight::run_with_user_context(workspace_root, user_context, redactor)?;
         if !preflight.project_admissible() {
             let admission = preflight.unadmissible_admission(policy);
             return Ok(preflight.finish_admission(admission, &budget));
@@ -778,17 +798,20 @@ impl ProjectContextBootstrap {
         workspace_root: &Path,
         redactor: &SecretRedactor,
     ) -> Result<Self, ProjectContextError> {
-        Self::admitted_for_tests_with_user_skills(workspace_root, None, redactor)
+        Self::admitted_for_tests_with_user_context(
+            workspace_root,
+            UserContextPaths::default(),
+            redactor,
+        )
     }
 
     #[cfg(test)]
-    pub(crate) fn admitted_for_tests_with_user_skills(
+    pub(crate) fn admitted_for_tests_with_user_context(
         workspace_root: &Path,
-        user_skills_root: Option<&Path>,
+        user_context: UserContextPaths<'_>,
         redactor: &SecretRedactor,
     ) -> Result<Self, ProjectContextError> {
-        let preflight =
-            Preflight::run_with_user_skills(workspace_root, user_skills_root, redactor)?;
+        let preflight = Preflight::run_with_user_context(workspace_root, user_context, redactor)?;
         // A collapsed or boundary-indeterminate preflight can never be
         // admitted, even by the test hook: the bounded scan could not produce
         // a trustworthy manifest.
@@ -956,6 +979,7 @@ fn sanitize_preflight(outcome: discovery::DiscoveryOutcome) -> (CandidateManifes
     let manifest = CandidateManifest {
         version: MANIFEST_VERSION,
         reason_counts: derive_reason_counts(&outcome.diagnostics),
+        user_instructions: outcome.user_instructions,
         sources: outcome.sources,
         skills: outcome.skills,
         diagnostics: outcome.diagnostics,
@@ -979,6 +1003,7 @@ fn sanitize_preflight(outcome: discovery::DiscoveryOutcome) -> (CandidateManifes
 fn collapsed_manifest(record: ManifestDiagnostic) -> CandidateManifest {
     let manifest = CandidateManifest {
         version: MANIFEST_VERSION,
+        user_instructions: None,
         sources: Vec::new(),
         skills: Vec::new(),
         reason_counts: derive_reason_counts(std::slice::from_ref(&record)),

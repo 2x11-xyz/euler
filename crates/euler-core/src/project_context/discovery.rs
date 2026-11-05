@@ -32,12 +32,15 @@
 use super::digest::{skill_digest_v1, source_digest_v1};
 use super::manifest::{
     validate_skill_description, validate_skill_name, ManifestDiagnostic, ManifestSkill,
-    ManifestSource, SkillScope, SKILL_NAME_DIRECTORY_MISMATCH_REASON, USER_SKILL_IDENTITY_ROOT,
+    ManifestSource, SkillScope, SKILL_NAME_DIRECTORY_MISMATCH_REASON, USER_INSTRUCTIONS_IDENTITY,
+    USER_SKILL_IDENTITY_ROOT,
 };
+use super::UserContextPaths;
 use super::{
     MAX_CHAIN_LEVELS, MAX_COMBINED_EULER_MD_BYTES, MAX_COMBINED_SKILL_BODY_BYTES, MAX_DIR_ENTRIES,
     MAX_EULER_MD_BYTES, MAX_EULER_MD_SOURCES, MAX_IDENTITY_BYTES, MAX_SKILLS,
     MAX_SKILL_DIRECTORIES, MAX_SKILL_FILE_BYTES, MAX_SKILL_TRAVERSAL_DEPTH,
+    MAX_USER_INSTRUCTIONS_BYTES,
 };
 use crate::redaction::SecretRedactor;
 use std::path::Path;
@@ -129,6 +132,9 @@ impl DiagnosticReason {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DiscoveryOutcome {
+    /// The user-level `<euler home>/AGENTS.md`, frozen post-redaction, when
+    /// present and admissible.
+    pub user_instructions: Option<ManifestSource>,
     /// Accepted sources in rendering order (project root first), frozen
     /// post-redaction.
     pub sources: Vec<ManifestSource>,
@@ -151,20 +157,21 @@ pub(crate) fn diagnostic(
     }
 }
 
-/// Discover `EULER.md` sources for an already canonicalized workspace root.
-/// Never fails: every problem becomes a typed diagnostic and startup
-/// continues with whatever was safely admitted.
-pub(crate) fn discover_with_user_skills(
+/// Discover `EULER.md` sources for an already canonicalized workspace root,
+/// plus the user-owned context under the Euler home. Never fails: every
+/// problem becomes a typed diagnostic and startup continues with whatever was
+/// safely admitted.
+pub(crate) fn discover_with_user_context(
     canonical_workspace: &Path,
-    user_skills_root: Option<&Path>,
+    user_context: UserContextPaths<'_>,
     redactor: &SecretRedactor,
 ) -> DiscoveryOutcome {
-    imp::discover(canonical_workspace, user_skills_root, redactor)
+    imp::discover(canonical_workspace, user_context, redactor)
 }
 
 #[cfg(test)]
 pub(crate) fn discover(canonical_workspace: &Path, redactor: &SecretRedactor) -> DiscoveryOutcome {
-    discover_with_user_skills(canonical_workspace, None, redactor)
+    discover_with_user_context(canonical_workspace, UserContextPaths::default(), redactor)
 }
 
 #[cfg(unix)]
@@ -229,16 +236,20 @@ mod imp {
 
     pub(super) fn discover(
         canonical_workspace: &Path,
-        user_skills_root: Option<&Path>,
+        user_context: UserContextPaths<'_>,
         redactor: &SecretRedactor,
     ) -> DiscoveryOutcome {
         let mut diagnostics = Vec::new();
-        // User-global skills are independent of repository-context discovery.
-        // Scan them first so a repository boundary failure can fail project
-        // context closed without suppressing user-owned guidance.
+        // User instructions and user-global skills are independent of
+        // repository-context discovery. Read them first so a repository
+        // boundary failure can fail project context closed without
+        // suppressing user-owned guidance.
+        let user_instructions = user_context
+            .instructions_path
+            .and_then(|path| read_user_instructions(path, redactor, &mut diagnostics));
         let mut skill_candidates = Vec::new();
         let mut skill_directories_examined = 0usize;
-        if let Some(root) = user_skills_root {
+        if let Some(root) = user_context.skills_root {
             let mut scan = SkillScan {
                 redactor,
                 diagnostics: &mut diagnostics,
@@ -257,6 +268,7 @@ mod imp {
                 None => {
                     let skills = admit_skill_candidates(skill_candidates, &mut diagnostics);
                     return DiscoveryOutcome {
+                        user_instructions,
                         sources: Vec::new(),
                         skills,
                         diagnostics,
@@ -287,6 +299,7 @@ mod imp {
                 ));
                 let skills = admit_skill_candidates(skill_candidates, &mut diagnostics);
                 return DiscoveryOutcome {
+                    user_instructions,
                     sources: Vec::new(),
                     skills,
                     diagnostics,
@@ -316,6 +329,7 @@ mod imp {
         );
         let skills = admit_skill_candidates(skill_candidates, &mut diagnostics);
         DiscoveryOutcome {
+            user_instructions,
             sources,
             skills,
             diagnostics,
@@ -651,6 +665,118 @@ mod imp {
             };
             scan_project_skills_entry(&dir.fd, names, &rel_dir, &mut scan);
         }
+    }
+
+    /// Read the user-level `AGENTS.md` under the same exact-name, no-follow,
+    /// stable-read, bound, and redaction rules as an `EULER.md` source. A
+    /// missing file adds nothing; a near-miss casing, or an unsafe or
+    /// oversized file, is omitted whole with a typed diagnostic under the
+    /// `user/AGENTS.md` identity.
+    fn read_user_instructions(
+        path: &Path,
+        redactor: &SecretRedactor,
+        diagnostics: &mut Vec<ManifestDiagnostic>,
+    ) -> Option<ManifestSource> {
+        let identity = || Some(USER_INSTRUCTIONS_IDENTITY.to_owned());
+        let (Some(parent), Some(file_name)) =
+            (path.parent(), path.file_name().and_then(OsStr::to_str))
+        else {
+            diagnostics.push(diagnostic(DiagnosticReason::IoError, identity(), None));
+            return None;
+        };
+        match parent.symlink_metadata() {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => {
+                diagnostics.push(diagnostic(DiagnosticReason::IoError, identity(), None));
+                return None;
+            }
+        }
+        let Some(dir) = open_absolute_dir_nofollow(parent) else {
+            diagnostics.push(diagnostic(
+                DiagnosticReason::SymlinkRejected,
+                identity(),
+                None,
+            ));
+            return None;
+        };
+        if !user_instructions_entry_exists(&dir, file_name, diagnostics) {
+            return None;
+        }
+        let bytes = match read_named_candidate_stable(&dir, file_name, MAX_USER_INSTRUCTIONS_BYTES)
+        {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let (reason, observed) = match error {
+                    ReadCandidateError::Symlink => (DiagnosticReason::SymlinkRejected, None),
+                    ReadCandidateError::NotRegular => (DiagnosticReason::NotRegularFile, None),
+                    ReadCandidateError::TooLarge(size) => {
+                        (DiagnosticReason::SourceTooLarge, Some(size))
+                    }
+                    ReadCandidateError::Unstable => (DiagnosticReason::ChangedDuringRead, None),
+                    ReadCandidateError::Io => (DiagnosticReason::IoError, None),
+                };
+                diagnostics.push(diagnostic(reason, identity(), observed));
+                return None;
+            }
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            diagnostics.push(diagnostic(DiagnosticReason::InvalidUtf8, identity(), None));
+            return None;
+        };
+        // Freeze the redacted bytes, exactly as for `EULER.md`. Redaction
+        // markers can lengthen text, so the bound applies again afterwards.
+        let content = redactor.redact(&text);
+        if content.len() > MAX_USER_INSTRUCTIONS_BYTES {
+            diagnostics.push(diagnostic(
+                DiagnosticReason::SourceTooLarge,
+                identity(),
+                Some(content.len() as u64),
+            ));
+            return None;
+        }
+        Some(ManifestSource {
+            digest: source_digest_v1(USER_INSTRUCTIONS_IDENTITY, &content),
+            byte_len: content.len() as u64,
+            path: USER_INSTRUCTIONS_IDENTITY.to_owned(),
+            content,
+        })
+    }
+
+    /// Whether the Euler home holds an entry named exactly `file_name`.
+    /// Entry names are compared exactly, as for `EULER.md`: a
+    /// case-insensitive filesystem would otherwise open `agents.md` as
+    /// `AGENTS.md`. A near-miss casing is diagnosed, never loaded.
+    fn user_instructions_entry_exists(
+        dir: &OwnedFd,
+        file_name: &str,
+        diagnostics: &mut Vec<ManifestDiagnostic>,
+    ) -> bool {
+        let identity = || Some(USER_INSTRUCTIONS_IDENTITY.to_owned());
+        let names = match enumerate_bounded(dir, false) {
+            Enumeration::Names(names) => names,
+            Enumeration::CapExceeded(observed) => {
+                diagnostics.push(diagnostic(
+                    DiagnosticReason::DirEntriesExceeded,
+                    identity(),
+                    Some(observed),
+                ));
+                return false;
+            }
+            Enumeration::Failed => {
+                diagnostics.push(diagnostic(DiagnosticReason::IoError, identity(), None));
+                return false;
+            }
+        };
+        let mut exact = false;
+        for name in &names {
+            if name.as_slice() == file_name.as_bytes() {
+                exact = true;
+            } else if name.eq_ignore_ascii_case(file_name.as_bytes()) {
+                diagnostics.push(diagnostic(DiagnosticReason::CaseMismatch, identity(), None));
+            }
+        }
+        exact
     }
 
     fn scan_user_skills_root(root: &Path, scan: &mut SkillScan<'_>) {
@@ -1278,10 +1404,11 @@ mod imp {
     /// rather than follow a link (project-context contract, containment).
     pub(super) fn discover(
         _canonical_workspace: &Path,
-        _user_skills_root: Option<&Path>,
+        _user_context: UserContextPaths<'_>,
         _redactor: &SecretRedactor,
     ) -> DiscoveryOutcome {
         DiscoveryOutcome {
+            user_instructions: None,
             sources: Vec::new(),
             skills: Vec::new(),
             diagnostics: vec![diagnostic(

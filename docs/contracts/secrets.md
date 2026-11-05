@@ -63,8 +63,8 @@ no grant covers it, and it never reaches the guardian:
 
 The match ignores ASCII case, so on a case-insensitive filesystem a write
 to `PROFILES.json` is recognized as `profiles.json`. Other writes under the
-Euler home (skills, sessions, `preferences.json`) follow the normal profile
-rules (`capabilities.md`).
+Euler home (skills, sessions, `preferences.json`, the user instructions
+`AGENTS.md`) follow the normal profile rules (`capabilities.md`).
 
 Known gap: only the structured write is checked. A shell command that
 writes one of these files (`echo > ~/.euler/providers.json`) is not

@@ -6,6 +6,19 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Project context: personal instructions from `~/.euler/AGENTS.md`
+
+- **New**: Euler loads `AGENTS.md` from your Euler home (`$EULER_HOME`,
+  default `~/.euler`) into every session as user instructions, ahead of
+  project `EULER.md` files. Use it for standing rules such as your name or
+  writing preferences. No prompt: it is your own file. Project instructions
+  are more specific and win when the two conflict.
+- A missing file changes nothing. A file over 32 KiB, or one named with
+  different casing such as `agents.md`, is skipped whole and the omission is
+  recorded in the session's project-context diagnostics.
+- The session snapshot records the file's label (`user/AGENTS.md`), byte
+  length, digest, and redacted content, like user-global skills.
+
 ### TUI: the first-run profile choice opens inside the app
 
 - **Behavior change**: the first `euler` / `euler tui` launch (or resume)

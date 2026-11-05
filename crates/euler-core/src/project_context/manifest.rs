@@ -11,7 +11,7 @@ use super::{
     MAX_COMBINED_EULER_MD_BYTES, MAX_COMBINED_SKILL_BODY_BYTES, MAX_EULER_MD_BYTES,
     MAX_EULER_MD_SOURCES, MAX_IDENTITY_BYTES, MAX_MANIFEST_ADVISORY_DIAGNOSTICS,
     MAX_MANIFEST_OMISSION_DIAGNOSTICS, MAX_SKILLS, MAX_SKILL_BODY_BYTES,
-    MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_NAME_BYTES,
+    MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_NAME_BYTES, MAX_USER_INSTRUCTIONS_BYTES,
 };
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,10 @@ use std::fmt;
 pub(crate) const LEGACY_MANIFEST_VERSION: u32 = 1;
 pub(crate) const MANIFEST_VERSION: u32 = 2;
 pub(crate) const USER_SKILL_IDENTITY_ROOT: &str = "user/skills";
+/// Normalized identity of the user-level instructions file
+/// (`<euler home>/AGENTS.md`). Project discovery never yields an `AGENTS.md`
+/// identity, so this exact value cannot name a repository source.
+pub(crate) const USER_INSTRUCTIONS_IDENTITY: &str = "user/AGENTS.md";
 pub(crate) const SKILL_NAME_DIRECTORY_MISMATCH_REASON: &str = "skill_name_directory_mismatch";
 
 /// One accepted `EULER.md` source: normalized project-root-relative identity
@@ -85,12 +89,12 @@ impl ManifestDiagnostic {
         self.reason == SKILL_NAME_DIRECTORY_MISMATCH_REASON
     }
 
-    /// User-global skill diagnostics do not participate in repository
-    /// acknowledgment or its disclosure card.
+    /// User-global skill and user-instructions diagnostics do not
+    /// participate in repository acknowledgment or its disclosure card.
     pub(crate) fn applies_to_project(&self) -> bool {
         self.path
             .as_deref()
-            .is_none_or(|path| !is_user_skill_identity(path))
+            .is_none_or(|path| !is_user_skill_identity(path) && path != USER_INSTRUCTIONS_IDENTITY)
     }
 }
 
@@ -118,6 +122,12 @@ pub(crate) fn diagnostics_within_bounds(diagnostics: &[ManifestDiagnostic]) -> b
 #[serde(deny_unknown_fields)]
 pub(crate) struct CandidateManifest {
     pub version: u32,
+    /// The user's own `<euler home>/AGENTS.md`, frozen post-redaction. User
+    /// owned: it never enters the project acknowledgment view. Absent from the
+    /// encoding when the file is missing, so manifests without it keep their
+    /// existing bytes and digests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_instructions: Option<ManifestSource>,
     pub sources: Vec<ManifestSource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<ManifestSkill>,
@@ -129,6 +139,7 @@ impl CandidateManifest {
     pub(crate) fn project_acknowledgment_view(&self) -> Self {
         let mut manifest = Self {
             version: self.version,
+            user_instructions: None,
             sources: self.sources.clone(),
             skills: self
                 .skills
@@ -158,6 +169,11 @@ impl CandidateManifest {
             manifest.derive_reason_counts();
         }
         manifest
+    }
+
+    /// True when this manifest carries anything that reaches the model.
+    pub(crate) fn has_model_facing_guidance(&self) -> bool {
+        self.user_instructions.is_some() || !self.sources.is_empty() || !self.skills.is_empty()
     }
 
     fn derive_reason_counts(&mut self) {
@@ -199,9 +215,42 @@ impl CandidateManifest {
                 "legacy manifests cannot contain skills".to_owned(),
             ));
         }
+        if self.version == LEGACY_MANIFEST_VERSION && self.user_instructions.is_some() {
+            return Err(ManifestError(
+                "legacy manifests cannot contain user instructions".to_owned(),
+            ));
+        }
+        self.validate_user_instructions()?;
         self.validate_sources()?;
         self.validate_skills()?;
         self.validate_diagnostics()?;
+        Ok(())
+    }
+
+    fn validate_user_instructions(&self) -> Result<(), ManifestError> {
+        let Some(user) = &self.user_instructions else {
+            return Ok(());
+        };
+        if user.path != USER_INSTRUCTIONS_IDENTITY {
+            return Err(ManifestError(
+                "user instructions carry an unexpected identity".to_owned(),
+            ));
+        }
+        if user.byte_len != user.content.len() as u64 {
+            return Err(ManifestError(
+                "recorded length for user instructions does not match their content".to_owned(),
+            ));
+        }
+        if user.content.len() > MAX_USER_INSTRUCTIONS_BYTES {
+            return Err(ManifestError(
+                "user instructions exceed their size limit".to_owned(),
+            ));
+        }
+        if user.digest != source_digest_v1(&user.path, &user.content) {
+            return Err(ManifestError(
+                "recorded digest for user instructions does not match their content".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -538,6 +587,7 @@ mod tests {
     fn manifest() -> CandidateManifest {
         CandidateManifest {
             version: MANIFEST_VERSION,
+            user_instructions: None,
             sources: vec![
                 source("EULER.md", "root\n"),
                 source("crates/EULER.md", "leaf"),
@@ -618,6 +668,41 @@ mod tests {
 
         assert!(!user_skill.applies_to_project());
         assert!(project_source.applies_to_project());
+    }
+
+    #[test]
+    fn user_instructions_round_trip_and_reject_forged_records() {
+        let mut manifest = manifest();
+        manifest.user_instructions = Some(source(USER_INSTRUCTIONS_IDENTITY, "be brief\n"));
+        let json = manifest.to_canonical_json();
+        assert_eq!(
+            CandidateManifest::from_canonical_json(&json).expect("round trip"),
+            manifest
+        );
+
+        let mut foreign = manifest.clone();
+        foreign.user_instructions = Some(source("EULER.md", "be brief\n"));
+        assert!(foreign.validate().is_err());
+
+        let mut tampered = manifest.clone();
+        if let Some(user) = tampered.user_instructions.as_mut() {
+            user.content = "be loud\n".to_owned();
+        }
+        assert!(tampered.validate().is_err());
+
+        let mut legacy = manifest;
+        legacy.version = LEGACY_MANIFEST_VERSION;
+        assert!(legacy.validate().is_err());
+    }
+
+    #[test]
+    fn user_instructions_diagnostics_stay_out_of_project_acknowledgment() {
+        let record = ManifestDiagnostic {
+            reason: "source_too_large".to_owned(),
+            path: Some(USER_INSTRUCTIONS_IDENTITY.to_owned()),
+            observed: Some(40_000),
+        };
+        assert!(!record.applies_to_project());
     }
 
     #[test]

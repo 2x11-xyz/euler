@@ -108,8 +108,8 @@ pub use project_context::{
     AcknowledgmentLookup, AcknowledgmentStore, AcknowledgmentWriteError, AdmissionBudget,
     PendingAcknowledgment, ProjectContextBootstrap, ProjectContextBudgetError, ProjectContextError,
     ProjectContextPolicy, ProjectContextResolution, ProjectContextResolveOptions,
-    ProjectContextStatus, MAX_COMBINED_EULER_MD_BYTES, MAX_EULER_MD_BYTES, MAX_EULER_MD_SOURCES,
-    SNAPSHOT_SCHEMA_VERSION as PROJECT_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
+    ProjectContextStatus, UserContextPaths, MAX_COMBINED_EULER_MD_BYTES, MAX_EULER_MD_BYTES,
+    MAX_EULER_MD_SOURCES, SNAPSHOT_SCHEMA_VERSION as PROJECT_CONTEXT_SNAPSHOT_SCHEMA_VERSION,
 };
 pub use provenance::{
     event_is_runtime_only, query_provenance, read_provenance, ProvenancePage, ProvenanceQuery,

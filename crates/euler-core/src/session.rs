@@ -276,6 +276,9 @@ pub struct SessionConfig {
     /// in-process fresh session (`/new`) re-resolves with the same root the
     /// startup bootstrap used — user skills must survive `/new`.
     pub user_skills_root: Option<PathBuf>,
+    /// User-level instructions file (`<euler-home>/AGENTS.md`). `None`
+    /// (default) disables it. Carried for `/new` like `user_skills_root`.
+    pub user_instructions_path: Option<PathBuf>,
 }
 
 impl SessionConfig {
@@ -364,6 +367,7 @@ impl SessionConfig {
             permission_reviewer: PermissionReviewer::default(),
             project_context: None,
             user_skills_root: None,
+            user_instructions_path: None,
         }
     }
 }
@@ -1517,9 +1521,12 @@ impl<D> Session<D> {
                 .unwrap_or(self.config.compaction_reserve_tokens as u64),
             canvas_budget_bytes: self.config.auto_compaction.budget_bytes,
         };
-        ProjectContextBootstrap::resolve_with_user_skills(
+        ProjectContextBootstrap::resolve_with_user_context(
             &self.config.root,
-            self.config.user_skills_root.as_deref(),
+            crate::project_context::UserContextPaths {
+                skills_root: self.config.user_skills_root.as_deref(),
+                instructions_path: self.config.user_instructions_path.as_deref(),
+            },
             &self.redactor,
             options,
             self.config.project_grant_consent_dir.as_deref(),

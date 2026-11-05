@@ -1317,6 +1317,55 @@ fn exec_reads_model_preference_under_home_when_euler_home_is_unset() {
 }
 
 #[test]
+fn exec_loads_user_instructions_from_euler_home_without_acknowledgment() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let euler_home = tempfile::tempdir().expect("euler home");
+    fs::write(
+        euler_home.path().join("AGENTS.md"),
+        "Address the user as Ada.\n",
+    )
+    .expect("write user instructions");
+    // With EULER_HOME set, an AGENTS.md under the default home is not read.
+    let default_home = home.path().join(".euler");
+    fs::create_dir_all(&default_home).expect("default euler dir");
+    fs::write(default_home.join("AGENTS.md"), "default home rule\n").expect("write default");
+    let logs = tempfile::tempdir().expect("log dir");
+    let log = logs.path().join("events.jsonl");
+
+    let output = command_with_home(exe, &home)
+        .env("EULER_HOME", euler_home.path())
+        .args(["exec", "--provider", "fixture", "--provenance"])
+        .arg(path_str(&log))
+        .arg("hello user instructions")
+        .output()
+        .expect("run exec");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snapshot = fs::read_to_string(&log)
+        .expect("read provenance")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event json"))
+        .find(|event| event["kind"] == "project.context.snapshot")
+        .expect("snapshot event");
+    let manifest: serde_json::Value =
+        serde_json::from_str(snapshot["payload"]["manifest"].as_str().expect("manifest"))
+            .expect("manifest json");
+    let user = &manifest["user_instructions"];
+    assert_eq!(user["path"], "user/AGENTS.md");
+    assert_eq!(user["content"], "Address the user as Ada.\n");
+    assert_eq!(user["byte_len"], "Address the user as Ada.\n".len());
+    assert!(user["digest"]
+        .as_str()
+        .is_some_and(|digest| digest.len() == 64));
+    assert!(!snapshot.to_string().contains("default home rule"));
+}
+
+#[test]
 fn headless_exec_and_offline_listing_do_not_start_catalog_refresh() {
     let exe = env!("CARGO_BIN_EXE_euler");
     let home = isolated_home();
