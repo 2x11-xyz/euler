@@ -726,7 +726,9 @@ two rows. The `a`, `p`, and `u` keys decide nothing on such a panel; with an
 empty draft they type into the composer like any other character. An ask a
 permission rule caused (ADR 0027) is once-only and adds a muted line naming
 the rule and its reason, for example `Asked by the shell rule "git push *":
-Pushes need review.`; the patch panel and the operation panel show the same
+Pushes need review.` (an ask caused by a path Euler cannot resolve names
+the surface instead: `Asked by the path rules: a path this request names
+cannot be resolved`); the patch panel and the operation panel show the same
 line, and the line-mode prompt appends it in parentheses.
 
 A `run_shell` escalation (ADR 0026) is titled `Run command outside the

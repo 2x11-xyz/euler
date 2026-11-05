@@ -3,6 +3,7 @@
 //! decision payload builders shared with the companion loop and extension
 //! bridge.
 use super::{EventSink, Session, SessionError, TurnState};
+use crate::command_safety::{PathAccess, PathTarget};
 use crate::execution_profile::{RuleMatch, RuleState};
 use crate::guardian::{self, GuardianRuling, PermissionReviewer};
 use crate::permissions::{
@@ -517,6 +518,7 @@ pub(crate) fn permission_request_for_tool(
         }
         _ => {}
     }
+    request.path_targets = rule_path_targets(tool_name, input);
     // Canonicalized workspace-relative form, resolved exactly as the tool
     // resolves it (`..` and symlinks). `None` when the path cannot be
     // resolved inside the workspace.
@@ -589,6 +591,32 @@ pub(crate) fn permission_request_for_tool(
         request.path = resolved;
     }
     request
+}
+
+/// The paths a core tool call names, as `path` and `outside_workspace`
+/// permission rules read them (ADR 0027 section 1): the file a structured
+/// write targets (an `apply_patch` heredoc's too), the file `read_file`
+/// reads, the workspace `git_status` and `git_diff` read, and the path
+/// operands of a `run_shell` command.
+fn rule_path_targets(tool_name: &str, input: &Value) -> Vec<PathTarget> {
+    if let Some(path) = crate::tools::structured_write_path(tool_name, input) {
+        return vec![PathTarget::new(path, PathAccess::Write)];
+    }
+    match tool_name {
+        "read_file" => input
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| PathTarget::new(path, PathAccess::Read))
+            .into_iter()
+            .collect(),
+        "git_status" | "git_diff" => vec![PathTarget::new(".", PathAccess::Read)],
+        "run_shell" => input
+            .get("command")
+            .and_then(Value::as_str)
+            .map(crate::command_safety::shell_path_targets)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// Build a permission.decision payload including optional grant scope fields.

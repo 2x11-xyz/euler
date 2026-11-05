@@ -7,7 +7,7 @@
 use super::{ExtensionExecutionError, Session, SessionConfig};
 use crate::execution_profile::{
     ExecutionProfile, PermissionRule, ProfileContext, ProfileFields, ProfileRules, ProfilesConfig,
-    ProjectOverlay, RuleLayer, RuleLayerLabel, RuleState,
+    ProjectOverlay, RuleLayer, RuleLayerLabel, RuleMatch, RuleState,
 };
 use crate::permissions::{
     ApprovalMode, DeciderVerdict, GateRuling, PermissionDecider, PermissionGate, PermissionRequest,
@@ -88,7 +88,11 @@ fn ruled<D>(
     request: &PermissionRequest,
 ) -> (ApprovalMode, Option<(usize, RuleState)>) {
     let GateRuling { mode, rule } = gate.ruling_for_request(request);
-    (mode, rule.map(|rule| (rule.index, rule.state())))
+    let rule = rule.map(|rule| match rule {
+        RuleMatch::Rule { index, rule, .. } => (index, rule.state),
+        RuleMatch::Unresolved { .. } => panic!("no unresolved path expected"),
+    });
+    (mode, rule)
 }
 
 /// Section 10 `dev`: `git push` asks and the `--force` spelling is denied.
@@ -340,7 +344,10 @@ fn overlays_add_no_allow_rules_and_named_child_profiles_apply_none() {
     let publish = child_gate.ruling_for_request(&shell("cargo publish"));
     assert_eq!(publish.mode, ApprovalMode::Ask);
     assert_eq!(
-        publish.rule.map(|rule| rule.layer),
+        publish.rule.and_then(|rule| match rule {
+            RuleMatch::Rule { layer, .. } => Some(layer),
+            RuleMatch::Unresolved { .. } => None,
+        }),
         Some(RuleLayerLabel::Subagent)
     );
 

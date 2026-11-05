@@ -1543,7 +1543,7 @@ fn permission_cancellation_preserves_a_failed_deny_instruction() {
     let (reply_tx, reply_rx) = mpsc::channel();
     type_text(&mut core, "pre-ask");
     core.open_permission_envelope(PermissionPromptEnvelope {
-        prompt: PermissionPrompt::Request(PermissionRequest::new(
+        prompt: PermissionPrompt::from(PermissionRequest::new(
             Capability::ShellExec,
             "tool run_shell".to_owned(),
         )),
@@ -1576,7 +1576,7 @@ fn cancelled_permission_never_receives_a_deny_reply_after_enqueue_completion() {
     let cancellation = euler_sdk::CancellationSource::new();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.open_permission_envelope(PermissionPromptEnvelope {
-        prompt: PermissionPrompt::Request(PermissionRequest::new(
+        prompt: PermissionPrompt::from(PermissionRequest::new(
             Capability::ShellExec,
             "tool run_shell".to_owned(),
         )),

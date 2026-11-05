@@ -13,13 +13,13 @@ pub struct TuiDecider {
 /// an answer from the terminal UI.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PermissionPrompt {
-    Request(PermissionRequest),
+    Request(Box<PermissionRequest>),
     Batch(PermissionRequestBatch),
 }
 
 impl From<PermissionRequest> for PermissionPrompt {
     fn from(request: PermissionRequest) -> Self {
-        Self::Request(request)
+        Self::Request(Box::new(request))
     }
 }
 
@@ -68,7 +68,7 @@ impl TuiDecider {
 
 impl PermissionDecider for TuiDecider {
     fn decide(&mut self, request: &PermissionRequest) -> DeciderVerdict {
-        self.decide_prompt(PermissionPrompt::Request(request.clone()))
+        self.decide_prompt(PermissionPrompt::from(request.clone()))
     }
 
     fn decide_batch(&mut self, batch: &PermissionRequestBatch) -> DeciderVerdict {
@@ -81,7 +81,7 @@ impl PermissionDecider for TuiDecider {
         cancellation: &CancellationToken,
     ) -> PermissionDecisionOutcome<DeciderVerdict> {
         self.decide_prompt_cancellable(
-            PermissionPrompt::Request(request.clone()),
+            PermissionPrompt::from(request.clone()),
             cancellation.clone(),
         )
     }
@@ -197,7 +197,7 @@ mod tests {
         let handle = thread::spawn(move || decider.decide(&request()));
 
         let sent = next_prompt(&channels);
-        assert_eq!(sent.prompt, PermissionPrompt::Request(request()));
+        assert_eq!(sent.prompt, PermissionPrompt::from(request()));
         sent.reply_tx
             .send(PermissionReply::AllowOnce)
             .expect("reply");

@@ -565,9 +565,13 @@ extension error does not consume the later result.
     extension operation's `allow` rule decisions are recorded only when the
     operation is authorized to run (after its prompt, if any, is allowed)
     and carry its `operation`, `extension_id`, and `command`.
-  - `rule`: `{ "surface": "shell" | "tools", "index", "pattern", "state",
-    "layer": "profile" | "overlay" | "subagent" }`, the rule that set the
-    state; `index` is its position in that layer's array for that surface.
+  - `rule`: `{ "surface": "shell" | "path" | "outside_workspace" |
+    "tools", "index", "pattern", "state", "layer": "profile" | "overlay" |
+    "subagent" }`, the rule that set the state; `index` is its position in
+    that layer's array for that surface. An ask caused by a path Euler
+    could not resolve records `{ "surface": "path" | "outside_workspace",
+    "unresolved": true }` instead; an escalation's ask records it too
+    when that ask is human-only.
     Present on rule decisions and on the decision that settles an `ask`
     rule's prompt, whoever settled it (`decision_source` then says who).
   - `tool`: the core tool name or `<extension-id>.<command>` the rule
