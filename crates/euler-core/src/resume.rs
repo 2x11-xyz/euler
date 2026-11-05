@@ -803,6 +803,7 @@ fn resume_from_folded_prefix<D>(
         config.probe_subprocess_sandbox(),
     );
     crate::root_identity::insert_root_object_identity(&mut resume_marker.payload, &config.root);
+    crate::session::insert_model_source(&mut resume_marker.payload, &providers, &active_target);
     writer
         .arm_resume_marker(resume_marker)
         .map_err(ResumeError::Append)?;

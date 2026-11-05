@@ -1,7 +1,8 @@
 //! Runtime provider construction for custom `providers.json` entries.
 
 use crate::auth::SecretString;
-use crate::provider_config::{ApiFamily, CustomProviderConfig};
+use crate::gateway_discovery::GatewayDiscovery;
+use crate::provider_config::{ApiFamily, CustomProviderConfig, DiscoverySource};
 use crate::{
     observed_http_agent, ModelProvider, ModelRequest, ProviderError, ProviderStream,
     ProviderTransportObserver, ResolvedSecretSink, TransportReader,
@@ -72,6 +73,18 @@ impl CustomOpenAiProvider {
         })
     }
 
+    /// Runs gateway discovery (ADR 0025) with this provider's resolved key
+    /// and header specs, the way a model request resolves them.
+    pub fn discover_models(&self) -> Result<GatewayDiscovery, String> {
+        let resolved = self.resolve_headers().map_err(|error| error.to_string())?;
+        crate::gateway_discovery::discover(
+            &self.config.base_url,
+            self.config.api_family,
+            &resolved.headers,
+        )
+        .map_err(|error| scrub_secrets(error, &resolved.secrets))
+    }
+
     fn report_resolved_secret(&self, value: &SecretString) {
         let sink = self
             .secret_sink
@@ -112,6 +125,12 @@ impl ModelProvider for CustomOpenAiProvider {
             validate_secret_spec(value, &self.config.id, &format!("headers.{name}"))?;
         }
         Ok(())
+    }
+
+    fn model_source(&self, model: &str) -> Option<serde_json::Value> {
+        self.config
+            .model_source(model)
+            .map(DiscoverySource::model_source_json)
     }
 
     fn set_resolved_secret_sink(&self, sink: ResolvedSecretSink) {

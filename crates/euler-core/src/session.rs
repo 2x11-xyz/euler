@@ -1408,7 +1408,11 @@ impl<D> Session<D> {
         push_session_bootstrap(
             &mut bus,
             &config,
-            session_start_payload(&config, tools.sandbox_status()),
+            session_start_payload(
+                &config,
+                tools.sandbox_status(),
+                providers.model_source(&config.provider, &config.model),
+            ),
         );
         // The session inherits the startup redactor that was constructed and
         // seeded before project-context discovery ran; without a bootstrap
@@ -3412,18 +3416,20 @@ impl<D: PermissionDecider> Session<D> {
             &next.model,
             self.config.reasoning_effort,
         );
+        let mut switch_payload = object([
+            ("from_provider", previous.provider.clone().into()),
+            ("from_model", previous.model.clone().into()),
+            ("to_provider", next.provider.clone().into()),
+            ("to_model", next.model.clone().into()),
+            ("reason", reason.to_owned().into()),
+        ]);
+        insert_model_source(&mut switch_payload, &self.providers, &next);
         let switch = EventEnvelope::new(
             self.config.session_id.clone(),
             self.config.agent_id.clone(),
             self.previous_persisted_event_id(),
             EventKind::MODEL_SWITCHED,
-            object([
-                ("from_provider", previous.provider.clone().into()),
-                ("from_model", previous.model.clone().into()),
-                ("to_provider", next.provider.clone().into()),
-                ("to_model", next.model.clone().into()),
-                ("reason", reason.to_owned().into()),
-            ]),
+            switch_payload,
         );
         let switch_id = switch.id.clone();
         let mut events = vec![switch];
@@ -6157,7 +6163,11 @@ impl<D: PermissionDecider> Session<D> {
 
 /// The `session.start` payload for a fresh session, including the compact
 /// project-context summary when a bootstrap is configured.
-fn session_start_payload(config: &SessionConfig, sandbox: SandboxStatus) -> JsonObject {
+fn session_start_payload(
+    config: &SessionConfig,
+    sandbox: SandboxStatus,
+    model_source: Option<Value>,
+) -> JsonObject {
     let mut payload = object([
         ("provider", config.provider.clone().into()),
         ("model", config.model.clone().into()),
@@ -6222,6 +6232,7 @@ fn session_start_payload(config: &SessionConfig, sandbox: SandboxStatus) -> Json
             bootstrap.session_start_summary(),
         );
     }
+    payload.extend(model_source.map(|source| ("model_source".to_owned(), source)));
     let attached_root = payload
         .get("root")
         .and_then(Value::as_str)
@@ -6292,6 +6303,18 @@ fn execution_profile_fields(config: &SessionConfig) -> JsonObject {
         ("execution_profile", config.execution_profile_record()),
         ("command_approvals", command_approvals.into()),
     ])
+}
+
+/// Records where the provider's listing of `target` came from when it is not
+/// the provider's own configuration (a discovered gateway model, ADR 0025).
+pub(crate) fn insert_model_source(
+    payload: &mut JsonObject,
+    providers: &ProviderSet,
+    target: &ModelTarget,
+) {
+    if let Some(source) = providers.model_source(&target.provider, &target.model) {
+        payload.insert("model_source".to_owned(), source);
+    }
 }
 
 /// The execution boundary agent subprocesses actually got, probed rather than

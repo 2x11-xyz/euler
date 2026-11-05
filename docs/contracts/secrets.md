@@ -32,6 +32,7 @@ x-secret = "!op read 'op://vault/item/secret'"
 - Euler does not add built-in TTL, stale-value reuse, or secret recovery logic for arbitrary commands.
 - If a command needs caching or retry behavior, the user should wrap it in their own script.
 - Model availability checks may use configured auth presence but must not execute shell secret commands.
+- A gateway discovery refresh (`"discovery": true`, see the provider contract) needs the provider's secrets: it resolves the `api_key` spec or stored key and every header spec the way a model request does, including running a `!command`, in interactive and headless launches alike. A launch refreshes only when the provider's cache is missing or older than a day, and `euler models refresh` and `euler login --provider <id>` refresh on request, so a `!command` key may run about once a day, and on every launch while refreshes keep failing. `/model` and `euler models` read the cache, so the availability rule above still holds for them.
 
 
 ## Auth File: Subscription Tokens and Stored API Keys

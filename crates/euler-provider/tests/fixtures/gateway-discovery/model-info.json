@@ -1,0 +1,523 @@
+{
+  "data": [
+    {
+      "model_name": "claude-sonnet-4-5",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "anthropic/claude-sonnet-4-5"
+      },
+      "model_info": {
+        "id": "1",
+        "db_model": false,
+        "litellm_provider": "anthropic",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "claude-sonnet-4-5",
+        "max_input_tokens": 200000,
+        "max_tokens": 64000,
+        "max_output_tokens": 64000,
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "claude-opus-4-1",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "bedrock/us.anthropic.claude-opus-4-1-20250805-v1:0"
+      },
+      "model_info": {
+        "id": "2",
+        "db_model": false,
+        "litellm_provider": "bedrock",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "us.anthropic.claude-opus-4-1-20250805-v1:0",
+        "max_input_tokens": 200000,
+        "max_tokens": 32000,
+        "max_output_tokens": 32000,
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "claude-opus-4-1",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "bedrock/converse/us.anthropic.claude-opus-4-1-20250805-v1:0"
+      },
+      "model_info": {
+        "id": "3",
+        "db_model": false,
+        "litellm_provider": "bedrock_converse",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "us.anthropic.claude-opus-4-1-20250805-v1:0",
+        "max_input_tokens": 180000,
+        "max_tokens": 32000,
+        "max_output_tokens": 32000,
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "claude-sonnet-4-vertex",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "vertex_ai/claude-sonnet-4@20250514"
+      },
+      "model_info": {
+        "id": "4",
+        "db_model": false,
+        "litellm_provider": "vertex_ai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "vertex_ai/claude-sonnet-4@20250514",
+        "max_input_tokens": 200000,
+        "max_tokens": 64000,
+        "max_output_tokens": 64000,
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "claude-haiku-3-5-vertex",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "vertex_ai/claude-3-5-haiku@20241022"
+      },
+      "model_info": {
+        "id": "5",
+        "db_model": false,
+        "litellm_provider": "vertex_ai-anthropic_models",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "vertex_ai/claude-3-5-haiku@20241022",
+        "max_input_tokens": 200000,
+        "max_tokens": 8192,
+        "max_output_tokens": 8192,
+        "supports_function_calling": true,
+        "supports_reasoning": false,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "claude-haiku-3-key",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false
+      },
+      "model_info": {
+        "id": "6",
+        "db_model": false,
+        "litellm_provider": "bedrock",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "anthropic.claude-3-haiku-20240307-v1:0",
+        "max_input_tokens": 200000,
+        "max_tokens": 4096,
+        "max_output_tokens": 4096,
+        "supports_function_calling": true,
+        "supports_reasoning": false,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "llama-3-70b",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "bedrock/meta.llama3-70b-instruct-v1:0"
+      },
+      "model_info": {
+        "id": "7",
+        "db_model": false,
+        "litellm_provider": "bedrock",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "meta.llama3-70b-instruct-v1:0",
+        "max_input_tokens": 8192,
+        "max_tokens": 8192,
+        "max_output_tokens": 8192,
+        "supports_function_calling": false,
+        "supports_reasoning": false,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "gemini-2-5-pro",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "vertex_ai/gemini-2.5-pro"
+      },
+      "model_info": {
+        "id": "8",
+        "db_model": false,
+        "litellm_provider": "vertex_ai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "gemini-2.5-pro",
+        "max_input_tokens": 1048576,
+        "max_tokens": 65535,
+        "max_output_tokens": 65535,
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "gpt-4o",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "openai/gpt-4o"
+      },
+      "model_info": {
+        "id": "9",
+        "db_model": false,
+        "litellm_provider": "openai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "gpt-4o",
+        "max_input_tokens": 128000,
+        "max_tokens": 16384,
+        "max_output_tokens": 16384,
+        "supports_function_calling": true,
+        "supports_reasoning": false,
+        "supported_endpoints": [
+          "/v1/chat/completions",
+          "/v1/batch",
+          "/v1/responses"
+        ]
+      }
+    },
+    {
+      "model_name": "o3",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "openai/o3"
+      },
+      "model_info": {
+        "id": "10",
+        "db_model": false,
+        "litellm_provider": "openai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "o3",
+        "max_input_tokens": 200000,
+        "max_tokens": 100000,
+        "max_output_tokens": 100000,
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supported_endpoints": [
+          "/v1/chat/completions",
+          "/v1/batch",
+          "/v1/responses"
+        ]
+      }
+    },
+    {
+      "model_name": "codex-mini",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "openai/codex-mini-latest"
+      },
+      "model_info": {
+        "id": "11",
+        "db_model": false,
+        "litellm_provider": "openai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "responses",
+        "key": "codex-mini-latest",
+        "max_input_tokens": 200000,
+        "max_tokens": 100000,
+        "max_output_tokens": 100000,
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supported_endpoints": [
+          "/v1/responses"
+        ]
+      }
+    },
+    {
+      "model_name": "text-embedding-3-small",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "openai/text-embedding-3-small"
+      },
+      "model_info": {
+        "id": "12",
+        "db_model": false,
+        "litellm_provider": "openai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "embedding",
+        "key": "text-embedding-3-small",
+        "max_input_tokens": 8191,
+        "max_tokens": null,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "dall-e-3",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "openai/dall-e-3"
+      },
+      "model_info": {
+        "id": "13",
+        "db_model": false,
+        "litellm_provider": "openai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "image_generation",
+        "key": "dall-e-3",
+        "supported_endpoints": [
+          "/v1/images/generations"
+        ]
+      }
+    },
+    {
+      "model_name": "mixed-route",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "anthropic/claude-sonnet-4-5"
+      },
+      "model_info": {
+        "id": "14",
+        "db_model": false,
+        "litellm_provider": "anthropic",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "claude-sonnet-4-5",
+        "max_input_tokens": 200000,
+        "max_tokens": 64000,
+        "max_output_tokens": 64000,
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "mixed-route",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "openai/gpt-4o"
+      },
+      "model_info": {
+        "id": "15",
+        "db_model": false,
+        "litellm_provider": "openai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "gpt-4o",
+        "max_input_tokens": 128000,
+        "max_tokens": 16384,
+        "max_output_tokens": 16384,
+        "supports_function_calling": true,
+        "supports_reasoning": false,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "auto-router",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "auto_router/auto"
+      },
+      "model_info": {
+        "id": "16",
+        "db_model": false,
+        "litellm_provider": "auto_router",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "key": "auto",
+        "max_input_tokens": 128000,
+        "max_tokens": null,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "bad::route",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "openai/gpt-4o-mini"
+      },
+      "model_info": {
+        "id": "17",
+        "db_model": false,
+        "litellm_provider": "openai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "gpt-4o-mini",
+        "max_input_tokens": 128000,
+        "max_tokens": 16384,
+        "max_output_tokens": 16384,
+        "supports_function_calling": true,
+        "supports_reasoning": false,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "partial-tools",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "openai/gpt-4.1"
+      },
+      "model_info": {
+        "id": "18",
+        "db_model": false,
+        "litellm_provider": "openai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "gpt-4.1",
+        "max_input_tokens": 1047576,
+        "max_tokens": 32768,
+        "max_output_tokens": 32768,
+        "supports_function_calling": true,
+        "supports_reasoning": false,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "partial-tools",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "custom_openai/gpt-4.1"
+      },
+      "model_info": {
+        "id": "19",
+        "db_model": false,
+        "litellm_provider": "custom_openai",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "gpt-4.1",
+        "max_input_tokens": 1047576,
+        "max_tokens": 32768,
+        "max_output_tokens": 32768,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "anthropic/*",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "anthropic/*"
+      },
+      "model_info": {
+        "id": "20",
+        "db_model": false,
+        "litellm_provider": "anthropic",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "anthropic/*",
+        "max_input_tokens": 200000,
+        "max_tokens": 8192,
+        "max_output_tokens": 8192,
+        "supports_function_calling": true,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "anthropic/claude-3-7*",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "anthropic/claude-3-7*"
+      },
+      "model_info": {
+        "id": "21",
+        "db_model": false,
+        "litellm_provider": "anthropic",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "anthropic/claude-3-7*",
+        "max_input_tokens": 200000,
+        "max_tokens": 128000,
+        "max_output_tokens": 128000,
+        "supports_function_calling": true,
+        "supports_reasoning": true,
+        "supported_endpoints": null
+      }
+    },
+    {
+      "model_name": "bedrock/*",
+      "litellm_params": {
+        "use_in_pass_through": false,
+        "use_litellm_proxy": false,
+        "merge_reasoning_content_in_choices": false,
+        "model": "bedrock/*"
+      },
+      "model_info": {
+        "id": "22",
+        "db_model": false,
+        "litellm_provider": "bedrock",
+        "input_cost_per_token": 3e-06,
+        "output_cost_per_token": 1.5e-05,
+        "mode": "chat",
+        "key": "bedrock/*",
+        "supported_endpoints": null
+      }
+    }
+  ]
+}

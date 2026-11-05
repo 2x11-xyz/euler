@@ -57,6 +57,18 @@ pub(crate) fn run() -> Result<()> {
     }
     let args = Args::parse(raw.into_iter())?;
     let live_provenance = args.live_provenance();
+    let result = run_command(args, live_provenance);
+    // Shown once, after the TUI (if any) has restored the terminal.
+    for warning in crate::provider_discovery::take_background_warnings() {
+        eprintln!("warning: {warning}");
+    }
+    result
+}
+
+fn run_command(
+    args: Args,
+    live_provenance: crate::session_lifecycle::LiveProvenance,
+) -> Result<()> {
     match args.command {
         Command::Replay { path } => {
             let events = read_provenance(&path)?;
@@ -96,6 +108,9 @@ pub(crate) fn run() -> Result<()> {
         ),
         Command::Models(ModelsCommand::Refresh) => model_catalog_refresh::refresh_model_catalog(
             model_catalog::default_model_catalog_path().as_deref(),
+            provider_config_runtime::resolve_provider_config_path()
+                .ok()
+                .as_deref(),
             io::stdout(),
             io::stderr(),
         ),

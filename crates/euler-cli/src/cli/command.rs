@@ -6,7 +6,7 @@ use super::model_resolution::{
 };
 use super::permission::EnvArgs;
 use super::providers::{
-    load_custom_provider_config, load_known_model_catalog, load_known_model_preference,
+    load_known_model_catalog, load_known_model_preference, load_launch_provider_config,
     provider_for_id,
 };
 use super::scrub::ScrubArgs;
@@ -264,7 +264,7 @@ fn build_command_from_parsed(
         build_models_args(parsed)?;
         Command::Models(parsed.models_command)
     } else if parsed.exec {
-        let custom_providers = load_custom_provider_config(paths.provider_config);
+        let custom_providers = load_launch_provider_config(paths.provider_config);
         let preference = load_known_model_preference(paths.preference, &custom_providers);
         let model_catalog = load_known_model_catalog(paths.model_catalog);
         Command::Exec(build_exec_args(
@@ -289,7 +289,7 @@ fn build_command_from_parsed(
     } else if let Some(path) = parsed.resume_path.clone() {
         ensure_no_provider_options(parsed, "--resume")?;
         let model_catalog = load_known_model_catalog(paths.model_catalog);
-        let custom_providers = load_custom_provider_config(paths.provider_config);
+        let custom_providers = load_launch_provider_config(paths.provider_config);
         Command::Resume {
             path,
             run: build_run_args(parsed, None, &model_catalog, &custom_providers)?,
@@ -300,7 +300,7 @@ fn build_command_from_parsed(
             },
         }
     } else {
-        let custom_providers = load_custom_provider_config(paths.provider_config);
+        let custom_providers = load_launch_provider_config(paths.provider_config);
         let preference = load_known_model_preference(paths.preference, &custom_providers);
         let model_catalog = load_known_model_catalog(paths.model_catalog);
         *default_interactive = !parsed.explicit_run;
@@ -318,7 +318,7 @@ fn build_tui_command(parsed: &RawArgs, paths: CatalogPaths<'_>) -> Result<Comman
     if parsed.no_tty {
         return Err(anyhow!("tui cannot be combined with --no-tty"));
     }
-    let custom_providers = load_custom_provider_config(paths.provider_config);
+    let custom_providers = load_launch_provider_config(paths.provider_config);
     let preference = load_known_model_preference(paths.preference, &custom_providers);
     let model_catalog = load_known_model_catalog(paths.model_catalog);
     let run = build_run_args(

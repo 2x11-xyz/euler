@@ -2,7 +2,36 @@ use anyhow::{anyhow, Context, Result};
 use std::io::Write;
 use std::path::Path;
 
+/// `euler models refresh`: the managed provider catalog, then every
+/// discovery provider in `providers.json` (ADR 0025). A discovery failure
+/// keeps that provider's cache and fails the command after the others run.
 pub(crate) fn refresh_model_catalog(
+    model_path: Option<&Path>,
+    provider_config_path: Option<&Path>,
+    mut stdout: impl Write,
+    mut stderr: impl Write,
+) -> Result<()> {
+    let catalog = refresh_provider_catalog(model_path, &mut stdout, &mut stderr);
+    let discovery_succeeded = match provider_config_path {
+        Some(path) => {
+            let load = crate::provider_config_runtime::load_provider_config(Some(path));
+            for warning in &load.warnings {
+                writeln!(stderr, "warning: ignored provider config: {warning}")?;
+            }
+            crate::provider_discovery::refresh_all(path, &load.registry, &mut stdout, &mut stderr)?
+        }
+        None => true,
+    };
+    catalog?;
+    if !discovery_succeeded {
+        return Err(anyhow!(
+            "provider discovery refresh failed; cached models left untouched"
+        ));
+    }
+    Ok(())
+}
+
+fn refresh_provider_catalog(
     model_path: Option<&Path>,
     mut stdout: impl Write,
     mut stderr: impl Write,

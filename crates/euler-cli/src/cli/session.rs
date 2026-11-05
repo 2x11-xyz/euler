@@ -1030,6 +1030,7 @@ where
     config.provider = folded.active_target.provider.clone();
     config.model = folded.active_target.model.clone();
     apply_catalog_context_limit(&mut config, &run.model_catalog);
+    crate::provider_discovery::print_resume_model_source_change(&folded, &providers);
 
     let outcome = intent.resume(config, providers, decider, writer, folded)?;
     let warning_count = outcome.warnings.len();

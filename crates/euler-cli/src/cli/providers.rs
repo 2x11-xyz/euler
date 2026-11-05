@@ -85,7 +85,7 @@ pub(crate) fn provider_for_id(
 }
 
 /// The key `euler login --provider <id>` stored in the default auth file.
-fn stored_custom_api_key(
+pub(crate) fn stored_custom_api_key(
     provider_id: &str,
 ) -> std::result::Result<Option<ProviderSecretString>, ProviderError> {
     let storage = AuthStorage::new_default().map_err(|error| {
@@ -292,6 +292,19 @@ pub(super) fn load_known_model_catalog(model_catalog_path: Option<&Path>) -> Mer
         eprintln!("warning: ignored model catalog: {warning}");
     }
     load.catalog
+}
+
+/// Loads `providers.json` for a session launch: discovery caches are brought
+/// up to date first (ADR 0025), so the launch routes from them.
+pub(crate) fn load_launch_provider_config(
+    provider_config_path: Option<&Path>,
+) -> ProviderConfigRegistry {
+    if let Some(path) = provider_config_path {
+        for warning in crate::provider_discovery::refresh_at_launch(path) {
+            eprintln!("warning: {warning}");
+        }
+    }
+    load_custom_provider_config(provider_config_path)
 }
 
 pub(crate) fn load_custom_provider_config(
