@@ -7,7 +7,9 @@
 use crate::auth::SecretString;
 use crate::provider_config::{model_id_is_valid, ApiFamily, CustomModelConfig};
 use serde_json::{json, Map, Value};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::io::Read;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -27,6 +29,29 @@ pub struct GatewayDiscovery {
     pub notes: Vec<String>,
 }
 
+/// A failed discovery run. `key_rejected` is set when every request was
+/// answered with HTTP 401 or 403, and the message then says so.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiscoveryError {
+    pub message: String,
+    pub key_rejected: bool,
+}
+
+impl From<String> for DiscoveryError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            key_rejected: false,
+        }
+    }
+}
+
+impl fmt::Display for DiscoveryError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 /// Runs discovery against the gateway root of `base_url` (its `/v1` removed)
 /// with the provider's resolved headers. Requests stay at the base URL's
 /// origin, follow no redirects, and share one overall deadline. Errors name
@@ -35,13 +60,15 @@ pub(crate) fn discover(
     base_url: &str,
     api_family: ApiFamily,
     headers: &BTreeMap<String, SecretString>,
-) -> Result<GatewayDiscovery, String> {
+) -> Result<GatewayDiscovery, DiscoveryError> {
     let root = gateway_root(base_url)?;
     let fetcher = Fetcher {
         agent: ureq::AgentBuilder::new().redirects(0).build(),
         root,
         headers,
         deadline: Instant::now() + RUN_TIMEOUT,
+        requests: Cell::new(0),
+        auth_rejections: Cell::new(0),
     };
     let model_info = fetcher.get(MODEL_INFO_PATH);
     if let Some(rows) = model_info.as_ref().ok().and_then(model_info_rows) {
@@ -51,18 +78,35 @@ pub(crate) fn discover(
                 .get(MODELS_PATH)
                 .and_then(|body| model_list_ids(&body, &fetcher.url(MODELS_PATH)))
         });
-        return map_model_info(&rows, listed_ids, &fetcher.url(MODEL_INFO_PATH));
+        return Ok(map_model_info(
+            &rows,
+            listed_ids,
+            &fetcher.url(MODEL_INFO_PATH),
+        )?);
     }
-    let models = fetcher
-        .get(MODELS_PATH)
-        .map_err(|error| match &model_info {
+    let models = fetcher.get(MODELS_PATH).map_err(|error| {
+        let message = match &model_info {
             Ok(_) => format!(
                 "{error} (GET {} did not return model rows)",
                 fetcher.url(MODEL_INFO_PATH)
             ),
             Err(info_error) => format!("{error} ({info_error})"),
-        })?;
-    map_model_list(&models, api_family, &fetcher.url(MODELS_PATH))
+        };
+        let key_rejected = fetcher.auth_rejections.get() == fetcher.requests.get();
+        DiscoveryError {
+            message: if key_rejected {
+                format!("the key was rejected: {message}")
+            } else {
+                message
+            },
+            key_rejected,
+        }
+    })?;
+    Ok(map_model_list(
+        &models,
+        api_family,
+        &fetcher.url(MODELS_PATH),
+    )?)
 }
 
 /// `base_url` with trailing slashes and the trailing `/v1` removed.
@@ -80,6 +124,9 @@ struct Fetcher<'a> {
     root: Url,
     headers: &'a BTreeMap<String, SecretString>,
     deadline: Instant,
+    /// Requests sent, and those answered with HTTP 401 or 403.
+    requests: Cell<usize>,
+    auth_rejections: Cell<usize>,
 }
 
 impl Fetcher<'_> {
@@ -91,6 +138,9 @@ impl Fetcher<'_> {
 
     fn get(&self, path: &str) -> Result<Value, String> {
         let url = self.url(path);
+        // Counted before the deadline check: a request the deadline stops
+        // was not answered, so it never counts toward a rejected key.
+        self.requests.set(self.requests.get() + 1);
         let remaining = self
             .deadline
             .checked_duration_since(Instant::now())
@@ -107,7 +157,10 @@ impl Fetcher<'_> {
         let response = match request.call() {
             Ok(response) => response,
             Err(ureq::Error::Status(status, _)) => {
-                return Err(format!("GET {url} returned HTTP {status}"))
+                if matches!(status, 401 | 403) {
+                    self.auth_rejections.set(self.auth_rejections.get() + 1);
+                }
+                return Err(format!("GET {url} returned HTTP {status}"));
             }
             Err(ureq::Error::Transport(transport)) => {
                 return Err(format!(

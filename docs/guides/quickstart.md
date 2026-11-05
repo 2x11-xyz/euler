@@ -48,21 +48,37 @@ export XAI_API_KEY='...'
 euler auth status
 ```
 
-Local models and other OpenAI-compatible endpoints can be wired as custom
-providers via `~/.euler/providers.json` — see the
-[headless guide](headless.md). For a custom provider that sets
-`"auth_header": true` and no `api_key`, store its key once instead of
-exporting it:
+To use an OpenAI-compatible gateway such as a LiteLLM proxy, log in with a
+provider id of your choice:
 
 ```sh
-euler login --provider my-gateway
-euler auth status
+euler login --provider litellm
 ```
 
-`euler login` asks for the key without echoing it (or reads one line from a
-pipe) and stores it in `~/.euler/auth.json` under the provider id. An
-`api_key` in the entry wins, so login refuses an entry that sets one.
-`euler logout --provider my-gateway` removes the stored key and leaves the
+```text
+Base URL: https://litellm.example.com
+Using https://litellm.example.com/v1
+API key:
+Found 42 models from /model/info: 12 anthropic_messages, 3 openai_responses, 27 openai_chat_completions.
+Added provider litellm to ~/.euler/providers.json.
+Stored the key for litellm in ~/.euler/auth.json.
+```
+
+Login asks for the base URL and then the key without echoing it (or reads
+one line each from a pipe), checks both by listing the gateway's models, and
+only then stores the key in `~/.euler/auth.json` and adds the provider to
+`~/.euler/providers.json` with `"discovery": true`. The models then appear in
+`/model` and `euler models`, each routed to its API family. A wrong URL or a
+rejected key stores nothing and says why. Running login again for the same
+id offers the current URL as the default and replaces the key.
+
+Local models and other endpoints can also be wired by hand in
+`~/.euler/providers.json`; see the [headless guide](headless.md). For a
+hand-written entry that sets `"auth_header": true` and no `api_key`, the same
+command stores its key; if you keep its URL and that gateway does not list
+its models or cannot be reached, login asks whether to save the key without
+model discovery and leaves the entry as written. An `api_key` in the entry
+wins, so login refuses an entry that sets one. `euler logout --provider litellm` removes the stored key and leaves the
 entry.
 
 Check the offline model catalog:

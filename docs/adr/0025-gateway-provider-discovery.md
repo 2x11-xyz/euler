@@ -346,6 +346,10 @@ the proposal in the draft.
    non-loopback host warns rather than fails; `/login <id>` works the same
    in the TUI. As proposed. Verifying before writing turns a bad URL or key
    into one clear error instead of a broken provider.
+   Note (2026-11-05, rollout step 3): login refuses an `http` URL to a
+   non-loopback host, since `providers.json` ignores such an entry, and an
+   existing entry whose gateway lists no models may store the key with the
+   entry left as written.
 3. The key is stored in `auth.json` under the provider id, an `api_key` spec
    wins, and `logout` removes only the key. As proposed.
 4. Stale caches refresh in the background, a missing cache is fetched in the

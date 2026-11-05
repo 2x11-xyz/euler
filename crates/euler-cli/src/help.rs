@@ -69,7 +69,7 @@ fn subcommand_help(name: &str) -> Option<String> {
         "login" => Some(credential_help(
             "Sign in and store",
             "login",
-            "chatgpt, or a providers.json provider with\n                             auth_header: true and no api_key",
+            "chatgpt, or a custom provider id; a new id\n                             prompts for the gateway URL and key and adds\n                             it to providers.json",
         )),
         "logout" => Some(credential_help(
             "Remove stored",
