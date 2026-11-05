@@ -4377,7 +4377,7 @@ impl AppCore {
 
     fn modal_for_prompt(&self, prompt: PermissionPrompt) -> Modal {
         match prompt {
-            PermissionPrompt::Request(request) => self.modal_for_request(request),
+            PermissionPrompt::Request(request) => self.modal_for_request(*request),
             PermissionPrompt::Batch(batch) => Modal::PermissionBatch(batch),
         }
     }

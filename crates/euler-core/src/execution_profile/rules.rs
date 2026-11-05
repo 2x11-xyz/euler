@@ -3,11 +3,13 @@
 //! never concatenated into another, so most restrictive across layers stays
 //! distinct from last match within one layer.
 
-use crate::command_safety::RuleSegment;
+use crate::command_safety::{PathTarget, RuleSegment};
 use crate::tools::CORE_TOOL_NAMES;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Component, Path};
+
+mod path_matching;
 
 /// At most this many rules per surface per layer (resolved question 11).
 const MAX_RULES_PER_SURFACE: usize = 256;
@@ -352,11 +354,12 @@ pub(super) fn lower_ask_timeout(left: Option<u32>, right: Option<u32>) -> Option
     }
 }
 
-/// The rule surfaces the gate enforces in this build. `path` and
-/// `outside_workspace` rules are parsed and recorded but refused at startup.
+/// A rule surface (ADR 0027 section 1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuleSurface {
     Shell,
+    Path,
+    OutsideWorkspace,
     Tools,
 }
 
@@ -364,40 +367,72 @@ impl RuleSurface {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Shell => "shell",
+            Self::Path => "path",
+            Self::OutsideWorkspace => "outside_workspace",
             Self::Tools => "tools",
         }
     }
 }
 
-/// The rule that set a request's rule state: where it sits and what it says.
+/// What set a request's rule state.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuleMatch {
-    pub surface: RuleSurface,
-    pub layer: RuleLayerLabel,
-    /// The rule's position in its layer's array for its surface.
-    pub index: usize,
-    pub rule: PermissionRule,
+pub enum RuleMatch {
+    /// A rule that matched: where it sits and what it says.
+    Rule {
+        surface: RuleSurface,
+        layer: RuleLayerLabel,
+        /// The rule's position in its layer's array for its surface.
+        index: usize,
+        rule: PermissionRule,
+    },
+    /// A path the request names that Euler cannot resolve, counted as `ask`
+    /// because its surface has an `ask` or `deny` rule (ADR 0027 section
+    /// 3). With a `deny` rule there the ask is human-only, since the
+    /// guardian cannot tell whether it is the denied case (resolved
+    /// question 3).
+    Unresolved {
+        surface: RuleSurface,
+        human_only: bool,
+    },
 }
 
 impl RuleMatch {
     pub fn state(&self) -> RuleState {
-        self.rule.state
+        match self {
+            Self::Rule { rule, .. } => rule.state,
+            Self::Unresolved { .. } => RuleState::Ask,
+        }
+    }
+
+    /// Whether only a person may settle this ask: the guardian never
+    /// reviews it.
+    pub fn human_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Unresolved {
+                human_only: true,
+                ..
+            }
+        )
     }
 
     /// `the shell rule "git push *": reason`, for a tool error or a prompt
     /// (ADR 0027 section 1: the reason is shown with a denial or a prompt).
     pub fn describe(&self) -> String {
-        let reason = self
-            .rule
-            .reason
-            .as_deref()
-            .map(|reason| format!(": {reason}"))
-            .unwrap_or_default();
-        format!(
-            "the {} rule \"{}\"{reason}",
-            self.surface.as_str(),
-            self.rule.pattern
-        )
+        match self {
+            Self::Rule { surface, rule, .. } => {
+                let reason = rule
+                    .reason
+                    .as_deref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default();
+                format!("the {} rule \"{}\"{reason}", surface.as_str(), rule.pattern)
+            }
+            Self::Unresolved { surface, .. } => format!(
+                "the {} rules: a path this request names cannot be resolved",
+                surface.as_str()
+            ),
+        }
     }
 
     /// `Asked by the shell rule "git push *": reason`, the line an approval
@@ -408,49 +443,90 @@ impl RuleMatch {
 
     /// The `rule` object of a `permission.decision` (ADR 0027 section 9).
     pub fn record(&self) -> Value {
-        json!({
-            "surface": self.surface.as_str(),
-            "index": self.index,
-            "pattern": self.rule.pattern,
-            "state": self.rule.state,
-            "layer": self.layer,
-        })
+        match self {
+            Self::Rule {
+                surface,
+                layer,
+                index,
+                rule,
+            } => json!({
+                "surface": surface.as_str(),
+                "index": index,
+                "pattern": rule.pattern,
+                "state": rule.state,
+                "layer": layer,
+            }),
+            Self::Unresolved { surface, .. } => json!({
+                "surface": surface.as_str(),
+                "unresolved": true,
+            }),
+        }
+    }
+
+    /// Whether this match sets a stricter state than `other`: a stricter
+    /// state, or an equally strict human-only ask.
+    fn stricter_than(&self, other: &Self) -> bool {
+        self.state() > other.state()
+            || (self.state() == other.state() && self.human_only() && !other.human_only())
     }
 }
 
+/// The paths a request names and the workspace root relative paths resolve
+/// against, for the `path` and `outside_workspace` surfaces.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestPaths<'a> {
+    pub targets: &'a [PathTarget],
+    pub workspace_root: &'a Path,
+}
+
 /// The rule state of one request under `layers` (ADR 0027 section 3), from
-/// the `shell` surface over `segments` (a `run_shell` command) and the
-/// `tools` surface over `tool` (a core tool name or
-/// `<extension-id>.<command>`). Within a surface the last matching rule
-/// wins; a command is `deny` if any segment is, else `ask` if any is, else
-/// `allow` only if every segment is. Surfaces and layers combine by most
-/// restrictive. `None` means no rule state.
+/// the `shell` surface over `segments` (a `run_shell` command), the `path`
+/// and `outside_workspace` surfaces over `paths`, and the `tools` surface
+/// over `tool` (a core tool name or `<extension-id>.<command>`). Within a
+/// surface the last matching rule wins for each segment or path; a request
+/// is `deny` if any segment or path is, else `ask` if any is, else `allow`
+/// only if every one is. Surfaces and layers combine by most restrictive.
+/// `None` means no rule state.
 pub fn rule_match(
     layers: &[RuleLayer],
     segments: Option<&[RuleSegment]>,
+    paths: Option<RequestPaths<'_>>,
     tool: Option<&str>,
 ) -> Option<RuleMatch> {
     // An `allow` never applies to a command Euler cannot resolve, on the
     // `tools` surface either (section 3).
     let unresolved = segments.is_some_and(|segments| segments.iter().any(|s| !s.resolved));
+    // Resolving touches the filesystem, so only where a path rule may read it.
+    let has_path_rules = layers
+        .iter()
+        .any(|layer| !layer.rules.path.is_empty() || !layer.rules.outside_workspace.is_empty());
+    let paths = paths
+        .filter(|_| has_path_rules)
+        .map(path_matching::ResolvedPaths::resolve);
     let mut found: Option<RuleMatch> = None;
     for layer in layers {
         let shell = segments.and_then(|segments| shell_match(layer, segments));
+        let path = paths
+            .as_ref()
+            .and_then(|paths| paths.surface_match(layer, RuleSurface::Path));
+        let outside = paths
+            .as_ref()
+            .and_then(|paths| paths.surface_match(layer, RuleSurface::OutsideWorkspace));
         let tools = tool.and_then(|tool| {
             last_match(&layer.rules.tools, unresolved, |pattern| {
                 glob_matches(pattern, tool)
             })
-            .map(|index| RuleMatch {
+            .map(|index| RuleMatch::Rule {
                 surface: RuleSurface::Tools,
                 layer: layer.layer,
                 index,
                 rule: layer.rules.tools[index].clone(),
             })
         });
-        for candidate in [shell, tools].into_iter().flatten() {
+        for candidate in [shell, path, outside, tools].into_iter().flatten() {
             if found
                 .as_ref()
-                .is_none_or(|found| candidate.state() > found.state())
+                .is_none_or(|found| candidate.stricter_than(found))
             {
                 found = Some(candidate);
             }
@@ -459,39 +535,42 @@ pub fn rule_match(
     found
 }
 
+/// The strictest of one surface's per-segment or per-path results, where
+/// `None` is a segment or path no rule matched: `None` unless some result
+/// is a match, and `None` when the strictest is `allow` but not every result
+/// is. Among results tied for the strictest state the first is kept.
+fn reduce_targets(results: Vec<Option<RuleMatch>>) -> Option<RuleMatch> {
+    let unmatched = results.iter().any(Option::is_none);
+    let strictest = results.into_iter().flatten().reduce(|found, next| {
+        if next.stricter_than(&found) {
+            next
+        } else {
+            found
+        }
+    })?;
+    (strictest.state() != RuleState::Allow || !unmatched).then_some(strictest)
+}
+
 fn shell_match(layer: &RuleLayer, segments: &[RuleSegment]) -> Option<RuleMatch> {
     let rules = &layer.rules.shell;
-    let mut matches = Vec::with_capacity(segments.len());
-    for segment in segments {
-        // An `allow` never covers a command Euler cannot read, but a `deny`
-        // or `ask` before it still does (`*` deny, then carve-outs).
-        let index = last_match(rules, !segment.resolved, |pattern| {
-            shell_pattern_matches(pattern, &segment.text)
-        });
-        matches.push(index.map(|index| RuleMatch {
-            surface: RuleSurface::Shell,
-            layer: layer.layer,
-            index,
-            rule: rules[index].clone(),
-        }));
-    }
-    // Among matches tied for the strictest state, the first in segment
-    // order is the one recorded.
-    let strictest = matches
+    let results = segments
         .iter()
-        .flatten()
-        .reduce(|found, next| {
-            if next.state() > found.state() {
-                next
-            } else {
-                found
-            }
+        .map(|segment| {
+            // An `allow` never covers a command Euler cannot read, but a
+            // `deny` or `ask` before it still does (`*` deny, then
+            // carve-outs).
+            last_match(rules, !segment.resolved, |pattern| {
+                shell_pattern_matches(pattern, &segment.text)
+            })
+            .map(|index| RuleMatch::Rule {
+                surface: RuleSurface::Shell,
+                layer: layer.layer,
+                index,
+                rule: rules[index].clone(),
+            })
         })
-        .cloned()?;
-    if strictest.state() == RuleState::Allow && matches.iter().any(Option::is_none) {
-        return None;
-    }
-    Some(strictest)
+        .collect();
+    reduce_targets(results)
 }
 
 /// The index of the last rule in `rules` whose pattern `matches`, skipping

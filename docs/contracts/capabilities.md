@@ -402,13 +402,11 @@ is not tracked.
   with the same label already holds exactly those rules; a lower
   `ask_timeout` and added `extension_reviewers` apply, the recorded ones
   stay, and the summary names the fields joined this way. The gate
-  enforces `shell` and `tools` rules ("Permission rules in the gate"
-  below). This build refuses at startup any profile, overlay, child, or
-  resume that sets `ask_timeout`, `extension_reviewers`, or a `path` or
-  `outside_workspace` rule, naming the field (`rules.path`,
-  `rules.outside_workspace`), because the gate does not enforce them yet;
-  when only the recording sets one, the error names the recorded profile
-  and `--profile`. Validation here is syntax only: the ADR 0027 section 8
+  enforces every rule surface ("Permission rules in the gate" below). This
+  build refuses at startup any profile, overlay, child, or resume that sets
+  `ask_timeout` or `extension_reviewers`, naming the field, because the
+  gate does not enforce them yet; when only the recording sets one, the
+  error names the recorded profile and `--profile`. Validation here is syntax only: the ADR 0027 section 8
   checks that need installed extensions (the hint for a `tools` pattern
   that matches an extension's model-visible tool name, the notice for an
   extension id that is not installed, and the error for an
@@ -441,8 +439,45 @@ is not tracked.
   `apply_patch` heredoc sent through `run_shell` is matched as
   `apply_patch`, the tool core runs it as. A `tools` `allow` does not apply
   to a shell command (`run_shell` or an extension's) with an unresolved
-  command either. Within a surface of one layer the last
-  matching rule wins; surfaces and layers combine by most restrictive. A
+  command either. `path` and `outside_workspace` rules match the paths a
+  core tool call names, each a target with a direction: the file
+  `read_file` reads, the file `write_file`, `edit_file`, or `apply_patch`
+  (its `run_shell` heredoc form too) writes, the workspace root `git_status`
+  and `git_diff` read, and the path operands of the full `run_shell` text
+  over the same commands `shell` rules see. Redirection targets are
+  writes (`<` reads; `2>&1` names no path); `cp`, `install`, `ln`, and
+  `rsync` write their last operand (or `-t`/`--target-directory` for all
+  but `rsync`) and read the others; `mv`, `tee`, `touch`, `mkdir`, `rm`,
+  `mktemp`, `patch`, and `ed` write every operand; `sed -i`, `perl -i`,
+  `ruby -i`, and `awk -i inplace` write their operands and read them
+  without in-place editing; `dd` reads `if=` and writes `of=`; `curl -o` and
+  `wget -O` write their file and read their other operands; `cat`, `ls`,
+  `head`, `tail`, `grep`, `rg`, `wc`, `stat`, and `diff` read; operands of
+  any other command, after options and with `-` skipped, have unknown
+  direction and match `read`, `write`, and `any` rules alike. A wrapper's
+  operands are those of the command it runs. A relative path resolves
+  against the workspace root (a `cd` earlier in the command is not
+  tracked), and a path and a pattern are each matched in literal and
+  canonical form (symlinks resolved up to the longest existing ancestor),
+  the target taking the stricter of its forms' last matches. `path`
+  patterns are globs over components (`*` within one, `**` zero or more,
+  so `secrets/**` also matches `secrets`), relative to the workspace root
+  unless absolute or `~/`; `outside_workspace` patterns are directory
+  prefixes matched by component, against targets whose canonical form is
+  outside the workspace root. A rule with `access` `read` or `write`
+  matches targets of that direction and of unknown direction. Within a
+  surface each target takes its last matching rule, and the surface is
+  `deny` if any target is, else `ask` if any is, else `allow` only if every
+  target on it is. A command with a dynamic word, an unreadable wrapper,
+  or a parse error is an unresolved target (a word with `$`, `~`, or a
+  glob is dynamic): where its surface has an `ask` or `deny` rule it counts
+  as `ask` and records `{surface, unresolved: true}`, so it never hides a
+  known `deny` and no `allow` covers it, and where that surface has a
+  `deny` rule the ask is human-only (the guardian never reviews it); with
+  only `allow` rules it has no rule state. Extension shell commands and
+  extension operations name no paths, so path rules do not apply to
+  them. Within a surface of one layer the last matching rule wins;
+  surfaces and layers combine by most restrictive. A
   `deny` rule refuses the request without asking anyone and covers that
   request only: the capability is not denied for the rest of the turn, and
   the tool error names the rule and its `reason` and tells the model not to

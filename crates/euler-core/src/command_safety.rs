@@ -78,6 +78,9 @@
 use std::path::{Component, Path};
 use tree_sitter::{Node, Parser, Tree};
 
+mod path_operands;
+pub use path_operands::{PathAccess, PathTarget};
+
 /// Recursion cap for wrapper unwrapping in both parsers (Codex uses the
 /// same bound). Exceeding it fails closed: not provable for the prove-safe
 /// grammar, dangerous for the danger walk.
@@ -2163,9 +2166,38 @@ pub struct RuleSegment {
 /// yields `sudo git push` and `git push`), through the danger walk's parser
 /// and wrapper table. A line that does not parse is one unresolved segment.
 pub fn rule_segments(command: &str) -> Vec<RuleSegment> {
-    let mut segments = Vec::new();
-    collect_rule_segments(command, 0, &mut segments);
-    segments
+    let mut walk = RuleWalk::default();
+    collect_rule_segments(command, 0, &mut walk);
+    walk.segments
+}
+
+/// Every path `command` names in a recognized position, for `path` and
+/// `outside_workspace` permission rules (ADR 0027 resolved question 3),
+/// over the same commands [`rule_segments`] yields: redirection targets and
+/// the operands of each literal command, a wrapper's through the command it
+/// runs. A command with a dynamic word, an unreadable wrapper, or a line
+/// that does not parse is one unresolved target.
+pub fn shell_path_targets(command: &str) -> Vec<PathTarget> {
+    let mut walk = RuleWalk::default();
+    collect_rule_segments(command, 0, &mut walk);
+    walk.paths
+}
+
+/// What permission rules read from one command line: its commands and the
+/// paths they name.
+#[derive(Default)]
+struct RuleWalk {
+    segments: Vec<RuleSegment>,
+    paths: Vec<PathTarget>,
+}
+
+impl RuleWalk {
+    /// A command that cannot be read statically: an unresolved segment and
+    /// an unresolved path.
+    fn push_unresolved(&mut self, source: &str) {
+        self.segments.push(unresolved_segment(source));
+        self.paths.push(PathTarget::unresolved());
+    }
 }
 
 fn unresolved_segment(source: &str) -> RuleSegment {
@@ -2175,22 +2207,22 @@ fn unresolved_segment(source: &str) -> RuleSegment {
     }
 }
 
-fn collect_rule_segments(script: &str, depth: usize, segments: &mut Vec<RuleSegment>) {
+fn collect_rule_segments(script: &str, depth: usize, walk: &mut RuleWalk) {
     let tree = (depth <= MAX_WRAPPER_DEPTH)
         .then(|| parse_script(script))
         .flatten()
         .filter(|tree| !tree.root_node().has_error() && !tree.root_node().is_missing());
     let Some(tree) = tree else {
-        segments.push(unresolved_segment(script));
+        walk.push_unresolved(script);
         return;
     };
-    let found_before = segments.len();
+    let found_before = walk.segments.len();
     let mut stack = vec![tree.root_node()];
     let mut visits = 0usize;
     while let Some(node) = stack.pop() {
         visits += 1;
         if visits > MAX_NODE_VISITS {
-            segments.push(unresolved_segment(script));
+            walk.push_unresolved(script);
             return;
         }
         let source = || node.utf8_text(script.as_bytes()).unwrap_or(script);
@@ -2198,16 +2230,19 @@ fn collect_rule_segments(script: &str, depth: usize, segments: &mut Vec<RuleSegm
             "command" => {
                 let words = rule_words(node, script);
                 match words.into_iter().collect::<Option<Vec<String>>>() {
-                    Some(words) => push_rule_words(&words, depth, segments),
-                    None => segments.push(unresolved_segment(source())),
+                    Some(words) => push_rule_words(&words, depth, walk),
+                    None => walk.push_unresolved(source()),
                 }
             }
+            "file_redirect" => walk
+                .paths
+                .extend(path_operands::redirect_target(node, script)),
             // Statements that change the shell or a file without a
             // `command` node (`export`, `unset`, `PATH=./bin`, `> out.txt`)
             // are unresolved segments, so a catch-all `deny` still covers
             // them and no `allow` does (section 10 `ci`).
             "declaration_command" | "unset_command" => {
-                segments.push(unresolved_segment(source()));
+                walk.segments.push(unresolved_segment(source()));
             }
             "variable_assignment" | "variable_assignments"
                 if node.parent().is_none_or(|parent| {
@@ -2217,10 +2252,10 @@ fn collect_rule_segments(script: &str, depth: usize, segments: &mut Vec<RuleSegm
                     )
                 }) =>
             {
-                segments.push(unresolved_segment(source()));
+                walk.segments.push(unresolved_segment(source()));
             }
             "redirected_statement" if node.child_by_field_name("body").is_none() => {
-                segments.push(unresolved_segment(source()));
+                walk.segments.push(unresolved_segment(source()));
             }
             _ => {}
         }
@@ -2230,9 +2265,10 @@ fn collect_rule_segments(script: &str, depth: usize, segments: &mut Vec<RuleSegm
         stack.extend(children.into_iter().rev());
     }
     // A line with no command at all (`> out.txt`, `PATH=./bin`) is still
-    // something to run: one unresolved segment.
-    if segments.len() == found_before && !script.trim().is_empty() {
-        segments.push(unresolved_segment(script));
+    // something to run: one unresolved segment. Its redirections were
+    // walked above, so it names no other path.
+    if walk.segments.len() == found_before && !script.trim().is_empty() {
+        walk.segments.push(unresolved_segment(script));
     }
 }
 
@@ -2256,13 +2292,15 @@ fn rule_words(node: Node<'_>, src: &str) -> Vec<Option<String>> {
     words
 }
 
-/// Push one literal command, then whatever its wrapper runs.
-fn push_rule_words(words: &[String], depth: usize, segments: &mut Vec<RuleSegment>) {
+/// Push one literal command and the paths it names, then whatever its
+/// wrapper runs. A wrapper's own operands are not paths: the command it
+/// runs names them.
+fn push_rule_words(words: &[String], depth: usize, walk: &mut RuleWalk) {
     let Some(first) = words.first() else {
         return;
     };
-    let at = segments.len();
-    segments.push(RuleSegment {
+    let at = walk.segments.len();
+    walk.segments.push(RuleSegment {
         text: words.join(" "),
         resolved: true,
     });
@@ -2270,37 +2308,42 @@ fn push_rule_words(words: &[String], depth: usize, segments: &mut Vec<RuleSegmen
         .rsplit_once('/')
         .map_or(first.as_str(), |(_, base)| base);
     let Some(spec) = wrapper_spec(&name.to_ascii_lowercase()) else {
+        walk.paths.extend(path_operands::command_targets(words));
         return;
+    };
+    let unreadable = |walk: &mut RuleWalk| {
+        walk.segments[at].resolved = false;
+        walk.paths.push(PathTarget::unresolved());
     };
     let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
     let Some(scan) = scan_wrapper_options(spec, &args) else {
         // The wrapper's operand layout is unknown, so what it runs is too.
-        segments[at].resolved = false;
+        unreadable(walk);
         return;
     };
     for script in &scan.scripts {
-        collect_rule_segments(script, depth + 1, segments);
+        collect_rule_segments(script, depth + 1, walk);
     }
     let rest = &args[scan.rest..];
     match spec.tail {
         WrapperTail::Shell => {
             if scan.scripts.is_empty() {
                 // A script read from stdin or a here-document is unreadable.
-                segments[at].resolved = false;
+                unreadable(walk);
             }
         }
         WrapperTail::Script => {
             if !rest.is_empty() {
-                collect_rule_segments(&rest.join(" "), depth + 1, segments);
+                collect_rule_segments(&rest.join(" "), depth + 1, walk);
             }
         }
         WrapperTail::Command | WrapperTail::Env => {
             if depth >= MAX_WRAPPER_DEPTH {
-                segments[at].resolved = false;
+                unreadable(walk);
                 return;
             }
             let rest: Vec<String> = rest.iter().map(|word| (*word).to_owned()).collect();
-            push_rule_words(&rest, depth + 1, segments);
+            push_rule_words(&rest, depth + 1, walk);
         }
     }
 }

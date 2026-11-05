@@ -96,7 +96,7 @@ mod tests {
     fn prompt_text_names_the_rule_that_asks() {
         let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
             .with_command("git push origin main")
-            .with_ask_rule(RuleMatch {
+            .with_ask_rule(RuleMatch::Rule {
                 surface: RuleSurface::Shell,
                 layer: RuleLayerLabel::Profile,
                 index: 0,
