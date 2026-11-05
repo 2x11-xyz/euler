@@ -10,14 +10,14 @@ use std::path::Path;
 const PROFILES: &str = "/home/ada/.euler/profiles.json";
 
 fn parse(text: &str) -> Result<ProfilesConfig, ProfileError> {
-    ProfilesConfig::parse(Path::new(PROFILES), text)
+    ProfilesConfig::parse(Path::new(PROFILES), text, &InstalledExtensions::default())
 }
 
 fn overlay(root: &Path, text: &str) -> ProjectOverlay {
     let directory = root.join(".euler");
     std::fs::create_dir_all(&directory).expect("overlay dir");
     std::fs::write(directory.join("profile-overlay.json"), text).expect("overlay");
-    ProjectOverlay::load(root)
+    ProjectOverlay::load(root, &InstalledExtensions::default())
         .expect("overlay parses")
         .expect("overlay present")
 }
@@ -381,7 +381,7 @@ fn duplicate_keys_inside_rules_are_errors() {
         r#"{"rules": {"shell": [], "shell": [{"pattern": "rm *", "state": "deny"}]}}"#,
     )
     .expect("overlay");
-    let message = ProjectOverlay::load(temp.path())
+    let message = ProjectOverlay::load(temp.path(), &InstalledExtensions::default())
         .expect_err("duplicate surface")
         .to_string();
     assert!(message.contains("duplicate key `shell`"), "{message}");
@@ -899,5 +899,151 @@ fn resume_summary_names_joined_fields_and_counts_rule_layers() {
     assert_eq!(
         same_count.summary().as_deref(),
         Some("execution profile: dev (recorded: dev; changed rules edited (1 layer))")
+    );
+}
+
+/// An installed `code-swarm` extension whose `review` command declares the
+/// model tool `code_swarm_review`, and a `lint` extension whose `check`
+/// command declares `lint_review`.
+fn installed_extensions() -> InstalledExtensions {
+    let linked = |id: &str, command: &str, tool: &str| euler_sdk::LinkedExtension {
+        id: id.to_owned(),
+        materialization: euler_sdk::ExtensionMaterialization::Linked,
+        source_path: std::path::PathBuf::from("/opt/extensions").join(id),
+        manifest_sha256: String::new(),
+        updated_ts_ms: 0,
+        status: euler_sdk::LinkedExtensionStatus::NeedsReview,
+        descriptor: serde_json::from_value(json!({
+            "id": id,
+            "display_name": id,
+            "version": "0.1.0",
+            "runtime_kind": "managed-process",
+            "capabilities": [],
+            "commands": [{
+                "name": command,
+                "display_name": command,
+                "summary": "",
+                "required_capabilities": [],
+                "invocation": "agent-only",
+                "model_tool": {"name": tool, "description": "", "input_schema": {"type": "object"}}
+            }]
+        }))
+        .expect("descriptor"),
+        broken_reason: None,
+    };
+    InstalledExtensions::from_linked(&[
+        linked("lint", "check", "lint_review"),
+        linked("code-swarm", "review", "code_swarm_review"),
+    ])
+}
+
+fn tools_profile(pattern: &str) -> String {
+    json!({"profiles": {"ci": {"extends": "full", "rules": {
+        "tools": [{"pattern": pattern, "state": "deny"}]
+    }}}})
+    .to_string()
+}
+
+/// ADR 0027 section 8: a `tools` pattern without `.` that names an
+/// installed extension's model-visible tool, not a core tool, is an error
+/// that names the `<extension-id>.<command>` form to write.
+#[test]
+fn a_tools_pattern_naming_an_extension_model_tool_names_its_command() {
+    let installed = installed_extensions();
+    let parse_with = |pattern: &str| {
+        ProfilesConfig::parse(Path::new(PROFILES), &tools_profile(pattern), &installed)
+            .expect_err("not a core tool")
+            .to_string()
+    };
+    let message = parse_with("code_swarm_review");
+    assert!(
+        message.contains(
+            "rules.tools[0]: tools pattern \"code_swarm_review\" matches no core tool; it is the \
+             model tool of extension command code-swarm.review, so write \"code-swarm.review\""
+        ),
+        "{message}"
+    );
+    let message = parse_with("*_*_review*");
+    assert!(
+        message.contains("extension command code-swarm.review"),
+        "{message}"
+    );
+    let message = parse_with("lint_*");
+    assert!(message.contains("lint.check"), "{message}");
+    // A glob that matches several model tools lists every command.
+    let message = parse_with("*_review");
+    assert!(
+        message.contains(
+            "it matches the model tools of extension commands \"code-swarm.review\", \
+             \"lint.check\", so name each as <extension-id>.<command>"
+        ),
+        "{message}"
+    );
+    // A name no core or extension tool has keeps the core-tool error.
+    let message = parse_with("code_swarm_reveiw");
+    assert!(
+        message.contains("name an extension command as"),
+        "{message}"
+    );
+
+    // The overlay is checked the same way.
+    let temp = tempfile::tempdir().expect("temp");
+    std::fs::create_dir_all(temp.path().join(".euler")).expect("overlay dir");
+    std::fs::write(
+        temp.path().join(".euler/profile-overlay.json"),
+        r#"{"rules": {"tools": [{"pattern": "code_swarm_review", "state": "deny"}]}}"#,
+    )
+    .expect("overlay");
+    let message = ProjectOverlay::load(temp.path(), &installed)
+        .expect_err("not a core tool")
+        .to_string();
+    assert!(
+        message.contains("so write \"code-swarm.review\""),
+        "{message}"
+    );
+}
+
+/// ADR 0027 resolved question 19: a `tools` rule whose literal extension id
+/// names no installed extension keeps the rule and gives a notice naming
+/// the rule and listing the installed ids.
+#[test]
+fn a_tools_rule_naming_an_uninstalled_extension_gives_a_notice() {
+    let temp = tempfile::tempdir().expect("temp");
+    let overlay = overlay(
+        temp.path(),
+        r#"{"rules": {"tools": [{"pattern": "policy.*", "state": "ask"}]}}"#,
+    );
+    let config = parse(
+        &json!({"profiles": {"ci": {"extends": "full", "rules": {"tools": [
+            {"pattern": "code-swarm.*", "state": "deny"},
+            {"pattern": "code_swarm.*", "state": "deny"},
+            {"pattern": "*.review", "state": "deny"},
+            {"pattern": "run_shell", "state": "ask"}
+        ]}}}})
+        .to_string(),
+    )
+    .expect("parses");
+    let profile = config
+        .resolve(Some("ci"), ProfileContext::Headless, Some(&overlay))
+        .expect("resolves");
+    assert_eq!(profile.fields.rules[0].rules.tools.len(), 4, "rules kept");
+    assert_eq!(
+        profile.missing_extension_notices(&installed_extensions()),
+        vec![
+            "notice: profile \"ci\" rules.tools[1] \"code_swarm.*\" names extension \
+             \"code_swarm\", which is not installed, so the rule matches nothing until it is; \
+             installed extensions: code-swarm, lint"
+                .to_owned(),
+            "notice: .euler/profile-overlay.json rules.tools[0] \"policy.*\" names extension \
+             \"policy\", which is not installed, so the rule matches nothing until it is; \
+             installed extensions: code-swarm, lint"
+                .to_owned(),
+        ]
+    );
+    assert_eq!(
+        profile.missing_extension_notices(&InstalledExtensions::default())[0],
+        "notice: profile \"ci\" rules.tools[0] \"code-swarm.*\" names extension \
+         \"code-swarm\", which is not installed, so the rule matches nothing until it is; no \
+         extensions are installed"
     );
 }

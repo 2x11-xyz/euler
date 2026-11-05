@@ -23,8 +23,8 @@ pub use config::{
     PROJECT_OVERLAY_PATH,
 };
 pub use rules::{
-    rule_match, PermissionRule, ProfileRules, RequestPaths, RuleAccess, RuleLayer, RuleLayerLabel,
-    RuleMatch, RuleState, RuleSurface,
+    rule_match, InstalledExtensions, PermissionRule, ProfileRules, RequestPaths, RuleAccess,
+    RuleLayer, RuleLayerLabel, RuleMatch, RuleState, RuleSurface,
 };
 
 use crate::guardian::PermissionReviewer;
@@ -452,6 +452,12 @@ impl ExecutionProfile {
             name: subagent.name.clone(),
             fields,
         }
+    }
+
+    /// Startup notices for this profile's `tools` rules that name an
+    /// extension id not in `installed` (ADR 0027 resolved question 19).
+    pub fn missing_extension_notices(&self, installed: &InstalledExtensions) -> Vec<String> {
+        installed.missing_extension_notices(&self.name, &self.fields.rules)
     }
 
     /// The `execution_profile` provenance object: name, effective fields,

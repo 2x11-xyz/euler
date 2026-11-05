@@ -406,15 +406,20 @@ is not tracked.
   build refuses at startup any profile, overlay, child, or resume that sets
   `ask_timeout` or `extension_reviewers`, naming the field, because the
   gate does not enforce them yet; when only the recording sets one, the
-  error names the recorded profile and `--profile`. Validation here is
-  syntax only: the ADR 0027 section 8 checks that need installed
-  extensions (the hint for a `tools` pattern that matches an extension's
-  model-visible tool name, the notice for an extension id that is not
-  installed, and the error for an `extension_reviewers` entry that is not
-  enabled or has no reviewer descriptor) are not implemented yet, and no
-  ADR 0027 rollout step names the first two; until they land, a `tools`
-  rule naming an extension id that is not installed matches nothing
-  without notice.
+  error names the recorded profile and `--profile`. `tools` patterns are
+  checked against the extensions installed in the Euler home (enabled or
+  not) when `profiles.json` and the overlay load: a pattern without `.`
+  that matches no core tool but matches an installed extension's
+  model-visible tool name is an error naming the
+  `<extension-id>.<command>` to write. At launch and resume, a `tools` rule
+  in the session's profile or in `defaults.subagent` whose extension id
+  (the part before the first `.`, when it has no `*`) names no installed
+  extension keeps the rule and prints a startup notice naming the profile
+  or overlay, the rule's index and pattern, and the installed ids. An
+  extension registry that cannot be read fails profile loading with an
+  error naming the registry and saying it was read to check `tools` rules.
+  The `extension_reviewers` check for an entry that is not
+  enabled or has no reviewer descriptor is not implemented yet.
 - **Permission rules in the gate (ADR 0027 section 3).** The gate decides
   a request in this order: a configured `always-deny`; a `deny` rule
   (`always-deny`, the escalated form of a command included); an

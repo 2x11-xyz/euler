@@ -622,13 +622,13 @@ impl AppCore {
     pub(super) fn choose_first_run_profile(
         &mut self,
         name: String,
-        profiles_file: PathBuf,
+        euler_home: EulerHome,
     ) -> CoreEffect {
         let AppState::Idle { session } = &mut self.state else {
             return CoreEffect::None;
         };
         let current = session.execution_profile().name.clone();
-        let sources = match ProfileSources::load_file(profiles_file, session.workspace_root()) {
+        let sources = match ProfileSources::load_in(&euler_home, session.workspace_root()) {
             Ok(sources) => sources,
             Err(error) => {
                 return self.error_item(format!(
@@ -751,8 +751,7 @@ pub(super) fn first_run_profile_picker(
     session: &Session<TuiDecider>,
     first_run: &FirstRunProfile,
 ) -> Result<Option<crate::ui::commands::PickerSpec>> {
-    let sources =
-        ProfileSources::load_file(first_run.profiles_file.clone(), session.workspace_root())?;
+    let sources = ProfileSources::load_in(&first_run.euler_home, session.workspace_root())?;
     if sources.profiles.has_interactive_default() {
         return Ok(None);
     }
@@ -781,6 +780,6 @@ pub(super) fn first_run_profile_picker(
     Ok(Some(crate::ui::commands::PickerSpec::FirstRunProfile {
         choices,
         esc_hint,
-        profiles_file: first_run.profiles_file.clone(),
+        euler_home: first_run.euler_home.clone(),
     }))
 }
