@@ -263,9 +263,9 @@ pub struct AppOptions {
 /// before the first turn.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FirstRunProfile {
-    /// The user's `profiles.json`: the picker opens when it has no
-    /// `defaults.interactive`, and Enter saves the choice there.
-    pub profiles_file: PathBuf,
+    /// The user's Euler home: the picker opens when its `profiles.json` has
+    /// no `defaults.interactive`, and Enter saves the choice there.
+    pub euler_home: EulerHome,
     /// A resumed session keeps the profile the resume rule chose on Esc
     /// instead of `full`, so declining never loosens a session.
     pub resumed: bool,
@@ -3629,10 +3629,9 @@ impl AppCore {
             CommandAction::OpenProfilePicker => self.open_profile_picker(),
             CommandAction::SetExecutionProfile { name } => self.set_execution_profile(name),
             CommandAction::SetDefaultProfile { name } => self.set_default_profile(name),
-            CommandAction::ChooseFirstRunProfile {
-                name,
-                profiles_file,
-            } => self.choose_first_run_profile(name, profiles_file),
+            CommandAction::ChooseFirstRunProfile { name, euler_home } => {
+                self.choose_first_run_profile(name, euler_home)
+            }
             CommandAction::DeferFirstRunProfile => self.defer_first_run_profile(),
             CommandAction::OpenPermissions => self.open_permissions_picker(),
             CommandAction::OpenPermissionsAdvanced => self.open_permissions_advanced_picker(),

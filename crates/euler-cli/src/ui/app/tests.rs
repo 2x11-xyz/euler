@@ -5875,7 +5875,7 @@ fn first_run_core(root: &Path, profile: &str, resumed: bool) -> AppCore {
         channels,
         AppOptions {
             first_run_profile: Some(FirstRunProfile {
-                profiles_file: root.join("profiles.json"),
+                euler_home: euler_core::EulerHome::from_root(root).expect("euler home"),
                 resumed,
             }),
             ..AppOptions::default()
@@ -5943,8 +5943,11 @@ fn first_run_profile_picker_enter_saves_and_applies_the_choice() {
 
     assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
     assert_eq!(session_profile_name(&core), "locked");
-    let saved = euler_core::ProfilesConfig::load(&temp.path().join("profiles.json"))
-        .expect("profiles.json");
+    let saved = euler_core::ProfilesConfig::load(
+        &temp.path().join("profiles.json"),
+        &euler_core::execution_profile::InstalledExtensions::default(),
+    )
+    .expect("profiles.json");
     assert_eq!(
         saved
             .resolve(None, euler_core::ProfileContext::Interactive, None)

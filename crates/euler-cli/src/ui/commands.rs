@@ -1,7 +1,8 @@
 use super::theme::ThemeChoice;
-use euler_core::{ActiveGrant, ApprovalMode, GrantSource, ReasoningEffort, SkillCatalogEntry};
+use euler_core::{
+    ActiveGrant, ApprovalMode, EulerHome, GrantSource, ReasoningEffort, SkillCatalogEntry,
+};
 use euler_sdk::Capability;
-use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
@@ -573,7 +574,7 @@ pub enum CommandAction {
     /// `defaults.interactive` and switch this session to it.
     ChooseFirstRunProfile {
         name: String,
-        profiles_file: PathBuf,
+        euler_home: EulerHome,
     },
     /// First-run picker Esc: keep this session's profile without saving.
     DeferFirstRunProfile,
@@ -661,12 +662,12 @@ pub enum PickerSpec {
     /// Execution profiles (ADR 0026): presets, then user profiles.
     Profiles(Vec<ProfileChoice>),
     /// The first-run profile picker (ADR 0026 section 5): the presets, Enter
-    /// saves the choice to `profiles_file`, and Esc keeps the session's
-    /// profile, which `esc_hint` names.
+    /// saves the choice to the `profiles.json` in `euler_home`, and Esc keeps
+    /// the session's profile, which `esc_hint` names.
     FirstRunProfile {
         choices: Vec<ProfileChoice>,
         esc_hint: String,
-        profiles_file: PathBuf,
+        euler_home: EulerHome,
     },
 }
 

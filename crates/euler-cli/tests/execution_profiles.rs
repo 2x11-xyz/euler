@@ -725,6 +725,160 @@ fn project_overlay_can_tighten_but_never_loosen() {
     assert!(message.contains("--profile locked"), "{message}");
 }
 
+/// ADR 0027 section 7 through a real session: a project overlay `deny`
+/// rule refuses a command under the user's `full` profile without a prompt,
+/// and the decision names the overlay layer.
+#[test]
+fn an_overlay_deny_rule_refuses_a_command_and_records_its_layer() {
+    let workspace = workspace();
+    write_overlay(
+        &workspace,
+        r#"{"rules": {"shell": [{"pattern": "printf *", "state": "deny",
+            "reason": "No printf in this repository."}]}}"#,
+    );
+    let script = shell_script(&workspace, "printf host-ran > out.txt");
+    let output = exec_new(
+        &workspace,
+        &["--profile", "full", "--provider-option", &script],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    assert!(!workspace.root.join("out.txt").exists(), "the command ran");
+    assert!(!asked_permission(&workspace.log));
+    let start = session_start(&workspace.log);
+    assert_eq!(
+        start["execution_profile"]["fields"]["rules"],
+        serde_json::json!([{"layer": "overlay", "rules": {"shell": [{
+            "pattern": "printf *", "state": "deny", "reason": "No printf in this repository."
+        }]}}])
+    );
+    let decision = fs::read_to_string(&workspace.log)
+        .expect("read log")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("json line"))
+        .find(|event| event["kind"] == "permission.decision")
+        .expect("permission.decision")["payload"]
+        .clone();
+    assert_eq!(decision["decision_source"], "rule");
+    assert_eq!(decision["allowed"], false);
+    assert_eq!(
+        decision["rule"],
+        serde_json::json!({"surface": "shell", "index": 0, "pattern": "printf *",
+            "state": "deny", "layer": "overlay"})
+    );
+    let error = first_tool_result(&workspace.log)["error"]
+        .as_str()
+        .expect("tool error")
+        .to_owned();
+    assert!(error.contains("No printf in this repository."), "{error}");
+}
+
+/// Link an extension `code-swarm` into the workspace's Euler home whose
+/// `review` command declares the model tool `code_swarm_review`.
+fn link_review_extension(workspace: &Workspace) {
+    let directory = workspace.home.join("code-swarm-extension");
+    fs::create_dir_all(&directory).expect("extension dir");
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": "code-swarm",
+        "display_name": "Code swarm",
+        "extension_version": "0.1.0",
+        "runtime_kind": "managed-process",
+        "entrypoint": {"command": ["python3", "extension.py"]},
+        "capabilities": [],
+        "commands": [{
+            "name": "review",
+            "display_name": "Review",
+            "summary": "Review a diff.",
+            "required_capabilities": [],
+            "invocation": "agent-only",
+            "model_tool": {
+                "name": "code_swarm_review",
+                "description": "Review a diff.",
+                "input_schema": {"type": "object", "properties": {}, "required": [], "additionalProperties": false}
+            }
+        }]
+    });
+    fs::write(
+        directory.join(euler_core::EXTENSION_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write manifest");
+    // Linking reads the manifest; the entrypoint never runs here.
+    fs::write(directory.join("extension.py"), "").expect("write entrypoint");
+    let linked = Command::new(env!("CARGO_BIN_EXE_euler"))
+        .env("HOME", &workspace.home)
+        .env_remove("EULER_HOME")
+        .args(["extension", "link", directory.to_str().expect("utf8 dir")])
+        .output()
+        .expect("link extension");
+    assert!(
+        linked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+}
+
+/// ADR 0027 section 8 and resolved question 19 at startup: a `tools`
+/// pattern that is an installed extension's model-visible tool name is an
+/// error naming the `<extension-id>.<command>` to write, and a rule naming
+/// an extension id that is not installed runs with a notice listing the
+/// installed ids.
+#[test]
+fn tools_rules_are_checked_against_installed_extensions_at_startup() {
+    let workspace = workspace();
+    link_review_extension(&workspace);
+    let tools_profile = |pattern: &str| {
+        serde_json::json!({"profiles": {"ci": {"extends": "full", "rules": {
+            "tools": [{"pattern": pattern, "state": "deny"}]
+        }}}})
+        .to_string()
+    };
+
+    write_profiles(&workspace, &tools_profile("code_swarm_review"));
+    let output = exec_new(&workspace, &["--profile", "ci"]);
+    assert!(!output.status.success());
+    let message = stderr(&output);
+    assert!(
+        message.contains(
+            "tools pattern \"code_swarm_review\" matches no core tool; it is the model tool of \
+             extension command code-swarm.review, so write \"code-swarm.review\""
+        ),
+        "{message}"
+    );
+    assert!(
+        !workspace.log.exists(),
+        "a refused profile started a session"
+    );
+
+    write_profiles(&workspace, &tools_profile("code_swarm.*"));
+    let output = exec_new(&workspace, &["--profile", "ci"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let message = stderr(&output);
+    assert!(
+        message.contains(
+            "notice: profile \"ci\" rules.tools[0] \"code_swarm.*\" names extension \
+             \"code_swarm\", which is not installed, so the rule matches nothing until it is; \
+             installed extensions: code-swarm"
+        ),
+        "{message}"
+    );
+    // Resume checks the profile it runs under the same way.
+    let output = exec_resume(&workspace, &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("rules.tools[0] \"code_swarm.*\" names extension"),
+        "{}",
+        stderr(&output)
+    );
+
+    write_profiles(&workspace, &tools_profile("code-swarm.*"));
+    fs::remove_file(&workspace.log).expect("remove log");
+    let output = exec_new(&workspace, &["--profile", "ci"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!stderr(&output).contains("notice:"), "{}", stderr(&output));
+}
+
 #[test]
 fn resume_records_the_profile_it_runs_under_and_shows_a_change() {
     let workspace = workspace();

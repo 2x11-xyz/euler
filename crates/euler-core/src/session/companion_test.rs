@@ -294,6 +294,103 @@ fn a_session_grant_never_settles_a_child_rule_ask() {
     assert_eq!(decisions[1].payload["allowed"], json!(false));
 }
 
+/// ADR 0027 sections 6 and 9 through real profile resolution: the session
+/// runs `dev` tightened by the project overlay, and its child runs under the
+/// named `defaults.subagent` profile `helper`. The child takes the session's
+/// `profile` and `overlay` layers with their labels and its own rules as a
+/// `subagent` layer (the overlay once), `agent.spawn` records those layers,
+/// and each refusal names the layer whose rule decided it.
+#[test]
+fn a_named_child_profile_runs_under_every_layer_and_records_their_labels() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::create_dir_all(temp.path().join(".euler")).expect("overlay dir");
+    std::fs::write(
+        temp.path().join(".euler/profile-overlay.json"),
+        r#"{"rules": {"shell": [{"pattern": "printf overlay*", "state": "deny"}]}}"#,
+    )
+    .expect("overlay");
+    let installed = crate::execution_profile::InstalledExtensions::default();
+    let overlay = crate::ProjectOverlay::load(temp.path(), &installed)
+        .expect("overlay parses")
+        .expect("overlay present");
+    let profiles = crate::ProfilesConfig::parse(
+        &temp.path().join("profiles.json"),
+        r#"{"defaults": {"subagent": "helper"}, "profiles": {
+            "dev": {"extends": "full", "rules": {"shell": [
+                {"pattern": "printf *", "state": "allow"},
+                {"pattern": "printf profile*", "state": "deny"}
+            ]}},
+            "helper": {"extends": "full", "rules": {"shell": [
+                {"pattern": "printf subagent*", "state": "deny"}
+            ]}}
+        }}"#,
+        &installed,
+    )
+    .expect("profiles parse");
+    let mut config = SessionConfig::new(temp.path());
+    config.set_execution_profile(
+        profiles
+            .resolve(
+                Some("dev"),
+                crate::ProfileContext::Interactive,
+                Some(&overlay),
+            )
+            .expect("dev"),
+    );
+    config.subagent_profile = profiles.resolve_subagent(Some(&overlay)).expect("helper");
+    let call = |id: &str, command: &str| ToolCall {
+        id: id.to_owned(),
+        name: "run_shell".to_owned(),
+        input: json!({ "command": command }),
+    };
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![
+            call("call-profile", "printf profile"),
+            call("call-overlay", "printf overlay"),
+            call("call-subagent", "printf subagent"),
+        ]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let writer = ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer");
+    let mut session =
+        Session::new(config, provider, ScriptedDecider::new(Vec::new())).with_provenance(writer);
+
+    session
+        .spawn_companion(task_with_caps([Capability::ShellExec]))
+        .expect("companion");
+
+    let spawn = only_event(session.events(), EventKind::AGENT_SPAWN);
+    assert_eq!(spawn.payload["execution_profile"]["name"], json!("helper"));
+    // The parent's `allow` is not applied in a named child, so its
+    // `profile` layer keeps only the `deny`, at index 0 of that layer.
+    assert_eq!(
+        spawn.payload["execution_profile"]["fields"]["rules"],
+        json!([
+            {"layer": "profile", "rules": {"shell": [
+                {"pattern": "printf profile*", "state": "deny"}
+            ]}},
+            {"layer": "overlay", "rules": {"shell": [
+                {"pattern": "printf overlay*", "state": "deny"}
+            ]}},
+            {"layer": "subagent", "rules": {"shell": [
+                {"pattern": "printf subagent*", "state": "deny"}
+            ]}}
+        ])
+    );
+    assert!(events_of_kind(session.events(), EventKind::PERMISSION_PROMPT).is_empty());
+    let layers: Vec<Value> = events_of_kind(session.events(), EventKind::PERMISSION_DECISION)
+        .iter()
+        .map(|decision| {
+            assert_eq!(decision.payload["allowed"], json!(false));
+            decision.payload["rule"]["layer"].clone()
+        })
+        .collect();
+    assert_eq!(
+        layers,
+        vec![json!("profile"), json!("overlay"), json!("subagent")]
+    );
+}
+
 #[test]
 fn companion_under_a_sandboxed_subagent_default_keeps_writes_in_the_workspace() {
     let outside = tempfile::tempdir().expect("outside dir");

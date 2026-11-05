@@ -3,7 +3,11 @@ use super::*;
 use std::path::Path;
 
 fn parse(text: &str) -> Result<ProfilesConfig, ProfileError> {
-    ProfilesConfig::parse(Path::new("/home/ada/.euler/profiles.json"), text)
+    ProfilesConfig::parse(
+        Path::new("/home/ada/.euler/profiles.json"),
+        text,
+        &InstalledExtensions::default(),
+    )
 }
 
 fn error_text(result: Result<impl std::fmt::Debug, ProfileError>) -> String {
@@ -14,7 +18,7 @@ fn overlay(root: &Path, text: &str) -> ProjectOverlay {
     let directory = root.join(".euler");
     std::fs::create_dir_all(&directory).expect("overlay dir");
     std::fs::write(directory.join("profile-overlay.json"), text).expect("overlay");
-    ProjectOverlay::load(root)
+    ProjectOverlay::load(root, &InstalledExtensions::default())
         .expect("overlay parses")
         .expect("overlay present")
 }
@@ -103,7 +107,7 @@ fn interactive_default_is_written_beside_existing_entries() {
     let temp = tempfile::tempdir().expect("temp");
     let file = temp.path().join("profiles.json");
     write_interactive_default(&file, "locked").expect("creates the file");
-    let config = ProfilesConfig::load(&file).expect("loads");
+    let config = ProfilesConfig::load(&file, &InstalledExtensions::default()).expect("loads");
     assert!(config.has_interactive_default());
     assert_eq!(
         config
@@ -119,7 +123,7 @@ fn interactive_default_is_written_beside_existing_entries() {
     )
     .expect("write");
     write_interactive_default(&file, "full").expect("updates the file");
-    let config = ProfilesConfig::load(&file).expect("loads");
+    let config = ProfilesConfig::load(&file, &InstalledExtensions::default()).expect("loads");
     assert_eq!(
         config
             .resolve(None, ProfileContext::Interactive, None)
@@ -144,7 +148,11 @@ fn interactive_default_is_written_beside_existing_entries() {
 #[test]
 fn missing_profiles_file_is_the_built_in_configuration() {
     let temp = tempfile::tempdir().expect("temp");
-    let config = ProfilesConfig::load(&temp.path().join("profiles.json")).expect("loads");
+    let config = ProfilesConfig::load(
+        &temp.path().join("profiles.json"),
+        &InstalledExtensions::default(),
+    )
+    .expect("loads");
     assert!(!config.has_interactive_default());
     let profile = config
         .resolve(None, ProfileContext::Interactive, None)
@@ -460,7 +468,10 @@ fn project_overlay_tightens_and_never_loosens() {
         r#"{"extends": "locked"}"#,
     )
     .expect("overlay");
-    let message = error_text(ProjectOverlay::load(temp.path()));
+    let message = error_text(ProjectOverlay::load(
+        temp.path(),
+        &InstalledExtensions::default(),
+    ));
     assert!(message.contains("unknown field `extends`"), "{message}");
 
     std::fs::write(
@@ -468,14 +479,21 @@ fn project_overlay_tightens_and_never_loosens() {
         r#"{"network": "off", "network": "on"}"#,
     )
     .expect("overlay");
-    let message = error_text(ProjectOverlay::load(temp.path()));
+    let message = error_text(ProjectOverlay::load(
+        temp.path(),
+        &InstalledExtensions::default(),
+    ));
     assert!(message.contains("duplicate key `network`"), "{message}");
 }
 
 #[test]
 fn project_overlay_is_absent_without_a_file() {
     let temp = tempfile::tempdir().expect("temp");
-    assert!(ProjectOverlay::load(temp.path()).expect("loads").is_none());
+    assert!(
+        ProjectOverlay::load(temp.path(), &InstalledExtensions::default())
+            .expect("loads")
+            .is_none()
+    );
 }
 
 #[test]

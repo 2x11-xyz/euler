@@ -25,6 +25,24 @@ pull requests that landed them; deeper design rationale lives in
   save-without-discovery `[Y/n]` question when an existing entry's gateway
   lists no models. No new block.
 
+### Execution profiles: `tools` rules are checked against installed extensions
+
+- **New**: a `tools` rule pattern without `.` that names an installed
+  extension's model tool (such as `code_swarm_review`) instead of a core
+  tool is a startup error that names the `<extension-id>.<command>` form to
+  write (`code-swarm.review`), in `profiles.json` and the project overlay
+  alike (ADR 0027 section 8, rollout step 4). Before, the error only listed
+  the core tools.
+- **New**: a `tools` rule naming an extension id that is not installed
+  (such as `code_swarm.*` for `code-swarm`) prints a startup notice naming
+  the rule and listing the installed extension ids. The rule is kept and
+  the session runs, so a shared profile can deny an extension some machines
+  never install. No new prompts.
+- **Changed**: loading profiles now reads the extension registry, so a
+  registry that Euler cannot read also fails `/profile`, the first-run picker,
+  and in-app `/resume`, with an error saying the registry was read to
+  check `tools` rules. Launch and `euler exec` already failed on it.
+
 ### Execution profiles: `path` and `outside_workspace` permission rules are enforced
 
 - **New**: profiles may now use `path` and `outside_workspace` rules (ADR

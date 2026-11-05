@@ -6,8 +6,8 @@
 
 use super::{ExtensionExecutionError, Session, SessionConfig};
 use crate::execution_profile::{
-    ExecutionProfile, PermissionRule, ProfileContext, ProfileFields, ProfileRules, ProfilesConfig,
-    ProjectOverlay, RuleLayer, RuleLayerLabel, RuleMatch, RuleState,
+    ExecutionProfile, InstalledExtensions, PermissionRule, ProfileContext, ProfileFields,
+    ProfileRules, ProfilesConfig, ProjectOverlay, RuleLayer, RuleLayerLabel, RuleMatch, RuleState,
 };
 use crate::permissions::{
     ApprovalMode, DeciderVerdict, GateRuling, PermissionDecider, PermissionGate, PermissionRequest,
@@ -358,7 +358,7 @@ fn overlays_add_no_allow_rules_and_named_child_profiles_apply_none() {
         r#"{"rules": {"shell": [{"pattern": "cargo *", "state": "allow"}]}}"#,
     )
     .expect("overlay");
-    let overlay = ProjectOverlay::load(temp.path())
+    let overlay = ProjectOverlay::load(temp.path(), &InstalledExtensions::default())
         .expect("overlay parses")
         .expect("overlay present");
     let error = ProfilesConfig::default()

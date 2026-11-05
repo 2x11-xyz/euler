@@ -4,7 +4,7 @@
 //! name the file and field, never warnings: a dropped field could leave a
 //! profile looser than written.
 
-use super::rules::{self, ProfileRules, RuleLayer, RuleLayerLabel};
+use super::rules::{self, InstalledExtensions, ProfileRules, RuleLayer, RuleLayerLabel};
 use super::{
     ApprovalsSetting, BackgroundJobsSetting, CachesSetting, CredentialsSetting, EscalationSetting,
     ExecutionProfile, NetworkSetting, Preset, ProfileError, ProfileFields, SandboxSetting,
@@ -190,6 +190,7 @@ impl ProfileOverrides {
     /// Parse each key on its own so an error names the field it is about.
     fn from_map<'a>(
         entries: impl IntoIterator<Item = (&'a String, &'a UniqueValue)>,
+        installed: &InstalledExtensions,
     ) -> Result<Self, String> {
         let mut overrides = Self::default();
         for (key, UniqueValue(value)) in entries {
@@ -215,7 +216,7 @@ impl ProfileOverrides {
                 "escalation" => overrides.escalation = Some(field_value(key, value)?),
                 "background_jobs" => overrides.background_jobs = Some(field_value(key, value)?),
                 "reviewer" => overrides.reviewer = Some(field_value(key, value)?),
-                "rules" => overrides.rules = ProfileRules::parse(value)?,
+                "rules" => overrides.rules = ProfileRules::parse(value, installed)?,
                 "ask_timeout" => overrides.ask_timeout = Some(rules::parse_ask_timeout(value)?),
                 "extension_reviewers" => {
                     overrides.extension_reviewers = rules::parse_extension_reviewers(value)?;
@@ -371,9 +372,10 @@ pub struct ProfilesConfig {
 
 impl ProfilesConfig {
     /// Read `file`; a missing file is the built-in configuration.
-    pub fn load(file: &Path) -> Result<Self, ProfileError> {
+    /// `installed` is checked against `tools` rules (ADR 0027 section 8).
+    pub fn load(file: &Path, installed: &InstalledExtensions) -> Result<Self, ProfileError> {
         match fs::read_to_string(file) {
-            Ok(text) => Self::parse(file, &text),
+            Ok(text) => Self::parse(file, &text, installed),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(error) => Err(ProfileError::Read {
                 file: file.to_path_buf(),
@@ -383,7 +385,11 @@ impl ProfilesConfig {
     }
 
     /// Parse and validate `text` as `profiles.json`.
-    pub fn parse(file: &Path, text: &str) -> Result<Self, ProfileError> {
+    pub fn parse(
+        file: &Path,
+        text: &str,
+        installed: &InstalledExtensions,
+    ) -> Result<Self, ProfileError> {
         let invalid = |message: String| ProfileError::InvalidFile {
             file: file.to_path_buf(),
             message,
@@ -392,7 +398,7 @@ impl ProfilesConfig {
             serde_json::from_str(text).map_err(|error| invalid(error.to_string()))?;
         let mut profiles = BTreeMap::new();
         for (name, body) in parsed.profiles.0 {
-            let profile = parse_user_profile(&name, &body)
+            let profile = parse_user_profile(&name, &body, installed)
                 .map_err(|message| invalid(format!("profile \"{name}\": {message}")))?;
             profiles.insert(name, profile);
         }
@@ -581,7 +587,11 @@ pub fn write_interactive_default(file: &Path, name: &str) -> Result<(), ProfileE
         .map_err(|error| write_error(error.error))
 }
 
-fn parse_user_profile(name: &str, body: &UniqueKeys<UniqueValue>) -> Result<UserProfile, String> {
+fn parse_user_profile(
+    name: &str,
+    body: &UniqueKeys<UniqueValue>,
+    installed: &InstalledExtensions,
+) -> Result<UserProfile, String> {
     let valid_name = !name.is_empty()
         && name
             .chars()
@@ -605,8 +615,10 @@ fn parse_user_profile(name: &str, body: &UniqueKeys<UniqueValue>) -> Result<User
             .ok_or_else(|| format!("extends: \"{preset}\" is not a preset ({presets})"))?,
         Some(_) => return Err(format!("extends must name a preset ({presets})")),
     };
-    let overrides =
-        ProfileOverrides::from_map(body.0.iter().filter(|(key, _)| key.as_str() != "extends"))?;
+    let overrides = ProfileOverrides::from_map(
+        body.0.iter().filter(|(key, _)| key.as_str() != "extends"),
+        installed,
+    )?;
     let mut fields = extends.fields();
     overrides.extend(&mut fields);
     if let Some(message) = fields.contradiction(overrides.credentials.is_some()) {
@@ -626,7 +638,11 @@ pub struct ProjectOverlay {
 
 impl ProjectOverlay {
     /// Read the overlay under `root`; `None` when the repository has none.
-    pub fn load(root: &Path) -> Result<Option<Self>, ProfileError> {
+    /// `installed` is checked against `tools` rules (ADR 0027 section 8).
+    pub fn load(
+        root: &Path,
+        installed: &InstalledExtensions,
+    ) -> Result<Option<Self>, ProfileError> {
         let file = root.join(PROJECT_OVERLAY_PATH);
         let text = match fs::read_to_string(&file) {
             Ok(text) => text,
@@ -644,7 +660,7 @@ impl ProjectOverlay {
         };
         let body: UniqueKeys<UniqueValue> =
             serde_json::from_str(&text).map_err(|error| invalid(error.to_string()))?;
-        let overrides = ProfileOverrides::from_map(&body.0).map_err(invalid)?;
+        let overrides = ProfileOverrides::from_map(&body.0, installed).map_err(invalid)?;
         Ok(Some(Self { file, overrides }))
     }
 
