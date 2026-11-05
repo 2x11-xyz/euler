@@ -2948,9 +2948,8 @@ fn user_instructions_are_loaded_labeled_and_rendered_before_project_sources() {
         .expect("project source label");
     assert!(user_at < project_at, "user instructions render first");
     assert!(rendered.contains("    Address the user as Ada."));
-    assert!(
-        rendered.contains("Project EULER.md sources below are more specific and take precedence")
-    );
+    assert!(rendered
+        .contains("Project EULER.md sources, when present, are more specific and take precedence"));
 }
 
 #[test]
@@ -3007,6 +3006,64 @@ fn user_instructions_size_bound_omits_the_whole_file_with_a_diagnostic() {
             assert_eq!(too_large[0].observed, Some(size as u64));
         }
     }
+}
+
+#[test]
+fn user_instructions_bound_applies_again_after_redaction() {
+    // An 8-byte secret becomes the longer `[redacted-secret]` marker, so a
+    // file exactly at the bound grows past it only after redaction.
+    let secret = "q9z8x7w6";
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    let path = user_instructions_path(&temp);
+    let text = format!(
+        "{secret}{}",
+        "x".repeat(MAX_USER_INSTRUCTIONS_BYTES - secret.len())
+    );
+    write(&path, &text);
+    let redactor = SecretRedactor::new();
+    redactor.add_value(secret);
+    let redacted_len = redactor.redact(&text).len() as u64;
+    assert!(redacted_len > MAX_USER_INSTRUCTIONS_BYTES as u64);
+
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
+        &repo,
+        user_instructions_only(&path),
+        &redactor,
+    )
+    .expect("preflight");
+
+    assert!(manifest_user_instructions(&bootstrap).is_none());
+    let too_large: Vec<_> = bootstrap
+        .diagnostics
+        .iter()
+        .filter(|record| record.reason == "source_too_large")
+        .collect();
+    assert_eq!(too_large.len(), 1);
+    assert_eq!(too_large[0].path.as_deref(), Some("user/AGENTS.md"));
+    assert_eq!(too_large[0].observed, Some(redacted_len));
+}
+
+#[test]
+fn user_instructions_with_near_miss_casing_are_diagnosed_not_loaded() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    let path = user_instructions_path(&temp);
+    write(
+        &path.parent().expect("home").join("agents.md"),
+        "lowercase rule\n",
+    );
+
+    let bootstrap = admitted_with_user_instructions(&repo, &path);
+
+    assert!(manifest_user_instructions(&bootstrap).is_none());
+    assert!(bootstrap.diagnostics.iter().any(|record| {
+        record.reason == "case_mismatch" && record.path.as_deref() == Some("user/AGENTS.md")
+    }));
+    let payload = serde_json::to_string(&bootstrap.snapshot_payload()).expect("payload");
+    assert!(!payload.contains("lowercase rule"));
 }
 
 #[test]

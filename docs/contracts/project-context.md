@@ -122,15 +122,21 @@ the Euler home: `${EULER_HOME}/AGENTS.md`, normally `~/.euler/AGENTS.md`. It
 carries a user's standing rules (name, writing preferences) into every
 session.
 
-- Reads use the same no-follow, stable-read, and redaction rules as an
-  `EULER.md` source. The Euler home must resolve to its canonical path; a
-  symlinked component, a symlinked or non-regular file, invalid UTF-8, or an
-  unstable read omits the file whole with a typed diagnostic.
+- Reads use the same exact-name, no-follow, stable-read, and redaction rules
+  as an `EULER.md` source. A near-miss casing such as `agents.md` is never
+  loaded, even on a case-insensitive filesystem; it is recorded as
+  `case_mismatch` under the `user/AGENTS.md` identity. The Euler home must
+  resolve to its canonical path; a symlinked component, a symlinked or
+  non-regular file, invalid UTF-8, or an unstable read omits the file whole
+  with a typed diagnostic.
 - A file larger than 32 KiB, measured before and again after redaction, is
   omitted whole with `source_too_large`. This bound is separate from the
   `EULER.md` bounds.
 - A missing file adds nothing: no diagnostic, and the manifest bytes and
-  candidate digest are identical to a session without the feature.
+  candidate digest are identical to a session without the feature. An Euler
+  home that cannot be listed (more than the per-level entry cap, or a read
+  failure) omits the file with `dir_entries_exceeded` or `io_error`, since
+  its exact name cannot be confirmed.
 - The normalized identity is `user/AGENTS.md`. Project discovery never yields
   an `AGENTS.md` identity, so it cannot name a repository source. Diagnostics
   with this identity, like `user/skills` ones, stay out of the acknowledgment
@@ -257,8 +263,9 @@ per-project trust store.
   declined, or unacknowledged project persists no repository-owned body,
   per-source content hash, exact content length, parser excerpt, or other
   reversible repository content. It may retain admitted user-global skills
-  and user instructions; otherwise only the portable candidate digest, bounded normalized identities,
-  counts, and content-free reason codes remain.
+  and user instructions; otherwise only the portable candidate digest,
+  bounded normalized identities, counts, and content-free reason codes
+  remain.
 - The admitted manifest is serialized once as versioned UTF-8 snapshot JSON in
   one top-level payload string. When it exceeds the provenance threshold that
   complete string is one content-addressed blob; individual bodies are not
@@ -327,10 +334,9 @@ per-project trust store.
 - The latest snapshot event in durable sequence is authoritative. A latest
   snapshot with a model-facing manifest yields exactly one pinned item,
   including a repository-disabled snapshot containing user-global skills or
-  user instructions. A
-  snapshot without a manifest is a tombstone and yields none. A malformed
-  latest snapshot rejects resume or request assembly and never resurrects an
-  older manifest.
+  user instructions. A snapshot without a manifest is a tombstone and yields
+  none. A malformed latest snapshot rejects resume or request assembly and
+  never resurrects an older manifest.
 - Independent sessions get independent snapshots; there is no process-global
   or workspace-global mutable project-context cache.
 
@@ -538,9 +544,9 @@ versioned and performed once before the rendered-context digest is computed.
 
 Pinned guidance, including a user-only manifest (user skills or user
 instructions) when repository context is off, counts against both the canvas
-byte budget and a known model context limit and does not silently vanish under compaction. The
-deterministic context-limit proxy is four rendered UTF-8 bytes per token. At
-snapshot admission, required tokens are
+byte budget and a known model context limit and does not silently vanish
+under compaction. The deterministic context-limit proxy is four rendered
+UTF-8 bytes per token. At snapshot admission, required tokens are
 `ceil((fixed_instruction_bytes + framed_project_context_bytes) / 4) + 1024 +
 output_reserve`, where `output_reserve` is configured `max_output_tokens` or,
 when absent, `compaction_reserve_tokens`. At request time the same checked

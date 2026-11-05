@@ -13,8 +13,9 @@ pull requests that landed them; deeper design rationale lives in
   project `EULER.md` files. Use it for standing rules such as your name or
   writing preferences. No prompt: it is your own file. Project instructions
   are more specific and win when the two conflict.
-- A missing file changes nothing. A file over 32 KiB is skipped whole and the
-  omission is recorded in the session's project-context diagnostics.
+- A missing file changes nothing. A file over 32 KiB, or one named with
+  different casing such as `agents.md`, is skipped whole and the omission is
+  recorded in the session's project-context diagnostics.
 - The session snapshot records the file's label (`user/AGENTS.md`), byte
   length, digest, and redacted content, like user-global skills.
 

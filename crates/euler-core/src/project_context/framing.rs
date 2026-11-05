@@ -35,8 +35,8 @@ pub(crate) fn render_project_context(manifest: &CandidateManifest) -> String {
     if let Some(user) = &manifest.user_instructions {
         lines.push(format!(
             "{MARKER} user instructions: {} from the user's Euler home. Apply them in every \
-             session. Project EULER.md sources below are more specific and take precedence \
-             where they conflict.",
+             session. Project EULER.md sources, when present, are more specific and take \
+             precedence where they conflict.",
             user.path
         ));
         push_indented_content(&mut lines, &user.content);

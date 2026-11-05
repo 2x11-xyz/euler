@@ -667,21 +667,16 @@ mod imp {
         }
     }
 
-    /// Read the user-level `AGENTS.md` under the same no-follow, stable-read,
-    /// bound, and redaction rules as an `EULER.md` source. A missing file adds
-    /// nothing; an unsafe or oversized one is omitted whole with a typed
-    /// diagnostic under the `user/AGENTS.md` identity.
+    /// Read the user-level `AGENTS.md` under the same exact-name, no-follow,
+    /// stable-read, bound, and redaction rules as an `EULER.md` source. A
+    /// missing file adds nothing; a near-miss casing, or an unsafe or
+    /// oversized file, is omitted whole with a typed diagnostic under the
+    /// `user/AGENTS.md` identity.
     fn read_user_instructions(
         path: &Path,
         redactor: &SecretRedactor,
         diagnostics: &mut Vec<ManifestDiagnostic>,
     ) -> Option<ManifestSource> {
-        if path
-            .symlink_metadata()
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-        {
-            return None;
-        }
         let identity = || Some(USER_INSTRUCTIONS_IDENTITY.to_owned());
         let (Some(parent), Some(file_name)) =
             (path.parent(), path.file_name().and_then(OsStr::to_str))
@@ -689,6 +684,14 @@ mod imp {
             diagnostics.push(diagnostic(DiagnosticReason::IoError, identity(), None));
             return None;
         };
+        match parent.symlink_metadata() {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => {
+                diagnostics.push(diagnostic(DiagnosticReason::IoError, identity(), None));
+                return None;
+            }
+        }
         let Some(dir) = open_absolute_dir_nofollow(parent) else {
             diagnostics.push(diagnostic(
                 DiagnosticReason::SymlinkRejected,
@@ -697,6 +700,9 @@ mod imp {
             ));
             return None;
         };
+        if !user_instructions_entry_exists(&dir, file_name, diagnostics) {
+            return None;
+        }
         let bytes = match read_named_candidate_stable(&dir, file_name, MAX_USER_INSTRUCTIONS_BYTES)
         {
             Ok(bytes) => bytes,
@@ -735,6 +741,42 @@ mod imp {
             path: USER_INSTRUCTIONS_IDENTITY.to_owned(),
             content,
         })
+    }
+
+    /// Whether the Euler home holds an entry named exactly `file_name`.
+    /// Entry names are compared exactly, as for `EULER.md`: a
+    /// case-insensitive filesystem would otherwise open `agents.md` as
+    /// `AGENTS.md`. A near-miss casing is diagnosed, never loaded.
+    fn user_instructions_entry_exists(
+        dir: &OwnedFd,
+        file_name: &str,
+        diagnostics: &mut Vec<ManifestDiagnostic>,
+    ) -> bool {
+        let identity = || Some(USER_INSTRUCTIONS_IDENTITY.to_owned());
+        let names = match enumerate_bounded(dir, false) {
+            Enumeration::Names(names) => names,
+            Enumeration::CapExceeded(observed) => {
+                diagnostics.push(diagnostic(
+                    DiagnosticReason::DirEntriesExceeded,
+                    identity(),
+                    Some(observed),
+                ));
+                return false;
+            }
+            Enumeration::Failed => {
+                diagnostics.push(diagnostic(DiagnosticReason::IoError, identity(), None));
+                return false;
+            }
+        };
+        let mut exact = false;
+        for name in &names {
+            if name.as_slice() == file_name.as_bytes() {
+                exact = true;
+            } else if name.eq_ignore_ascii_case(file_name.as_bytes()) {
+                diagnostics.push(diagnostic(DiagnosticReason::CaseMismatch, identity(), None));
+            }
+        }
+        exact
     }
 
     fn scan_user_skills_root(root: &Path, scan: &mut SkillScan<'_>) {

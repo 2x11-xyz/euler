@@ -7080,6 +7080,40 @@ mod project_context_seam {
     }
 
     #[test]
+    fn fresh_project_context_carries_user_instructions() {
+        // `/new` re-resolves from the session config, so the user-level
+        // `AGENTS.md` path must reach that preflight.
+        let temp = tempfile::tempdir().expect("temp");
+        let root = repo_with_euler_md(&temp, REPO_TEXT);
+        let home = std::fs::canonicalize(temp.path())
+            .expect("canonical temp")
+            .join("home");
+        std::fs::create_dir_all(&home).expect("home dir");
+        std::fs::write(home.join("AGENTS.md"), "Address the user as Ada.\n")
+            .expect("write AGENTS.md");
+        let mut config = dormant_config(&root);
+        config.user_instructions_path = Some(home.join("AGENTS.md"));
+        let (session, _captured) = captured_session(config);
+
+        let bootstrap = resolution_bootstrap(
+            session
+                .prepare_fresh_project_context()
+                .expect("fresh preflight"),
+        );
+
+        let payload = bootstrap.snapshot_payload();
+        let manifest: serde_json::Value = serde_json::from_str(
+            payload["manifest"]
+                .as_str()
+                .expect("fresh snapshot carries a manifest"),
+        )
+        .expect("manifest json");
+        let user = &manifest["user_instructions"];
+        assert_eq!(user["path"], "user/AGENTS.md");
+        assert_eq!(user["content"], "Address the user as Ada.\n");
+    }
+
+    #[test]
     fn new_after_resume_rebuilds_the_bootstrap() {
         // Reviewer attack (blocker 3): a resumed session carries no
         // bootstrap in config (its snapshot folds from events), so a /new
