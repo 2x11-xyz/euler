@@ -406,14 +406,15 @@ is not tracked.
   build refuses at startup any profile, overlay, child, or resume that sets
   `ask_timeout` or `extension_reviewers`, naming the field, because the
   gate does not enforce them yet; when only the recording sets one, the
-  error names the recorded profile and `--profile`. Validation here is syntax only: the ADR 0027 section 8
-  checks that need installed extensions (the hint for a `tools` pattern
-  that matches an extension's model-visible tool name, the notice for an
-  extension id that is not installed, and the error for an
-  `extension_reviewers` entry that is not enabled or has no reviewer
-  descriptor) are not implemented yet, and no ADR 0027 rollout step names
-  the first two; until they land, a `tools` rule naming an extension id
-  that is not installed matches nothing without notice.
+  error names the recorded profile and `--profile`. Validation here is
+  syntax only: the ADR 0027 section 8 checks that need installed
+  extensions (the hint for a `tools` pattern that matches an extension's
+  model-visible tool name, the notice for an extension id that is not
+  installed, and the error for an `extension_reviewers` entry that is not
+  enabled or has no reviewer descriptor) are not implemented yet, and no
+  ADR 0027 rollout step names the first two; until they land, a `tools`
+  rule naming an extension id that is not installed matches nothing
+  without notice.
 - **Permission rules in the gate (ADR 0027 section 3).** The gate decides
   a request in this order: a configured `always-deny`; a `deny` rule
   (`always-deny`, the escalated form of a command included); an
@@ -445,9 +446,12 @@ is not tracked.
   (its `run_shell` heredoc form too) writes, the workspace root `git_status`
   and `git_diff` read, and the path operands of the full `run_shell` text
   over the same commands `shell` rules see. Redirection targets are
-  writes (`<` reads; `2>&1` names no path); `cp`, `install`, `ln`, and
-  `rsync` write their last operand (or `-t`/`--target-directory` for all
-  but `rsync`) and read the others; `mv`, `tee`, `touch`, `mkdir`, `rm`,
+  writes (`<` reads; `2>&1` names no path), and a later word the parser
+  attaches to the redirect (`cat > out /etc/shadow`) is a command operand
+  of unknown direction; `cp`, `install`, `ln`, and `rsync` write their
+  last operand (or `-t`/`--target-directory` for all but `rsync`) and read
+  the others, and with an option after an operand every target of theirs
+  has unknown direction; `mv`, `tee`, `touch`, `mkdir`, `rm`,
   `mktemp`, `patch`, and `ed` write every operand; `sed -i`, `perl -i`,
   `ruby -i`, and `awk -i inplace` write their operands and read them
   without in-place editing; `dd` reads `if=` and writes `of=`; `curl -o` and
@@ -455,11 +459,15 @@ is not tracked.
   `head`, `tail`, `grep`, `rg`, `wc`, `stat`, and `diff` read; operands of
   any other command, after options and with `-` skipped, have unknown
   direction and match `read`, `write`, and `any` rules alike. A wrapper's
-  operands are those of the command it runs. A relative path resolves
+  operands are those of the command it runs, and a command `xargs` runs
+  also has an unresolved target (its operands come from standard input).
+  A relative path resolves
   against the workspace root (a `cd` earlier in the command is not
   tracked), and a path and a pattern are each matched in literal and
-  canonical form (symlinks resolved up to the longest existing ancestor),
-  the target taking the stricter of its forms' last matches. `path`
+  canonical form (symlinks resolved up to the longest existing ancestor;
+  for a pattern, in its literal prefix before the first `*`, the
+  workspace part of a relative pattern included), the target taking the
+  stricter of its forms' last matches. `path`
   patterns are globs over components (`*` within one, `**` zero or more,
   so `secrets/**` also matches `secrets`), relative to the workspace root
   unless absolute or `~/`; `outside_workspace` patterns are directory
@@ -473,7 +481,8 @@ is not tracked.
   glob is dynamic): where its surface has an `ask` or `deny` rule it counts
   as `ask` and records `{surface, unresolved: true}`, so it never hides a
   known `deny` and no `allow` covers it, and where that surface has a
-  `deny` rule the ask is human-only (the guardian never reviews it); with
+  `deny` rule the ask is human-only (the guardian never reviews it, and an
+  escalation's ask carries it so the guardian refuses that too); with
   only `allow` rules it has no rule state. Extension shell commands and
   extension operations name no paths, so path rules do not apply to
   them. Within a surface of one layer the last matching rule wins;

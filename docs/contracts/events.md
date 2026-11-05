@@ -570,7 +570,8 @@ extension error does not consume the later result.
     "subagent" }`, the rule that set the state; `index` is its position in
     that layer's array for that surface. An ask caused by a path Euler
     could not resolve records `{ "surface": "path" | "outside_workspace",
-    "unresolved": true }` instead.
+    "unresolved": true }` instead; an escalation's ask records it too
+    when that ask is human-only.
     Present on rule decisions and on the decision that settles an `ask`
     rule's prompt, whoever settled it (`decision_source` then says who).
   - `tool`: the core tool name or `<extension-id>.<command>` the rule

@@ -43,35 +43,48 @@ impl PathTarget {
     }
 }
 
-/// The target of one `file_redirect` node: `<` reads, the `>` family
-/// writes, and a descriptor duplication or close (`2>&1`, `>&-`) names no
-/// path. A dynamic target is unresolved.
-pub(super) fn redirect_target(node: Node<'_>, src: &str) -> Option<PathTarget> {
+/// The targets of one `file_redirect` node. Its first destination word is
+/// the redirect target: `<` reads, the `>` family writes, and a descriptor
+/// duplication or close (`2>&1`, `>&-`) names no path. `tree-sitter-bash`
+/// also hangs every later word of the command on the redirect as further
+/// destinations (`cat > out /etc/shadow`); those are operands of the
+/// command, so each is its own target of unknown direction. A dynamic word
+/// is unresolved.
+pub(super) fn redirect_targets(node: Node<'_>, src: &str) -> Vec<PathTarget> {
     let mut cursor = node.walk();
-    let operator = node
+    let Some(operator) = node
         .children(&mut cursor)
         .find(|child| !child.is_named())
-        .map(|child| child.kind())?;
+        .map(|child| child.kind())
+    else {
+        return Vec::new();
+    };
     let mut cursor = node.walk();
-    let destination = node
+    let mut words = node
         .children_by_field_name("destination", &mut cursor)
-        .map(|word| literal_word(word, src))
-        .collect::<Option<Vec<String>>>();
-    let Some(destination) = destination else {
-        return Some(PathTarget::unresolved());
-    };
-    let destination = destination.concat();
-    let duplicates_descriptor = matches!(operator, "<&" | ">&")
-        && (destination == "-" || destination.bytes().all(|byte| byte.is_ascii_digit()));
-    if destination.is_empty() || duplicates_descriptor || operator.ends_with("&-") {
-        return None;
+        .map(|word| literal_word(word, src));
+    let mut targets = Vec::new();
+    match words.next() {
+        None => {}
+        Some(None) => targets.push(PathTarget::unresolved()),
+        Some(Some(destination)) => {
+            let duplicates_descriptor = matches!(operator, "<&" | ">&")
+                && (destination == "-" || destination.bytes().all(|byte| byte.is_ascii_digit()));
+            if !destination.is_empty() && !duplicates_descriptor && !operator.ends_with("&-") {
+                let access = if operator.starts_with('<') {
+                    PathAccess::Read
+                } else {
+                    PathAccess::Write
+                };
+                targets.push(PathTarget::new(destination, access));
+            }
+        }
     }
-    let access = if operator.starts_with('<') {
-        PathAccess::Read
-    } else {
-        PathAccess::Write
-    };
-    Some(PathTarget::new(destination, access))
+    targets.extend(words.map(|word| match word {
+        Some(operand) => PathTarget::new(operand, PathAccess::Unknown),
+        None => PathTarget::unresolved(),
+    }));
+    targets
 }
 
 /// The path operands of one literal command (`words[0]` is its name).
@@ -143,27 +156,36 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// other operands. The destination is the last operand, or the value of
 /// `-t`/`--target-directory` where `target_option` (not for `rsync`, whose
 /// `-t` keeps times). A lone operand has unknown direction (`ln -s target`
-/// writes a link named after it).
+/// writes a link named after it). An option after an operand makes every
+/// target's direction unknown: GNU tools read it as an option, whose value
+/// may then look like the last operand (`cp a dst -S .bak`), while BSD
+/// tools read it as an operand.
 fn copy_targets(args: &[&str], target_option: bool) -> Vec<PathTarget> {
     let mut target = None;
     let mut rest = Vec::new();
     let mut index = 0;
     let mut options_end = false;
+    let mut option_after_operand = false;
     while index < args.len() {
         let arg = args[index];
         index += 1;
         if options_end || arg == "-" || !arg.starts_with('-') {
             rest.push(arg);
-        } else if arg == "--" {
+            continue;
+        }
+        if arg == "--" {
             options_end = true;
-        } else if target_option {
+            continue;
+        }
+        option_after_operand |= !rest.is_empty();
+        if target_option {
             if let Some(value) = option_value(args, &mut index, arg, 't', "--target-directory") {
                 target = Some(value);
             }
         }
     }
     let read = |operand: &&str| PathTarget::new(*operand, PathAccess::Read);
-    match (target, rest.as_slice()) {
+    let targets: Vec<PathTarget> = match (target, rest.as_slice()) {
         (Some(target), _) => std::iter::once(PathTarget::new(target, PathAccess::Write))
             .chain(rest.iter().map(read))
             .collect(),
@@ -177,7 +199,17 @@ fn copy_targets(args: &[&str], target_option: bool) -> Vec<PathTarget> {
             )))
             .collect(),
         (None, []) => Vec::new(),
+    };
+    if !option_after_operand {
+        return targets;
     }
+    targets
+        .into_iter()
+        .map(|target| PathTarget {
+            access: PathAccess::Unknown,
+            ..target
+        })
+        .collect()
 }
 
 /// `-d` or `--directory`, alone or in a short cluster.
@@ -283,6 +315,26 @@ mod tests {
             ),
             ("ln -s target link", vec![read("target"), write("link")]),
             ("ln -s target", vec![unknown("target")]),
+            // An option after an operand: GNU reads `-S .bak` as an option
+            // and BSD as operands, so no direction is known.
+            (
+                "cp a /x/profiles.json -S .bak",
+                vec![unknown("a"), unknown("/x/profiles.json"), unknown(".bak")],
+            ),
+            (
+                "install a /opt/a -m 755",
+                vec![unknown("a"), unknown("/opt/a"), unknown("755")],
+            ),
+            (
+                "ln -s target link --suffix=.old",
+                vec![unknown("target"), unknown("link")],
+            ),
+            (
+                "rsync -a src/ dst/ -e ssh",
+                vec![unknown("src/"), unknown("dst/"), unknown("ssh")],
+            ),
+            ("cp -- a -S", vec![read("a"), write("-S")]),
+            ("cp a -- b", vec![read("a"), write("b")]),
             (
                 "rsync -t src/ /backup/",
                 vec![read("src/"), write("/backup/")],
@@ -352,8 +404,39 @@ mod tests {
             ),
             ("sort < in.txt >> log", vec![read("in.txt"), write("log")]),
             ("> /tmp/x", vec![write("/tmp/x")]),
+            // Later words hang on the redirect but are command operands.
+            (
+                "echo x > .env foo",
+                vec![unknown("x"), write(".env"), unknown("foo")],
+            ),
+            (
+                "cat > out /etc/shadow",
+                vec![write("out"), unknown("/etc/shadow")],
+            ),
+            ("cat < a b", vec![read("a"), unknown("b")]),
+            (
+                "echo x > /home/me/.bashrc /../../../tmp/y",
+                vec![
+                    unknown("x"),
+                    write("/home/me/.bashrc"),
+                    unknown("/../../../tmp/y"),
+                ],
+            ),
+            ("echo x 2>&1 foo", vec![unknown("x"), unknown("foo")]),
+            (
+                "echo x > out $Y",
+                vec![unknown("x"), write("out"), UNRESOLVED],
+            ),
             ("sudo cp a /etc/x", vec![read("a"), write("/etc/x")]),
             ("bash -c 'tee /opt/y'", vec![write("/opt/y")]),
+            // `xargs` adds operands from standard input.
+            ("echo /x | xargs rm", vec![unknown("/x"), UNRESOLVED]),
+            ("xargs -0 rm -f a", vec![UNRESOLVED, write("a")]),
+            ("ls | xargs", vec![]),
+            (
+                "ls | xargs -n 1 cp -t /dst",
+                vec![UNRESOLVED, write("/dst")],
+            ),
             ("echo $(cat secret)", vec![UNRESOLVED, read("secret")]),
             ("cat $FILE", vec![UNRESOLVED]),
             ("cat ~/.ssh/config", vec![UNRESOLVED]),

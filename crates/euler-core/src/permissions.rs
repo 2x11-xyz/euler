@@ -682,7 +682,8 @@ impl<D> PermissionGate<D> {
     /// 1. `always-deny` wins.
     /// 2. A `deny` rule denies, the escalated form included.
     /// 3. An escalation asks when the profile allows escalation and is
-    ///    denied otherwise.
+    ///    denied otherwise. Its ask carries a human-only unresolved-path
+    ///    rule match, if any, so the guardian refuses it.
     /// 4. A dangerous or unreadable command asks, since under ADR 0021
     ///    decision D the danger veto holds in EVERY mode.
     /// 5. An `ask` rule asks.
@@ -707,13 +708,16 @@ impl<D> PermissionGate<D> {
             };
         }
         // An escalation always asks, and only a profile that allows it may
-        // ask at all (ADR 0026 section 3).
+        // ask at all (ADR 0026 section 3). A human-only rule ask rides along,
+        // so the guardian never takes it (ADR 0027 resolved question 3).
         if request.escalation.is_some() {
-            return GateRuling::mode(if self.profile.escalation == EscalationSetting::Allowed {
-                ApprovalMode::Ask
-            } else {
-                ApprovalMode::AlwaysDeny
-            });
+            if self.profile.escalation != EscalationSetting::Allowed {
+                return GateRuling::mode(ApprovalMode::AlwaysDeny);
+            }
+            return GateRuling {
+                mode: ApprovalMode::Ask,
+                rule: rule.filter(RuleMatch::human_only),
+            };
         }
         if request.dangerous_command {
             return GateRuling::mode(ApprovalMode::Ask);

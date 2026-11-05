@@ -14,9 +14,10 @@ pull requests that landed them; deeper design rationale lives in
   workspace `git_status` and `git_diff` read, and the paths a `run_shell`
   command names: redirection targets, the destinations of copy, move, link,
   and in-place edit commands, and the operands of other commands. A
-  command that names several paths takes its strictest one, and a path
-  Euler cannot resolve (a variable, a glob, `~`) asks wherever a rule on
-  its surface asks or denies, a person only when a rule there denies.
+  command is denied or asks if any path it names is, and is allowed only
+  if every path it names is allowed. A path Euler cannot resolve (a
+  variable, a glob, `~`, the operands `xargs` reads) asks wherever a rule
+  on its surface asks or denies, a person only when a rule there denies.
   `ask_timeout` and `extension_reviewers` are still refused at startup.
 
 ### Execution profiles: `shell` and `tools` permission rules are enforced

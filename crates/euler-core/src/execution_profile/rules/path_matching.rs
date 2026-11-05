@@ -127,8 +127,11 @@ impl ResolvedPaths {
     /// The literal and canonical absolute forms of a pattern: `~/` under
     /// `HOME` (no forms without one), a relative pattern under the literal
     /// and canonical workspace root, and the canonical form of the literal
-    /// prefix before the first component with `*`.
+    /// prefix before the first component with `*`, so a symlink in that
+    /// prefix (in the workspace part of a relative pattern too) resolves as
+    /// it does for a target.
     fn pattern_forms(&self, pattern: &str) -> Vec<PathBuf> {
+        let mut forms = Vec::new();
         let absolute = match pattern.strip_prefix("~/") {
             Some(rest) => match &self.home {
                 Some(home) => home.join(rest),
@@ -136,10 +139,8 @@ impl ResolvedPaths {
             },
             None if Path::new(pattern).is_absolute() => PathBuf::from(pattern),
             None => {
-                return vec![
-                    lexical(&self.root.join(pattern)),
-                    lexical(&self.canonical_root.join(pattern)),
-                ]
+                forms.push(lexical(&self.canonical_root.join(pattern)));
+                self.root.join(pattern)
             }
         };
         let literal = lexical(&absolute);
@@ -150,7 +151,8 @@ impl ResolvedPaths {
             .unwrap_or(components.len());
         let mut canonical_form = canonical(&components[..prefix_len].iter().collect::<PathBuf>());
         canonical_form.extend(&components[prefix_len..]);
-        vec![literal, canonical_form]
+        forms.extend([literal, canonical_form]);
+        forms
     }
 }
 

@@ -2236,7 +2236,7 @@ fn collect_rule_segments(script: &str, depth: usize, walk: &mut RuleWalk) {
             }
             "file_redirect" => walk
                 .paths
-                .extend(path_operands::redirect_target(node, script)),
+                .extend(path_operands::redirect_targets(node, script)),
             // Statements that change the shell or a file without a
             // `command` node (`export`, `unset`, `PATH=./bin`, `> out.txt`)
             // are unresolved segments, so a catch-all `deny` still covers
@@ -2341,6 +2341,12 @@ fn push_rule_words(words: &[String], depth: usize, walk: &mut RuleWalk) {
             if depth >= MAX_WRAPPER_DEPTH {
                 unreadable(walk);
                 return;
+            }
+            // `xargs` appends operands read from standard input to the
+            // command it runs, so that command names a path Euler cannot
+            // see.
+            if name.eq_ignore_ascii_case("xargs") && !rest.is_empty() {
+                walk.paths.push(PathTarget::unresolved());
             }
             let rest: Vec<String> = rest.iter().map(|word| (*word).to_owned()).collect();
             push_rule_words(&rest, depth + 1, walk);

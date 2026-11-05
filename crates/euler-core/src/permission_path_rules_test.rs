@@ -214,6 +214,60 @@ fn an_unresolved_operand_asks_and_never_hides_a_known_deny_or_rides_an_allow() {
     );
 }
 
+/// Resolved question 3: `tree-sitter-bash` hangs the words after a redirect
+/// target on the redirect, but they are command operands, each its own
+/// target, so a deny on one of them still applies.
+#[test]
+fn a_word_after_a_redirect_target_is_a_target_of_its_own() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let tools = ToolRegistry::new(workspace.path());
+    let gate = locked_gate(ProfileRules {
+        path: vec![rule("/opt/**", Some(RuleAccess::Read), RuleState::Deny)],
+        ..ProfileRules::default()
+    });
+    assert_eq!(
+        ruled(&gate, &shell(&tools, "cat > out /opt/secret")),
+        (
+            ApprovalMode::AlwaysDeny,
+            Cause::Rule("path", 0, RuleState::Deny)
+        )
+    );
+}
+
+/// Resolved question 3 with section 3 step 3: an escalation still asks,
+/// but an unresolved operand beside a `deny` rule rides along on it, so the
+/// guardian refuses it. A rule ask that is not human-only does not.
+#[test]
+fn an_escalated_unresolved_operand_beside_a_deny_rule_stays_human_only() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let tools = ToolRegistry::new(workspace.path());
+    let mut gate = PermissionGate::new(Unreachable);
+    let profile = preset_with(
+        "workspace",
+        ProfileRules {
+            path: vec![rule("secrets/**", None, RuleState::Deny)],
+            outside_workspace: vec![rule("/", Some(RuleAccess::Write), RuleState::Ask)],
+            ..ProfileRules::default()
+        },
+    );
+    gate.set_execution_profile(profile.fields, true);
+    let escalated = |command| shell(&tools, command).with_escalation("needs the host");
+
+    let request = escalated("cat $FILE");
+    let GateRuling { mode, rule } = gate.ruling_for_request(&request);
+    assert_eq!(mode, ApprovalMode::Ask);
+    let rule = rule.expect("the unresolved operand rides along");
+    assert!(rule.human_only());
+    assert!(!crate::guardian::adjudicates_verbatim(
+        &request.with_ask_rule(rule)
+    ));
+
+    assert_eq!(
+        ruled(&gate, &escalated("tee /opt/out")),
+        (ApprovalMode::Ask, Cause::None)
+    );
+}
+
 /// Section 1: `path` rules cover structured tools by direction, and `git_*`
 /// tools read the workspace. Relative patterns are workspace-relative and
 /// `**` matches the workspace itself.
@@ -360,6 +414,23 @@ fn a_symlink_out_of_the_workspace_and_an_outside_write_are_outside() {
         ruled(&gate, &shell(&tools, "tee inside.txt")),
         (ApprovalMode::Ask, Cause::None)
     );
+
+    // A relative pattern resolves its workspace part as a target does, so
+    // a deny on `link/**` covers the directory the link points to.
+    let link_gate = locked_gate(ProfileRules {
+        path: vec![rule("link/**", None, RuleState::Deny)],
+        ..ProfileRules::default()
+    });
+    let through_target = format!("tee {}", elsewhere.path().join("x").display());
+    let link_deny = (
+        ApprovalMode::AlwaysDeny,
+        Cause::Rule("path", 0, RuleState::Deny),
+    );
+    assert_eq!(
+        ruled(&link_gate, &shell(&tools, &through_target)),
+        link_deny
+    );
+    assert_eq!(ruled(&link_gate, &shell(&tools, "tee link/x")), link_deny);
 }
 
 #[derive(Default)]
