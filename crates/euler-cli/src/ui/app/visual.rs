@@ -394,6 +394,12 @@ impl AppCore {
                 CanvasLine::styled_lossy(line, TextRole::Status),
             );
         }
+        if self.bottom.is_first_run_profile_picker() {
+            return CanvasStatusSnapshot::new(
+                target,
+                CanvasLine::styled_lossy(format!("  {FIRST_RUN_PROFILE_STATUS}"), TextRole::Status),
+            );
+        }
         let has_foldable = self
             .visual_canvas
             .has_foldable_artifact(TOOL_CALL_MAX_LINES);

@@ -1,6 +1,7 @@
 use super::theme::ThemeChoice;
 use euler_core::{ActiveGrant, ApprovalMode, GrantSource, ReasoningEffort, SkillCatalogEntry};
 use euler_sdk::Capability;
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandSpec {
@@ -568,6 +569,14 @@ pub enum CommandAction {
     SetDefaultProfile {
         name: String,
     },
+    /// First-run picker Enter: save the named profile as
+    /// `defaults.interactive` and switch this session to it.
+    ChooseFirstRunProfile {
+        name: String,
+        profiles_file: PathBuf,
+    },
+    /// First-run picker Esc: keep this session's profile without saving.
+    DeferFirstRunProfile,
     /// Open the permissions picker with live session/project grants.
     OpenPermissions,
     /// §5.1: drill into the per-capability controls from the posture picker.
@@ -651,6 +660,14 @@ pub enum PickerSpec {
     PermissionsAdvanced(Vec<PermissionChoice>),
     /// Execution profiles (ADR 0026): presets, then user profiles.
     Profiles(Vec<ProfileChoice>),
+    /// The first-run profile picker (ADR 0026 section 5): the presets, Enter
+    /// saves the choice to `profiles_file`, and Esc keeps the session's
+    /// profile, which `esc_hint` names.
+    FirstRunProfile {
+        choices: Vec<ProfileChoice>,
+        esc_hint: String,
+        profiles_file: PathBuf,
+    },
 }
 
 /// One execution profile row in the `/profile` picker.

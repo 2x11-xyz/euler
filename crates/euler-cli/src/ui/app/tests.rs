@@ -5858,6 +5858,288 @@ fn resume_installs_the_execution_profile_it_resolves() {
     );
 }
 
+/// An app launched with the first-run profile picker in effect: the session
+/// runs `profile`, and `profiles.json` lives under `root`.
+fn first_run_core(root: &Path, profile: &str, resumed: bool) -> AppCore {
+    let (decider, channels) = TuiDecider::new();
+    let mut config = euler_core::SessionConfig::new(root);
+    config.model = "echo".to_owned();
+    config.set_execution_profile(
+        euler_core::ProfilesConfig::default()
+            .resolve(Some(profile), euler_core::ProfileContext::Interactive, None)
+            .expect("preset resolves"),
+    );
+    let session = Session::new(config, EchoProvider, decider);
+    AppCore::new_with_options(
+        session,
+        channels,
+        AppOptions {
+            first_run_profile: Some(FirstRunProfile {
+                profiles_file: root.join("profiles.json"),
+                resumed,
+            }),
+            ..AppOptions::default()
+        },
+    )
+    .expect("app core")
+}
+
+fn session_profile_name(core: &AppCore) -> String {
+    let AppState::Idle { session } = &core.state else {
+        panic!("session must be idle");
+    };
+    session.execution_profile().name.clone()
+}
+
+/// ADR 0026 section 5: the first interactive launch without a saved default
+/// opens the profile picker in the app, `full` preselected and recommended,
+/// and the status bar says why nothing else works yet.
+#[test]
+fn first_run_profile_picker_opens_with_the_welcome_header() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    // A user profile without a saved default: the picker still opens and
+    // offers the presets only.
+    std::fs::write(
+        temp.path().join("profiles.json"),
+        r#"{"profiles": {"ci": {"extends": "locked"}}}"#,
+    )
+    .expect("write profiles.json");
+    let core = first_run_core(temp.path(), "full", false);
+
+    let lines = core.bottom.surface_lines(120).expect("picker is open");
+    let rows = lines.iter().map(|line| line.trim_end()).collect::<Vec<_>>();
+    assert_eq!(
+        &rows[1..],
+        [
+            "Welcome to Euler. How should it run commands?",
+            "You can change this any time with /profile.",
+            "",
+            "\u{2192} \u{25cf} full       runs on this machine with your permissions \u{b7} only \
+             dangerous commands ask   (recommended)",
+            "  \u{25cb} workspace  sandboxed, network on \u{b7} dangerous commands and sensitive \
+             paths ask",
+            "  \u{25cb} locked     sandboxed, network off \u{b7} every command asks",
+            "",
+            "\u{2191}\u{2193} move \u{b7} \u{23ce} choose and save \u{b7} esc use full for now",
+        ]
+    );
+    assert_eq!(
+        core.canvas_status_snapshot(120).line.plain_text().trim(),
+        "choose a profile to start"
+    );
+}
+
+/// Enter saves the choice as `defaults.interactive` and switches the
+/// session to it.
+#[test]
+fn first_run_profile_picker_enter_saves_and_applies_the_choice() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "full", false);
+    core.drain_finalized_visual_lines(200);
+
+    core.handle_input(key(KeyCode::Down));
+    core.handle_input(key(KeyCode::Down));
+    core.handle_input(key(KeyCode::Enter));
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert_eq!(session_profile_name(&core), "locked");
+    let saved = euler_core::ProfilesConfig::load(&temp.path().join("profiles.json"))
+        .expect("profiles.json");
+    assert_eq!(
+        saved
+            .resolve(None, euler_core::ProfileContext::Interactive, None)
+            .expect("saved default")
+            .name,
+        "locked"
+    );
+    assert!(drain_finalized_visual_text(&mut core, 200).contains(
+        "execution profile set to locked and saved as your default \u{b7} change it with /profile"
+    ));
+}
+
+/// When the default cannot be saved, the chosen profile still applies to
+/// this session and the error says it was not saved.
+#[cfg(unix)]
+#[test]
+fn first_run_profile_picker_enter_reports_a_default_it_could_not_save() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "full", false);
+    core.drain_finalized_visual_lines(200);
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o555))
+        .expect("make the profiles directory read-only");
+
+    core.handle_input(key(KeyCode::Down));
+    core.handle_input(key(KeyCode::Down));
+    core.handle_input(key(KeyCode::Enter));
+
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o755))
+        .expect("restore permissions");
+    assert_eq!(session_profile_name(&core), "locked");
+    assert!(!temp.path().join("profiles.json").exists());
+    assert!(drain_finalized_visual_text(&mut core, 200).contains(
+        "execution profile set to locked for this session but not saved as your default"
+    ));
+}
+
+/// Esc on a fresh start runs `full` for this session and saves nothing, so
+/// the picker returns next launch.
+#[test]
+fn first_run_profile_picker_esc_uses_full_without_saving() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "full", false);
+    core.drain_finalized_visual_lines(200);
+
+    core.handle_input(key(KeyCode::Esc));
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert_eq!(session_profile_name(&core), "full");
+    assert!(!temp.path().join("profiles.json").exists());
+    assert!(drain_finalized_visual_text(&mut core, 200).contains(
+        "using full for this session (not saved) \u{b7} you'll be asked again next time, or use \
+         /profile"
+    ));
+    assert_ne!(
+        core.canvas_status_snapshot(120).line.plain_text().trim(),
+        "choose a profile to start"
+    );
+}
+
+/// On a resume the picker's Esc keeps the profile the resume rule chose, so
+/// declining never loosens a session (ADR 0026 resolved question 16).
+#[test]
+fn first_run_profile_picker_esc_on_resume_keeps_the_resumed_profile() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "locked", true);
+    core.drain_finalized_visual_lines(200);
+    let lines = core.bottom.surface_lines(120).expect("picker is open");
+    assert_eq!(
+        lines.last().map(|line| line.trim_end()),
+        Some(
+            "\u{2191}\u{2193} move \u{b7} \u{23ce} choose and save \u{b7} esc keep locked for now"
+        )
+    );
+
+    core.handle_input(key(KeyCode::Esc));
+
+    assert_eq!(session_profile_name(&core), "locked");
+    assert!(!temp.path().join("profiles.json").exists());
+    assert!(drain_finalized_visual_text(&mut core, 200).contains(
+        "using locked for this session (not saved) \u{b7} you'll be asked again next time, or \
+         use /profile"
+    ));
+}
+
+/// While the picker is open, typed text goes nowhere and no turn starts.
+#[test]
+fn first_run_profile_picker_blocks_submitting_a_turn() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "full", false);
+
+    type_text(&mut core, "hello");
+    core.handle_input(InputEvent::Paste("hello".to_owned()));
+    assert_eq!(core.bottom.composer().submit_text(), "");
+    assert_eq!(core.handle_submit(), CoreEffect::Render);
+    assert_eq!(core.notice.as_deref(), Some("choose a profile to start"));
+    assert_eq!(
+        core.start_expected_queued_turn("queued".to_owned()),
+        CoreEffect::Render
+    );
+    assert!(!core.turn_in_flight());
+    core.handle_input(key(KeyCode::Enter));
+
+    assert!(!core.turn_in_flight());
+    let AppState::Idle { session } = &core.state else {
+        panic!("session must be idle");
+    };
+    assert!(!session
+        .events()
+        .iter()
+        .any(|event| event.kind.as_str() == EventKind::USER_MESSAGE));
+}
+
+/// Enter or Esc while the session is busy (a startup queue recovery) keeps
+/// the picker open and saves nothing; the choice applies once it is idle.
+#[test]
+fn first_run_profile_picker_waits_while_the_session_is_busy() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "full", false);
+    let session = core.take_idle_session();
+    let (_worker_tx, worker_rx) = mpsc::channel();
+    let interrupt_flag = Arc::new(AtomicBool::new(false));
+    core.state = AppState::TurnInFlight {
+        worker_rx,
+        interrupt_flag: Arc::clone(&interrupt_flag),
+        started_at: Instant::now(),
+    };
+
+    core.handle_input(key(KeyCode::Down));
+    core.handle_input(key(KeyCode::Down));
+    core.handle_input(key(KeyCode::Enter));
+    core.handle_input(key(KeyCode::Esc));
+
+    assert!(core.bottom.is_first_run_profile_picker());
+    assert_eq!(
+        core.notice.as_deref(),
+        Some("profile change waits for the active turn")
+    );
+    assert!(!temp.path().join("profiles.json").exists());
+    // Ctrl+C keeps interrupting the busy session.
+    core.handle_input(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(interrupt_flag.load(Ordering::SeqCst));
+    assert!(core.bottom.is_first_run_profile_picker());
+
+    core.state = AppState::Idle { session };
+    core.handle_input(key(KeyCode::Enter));
+
+    assert_eq!(session_profile_name(&core), "locked");
+    assert!(temp.path().join("profiles.json").exists());
+}
+
+/// Ctrl+C quits from the picker, as from the composer: the first press
+/// arms, the second quits, and nothing is saved.
+#[test]
+fn first_run_profile_picker_ctrl_c_quits_without_saving() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "full", false);
+    let ctrl_c = || modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+    assert_eq!(core.handle_input(ctrl_c()), CoreEffect::Render);
+    assert!(core.bottom.is_first_run_profile_picker());
+    assert_eq!(core.handle_input(ctrl_c()), CoreEffect::Quit);
+    assert!(!temp.path().join("profiles.json").exists());
+}
+
+/// A command-context rebuild (a catalog refresh at launch) leaves the
+/// picker open: only Enter or Esc answers it.
+#[test]
+fn first_run_profile_picker_survives_a_command_context_rebuild() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let mut core = first_run_core(temp.path(), "full", false);
+
+    core.rebuild_bottom_surface();
+
+    assert!(core.bottom.is_first_run_profile_picker());
+}
+
+/// A saved `defaults.interactive` means the choice was made: no picker.
+#[test]
+fn first_run_profile_picker_is_skipped_with_a_saved_default() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    std::fs::write(
+        temp.path().join("profiles.json"),
+        r#"{"defaults": {"interactive": "workspace"}}"#,
+    )
+    .expect("write profiles.json");
+    let core = first_run_core(temp.path(), "workspace", false);
+
+    assert!(matches!(core.bottom.owner(), BottomOwner::Composer));
+    assert_ne!(
+        core.canvas_status_snapshot(120).line.plain_text().trim(),
+        "choose a profile to start"
+    );
+}
+
 #[test]
 fn resume_rehydrates_terminal_cancelled_steering_as_a_recovery_decision() {
     let temp = tempfile::tempdir().expect("temp dir");

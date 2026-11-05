@@ -117,7 +117,7 @@ euler
 # Headless: one task, full provenance, bounded rounds
 # Default: indexed home session under ~/.euler/sessions/ (shows in /resume).
 # Pass --provenance <path> for a standalone JSONL log instead.
-# Shell and writes run without a prompt in the workspace sandbox, with network.
+# Runs unrestricted on the host by default (the full profile), like the TUI.
 euler exec --provider openrouter --model anthropic/claude-sonnet-5 \
   --max-tool-rounds 100 \
   "Read BRIEF.md in this directory and carry it out fully."
@@ -125,9 +125,9 @@ euler exec --provider openrouter --model anthropic/claude-sonnet-5 \
 
 Useful exec flags: `--reasoning-effort xsmall|small|medium|large|xlarge|max`,
 `--auto-compaction off|stubs`, `--extensions <list|none>`,
-`--profile full|workspace|locked|<name>`, `--provenance <path>`. `--profile locked`
-runs without network and with `--auto-approve read-only|trusted-local` deciding
-writes and shell.
+`--profile full|workspace|locked|<name>`, `--provenance <path>`. `--profile workspace`
+sandboxes shell and writes; `--profile locked` runs without network and with
+`--auto-approve read-only|trusted-local` deciding writes and shell.
 
 In the TUI: `/` lists actions; slash commands cover models, sessions, and
 extensions.

@@ -13,6 +13,9 @@ maintainer on 2026-10-28 and are listed at the end; the Decision text cites
 them as "resolved question n". No contract changes until the rollout PRs land;
 each PR updates its owning contract.
 
+Amended (2026-10-29): the built-in headless default is `full`, the same as
+interactive, instead of `workspace` (resolved question 11).
+
 ## Context
 
 Euler has become too restrictive for a research agent. Its value should be
@@ -359,7 +362,8 @@ is a profile change.
 ### 5. Selection
 
 - **Context defaults.** `profiles.json` holds `defaults.interactive`
-  (built-in: `full`), `defaults.headless` (built-in: `workspace`), and
+  (built-in: `full`), `defaults.headless` (built-in: `full`; `workspace`
+  before the 2026-10-29 amendment of resolved question 11), and
   `defaults.subagent` (built-in: `inherit`, see section 7). Headless means
   `euler exec`.
 - **First run.** The first interactive launch with no
@@ -548,7 +552,10 @@ contract (`capabilities.md`, `tools.md`, `events.md`, `ui.md`,
    step 6.
 6. **Escalation.** The `escalate` field, prompt, grants (resolved question
    8), guardian routing, and never-prompt errors.
-7. **Headless default.** The built-in `defaults.headless` becomes
+7. **Headless default.** (Amended 2026-10-29: the built-in
+   `defaults.headless` is now `full`, a second **behavior change**; headless
+   `exec` runs unrestricted unless a profile says otherwise. See resolved
+   question 11.) As first shipped: the built-in `defaults.headless` becomes
    `workspace`, and the project context rule applies (resolved question 10).
    **Behavior change** for scripts relying on read-only exec (resolved
    question 11).
@@ -568,10 +575,12 @@ contract (`capabilities.md`, `tools.md`, `events.md`, `ui.md`,
   Provenance records them; checkpoints and `/rollback` do not cover them.
 - Users tune execution in one file: per-context defaults, user profiles that
   extend a preset, and repository overlays that can only tighten.
-- Headless runs gain shell, writes, and network inside a sandbox by default,
-  so CI on hosts without user namespaces (some hosted Linux runners) fails
-  closed until it selects a profile with `sandbox: off`, the only kind that
-  needs no backend. Headless runs that need credentialed CLIs without
+- Headless runs default to `full`, like interactive ones (resolved question
+  11, amended 2026-10-29): no sandbox, no routine prompts, the user's `HOME`
+  and credentials. CI and untrusted repositories select `workspace` or
+  `locked` through `--profile` or `defaults.headless`. A sandboxed profile
+  on a host without user namespaces (some hosted Linux runners) fails
+  closed. Sandboxed headless runs that need credentialed CLIs without
   prompts use a profile with `credentials: "pass"`, which hands those
   credentials to sandboxed code that has network.
 - `--auto-approve` keeps working under every profile; under profiles that
@@ -637,6 +646,19 @@ Entries marked **changed** differ from the proposal in the draft.
 11. The built-in headless default flips from read-only to `workspace` in one
     release, without an alias; `--profile locked` restores today's behavior.
     As proposed.
+
+    **Amended 2026-10-29.** The built-in headless default is `full`, the
+    same as interactive. An audit of 351 recent unattended long-horizon
+    agent runs (14,366 shell commands) found that about 81% needed
+    credentials or the real `HOME`: `gh` in 34%, `git push` or `git fetch`
+    in 30%, model or API keys in 32%, warehouse and cloud CLIs in 9%, and
+    writes to shared state outside the worktree in 52%. Under `workspace`,
+    the default `credentials: private`, the private `HOME`, and escalation
+    that a headless run cannot answer break those runs. `workspace` and
+    `locked` stay available through `--profile` or `defaults.headless`, for
+    example for CI or untrusted repositories. Resolved question 20 still
+    governs a user `defaults.headless`; the built-in sandbox-off default is
+    this maintainer decision.
 12. **Changed.** A profile change clears escalation grants and ends the jobs
     Euler started under a sandboxed profile. Jobs started under a
     sandbox-off profile keep running and are listed at exit (see 6).

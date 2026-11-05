@@ -112,17 +112,17 @@ fn recorded_profiles(log: &Path, kind: &str) -> Vec<serde_json::Value> {
 }
 
 #[test]
-fn built_in_headless_default_records_the_workspace_preset() {
+fn built_in_headless_default_records_the_full_preset() {
     let workspace = workspace();
     let output = exec_new(&workspace, &[]);
     assert!(output.status.success(), "{}", stderr(&output));
 
     let profiles = recorded_profiles(&workspace.log, "session.start");
     assert_eq!(profiles.len(), 1);
-    assert_eq!(profiles[0]["name"], "workspace");
-    assert_eq!(profiles[0]["fields"]["sandbox"], "on");
+    assert_eq!(profiles[0]["name"], "full");
+    assert_eq!(profiles[0]["fields"]["sandbox"], "off");
     assert_eq!(profiles[0]["fields"]["network"], "on");
-    assert_eq!(profiles[0]["fields"]["approvals"], "escalation-only");
+    assert_eq!(profiles[0]["fields"]["approvals"], "never");
     assert_eq!(profiles[0]["fields"]["reviewer"], "user");
     assert!(profiles[0]["fields_sha256"].is_string());
 }
@@ -355,9 +355,10 @@ fn first_tool_result(log: &Path) -> serde_json::Value {
         .clone()
 }
 
-/// The built-in headless default is `workspace` (ADR 0026 step 7), so plain
-/// `euler exec` runs a command without a prompt, and `--profile locked`
-/// restores the read-only tier's denial (resolved question 11).
+/// The built-in headless default is `full` (ADR 0026 resolved question 11,
+/// amended 2026-10-29), so plain `euler exec` runs a command on the host
+/// without a prompt, and `--profile locked` restores the read-only tier's
+/// denial.
 #[test]
 fn headless_default_runs_commands_and_the_locked_profile_restores_read_only() {
     let workspace = workspace();
@@ -386,11 +387,9 @@ fn headless_default_runs_commands_and_the_locked_profile_restores_read_only() {
     };
 
     let (start, result) = run(&[]);
-    assert_eq!(start["execution_profile"]["name"], "workspace");
-    // Without a backend the profile lifts no approval and the command fails
-    // closed.
-    let backend_enforced = start["sandbox_backend"] != "unavailable";
-    assert_eq!(result["ok"], backend_enforced, "{result}");
+    assert_eq!(start["execution_profile"]["name"], "full");
+    assert_eq!(start["sandbox_backend"], "host");
+    assert_eq!(result["ok"], true, "{result}");
 
     let (start, result) = run(&["--profile", "locked"]);
     assert_eq!(start["execution_profile"]["name"], "locked");
@@ -405,7 +404,7 @@ fn headless_default_runs_commands_and_the_locked_profile_restores_read_only() {
 #[test]
 fn auto_approve_under_a_profile_that_covers_it_prints_a_notice() {
     let workspace = workspace();
-    let notice = "note: --auto-approve has no effect: execution profile workspace already \
+    let notice = "note: --auto-approve has no effect: execution profile full already \
                   allows what it asks for";
 
     let output = exec_new(&workspace, &["--auto-approve", "read-only"]);
@@ -637,7 +636,7 @@ fn project_overlay_can_tighten_but_never_loosen() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
         stderr(&output)
-            .contains("execution profile: workspace, tightened by .euler/profile-overlay.json"),
+            .contains("execution profile: full, tightened by .euler/profile-overlay.json"),
         "{}",
         stderr(&output)
     );
@@ -694,11 +693,11 @@ fn resume_records_the_profile_it_runs_under_and_shows_a_change() {
 }
 
 /// A session started under `locked` (the headless default before ADR 0026
-/// step 7) resumes under `locked`: the `workspace` default is looser, so the
+/// step 7) resumes under `locked`: the `full` default is looser, so the
 /// recorded profile is kept and named on stderr, and `--auto-approve` applies
 /// its tier without the profile notice.
 #[test]
-fn resume_of_a_locked_session_keeps_locked_under_the_workspace_default() {
+fn resume_of_a_locked_session_keeps_locked_under_the_full_default() {
     let workspace = workspace();
     let output = exec_new(&workspace, &["--profile", "locked"]);
     assert!(output.status.success(), "{}", stderr(&output));
@@ -742,7 +741,7 @@ fn resume_with_the_same_reviewer_flag_shows_no_profile_change() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
         stderr(&output).contains(
-            "execution profile: workspace (recorded: workspace; changed reviewer guardian -> user)"
+            "execution profile: full (recorded: full; changed reviewer guardian -> user)"
         ),
         "{}",
         stderr(&output)
@@ -812,7 +811,7 @@ fn resume_of_a_log_without_a_profile_resolves_as_a_new_session() {
     let output = exec_resume(&workspace, &[]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("execution profile: workspace (this session recorded no profile)"),
+        stderr(&output).contains("execution profile: full (this session recorded no profile)"),
         "{}",
         stderr(&output)
     );

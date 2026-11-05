@@ -26,7 +26,8 @@ use std::sync::Arc;
 use crate::auth_validation::validate_provider_auth;
 use crate::companion_run::execute_headless_companion_run;
 use crate::execution_profile_runtime::{
-    launch_profile, print_notices, resolve_resume_profile, ProfileRequest, ResolvedResumeProfile,
+    first_run_profiles_file, launch_profile, print_notices, prompt_first_run_profile_on_terminal,
+    resolve_resume_profile, ProfileRequest, ResolvedResumeProfile,
 };
 use crate::extension_cli::resolve_round_observer;
 use crate::extension_enablement::resolve_session_extensions;
@@ -35,7 +36,7 @@ use crate::session_lifecycle::{
     HomeSessionRefresh, LiveProvenance, ResumeTarget, SESSION_ID,
 };
 use crate::subagent::{AutoApproveTier, SubagentDecider};
-use crate::ui::app::{App, AppOptions, ResumedAppState};
+use crate::ui::app::{App, AppOptions, FirstRunProfile, ResumedAppState};
 use crate::ui::banner;
 use crate::ui::transcript::render_line_oriented;
 use crate::ui::tui_decider::TuiDecider;
@@ -74,6 +75,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         run.provider.validate_auth()
     })?;
     let root = std::env::current_dir()?;
+    prompt_first_run_profile_on_terminal(run_profile_request(&run, ProfileContext::Interactive))?;
     let profile = launch_profile(
         run_profile_request(&run, ProfileContext::Interactive),
         &root,
@@ -264,6 +266,7 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
         run.provider.validate_auth()
     })?;
     let root = std::env::current_dir()?;
+    let first_run_profile = first_run_profile(&run, false);
     let profile = launch_profile(
         run_profile_request(&run, ProfileContext::Interactive),
         &root,
@@ -332,6 +335,7 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
             extensions: run.extensions.clone(),
             observe: run.observe.clone(),
             auth_file: run.auth_file.clone(),
+            first_run_profile,
         },
     )?;
     if let Some(path) = crate::model_catalog::default_model_catalog_path() {
@@ -734,6 +738,7 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
     let extensions = run.extensions.clone();
     let observe = run.observe.clone();
     let auth_file = run.auth_file.clone();
+    let first_run_profile = first_run_profile(&run, true);
     let (decider, channels) = TuiDecider::new();
     let preference_path = model_preference::default_model_preference_path();
     let theme_choice = load_known_theme_preference(preference_path.as_deref()).unwrap_or_default();
@@ -768,6 +773,7 @@ fn resume_tui(target: ResumeTarget, run: RunArgs) -> Result<()> {
         extensions,
         observe,
         auth_file,
+        first_run_profile,
     };
     let mut app = App::enter_resumed_with_options(
         outcome.session,
@@ -1092,6 +1098,17 @@ fn print_background_job_lines(jobs: &[String]) {
     for job in jobs {
         eprintln!("  {job}");
     }
+}
+
+/// The TUI's first-run profile picker for this launch or resume: the app
+/// shows it when the profiles file has no `defaults.interactive`.
+fn first_run_profile(run: &RunArgs, resumed: bool) -> Option<FirstRunProfile> {
+    first_run_profiles_file(run_profile_request(run, ProfileContext::Interactive)).map(
+        |profiles_file| FirstRunProfile {
+            profiles_file,
+            resumed,
+        },
+    )
 }
 
 fn run_profile_request(run: &RunArgs, context: ProfileContext) -> ProfileRequest<'_> {

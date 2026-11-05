@@ -56,6 +56,9 @@ pub struct ReplacementPicker {
     resume_preview: Option<Vec<String>>,
     /// Set exactly when `kind` is `ModelTargets`.
     pub(super) model_targets: Option<ModelTargetsSelection>,
+    /// The footer naming what Esc keeps. Set exactly when `kind` is
+    /// `FirstRunProfile`.
+    first_run_footer: Option<String>,
 }
 
 /// The model-targets checklist's bound and what Enter does with the set.
@@ -75,6 +78,8 @@ pub(super) enum PickerKind {
     Compaction,
     /// §5.1 Advanced, one level down from the posture picker.
     PermissionsAdvanced,
+    /// The first-run profile picker: no turn starts until it is answered.
+    FirstRunProfile,
 }
 
 impl PickerKind {
@@ -143,6 +148,7 @@ impl ReplacementPicker {
                 matches!(item.action, CommandAction::SetPermissionPosture { .. }).then_some(dot)
             }
             PickerKind::Generic => self.items.iter().any(|item| item.current).then_some(dot),
+            PickerKind::FirstRunProfile => Some(dot),
             PickerKind::Resume | PickerKind::PermissionsAdvanced => None,
         }
     }
@@ -253,10 +259,13 @@ impl ReplacementPicker {
                 footer: "↑↓ move · ⏎ select · ⌫ back · esc cancel".to_owned(),
                 empty: "no matches",
             },
-            PickerKind::Generic => PickerChrome {
+            PickerKind::Generic | PickerKind::FirstRunProfile => PickerChrome {
                 title: self.title.clone(),
                 params: Vec::new(),
-                footer: "↑↓ move · ⏎ select · esc cancel".to_owned(),
+                footer: self
+                    .first_run_footer
+                    .clone()
+                    .unwrap_or_else(|| "↑↓ move · ⏎ select · esc cancel".to_owned()),
                 empty: "no matches",
             },
         }
@@ -280,10 +289,21 @@ impl ReplacementPicker {
         // second rule there would be redundant chrome.
         let mut lines = vec![row("─".repeat(cols), false)];
 
-        let mut title_parts = vec![chrome.title];
-        title_parts.extend(chrome.params);
-        title_parts.push(self.position_indicator());
-        lines.push(row(truncate_display(&title_parts.join(" · "), cols), false));
+        if self.kind == PickerKind::FirstRunProfile {
+            // A welcome, not a list to page through: no position counter,
+            // and one line saying the choice is not final.
+            lines.push(row(truncate_display(&chrome.title, cols), false));
+            lines.push(row(
+                truncate_display("You can change this any time with /profile.", cols),
+                false,
+            ));
+            lines.push(row(String::new(), false));
+        } else {
+            let mut title_parts = vec![chrome.title];
+            title_parts.extend(chrome.params);
+            title_parts.push(self.position_indicator());
+            lines.push(row(truncate_display(&title_parts.join(" · "), cols), false));
+        }
 
         // The query line is the picker's input box: a bare `>` prompt while
         // empty, the typed query echoing after it — never folded into the
@@ -348,6 +368,9 @@ impl ReplacementPicker {
             for line in preview {
                 lines.push(row(truncate_display(&format!("    {line}"), cols), false));
             }
+        }
+        if self.kind == PickerKind::FirstRunProfile {
+            lines.push(row(String::new(), false));
         }
         lines.push(row(truncate_display(&chrome.footer, cols), false));
         lines
@@ -458,6 +481,12 @@ impl ReplacementPicker {
             }),
             _ => None,
         };
+        let first_run_footer = match &spec {
+            PickerSpec::FirstRunProfile { esc_hint, .. } => {
+                Some(format!("↑↓ move · ⏎ choose and save · esc {esc_hint}"))
+            }
+            _ => None,
+        };
         let (kind, title, items) = picker_parts(spec);
         let mut picker = Self {
             kind,
@@ -470,6 +499,7 @@ impl ReplacementPicker {
             saved_draft,
             resume_preview: None,
             model_targets,
+            first_run_footer,
         };
         picker.ensure_selected_visible();
         picker
@@ -737,6 +767,15 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
             "Execution profile".to_owned(),
             profile_items(choices),
         ),
+        PickerSpec::FirstRunProfile {
+            choices,
+            profiles_file,
+            ..
+        } => (
+            PickerKind::FirstRunProfile,
+            "Welcome to Euler. How should it run commands?".to_owned(),
+            first_run_profile_items(choices, &profiles_file),
+        ),
         PickerSpec::PermissionsAdvanced(choices) => (
             PickerKind::PermissionsAdvanced,
             "Permissions › Advanced".to_owned(),
@@ -909,6 +948,24 @@ fn profile_items(choices: Vec<ProfileChoice>) -> Vec<PickerItem> {
             provider_tag: None,
             current: choice.current,
             action: CommandAction::SetExecutionProfile { name: choice.name },
+        })
+        .collect()
+}
+
+fn first_run_profile_items(choices: Vec<ProfileChoice>, profiles_file: &Path) -> Vec<PickerItem> {
+    choices
+        .into_iter()
+        .map(|choice| PickerItem {
+            label: choice.name.clone(),
+            detail: Some(choice.detail),
+            status: None,
+            group: None,
+            provider_tag: None,
+            current: choice.current,
+            action: CommandAction::ChooseFirstRunProfile {
+                name: choice.name,
+                profiles_file: profiles_file.to_path_buf(),
+            },
         })
         .collect()
 }

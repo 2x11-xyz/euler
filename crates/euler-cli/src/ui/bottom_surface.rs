@@ -106,11 +106,17 @@ impl BottomSurface {
         &self.context
     }
 
+    /// Rebuild the command context and return input to an empty composer.
+    /// The first-run profile picker stays open: a rebuild (a catalog refresh
+    /// at launch) must not answer it.
     pub fn reset_context(&mut self, context: CommandContext) {
-        self.composer = ComposerDraft::new();
-        self.owner = BottomOwner::Composer;
         self.context = context;
         self.history.detach();
+        if self.is_first_run_profile_picker() {
+            return;
+        }
+        self.composer = ComposerDraft::new();
+        self.owner = BottomOwner::Composer;
     }
 
     pub fn record_submission(&mut self, text: &str) {
@@ -256,6 +262,15 @@ impl BottomSurface {
         matches!(
             &self.owner,
             BottomOwner::Picker(picker) if picker.kind == PickerKind::ModelTargets
+        )
+    }
+
+    /// Whether the first-run profile picker is open. No turn starts while
+    /// it is.
+    pub fn is_first_run_profile_picker(&self) -> bool {
+        matches!(
+            &self.owner,
+            BottomOwner::Picker(picker) if picker.kind == PickerKind::FirstRunProfile
         )
     }
 
@@ -501,7 +516,12 @@ impl BottomSurface {
     pub fn cancel(&mut self) -> SurfaceEvent {
         match std::mem::replace(&mut self.owner, BottomOwner::Composer) {
             BottomOwner::Palette(palette) => self.composer = palette.saved_draft,
-            BottomOwner::Picker(picker) => self.composer = picker.saved_draft,
+            BottomOwner::Picker(picker) => {
+                self.composer = picker.saved_draft;
+                if picker.kind == PickerKind::FirstRunProfile {
+                    return SurfaceEvent::Action(CommandAction::DeferFirstRunProfile);
+                }
+            }
             BottomOwner::Mention(mention) => self.composer = mention.saved_draft,
             BottomOwner::TextPrompt(prompt) => self.composer = prompt.saved_draft,
             BottomOwner::ConfirmPrompt(prompt) => self.composer = prompt.saved_draft,

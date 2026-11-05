@@ -135,10 +135,12 @@ jobs:
               {"finished": {"stop_reason": "tool_use"}}]},
             {"events": [{"text_delta": "done"}, {"finished": {"stop_reason": "completed"}}]}]}
           JSON
+          # A sandboxed profile must fail closed without a backend; `full` (the
+          # default since ADR 0026's 2026-10-29 amendment) runs on the host.
           mkdir -p fail-closed && cd fail-closed
           ../target/debug/euler exec --provider fixture \
             --provider-option "event-script=$PWD/../script.json" \
-            --extensions none --project-context off --auto-approve trusted-local \
+            --extensions none --project-context off --profile workspace \
             --provenance events.jsonl "run a shell command"
           cat events.jsonl
           grep -q '"sandbox_backend":"unavailable"' events.jsonl
