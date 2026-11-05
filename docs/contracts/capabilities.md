@@ -391,7 +391,8 @@ is not tracked.
   empty surface, or empty `extension_reviewers` list is unset. The project
   overlay may add `ask` and `deny` rules (an `allow` is an error naming the
   surface, index, and pattern) and an `ask_timeout` no higher than the
-  profile's, and may not set `extension_reviewers`. A resolved profile
+  profile's (any value when the profile sets none), and may not set
+  `extension_reviewers`. A resolved profile
   keeps its rules as layers, never merged: `profile`, then `overlay`. A
   named `defaults.subagent` child gets the parent's layers and its own
   (`profile` relabeled `subagent`) with every `allow` removed, the lower
@@ -403,7 +404,13 @@ is not tracked.
   stay, and the summary names the fields joined this way. This build
   refuses at startup any profile, overlay, child, or resume that sets one
   of these fields, naming the field, because the gate does not enforce
-  them yet.
+  them yet; when only the recording sets one, the error names the recorded
+  profile and `--profile`. Validation here is syntax only: the ADR 0027
+  section 8 checks that need installed extensions (the hint for a `tools`
+  pattern that matches an extension's model-visible tool name, the notice
+  for an extension id that is not installed, and the error for an
+  `extension_reviewers` entry that is not enabled or has no reviewer
+  descriptor) are not implemented, so this refusal stays until they are.
 - **Selection.** `--profile <name>` on `euler` and `euler exec`, then
   `/profile` in the TUI, then the context default in `profiles.json`, then
   the built-in default: `full` for both interactive and headless. An unknown

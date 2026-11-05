@@ -315,7 +315,8 @@ impl ProfileFields {
 
     /// Each field that differs from `self` in `other`, as
     /// `field old -> new`, in sorted field order. An omitted field reads
-    /// `unset`, and `rules` reads as its number of layers.
+    /// `unset`. `rules` reads as its number of layers, or `rules edited (N
+    /// layers)` when the count is the same but the rules differ.
     fn changes_to(&self, other: &Self) -> Vec<String> {
         let (Value::Object(before), Value::Object(after)) = (
             serde_json::to_value(self).expect("profile fields serialize"),
@@ -338,11 +339,13 @@ impl ProfileFields {
             .into_iter()
             .filter(|field| before.get(field.as_str()) != after.get(field.as_str()))
             .map(|field| {
-                format!(
-                    "{field} {} -> {}",
-                    text(field, before.get(field.as_str())),
-                    text(field, after.get(field.as_str()))
-                )
+                let before = text(field, before.get(field.as_str()));
+                let after = text(field, after.get(field.as_str()));
+                if field == "rules" && before == after {
+                    format!("rules edited ({after})")
+                } else {
+                    format!("{field} {before} -> {after}")
+                }
             })
             .collect()
     }
@@ -593,11 +596,20 @@ impl ResumeProfile {
             });
         }
         let Some(looser_field) = resolved.fields.first_looser_field(&recorded.fields) else {
+            resolved.check_enforced()?;
             let mut profile = resolved.clone();
             profile
                 .fields
                 .join_resumed_policy(&recorded.fields, &resolved.fields);
-            profile.check_enforced()?;
+            // `resolved` passed, so a refusal here comes from a recorded
+            // value the join kept; name the recording, not profiles.json.
+            profile.check_enforced().map_err(|error| match error {
+                ProfileError::Unenforced { field, .. } => ProfileError::RecordedUnenforced {
+                    profile: recorded.name.clone(),
+                    field,
+                },
+                other => other,
+            })?;
             return Ok(Self {
                 joined_fields: profile
                     .fields
@@ -609,18 +621,35 @@ impl ResumeProfile {
         };
         // The overlay applies here for its ADR 0026 fields. Its ADR 0027
         // fields are already in `resolved` (checked against the resolved
-        // profile), and the join below brings them in.
+        // profile), and the join below brings them in. Unsetting the
+        // recorded `ask_timeout` keeps `apply` from checking the overlay's
+        // timeout again against it, which would refuse a value the join
+        // lowers anyway.
         let mut profile = recorded.clone();
-        profile.fields.rules.clear();
         profile.fields.ask_timeout = None;
-        profile.fields.extension_reviewers.clear();
         if let Some(overlay) = overlay {
             overlay.apply(&mut profile)?;
         }
         profile
             .fields
             .join_resumed_policy(&recorded.fields, &resolved.fields);
+        // An ADR 0027 field the recording does not set was joined from the
+        // resolved profile, so the refusal names that profile instead.
+        let recorded_refuses = |field| {
+            matches!(
+                recorded.check_enforced(),
+                Err(ProfileError::Unenforced { field: refused, .. }) if refused == field
+            )
+        };
         profile.check_enforced().map_err(|error| match error {
+            ProfileError::Unenforced { field, .. }
+                if enforced::NOT_ENFORCED_YET.contains(&field) && !recorded_refuses(field) =>
+            {
+                ProfileError::Unenforced {
+                    profile: resolved.name.clone(),
+                    field,
+                }
+            }
             ProfileError::Unenforced { profile, field } => {
                 ProfileError::RecordedUnenforced { profile, field }
             }
@@ -724,9 +753,7 @@ pub enum ProfileError {
         profile: String,
         field: &'static str,
     },
-    #[error(
-        "this session recorded profile \"{profile}\", whose {field} this host cannot enforce, and the newly resolved profile is looser; pass --profile to resume under a profile this host can enforce"
-    )]
+    #[error("{}", recorded_unenforced_message(profile, field))]
     RecordedUnenforced {
         profile: String,
         field: &'static str,
@@ -744,6 +771,21 @@ fn unenforced_message(profile: &str, field: &str) -> String {
         "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; \
          the full, workspace, and locked presets' boundaries are available, and writable_paths \
          must name existing paths"
+    )
+}
+
+fn recorded_unenforced_message(profile: &str, field: &str) -> String {
+    if enforced::NOT_ENFORCED_YET.contains(&field) {
+        return format!(
+            "this session recorded profile \"{profile}\" with {field}, which this version parses \
+             and records but does not enforce yet, and resume keeps the recorded {field}; pass \
+             --profile to resume under a profile without it"
+        );
+    }
+    format!(
+        "this session recorded profile \"{profile}\", whose {field} this host cannot enforce, and \
+         the newly resolved profile is looser; pass --profile to resume under a profile this \
+         host can enforce"
     )
 }
 

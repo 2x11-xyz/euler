@@ -19,6 +19,10 @@ use crate::sandbox::{SandboxProfile, SubprocessSandbox, WorkspaceNetworkAccess};
 use std::path::{Path, PathBuf};
 
 /// The ADR 0027 fields this build parses and records but does not enforce.
+/// Their validation checks syntax only; the ADR 0027 section 8 checks that
+/// need installed extensions (extension tool name hint, unknown extension id
+/// notice, enabled `extension_reviewers` with a descriptor) must land before
+/// a field leaves this list.
 pub(super) const NOT_ENFORCED_YET: [&str; 3] = ["rules", "ask_timeout", "extension_reviewers"];
 
 /// The subprocess sandbox for `fields`, or the first field this build cannot
