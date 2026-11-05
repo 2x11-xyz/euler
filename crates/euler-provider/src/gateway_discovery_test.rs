@@ -167,6 +167,37 @@ fn wildcard_routes_expand_to_listed_ids_with_the_longest_literal_prefix() {
 }
 
 #[test]
+fn wildcard_expansion_never_adds_an_id_dropped_as_non_chat() {
+    let model_info = json!({"data": [
+        {"model_name": "text-embedding-3-small", "model_info": {"mode": "embedding"}},
+        {"model_name": "images/*", "model_info": {"mode": "image_generation"}},
+        {"model_name": "*", "model_info": {"max_output_tokens": 4096}}
+    ]});
+    let models = json!({"data": [
+        {"id": "text-embedding-3-small"},
+        {"id": "images/dall-e-3"},
+        {"id": "gpt-4o"}
+    ]});
+
+    let discovery = map_model_info_for_test(&model_info, Some(Ok(models))).expect("discovery");
+
+    // The explicit embedding row wins over `*`, and the longer image
+    // wildcard wins over `*`; both are then dropped as non-chat.
+    assert_eq!(ids(&discovery), vec!["gpt-4o"]);
+
+    // A failed expansion names only wildcard routes that had a chat row.
+    let failed = map_model_info_for_test(
+        &json!({"data": [
+            {"model_name": "gpt-4o"},
+            {"model_name": "images/*", "model_info": {"mode": "image_generation"}}
+        ]}),
+        Some(Err("GET /v1/models returned HTTP 500".to_owned())),
+    )
+    .expect("explicit rows stand");
+    assert!(failed.notes.is_empty(), "{:?}", failed.notes);
+}
+
+#[test]
 fn failed_wildcard_expansion_keeps_explicit_rows_and_names_the_dropped_routes() {
     let discovery = map_model_info_for_test(
         &fixture(MODEL_INFO),
@@ -225,6 +256,15 @@ fn malformed_or_empty_models_list_fails() {
 /// Serves `responses` (path, status, body) in order on one port, one
 /// connection each, and reports each request's raw head.
 fn spawn_gateway(responses: Vec<(&'static str, u16, String)>) -> (String, mpsc::Receiver<String>) {
+    spawn_gateway_with_length(responses, true)
+}
+
+/// [`spawn_gateway`], optionally without `Content-Length` so the body ends
+/// when the connection closes.
+fn spawn_gateway_with_length(
+    responses: Vec<(&'static str, u16, String)>,
+    content_length: bool,
+) -> (String, mpsc::Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let base_url = format!("http://{}/v1/", listener.local_addr().expect("addr"));
     let (sender, receiver) = mpsc::channel();
@@ -246,10 +286,14 @@ fn spawn_gateway(responses: Vec<(&'static str, u16, String)>) -> (String, mpsc::
             } else {
                 ""
             };
+            let length = if content_length {
+                format!("Content-Length: {}\r\n", body.len())
+            } else {
+                String::new()
+            };
             let _ = write!(
                 stream,
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{location}{length}Connection: close\r\n\r\n{body}"
             );
         }
     });
@@ -343,6 +387,31 @@ fn discovery_refuses_a_body_over_4_mib() {
         ("/model/info", 200, oversized.clone()),
         ("/v1/models", 200, oversized),
     ]);
+    let root = base_url.trim_end_matches("/v1/");
+
+    let error = discovery_provider(&base_url)
+        .discover_models()
+        .expect_err("oversized");
+
+    assert!(
+        error.starts_with(&format!("GET {root}/v1/models returned a body over 4 MiB")),
+        "{error}"
+    );
+}
+
+#[test]
+fn discovery_refuses_a_body_over_4_mib_without_a_content_length() {
+    let oversized = format!(
+        "{{\"data\": [], \"pad\": \"{}\"}}",
+        "x".repeat(4 * 1024 * 1024)
+    );
+    let (base_url, _requests) = spawn_gateway_with_length(
+        vec![
+            ("/model/info", 200, oversized.clone()),
+            ("/v1/models", 200, oversized),
+        ],
+        false,
+    );
     let root = base_url.trim_end_matches("/v1/");
 
     let error = discovery_provider(&base_url)

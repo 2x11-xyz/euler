@@ -67,7 +67,7 @@ Euler has three deliberately different command paths:
 | Path | Network behavior | Result |
 | --- | --- | --- |
 | `euler models` | Always offline | Lists the effective local catalog |
-| `euler models refresh` | Explicit bounded GitHub check | Installs a newer compatible catalog, or reports that the current catalog is latest |
+| `euler models refresh` | Explicit bounded GitHub check, then a discovery refresh of each `"discovery": true` provider | Installs a newer compatible catalog, or reports that the current catalog is latest; fails if a discovery provider fails |
 | Full-screen `euler` / `euler tui` | Non-blocking background check when due | Reloads the model picker if a newer catalog is accepted |
 
 After any successful check, the automatic path is due again after 24 hours.

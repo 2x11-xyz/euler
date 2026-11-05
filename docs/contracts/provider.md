@@ -265,10 +265,10 @@ transport error, never a response body.
    with a string `model_name` is the source. A wildcard route (a
    `model_name` containing `*`) expands to the `GET <root>/v1/models` ids it
    matches, each taking the deployments of the matching wildcard route with
-   the longest literal prefix; an explicit row wins and unmatched ids are not
-   added. If that request fails, the explicit rows stand and a warning names
-   the dropped wildcard routes. If no chat model survives mapping, discovery
-   fails.
+   the longest literal prefix; an explicit row wins, even one dropped below
+   as non-chat, and unmatched ids are not added. If that request fails, the
+   explicit rows stand and a warning names the dropped wildcard routes that
+   have a chat row. If no chat model survives mapping, discovery fails.
 2. Any other answer, or a transport failure: `GET <root>/v1/models`. Every
    listed id appears with the provider's family and no declared metadata,
    like an unlisted `--model`. A non-200, malformed, or empty answer fails
@@ -326,7 +326,13 @@ command fail after the others run. `euler models` reads the cache and lists
 discovered models with their provider, family, and `"source":
 "discovered"`. `euler login --provider <id>` refreshes a discovery
 provider's cache after it stores the key, so a key change takes effect at
-once. `/model` lists discovered models from the cache too.
+once. `/model` lists discovered models from the cache too. Known limit: the
+running session keeps the provider list it launched with, so after a
+background refresh `/model` can offer an id that this session sends as an
+unlisted model (the provider family, no `model_source`) until the next
+launch. A refresh interrupted by process exit can leave an owner-only
+`.<provider id>-*.tmp` file in the cache directory; the cache itself is
+replaced only by an atomic rename.
 
 A discovered model reports its cache as the provider's `model_source`
 (endpoint, fetch time, and the cache file's SHA-256), which core records on

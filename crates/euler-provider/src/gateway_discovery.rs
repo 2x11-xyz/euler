@@ -7,7 +7,7 @@
 use crate::auth::SecretString;
 use crate::provider_config::{model_id_is_valid, ApiFamily, CustomModelConfig};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::time::{Duration, Instant};
 use url::Url;
@@ -279,31 +279,41 @@ fn map_model_info(
     url: &str,
 ) -> Result<GatewayDiscovery, String> {
     let mut routes = BTreeMap::<String, Vec<Deployment<'_>>>::new();
+    // Every explicit name, chat or not, so a wildcard never re-adds an id
+    // whose own row was dropped as non-chat.
+    let mut explicit_names = BTreeSet::<&str>::new();
+    // Wildcards keep their non-chat rows so the longest-prefix match sees
+    // them; expansion drops those rows afterwards.
     let mut wildcards = BTreeMap::<&str, Vec<&Value>>::new();
     for row in rows {
-        if !Deployment::from_row(row).is_chat() {
-            continue;
-        }
         let name = row_name(row);
         if name.contains('*') {
             wildcards.entry(name).or_default().push(row);
-        } else {
-            routes
-                .entry(name.to_owned())
-                .or_default()
-                .push(Deployment::from_row(row));
+            continue;
+        }
+        explicit_names.insert(name);
+        let deployment = Deployment::from_row(row);
+        if deployment.is_chat() {
+            routes.entry(name.to_owned()).or_default().push(deployment);
         }
     }
     let mut notes = Vec::new();
-    if !wildcards.is_empty() {
-        match listed_ids {
-            Some(Ok(ids)) => expand_wildcards(&mut routes, &wildcards, ids),
-            Some(Err(error)) => notes.push(format!(
-                "dropped wildcard routes {} because {error}",
-                wildcards.keys().copied().collect::<Vec<_>>().join(", ")
-            )),
-            None => {}
+    match listed_ids {
+        Some(Ok(ids)) => expand_wildcards(&mut routes, &explicit_names, &wildcards, ids),
+        Some(Err(error)) => {
+            let dropped = wildcards
+                .iter()
+                .filter(|(_, rows)| rows.iter().any(|row| Deployment::from_row(row).is_chat()))
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>();
+            if !dropped.is_empty() {
+                notes.push(format!(
+                    "dropped wildcard routes {} because {error}",
+                    dropped.join(", ")
+                ));
+            }
         }
+        None => {}
     }
     let mut invalid = Vec::new();
     let mut disagreeing = Vec::new();
@@ -348,14 +358,16 @@ fn map_model_info(
 }
 
 /// Adds each listed id that no explicit row names and a wildcard route
-/// matches, with that route's deployments and the id as underlying model.
+/// matches, with that route's chat deployments and the id as underlying
+/// model. An id whose best-matching route has no chat deployment is dropped.
 fn expand_wildcards<'a>(
     routes: &mut BTreeMap<String, Vec<Deployment<'a>>>,
+    explicit_names: &BTreeSet<&str>,
     wildcards: &BTreeMap<&'a str, Vec<&'a Value>>,
     ids: Vec<String>,
 ) {
     for id in ids {
-        if routes.contains_key(&id) {
+        if explicit_names.contains(id.as_str()) || routes.contains_key(&id) {
             continue;
         }
         if let Some(rows) = longest_prefix_match(wildcards, &id) {
@@ -365,8 +377,11 @@ fn expand_wildcards<'a>(
                     underlying_model: id.clone(),
                     ..Deployment::from_row(row)
                 })
-                .collect();
-            routes.insert(id, deployments);
+                .filter(Deployment::is_chat)
+                .collect::<Vec<_>>();
+            if !deployments.is_empty() {
+                routes.insert(id, deployments);
+            }
         }
     }
 }

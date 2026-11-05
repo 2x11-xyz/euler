@@ -508,6 +508,49 @@ mod tests {
     }
 
     #[test]
+    fn stale_cache_routes_this_launch_and_holds_a_background_failure_for_exit_once() {
+        let home = tempfile::tempdir().expect("home");
+        let (base_url, requests) = spawn_gateway(503, "{}");
+        let path = write_providers(home.path(), &base_url);
+        let dir = cache_dir(&path);
+        let cached = GatewayDiscovery {
+            endpoint: "/v1/models",
+            models: parse_discovered_models(&[
+                json!({"id": "gpt-4o", "api_family": "openai_chat_completions"}),
+            ]),
+            notes: Vec::new(),
+        };
+        let fetched_at = Utc::now() - chrono::Duration::hours(STALE_AFTER_HOURS + 1);
+        write_cache(&dir, "gw", &base_url, &cached, fetched_at).expect("seed cache");
+        let before = fs::read(cache_path(&dir, "gw")).expect("cache");
+
+        let warnings = refresh_at_launch(&path);
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(registry(&path)
+            .provider("gw")
+            .expect("gw")
+            .model_source("gpt-4o")
+            .is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let background = loop {
+            let taken = take_background_warnings();
+            if !taken.is_empty() || std::time::Instant::now() > deadline {
+                break taken;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(background.len(), 1, "{background:?}");
+        assert!(
+            background[0].starts_with("discovery for provider `gw` failed: GET "),
+            "{background:?}"
+        );
+        assert!(take_background_warnings().is_empty());
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read(cache_path(&dir, "gw")).expect("cache"), before);
+    }
+
+    #[test]
     fn models_refresh_reports_family_counts_and_added_and_removed_ids_and_keeps_cache_on_failure() {
         let home = tempfile::tempdir().expect("home");
         let (base_url, _requests) = spawn_gateway(200, MODEL_INFO);
