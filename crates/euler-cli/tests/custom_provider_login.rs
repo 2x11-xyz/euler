@@ -1,6 +1,7 @@
 //! `euler login`, `auth status`, and `logout` for a custom provider in
-//! `providers.json` (ADR 0025 rollout step 1): the stored key authenticates
-//! requests, status lists it without the value, and logout keeps the entry.
+//! `providers.json` (ADR 0025 rollout steps 1 and 3): the stored key
+//! authenticates requests, status lists it without the value, and logout
+//! keeps the entry.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -51,8 +52,8 @@ fn write_providers(home: &Path, entry: &str) -> String {
     contents
 }
 
-/// Answers every chat completions request with "ok" and reports each
-/// request's head.
+/// Answers `GET /model/info` with one chat model and every other request
+/// with an "ok" chat completions stream, and reports each request's head.
 fn spawn_gateway() -> (String, Receiver<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind gateway");
     let address = listener.local_addr().expect("address");
@@ -61,7 +62,17 @@ fn spawn_gateway() -> (String, Receiver<String>) {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { return };
             let request = read_request(&mut stream);
+            let model_info = request.starts_with("GET /model/info ");
             let _ = request_tx.send(request);
+            if model_info {
+                let body = r#"{"data": [{"model_name": "gw-model", "model_info": {"litellm_provider": "openai", "mode": "chat"}}]}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                continue;
+            }
             let _ = stream.write_all(
                 concat!(
                     "HTTP/1.1 200 OK\r\n",
@@ -106,6 +117,22 @@ fn read_request(stream: &mut impl Read) -> String {
     String::from_utf8_lossy(&buffer).into_owned()
 }
 
+/// Session files and every other file under the Euler home except the auth
+/// file never hold the stored key.
+fn assert_key_only_in_auth_file(euler_home: &Path) {
+    let written = files_under(euler_home);
+    assert!(
+        written.iter().any(|path| path.ends_with("events.jsonl")),
+        "exec wrote no session events: {written:?}"
+    );
+    for path in written {
+        if path != euler_home.join("auth.json") {
+            let contents = text(&fs::read(&path).expect("read written file"));
+            assert!(!contents.contains(STORED_KEY), "{}", path.display());
+        }
+    }
+}
+
 fn files_under(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     for entry in fs::read_dir(dir).expect("read dir") {
@@ -123,7 +150,7 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
 fn login_stores_key_that_requests_send_and_logout_removes_it() {
     let home = tempfile::tempdir().expect("home");
     let (base_url, requests) = spawn_gateway();
-    let providers = write_providers(
+    write_providers(
         home.path(),
         &format!(
             r#"{{"api_family": "openai_chat_completions", "base_url": "{base_url}", "auth_header": true, "default_model": "gw-model"}}"#
@@ -133,11 +160,24 @@ fn login_stores_key_that_requests_send_and_logout_removes_it() {
     let login = euler(
         home.path(),
         &["login", "--provider", "gw"],
-        &format!("{STORED_KEY}\n"),
+        &format!("\n{STORED_KEY}\n"),
     );
     assert!(login.status.success(), "stderr: {}", text(&login.stderr));
     let login_stdout = text(&login.stdout);
-    assert!(login_stdout.starts_with("API key: "), "{login_stdout}");
+    assert!(
+        login_stdout.starts_with(&format!(
+            "Base URL [{base_url}]: Using {base_url}\nAPI key: "
+        )),
+        "{login_stdout}"
+    );
+    assert!(
+        requests
+            .try_recv()
+            .expect("discovery request")
+            .to_ascii_lowercase()
+            .contains(&format!("authorization: bearer {STORED_KEY}")),
+        "login verifies the key with discovery"
+    );
     assert!(
         login_stdout.contains("Stored the key for gw in "),
         "{login_stdout}"
@@ -146,6 +186,9 @@ fn login_stores_key_that_requests_send_and_logout_removes_it() {
     assert!(!text(&login.stderr).contains(STORED_KEY));
     let auth = text(&fs::read(home.path().join(".euler/auth.json")).expect("auth.json"));
     assert!(auth.contains(&format!("${STORED_KEY}")), "{auth}");
+    let providers =
+        fs::read_to_string(home.path().join(".euler/providers.json")).expect("providers.json");
+    assert!(providers.contains(r#""discovery": true"#), "{providers}");
 
     let status = euler(home.path(), &["auth", "status"], "");
     let status_stdout = text(&status.stdout);
@@ -167,18 +210,7 @@ fn login_stores_key_that_requests_send_and_logout_removes_it() {
     );
     assert!(!text(&exec.stdout).contains(STORED_KEY));
     assert!(!text(&exec.stderr).contains(STORED_KEY));
-    let euler_home = home.path().join(".euler");
-    let written = files_under(&euler_home);
-    assert!(
-        written.iter().any(|path| path.ends_with("events.jsonl")),
-        "exec wrote no session events: {written:?}"
-    );
-    for path in written {
-        if path != euler_home.join("auth.json") {
-            let contents = text(&fs::read(&path).expect("read written file"));
-            assert!(!contents.contains(STORED_KEY), "{}", path.display());
-        }
-    }
+    assert_key_only_in_auth_file(&home.path().join(".euler"));
 
     let logout = euler(home.path(), &["logout", "--provider", "gw"], "");
     assert!(logout.status.success(), "stderr: {}", text(&logout.stderr));

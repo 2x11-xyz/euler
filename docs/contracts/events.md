@@ -777,6 +777,9 @@ extension error does not consume the later result.
   comparison uses exact canonical `(provider id, provider-scoped model id)`
   strings after caller/provider-selection parsing; aliases are out of
   scope.
+  Optional `model_source` records where the provider's listing of
+  `to_model` came from when it is not the provider's own configuration;
+  see `session.start`.
 - `context.limit`: `provider`, `model`, `used_tokens`, `limit_tokens`,
   `threshold`. A local guardrail, distinct from the provider `max_tokens`
   stop reason: evaluated at the turn boundary, after a `model.result` and
@@ -857,6 +860,14 @@ extension error does not consume the later result.
   the first call after a binary update changes that identity. Older streams may
   omit these fields. They are provenance metadata, not canvas content or resume
   authority.
+  Optional `model_source` records where the provider's listing of `model`
+  came from when it is not the provider's own configuration. Today that is a
+  gateway-discovered model (ADR 0025): `{"kind": "discovered", "endpoint":
+  "/model/info" | "/v1/models", "fetched_at": <RFC 3339>, "cache_sha256":
+  <hex>}`, naming the discovery cache the launch routed from. A configured
+  model omits it. It is provider-reported provenance metadata: core records
+  it without interpreting it, and it is part of the projection the
+  `runtime` digest commits to. Older streams omit it.
   Optional `session_kind` is `interactive` or `non-interactive`. It records
   how the session was launched for discovery/resume UI grouping only. Omitted
   means unknown/legacy and must not affect resume authority or canvas content.
@@ -964,8 +975,11 @@ extension error does not consume the later result.
   never fails resume.
 - `session.resumed`: `provider`, `model`, `events_folded`, `sandbox_backend`,
   `sandbox_unavailable_reason`, optional
-  `resumed_from_event_id`. The two sandbox fields carry the same values and
-  meanings as on `session.start`, probed again at the resume boundary: a
+  `resumed_from_event_id`, and optional `model_source` (the `session.start`
+  shape) for the target it resumed against, recorded from the source
+  current at the resume, which may differ from the one recorded earlier.
+  The two sandbox fields carry the same values and meanings as on
+  `session.start`, probed again at the resume boundary: a
   session resumed on a different host records the boundary it actually got
   rather than the one the original stream recorded. A durable audit marker
   recording that the session

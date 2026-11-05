@@ -638,6 +638,87 @@ fn resumed_session_records_its_execution_profile_on_session_resumed() {
     );
 }
 
+/// A `fixture` provider whose listing of every model except `configured`
+/// came from elsewhere, as a discovery provider reports it.
+struct SourcedProvider(ScriptedProvider);
+
+impl ModelProvider for SourcedProvider {
+    fn name(&self) -> &'static str {
+        "fixture"
+    }
+
+    fn model_source(&self, model: &str) -> Option<serde_json::Value> {
+        (model != "configured").then(|| json!({"kind": "discovered", "model": model}))
+    }
+
+    fn invoke(&self, request: ModelRequest) -> Result<ProviderStream, ProviderError> {
+        self.0.invoke(request)
+    }
+}
+
+fn sourced_providers(replies: &[&str]) -> ProviderSet {
+    ProviderSet::single(SourcedProvider(ScriptedProvider::new(
+        replies
+            .iter()
+            .map(|reply| FixtureResponse::Assistant((*reply).to_owned()))
+            .collect(),
+    )))
+}
+
+#[test]
+fn start_switch_and_resume_record_the_provider_model_source() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let log = temp.path().join("events.jsonl");
+    let mut session = Session::new_with_providers(
+        fixture_config(temp.path()),
+        sourced_providers(&["one"]),
+        CountingDecider::default(),
+    )
+    .with_provenance(ProvenanceWriter::new(&log).expect("writer"));
+    session.run_turn("first").expect("first turn");
+    session
+        .switch_model("fixture", "configured", "user", None)
+        .expect("switch to configured");
+    session
+        .switch_model("fixture", "discovered-model", "user", None)
+        .expect("switch to discovered");
+    drop(session);
+    let mut resumed = resume_session(
+        fixture_config(temp.path()),
+        sourced_providers(&["two"]),
+        CountingDecider::default(),
+        &log,
+    )
+    .expect("resume");
+    resumed.run_turn("continue").expect("continued turn");
+
+    let events = read_resume_prefix(&log).expect("read session");
+    let source = |kind: &str| {
+        events
+            .iter()
+            .filter(|event| event.kind.as_str() == kind)
+            .map(|event| event.payload.get("model_source").cloned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        source(EventKind::SESSION_START),
+        [Some(json!({"kind": "discovered", "model": "fixture"}))]
+    );
+    assert_eq!(
+        source(EventKind::MODEL_SWITCHED),
+        [
+            None,
+            Some(json!({"kind": "discovered", "model": "discovered-model"}))
+        ]
+    );
+    assert_eq!(
+        source(EventKind::SESSION_RESUMED),
+        [Some(
+            json!({"kind": "discovered", "model": "discovered-model"})
+        )]
+    );
+}
+
 fn preset_profile(name: &str) -> euler_core::ExecutionProfile {
     euler_core::ProfilesConfig::default()
         .resolve(Some(name), euler_core::ProfileContext::Interactive, None)

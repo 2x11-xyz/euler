@@ -1,5 +1,6 @@
 use crate::provider_config::{
-    referenced_env_names, ApiFamily, CustomModelConfig, ProviderConfigRegistry,
+    login_base_url, parse_discovered_models, referenced_env_names, ApiFamily, CustomModelConfig,
+    DiscoveredModels, DiscoverySource, ProviderConfigRegistry,
 };
 
 #[test]
@@ -595,6 +596,7 @@ fn default_model_without_models_becomes_the_only_model_with_no_metadata() {
             supports_tools: None,
             supports_reasoning: None,
             compat: None,
+            discovered: false,
         }]
     );
 }
@@ -991,4 +993,235 @@ fn referenced_env_names_includes_every_entry_of_a_repeated_provider_id() {
         ["FIRST_PROXY_KEY", "TEAM_TOKEN"]
     );
     assert!(referenced_env_names(r#"[{"proxy": {"api_key": "$KEY"}}]"#).is_empty());
+}
+
+fn discovered_model(id: &str, api_family: ApiFamily) -> CustomModelConfig {
+    CustomModelConfig {
+        id: id.to_owned(),
+        display_name: id.to_owned(),
+        api_family,
+        context_window_tokens: Some(200_000),
+        max_output_tokens: None,
+        supports_tools: Some(true),
+        supports_reasoning: None,
+        compat: None,
+        discovered: true,
+    }
+}
+
+fn discovered_source() -> DiscoverySource {
+    DiscoverySource {
+        endpoint: "/model/info".to_owned(),
+        fetched_at: "2026-11-05T10:00:00Z".to_owned(),
+        cache_sha256: "ab".repeat(32),
+    }
+}
+
+#[test]
+fn discovery_provider_needs_no_models_or_default_model() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{"providers": {"gateway": {
+            "api_family": "openai_chat_completions",
+            "base_url": "https://gateway.example.com/v1/",
+            "auth_header": true,
+            "discovery": true
+        }}}"#,
+    );
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let provider = registry
+        .provider("gateway")
+        .expect("discovery provider loads");
+    assert!(provider.discovery);
+    assert!(provider.models.is_empty());
+    assert_eq!(provider.default_model, None);
+}
+
+#[test]
+fn discovery_provider_whose_base_url_does_not_end_in_v1_is_ignored() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{"providers": {"gateway": {
+            "api_family": "openai_chat_completions",
+            "base_url": "https://gateway.example.com/api",
+            "discovery": true
+        }}}"#,
+    );
+
+    assert!(registry.provider("gateway").is_none());
+    assert_eq!(
+        warnings,
+        ["ignored provider `gateway` because discovery needs a base_url that ends in /v1"]
+    );
+}
+
+#[test]
+fn discovered_models_join_configured_ones_and_a_configured_entry_replaces_its_discovered_id() {
+    let mut asked = Vec::new();
+    let (registry, warnings) = ProviderConfigRegistry::with_json_and_discovered(
+        r#"{"providers": {"gateway": {
+            "api_family": "openai_chat_completions",
+            "base_url": "https://gateway.example.com/v1",
+            "default_model": "claude-sonnet",
+            "models": [{"id": "gpt-4o", "display_name": "Configured GPT"}],
+            "discovery": true
+        }}}"#,
+        |id, base_url| {
+            asked.push((id.to_owned(), base_url.to_owned()));
+            Some(DiscoveredModels {
+                source: discovered_source(),
+                models: vec![
+                    discovered_model("claude-sonnet", ApiFamily::AnthropicMessages),
+                    discovered_model("gpt-4o", ApiFamily::OpenAiResponses),
+                ],
+            })
+        },
+    );
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert_eq!(
+        asked,
+        [(
+            "gateway".to_owned(),
+            "https://gateway.example.com/v1".to_owned()
+        )]
+    );
+    let provider = registry.provider("gateway").expect("provider");
+    assert_eq!(provider.default_model.as_deref(), Some("claude-sonnet"));
+    let configured = &provider.models["gpt-4o"];
+    assert_eq!(configured.display_name, "Configured GPT");
+    assert_eq!(configured.api_family, ApiFamily::OpenAiChatCompletions);
+    assert_eq!(configured.context_window_tokens, None);
+    assert_eq!(provider.model_source("gpt-4o"), None);
+    assert_eq!(
+        provider.model_api_family("claude-sonnet"),
+        ApiFamily::AnthropicMessages
+    );
+    assert_eq!(
+        provider.model_source("claude-sonnet"),
+        Some(&discovered_source())
+    );
+}
+
+#[test]
+fn discovery_provider_default_model_loads_without_discovered_models() {
+    let (registry, warnings) = ProviderConfigRegistry::with_json(
+        r#"{"providers": {"gateway": {
+            "api_family": "openai_chat_completions",
+            "base_url": "https://gateway.example.com/v1",
+            "default_model": "claude-sonnet",
+            "discovery": true
+        }}}"#,
+    );
+
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let provider = registry.provider("gateway").expect("provider");
+    assert_eq!(provider.default_model.as_deref(), Some("claude-sonnet"));
+    assert!(!provider.models["claude-sonnet"].discovered);
+    assert_eq!(provider.model_source("claude-sonnet"), None);
+}
+
+#[test]
+fn discovery_is_not_asked_for_providers_without_the_setting() {
+    let (registry, _) = ProviderConfigRegistry::with_json_and_discovered(
+        r#"{"providers": {"plain": {
+            "api_family": "openai_chat_completions",
+            "base_url": "https://gateway.example.com/v1",
+            "default_model": "m"
+        }}}"#,
+        |_, _| panic!("discovery asked for a provider without discovery: true"),
+    );
+
+    assert!(!registry.provider("plain").expect("plain").discovery);
+}
+
+#[test]
+fn discovered_model_entries_round_trip_through_the_cache_shape() {
+    let mut model = discovered_model("o3", ApiFamily::OpenAiChatCompletions);
+    model.compat =
+        Some(serde_json::json!({"reasoning": {"request_format": "openai_reasoning_effort"}}));
+    model.supports_reasoning = Some(true);
+
+    let mut no_family = model.entry_json();
+    no_family
+        .as_object_mut()
+        .expect("entry object")
+        .remove("api_family");
+
+    let messages = discovered_model("claude", ApiFamily::AnthropicMessages);
+
+    let parsed = parse_discovered_models(&[model.entry_json(), messages.entry_json(), no_family]);
+
+    assert_eq!(parsed, [model, messages]);
+}
+
+#[test]
+fn login_base_url_normalizes_to_v1_and_refuses_endpoint_paths_and_urls_providers_json_ignores() {
+    for (typed, expected) in [
+        (
+            "https://gateway.example.com",
+            "https://gateway.example.com/v1",
+        ),
+        (
+            "https://gateway.example.com/",
+            "https://gateway.example.com/v1",
+        ),
+        (
+            " https://gateway.example.com/v1/ ",
+            "https://gateway.example.com/v1",
+        ),
+        (
+            "https://gateway.example.com/proxy/v1",
+            "https://gateway.example.com/proxy/v1",
+        ),
+        ("http://127.0.0.1:4000", "http://127.0.0.1:4000/v1"),
+        ("http://localhost:4000/v1", "http://localhost:4000/v1"),
+    ] {
+        assert_eq!(login_base_url(typed).as_deref(), Ok(expected), "{typed}");
+    }
+    // No error echoes the input: a key piped on the URL line, or a URL with
+    // embedded credentials, must not reach the terminal.
+    for (typed, expected) in [
+        (
+            "https://gateway.example.com/v1/chat/completions",
+            "the base URL ends in the endpoint path /chat/completions; enter the gateway's base URL without it",
+        ),
+        (
+            "https://gateway.example.com/v1/messages/",
+            "the base URL ends in the endpoint path /messages; enter the gateway's base URL without it",
+        ),
+        (
+            "https://gateway.example.com/v1/responses",
+            "the base URL ends in the endpoint path /responses; enter the gateway's base URL without it",
+        ),
+        (
+            "https://user:url-secret@gateway.example.com/v1/responses",
+            "the base URL ends in the endpoint path /responses; enter the gateway's base URL without it",
+        ),
+        (
+            "http://gateway.example.com",
+            "the base URL uses HTTP to a non-loopback host, so the key would travel unencrypted; use https://gateway.example.com/v1",
+        ),
+        (
+            "sk-key-secret-123",
+            "the base URL is not a valid URL; enter one such as https://gateway.example.com",
+        ),
+        (
+            "sk:key-secret-123",
+            "the base URL must use http or https",
+        ),
+        (
+            "https://user:url-secret@gateway.example.com",
+            "the base URL must not include embedded credentials",
+        ),
+        (
+            "https://gateway.example.com?team=a",
+            "the base URL must not include query strings or fragments",
+        ),
+        (
+            "https://gateway.example.com/#frag",
+            "the base URL must not include query strings or fragments",
+        ),
+    ] {
+        assert_eq!(login_base_url(typed), Err(expected.to_owned()), "{typed}");
+    }
 }

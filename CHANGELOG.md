@@ -26,6 +26,25 @@ pull requests that landed them; deeper design rationale lives in
 - New blocks: timed-out asks and expired guardian reviews deny. No new
   prompts.
 
+### First-run gateway login
+
+- **New**: `euler login --provider <id>` for a new id asks for the gateway's
+  base URL and key, checks them by listing the gateway's models, then
+  stores the key, adds a `"discovery": true` entry to `providers.json`, and
+  writes the model cache, so a gateway takes one command and no file edit.
+  A wrong URL or rejected key stores nothing and says why, and a URL error
+  never echoes what was typed. An id that `providers.json` would ignore is
+  refused. For an existing entry, login offers its `base_url` as the
+  default and adds `"discovery": true`; if that gateway lists no models or
+  cannot be reached and the URL was kept, login asks whether to save the
+  key without model discovery (Enter saves it).
+- Scripted login reads the base URL line before the key: pipe
+  `printf '%s\n%s\n' "$URL" "$KEY"`, or an empty first line to keep an
+  existing entry's URL.
+- **New prompts**: the base URL prompt in `euler login`, and the
+  save-without-discovery `[Y/n]` question when an existing entry's gateway
+  lists no models. No new block.
+
 ### Execution profiles: `tools` rules are checked against installed extensions
 
 - **New**: a `tools` rule pattern without `.` that names an installed
@@ -66,10 +85,32 @@ pull requests that landed them; deeper design rationale lives in
   work; an `ask` rule prompts under every profile, `full` included, with
   allow once and deny only, and the prompt names the rule and its reason;
   an `allow` rule pre-approves a command a profile would otherwise ask
-  about, never a dangerous command or a sensitive file. Rules apply to root and child tool calls and to extension
-  tools and commands, and every rule decision records the rule in
-  `permission.decision`. `path` and `outside_workspace` rules,
-  `ask_timeout`, and `extension_reviewers` are still refused at startup.
+  about, never a dangerous command or a sensitive file. Rules apply to
+  root and child tool calls and to extension tools and commands, and every
+  rule decision records the rule in `permission.decision`. `path` and
+  `outside_workspace` rules, `ask_timeout`, and `extension_reviewers` are
+  still refused at startup.
+
+### Gateway model discovery
+
+- **New**: a `providers.json` provider may set `"discovery": true` instead
+  of listing `models`. Euler reads the gateway's models from LiteLLM's
+  `/model/info` (falling back to the generic `/v1/models`), routes Claude
+  to `anthropic_messages` wherever the gateway hosts it (Anthropic,
+  Bedrock, or Vertex), `mode: responses` models to `openai_responses`, and
+  the rest to chat completions, with conservative token limits and tool and
+  reasoning flags. Configured `models` entries still win per id. The
+  `base_url` must end in `/v1`.
+- The list is cached in `~/.euler/cache/provider-discovery/`. A launch
+  with no cache fetches first (10-second limit); a cache older than a day
+  refreshes in the background. A failure warns and names
+  `euler models refresh`, which now also refreshes discovery providers and
+  reports counts per family and ids added and removed. `euler models` and
+  `/model` list discovered models; `euler login --provider <id>` writes
+  the cache from the discovery that verifies the key.
+- Sessions record `model_source` (endpoint, fetch time, cache digest) on
+  `session.start`, `model.switched`, and `session.resumed` when the model
+  is a discovered one. No new prompt or block.
 
 ### Stored keys for custom providers
 
@@ -81,8 +122,9 @@ pull requests that landed them; deeper design rationale lives in
   `~/.euler/auth.json`, which seeds the redactor like other stored
   credentials. **New prompt (flagged)**: the hidden `API key:` prompt.
 - An `api_key` spec in the entry wins: login refuses such an entry and says
-  to remove `api_key`. It also refuses an unknown id or an entry without
-  `auth_header: true`, and stores nothing.
+  to remove `api_key`. It also refuses an entry without
+  `auth_header: true`, and stores nothing. An unknown id is added as a new
+  gateway (see First-run gateway login).
 - `euler logout --provider <id>` removes the stored key and leaves the
   entry; `euler auth status` lists stored custom-provider keys. A provider
   that needs a stored key and has none fails with an error naming

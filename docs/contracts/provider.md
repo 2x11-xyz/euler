@@ -211,9 +211,11 @@ Each provider lists its models in a non-empty `models` array of objects with
 an `id`. A provider may omit `models` when it sets `default_model`; the parser
 then records one model with that id and no declared metadata (context window,
 output limit, tool and reasoning support, compat), which is how an unlisted
-`--model` is treated. A provider whose `models` is empty, is not an array, or
-holds no valid entries, or that omits `models` without a valid string
-`default_model`, is ignored with a warning that names both fixes.
+`--model` is treated. A provider that sets `"discovery": true` may omit both
+(see Gateway discovery). A provider whose `models` is empty, is not an array,
+or holds no valid entries, or that omits `models` without a valid string
+`default_model` or `"discovery": true`, is ignored with a warning that names
+the three fixes.
 
 ### Stored keys
 
@@ -226,20 +228,171 @@ stored during a session is used by its next request. A provider that needs a
 stored key and has none fails with an auth error naming
 `euler login --provider <id>`.
 
-`euler login --provider <id>`, for an id that is not built-in, stores that
-key for an existing entry: it prompts for the key without echo (or reads one
-line from a non-terminal stdin) and writes it to the auth file as a literal
-(a key starting with `$` or `!` gets the `$` escape, so it is never read back
-as an environment or command reference). It refuses,
-storing nothing, when `providers.json` has no loaded entry for the id, when
-the entry sets an `api_key` spec (the error says to remove `api_key` to use a
-stored key), when the entry does not set `auth_header: true` (a stored key
-would not be sent), or when the key is empty. It does not edit
-`providers.json` and does not contact the provider. `euler logout --provider
+`euler login --provider <id>`, for an id that is not built-in, sets up a
+gateway (ADR 0025 section 1). It prompts for the base URL (visible) and the
+key (without echo; a non-terminal stdin supplies one line each), so a new
+user needs no file edit:
+
+- **No entry for the id:** the base URL is required. It is normalized to
+  `<root>/v1` (trailing slashes and a trailing `/v1` removed, then `/v1`
+  appended) and printed. A URL ending in a family endpoint path
+  (`/chat/completions`, `/messages`, `/responses`) is refused, and so is
+  one this file would ignore, including HTTP to a non-loopback host (the
+  error suggests the `https` URL). Login then runs gateway discovery with
+  the typed key. On success it stores the key, then adds the entry
+  `{"api_family": "openai_chat_completions", "base_url": "<root>/v1",
+  "auth_header": true, "discovery": true}`, then writes the discovery
+  cache, and prints the model counts per family. On failure it stores
+  nothing and names the endpoint and the status or transport error; when
+  every request answered HTTP 401 or 403, the error says the key was
+  rejected.
+- **An entry with `auth_header: true` and no `api_key`:** the prompt shows
+  the current `base_url` as the default (Enter keeps it), and the same
+  normalization, verification, and writes apply; login sets `base_url` and
+  `discovery: true` and leaves every other field as written. When
+  discovery fails for a reason other than a rejected key (the gateway lists
+  no models or cannot be reached) and the typed base URL normalizes to the
+  entry's own (Enter, or the same URL in another form), login prints the
+  error and asks "Save the key without model discovery? [Y/n]" (Enter or
+  end of input means yes); yes stores the key unverified, leaves the entry unchanged, and
+  names the `base_url` the key is sent to; no stores nothing.
+
+Login refuses, storing nothing and before any prompt, an id that breaks the
+`providers.json` id rule (lowercase ASCII letters, numbers, `-`, `_`). Base
+URL errors name the problem but never echo the typed text, which may be a
+key sent on the wrong line or a URL with embedded credentials. Login also
+refuses, storing nothing, when the entry sets an `api_key` spec (the
+error says to remove `api_key` to use a stored key), when it does not set
+`auth_header: true` (a stored key would not be sent), when `providers.json`
+has an entry for the id that failed to load, when `providers.json` is not
+valid JSON (the file is left untouched and the error names it), or when the
+URL or key is empty. Keys are stored as literals (a key starting with `$`
+or `!` gets the `$` escape, so it is never read back as an environment or
+command reference). The key is written before the entry so a provider never
+points at a missing key; if the entry write fails, login restores the
+credential the key replaced (or removes it) and reports the error. A failed
+cache write is a warning, and the next launch fetches. `providers.json` is
+updated by parsing it, changing the one entry, keeping every other entry and
+field, and replacing the file atomically with its permissions preserved
+(owner-only for a new file); it is rewritten as formatted JSON with object
+keys in sorted order. `euler logout --provider
 <id>` removes the stored key, leaves the entry, and says so. `euler auth
 status` lists each stored custom-provider key after the built-in providers,
 without its value. Built-in ids other than `chatgpt` still reject `login` and
 `logout`.
+
+### Gateway discovery
+
+A custom provider may set `"discovery": true` (ADR 0025). Core then adds the
+gateway's models to the provider's. Configured `models` stay listed beside
+discovered ones, a configured entry with a discovered id replaces the
+discovered descriptor whole (so it can override one model's family), and
+`default_model` may name a discovered id; a `default_model` the gateway does
+not list still loads as an unlisted model. A discovery provider's `base_url`
+must end in `/v1` (trailing slashes allowed); any other shape ignores the
+provider with a warning.
+
+Requests go to the gateway root (`base_url` without trailing slashes and
+`/v1`), with the provider's auth and header specs resolved as for a model
+request. Redirects are not followed, each request has a 5-second deadline,
+one discovery run has a 10-second overall deadline, and a body over 4 MiB
+fails the request. Failure messages name the endpoint and the status or
+transport error, never a response body, and begin "the key was rejected"
+when every request answered HTTP 401 or 403.
+
+1. `GET <root>/model/info`. A 200 whose `data` (or bare list) holds rows
+   with a string `model_name` is the source. A wildcard route (a
+   `model_name` containing `*`) expands to the `GET <root>/v1/models` ids it
+   matches, each taking the deployments of the matching wildcard route with
+   the longest literal prefix; an explicit row wins, even one dropped below
+   as non-chat, and unmatched ids are not added. If that request fails, the
+   explicit rows stand and a warning names the dropped wildcard routes that
+   have a chat row. If no chat model survives mapping, discovery fails.
+2. Any other answer, or a transport failure: `GET <root>/v1/models`. Every
+   listed id appears with the provider's family and no declared metadata,
+   like an unlisted `--model`. A non-200, malformed, or empty answer fails
+   discovery.
+
+Mapping `/model/info` keeps deployments whose `model_info.mode` is `chat`,
+`responses`, or unset and drops every other mode (embedding, image
+generation, completion, audio, rerank, and the rest). Rows are grouped by
+`model_name`; routes that fail the model-id rule are dropped and listed.
+Deployments merge conservatively: `context_window_tokens` is the minimum
+`max_input_tokens`, `max_output_tokens` the minimum `max_output_tokens`, and
+`supports_tools` (`supports_function_calling`) and `supports_reasoning` are
+true only when every deployment says so; a field missing from any deployment
+is omitted. A deployment routes to:
+
+- `anthropic_messages` when its mode is `chat` and it is Claude behind an
+  Anthropic-hosting provider: `litellm_provider` is `anthropic` or
+  `vertex_ai-anthropic_models`, or it is `bedrock`, `bedrock_converse`, or
+  `vertex_ai` and the underlying model (`litellm_params.model`, else
+  `model_info.key`, or the expanded id for a wildcard route) contains
+  `claude`, ignoring case. `supported_endpoints` is not consulted;
+- `openai_responses` when its mode is `responses`;
+- `openai_chat_completions` otherwise.
+
+A route keeps a family only when every deployment agrees; a disagreeing
+route uses `openai_chat_completions` and is listed. Only chat-completions
+models that support reasoning get
+`compat.reasoning.request_format: "openai_reasoning_effort"`.
+
+A full successful discovery is written atomically and owner-only to
+`<euler home>/cache/provider-discovery/<provider id>.json`, recording the
+format version, base URL, fetch time, source endpoint, and mapped models in
+the model-entry shape. A cache whose format version or base URL does not
+match the entry is a miss. Concurrent writers are last-writer-wins. A failed
+or empty discovery never replaces a cache.
+
+Every launch of a session (`run`, `tui`, `exec`, `--resume`) routes from
+the cache, headless or interactive alike:
+
+- **No cache:** the launch fetches before it starts, all discovery providers
+  in parallel, each under the 10-second deadline. On failure the provider
+  loads with only its configured `models` or `default_model` (or no listed
+  models; an explicit `--model` still works as an unlisted model), and a
+  warning names the endpoint, the status or transport error, and
+  `euler models refresh`.
+- **Cache older than 24 hours:** the launch refreshes it in the background
+  and uses the cached list; later sessions see the update. A failed
+  background refresh keeps the cache and its warning prints once, when the
+  command exits. Until a refresh succeeds, every launch retries.
+
+`euler models refresh` also refreshes every discovery provider and prints,
+per provider, its model count per family, the ids added and removed, and
+mapping notes; a failed provider keeps its cache, is reported, and makes the
+command fail after the others run. `euler models` reads the cache and lists
+discovered models with their provider, family, and `"source":
+"discovered"`. `euler login --provider <id>` writes a discovery
+provider's cache from the discovery that verified the key, so a key change
+takes effect at once. `/model` lists discovered models from the cache too. Known limit: the
+running session keeps the provider list it launched with, so after a
+background refresh `/model` can offer an id that this session sends as an
+unlisted model (the provider family, no `model_source`) until the next
+launch. A refresh interrupted by process exit can leave an owner-only
+`.<provider id>-*.tmp` file in the cache directory; the cache itself is
+replaced only by an atomic rename.
+
+A discovered model reports its cache as the provider's `model_source`
+(endpoint, fetch time, and the cache file's SHA-256), which core records on
+`session.start`, `model.switched`, and `session.resumed` (see the events
+contract). A configured entry, including a configured replacement of a
+discovered id, has no `model_source`. A resume whose recorded source
+differs from the current one proceeds, records the new source, and prints a
+note; a model a refresh removed is sent as an unlisted model.
+
+Boundary exception (boundary contract, Exceptions). The setting, cache,
+refresh, and `/v1/models` are product-neutral, but reading `/model/info`
+means core knows one gateway product's endpoint and field names
+(`model_name`, `litellm_params`, `model_info`, `litellm_provider`):
+
+- **Invariant:** adopting a gateway takes one command, with nothing to
+  install.
+- **Why the extension boundary is insufficient:** an extension needs an
+  install step and new core surfaces before it can contribute a provider.
+- **Exit:** move the `/model/info` reader into an extension once extension
+  install is one command and extensions can contribute providers, or sooner
+  if a second gateway format is proposed for core.
 
 ### API families and endpoints
 
