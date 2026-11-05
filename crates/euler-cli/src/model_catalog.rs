@@ -273,7 +273,12 @@ fn custom_model_json(model: &CustomModelConfig, is_default: bool) -> Value {
         "display_name".to_owned(),
         json!(model.display_name.as_str()),
     );
-    object.insert("source".to_owned(), json!("custom"));
+    let source = if model.discovered {
+        "discovered"
+    } else {
+        "custom"
+    };
+    object.insert("source".to_owned(), json!(source));
     object.insert("api_family".to_owned(), json!(model.api_family.as_str()));
     object.insert("default".to_owned(), json!(is_default));
     if let Some(value) = model.context_window_tokens {

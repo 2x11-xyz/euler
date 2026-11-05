@@ -1285,8 +1285,11 @@ fn custom_config_with_compat<'a>(
                 supports_tools: Some(true),
                 supports_reasoning: None,
                 compat: Some(compat),
+                discovered: false,
             },
         )]),
+        discovery: false,
+        discovery_source: None,
     }
 }
 
@@ -1305,6 +1308,7 @@ fn messages_model_config(base_url: &str) -> CustomProviderConfig {
             supports_tools: Some(true),
             supports_reasoning: Some(true),
             compat: None,
+            discovered: false,
         },
     );
     config
@@ -1325,6 +1329,7 @@ fn responses_model_config(base_url: &str) -> CustomProviderConfig {
             supports_tools: Some(true),
             supports_reasoning: Some(true),
             compat: None,
+            discovered: false,
         },
     );
     config

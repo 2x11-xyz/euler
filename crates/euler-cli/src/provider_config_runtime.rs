@@ -59,7 +59,13 @@ pub(crate) fn load_provider_config(path: Option<&Path>) -> ProviderConfigLoad {
             };
         }
     };
-    let (registry, warnings) = ProviderConfigRegistry::with_json(&contents);
+    // Discovery providers add the models their cache lists (ADR 0025).
+    let cache_dir = crate::provider_discovery::cache_dir(path);
+    let (registry, warnings) =
+        ProviderConfigRegistry::with_json_and_discovered(&contents, |provider_id, base_url| {
+            crate::provider_discovery::read_cache(&cache_dir, provider_id, base_url)
+                .map(|cache| cache.discovered)
+        });
     ProviderConfigLoad { registry, warnings }
 }
 

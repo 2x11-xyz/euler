@@ -44,7 +44,27 @@ pub(crate) fn run_login(login: LoginArgs) -> Result<()> {
         None,
         read_hidden_key,
         io::stdout(),
-    )
+    )?;
+    // A key change takes effect at once: refresh the discovery cache with it.
+    if let Some(provider) = custom_providers
+        .provider(&login.provider_id)
+        .filter(|provider| provider.discovery)
+    {
+        let cache_dir = crate::provider_discovery::cache_dir(&provider_config);
+        match crate::provider_discovery::refresh_provider(&cache_dir, provider) {
+            Ok(outcome) => crate::provider_discovery::write_refresh_outcome(
+                &provider.id,
+                &outcome,
+                io::stdout(),
+                io::stderr(),
+            )?,
+            Err(error) => eprintln!(
+                "warning: {}",
+                crate::provider_discovery::failure_warning(&provider.id, &error)
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Stores an API key for an existing `providers.json` entry that sends

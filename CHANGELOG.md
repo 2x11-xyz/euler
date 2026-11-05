@@ -6,6 +6,27 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Gateway model discovery
+
+- **New**: a `providers.json` provider may set `"discovery": true` instead
+  of listing `models`. Euler reads the gateway's models from LiteLLM's
+  `/model/info` (falling back to the generic `/v1/models`), routes Claude
+  to `anthropic_messages` wherever the gateway hosts it (Anthropic,
+  Bedrock, or Vertex), `mode: responses` models to `openai_responses`, and
+  the rest to chat completions, with conservative token limits and tool and
+  reasoning flags. Configured `models` entries still win per id. The
+  `base_url` must end in `/v1`.
+- The list is cached in `~/.euler/cache/provider-discovery/`. A launch
+  with no cache fetches first (10-second limit); a cache older than a day
+  refreshes in the background. A failure warns and names
+  `euler models refresh`, which now also refreshes discovery providers and
+  reports counts per family and ids added and removed. `euler models` and
+  `/model` list discovered models; `euler login --provider <id>` refreshes
+  the cache after storing a key.
+- Sessions record `model_source` (endpoint, fetch time, cache digest) on
+  `session.start`, `model.switched`, and `session.resumed` when the model
+  is a discovered one. No new prompt or block.
+
 ### Stored keys for custom providers
 
 - **New**: `euler login --provider <id>` stores an API key for a

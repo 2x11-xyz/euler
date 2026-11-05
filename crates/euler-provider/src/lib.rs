@@ -10,6 +10,7 @@ pub mod chatgpt;
 mod chatgpt_device;
 mod chatgpt_websocket;
 pub mod custom_provider;
+pub mod gateway_discovery;
 mod liveness;
 pub mod openai;
 pub mod openrouter;
@@ -21,6 +22,8 @@ pub mod xai;
 mod conformance_tests;
 #[cfg(test)]
 mod custom_provider_test;
+#[cfg(test)]
+mod gateway_discovery_test;
 #[cfg(test)]
 mod provider_config_test;
 #[cfg(test)]
@@ -585,6 +588,12 @@ pub trait ModelProvider: Send + Sync {
     fn reasoning_effort(&self, _model: &str) -> Option<&str> {
         None
     }
+    /// Where this provider's listing of `model` came from, when it is not
+    /// its own configuration: the `model_source` provenance field (ADR 0025
+    /// section 4). Core records it without interpreting it.
+    fn model_source(&self, _model: &str) -> Option<serde_json::Value> {
+        None
+    }
     /// Install the host's resolved-secret observer. Default no-op: only
     /// providers that resolve secrets at request time (custom providers)
     /// have anything to report; built-in providers read pre-seeded env vars
@@ -618,6 +627,10 @@ impl ModelProvider for Box<dyn ModelProvider> {
 
     fn reasoning_effort(&self, model: &str) -> Option<&str> {
         self.as_ref().reasoning_effort(model)
+    }
+
+    fn model_source(&self, model: &str) -> Option<serde_json::Value> {
+        self.as_ref().model_source(model)
     }
 
     fn set_resolved_secret_sink(&self, sink: ResolvedSecretSink) {
@@ -738,6 +751,12 @@ impl ProviderSet {
         self.providers
             .get(provider)
             .and_then(|provider| provider.reasoning_effort(model))
+    }
+
+    pub fn model_source(&self, provider: &str, model: &str) -> Option<serde_json::Value> {
+        self.providers
+            .get(provider)
+            .and_then(|provider| provider.model_source(model))
     }
 
     /// Normalize a carried user-selectable effort against the destination

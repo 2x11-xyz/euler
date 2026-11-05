@@ -214,7 +214,8 @@ Options:
 ";
 
 const MODELS_HELP: &str = "\
-List the offline provider catalog, or verify and cache the latest GitHub release.
+List the offline provider catalog and discovered gateway models, or verify and
+cache the latest GitHub release and refresh gateway discovery.
 
 Usage: euler models
        euler models refresh

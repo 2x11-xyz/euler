@@ -16,6 +16,16 @@ pub struct ProviderConfigRegistry {
 
 impl ProviderConfigRegistry {
     pub fn with_json(contents: &str) -> (Self, Vec<String>) {
+        Self::with_json_and_discovered(contents, |_, _| None)
+    }
+
+    /// Parses `providers.json`, adding to each `discovery: true` provider the
+    /// models `discovered(provider_id, base_url)` returns (ADR 0025). A
+    /// configured model with a discovered id replaces the discovered one.
+    pub fn with_json_and_discovered(
+        contents: &str,
+        mut discovered: impl FnMut(&str, &str) -> Option<DiscoveredModels>,
+    ) -> (Self, Vec<String>) {
         let mut warnings = Vec::new();
         let contents = contents.trim_start_matches('\u{feff}');
         if contents.trim().is_empty() {
@@ -45,7 +55,7 @@ impl ProviderConfigRegistry {
             .providers
             .map_or_else(BTreeMap::new, |providers| providers.0)
         {
-            if let Some(provider) = parse_provider(&id, &value, &mut warnings) {
+            if let Some(provider) = parse_provider(&id, &value, &mut discovered, &mut warnings) {
                 registry.providers.insert(id, provider);
             }
         }
@@ -190,6 +200,40 @@ pub struct CustomProviderConfig {
     pub default_model: Option<String>,
     pub default_model_error: Option<String>,
     pub models: BTreeMap<String, CustomModelConfig>,
+    /// `"discovery": true`: the gateway's models are added to `models`.
+    pub discovery: bool,
+    /// Where the discovered models in `models` came from, when any did.
+    pub discovery_source: Option<DiscoverySource>,
+}
+
+/// One gateway discovery result read back from its cache.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DiscoveredModels {
+    pub source: DiscoverySource,
+    pub models: Vec<CustomModelConfig>,
+}
+
+/// The cache a discovered model was read from, recorded as `model_source`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscoverySource {
+    /// The gateway path the models came from: `/model/info` or `/v1/models`.
+    pub endpoint: String,
+    /// RFC 3339 time of the discovery run.
+    pub fetched_at: String,
+    /// Lowercase hex SHA-256 of the cache file.
+    pub cache_sha256: String,
+}
+
+impl DiscoverySource {
+    /// The `model_source` event field for a discovered model.
+    pub fn model_source_json(&self) -> Value {
+        serde_json::json!({
+            "kind": "discovered",
+            "endpoint": self.endpoint,
+            "fetched_at": self.fetched_at,
+            "cache_sha256": self.cache_sha256,
+        })
+    }
 }
 
 impl fmt::Debug for CustomProviderConfig {
@@ -210,6 +254,8 @@ impl fmt::Debug for CustomProviderConfig {
             .field("default_model", &self.default_model)
             .field("default_model_error", &self.default_model_error)
             .field("models", &self.models)
+            .field("discovery", &self.discovery)
+            .field("discovery_source", &self.discovery_source)
             .finish()
     }
 }
@@ -221,6 +267,15 @@ impl CustomProviderConfig {
         self.models
             .get(model)
             .map_or(self.api_family, |model| model.api_family)
+    }
+
+    /// The discovery cache `model` came from, when it is a discovered model
+    /// (not configured, and not a configured replacement).
+    pub fn model_source(&self, model: &str) -> Option<&DiscoverySource> {
+        self.models
+            .get(model)
+            .filter(|model| model.discovered)
+            .and(self.discovery_source.as_ref())
     }
 }
 
@@ -266,6 +321,62 @@ pub struct CustomModelConfig {
     pub supports_tools: Option<bool>,
     pub supports_reasoning: Option<bool>,
     pub compat: Option<Value>,
+    /// Added by gateway discovery rather than listed in `providers.json`.
+    pub discovered: bool,
+}
+
+impl CustomModelConfig {
+    /// The `providers.json` model entry for this model, as a discovery cache
+    /// stores it.
+    pub fn entry_json(&self) -> Value {
+        let mut entry = Map::new();
+        entry.insert("id".to_owned(), self.id.clone().into());
+        entry.insert("api_family".to_owned(), self.api_family.as_str().into());
+        let numbers = [
+            ("context_window_tokens", self.context_window_tokens),
+            ("max_output_tokens", self.max_output_tokens),
+        ];
+        for (field, value) in numbers {
+            if let Some(value) = value {
+                entry.insert(field.to_owned(), value.into());
+            }
+        }
+        let flags = [
+            ("supports_tools", self.supports_tools),
+            ("supports_reasoning", self.supports_reasoning),
+        ];
+        for (field, value) in flags {
+            if let Some(value) = value {
+                entry.insert(field.to_owned(), value.into());
+            }
+        }
+        if let Some(compat) = &self.compat {
+            entry.insert("compat".to_owned(), compat.clone());
+        }
+        Value::Object(entry)
+    }
+}
+
+/// Parses discovery-cache model entries (the `providers.json` model entry
+/// shape, `api_family` always set). Entries that fail the model rules are
+/// dropped.
+pub fn parse_discovered_models(entries: &[Value]) -> Vec<CustomModelConfig> {
+    // A discovery provider's `base_url` ends in `/v1`, which serves every
+    // family, so no entry is refused for its family.
+    let route = ProviderRoute {
+        api_family: ApiFamily::OpenAiChatCompletions,
+        base_url: "https://discovery.invalid/v1",
+    };
+    let mut ignored = Vec::new();
+    entries
+        .iter()
+        .filter(|entry| entry.get("api_family").is_some())
+        .filter_map(|entry| parse_model(entry, "discovered model", &route, &mut ignored))
+        .map(|model| CustomModelConfig {
+            discovered: true,
+            ..model
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -307,6 +418,7 @@ impl<'de, V: Deserialize<'de>> Deserialize<'de> for UniqueMap<V> {
 fn parse_provider(
     id: &str,
     value: &Value,
+    discovered: &mut impl FnMut(&str, &str) -> Option<DiscoveredModels>,
     warnings: &mut Vec<String>,
 ) -> Option<CustomProviderConfig> {
     let id = valid_provider_id(id, warnings)?;
@@ -322,6 +434,7 @@ fn parse_provider(
             "headers",
             "default_model",
             "models",
+            "discovery",
         ],
         &scope,
         warnings,
@@ -344,11 +457,24 @@ fn parse_provider(
         api_family,
         base_url: &base_url,
     };
+    let discovery = bool_field(object, "discovery", &scope, warnings).unwrap_or(false);
+    if discovery && !discovery_base_url(&base_url) {
+        warnings.push(format!(
+            "ignored {scope} because discovery needs a base_url that ends in /v1"
+        ));
+        return None;
+    }
     let auth_header = bool_field(object, "auth_header", &scope, warnings).unwrap_or(false);
     let headers = parse_headers(object.get("headers"), &scope, auth_header, warnings)?;
-    let models = match object.get("models") {
+    let mut models = match object.get("models") {
         Some(models) => parse_models(models, &scope, &route, warnings)?,
+        None if discovery => BTreeMap::new(),
         None => default_model_only(object.get("default_model"), &scope, api_family, warnings)?,
+    };
+    let discovery_source = if discovery {
+        add_discovered_models(&mut models, discovered(&id, &base_url), object, api_family)
+    } else {
+        None
     };
     let (default_model, default_model_error) =
         parse_default_model(object.get("default_model"), &id, &models, warnings);
@@ -362,7 +488,38 @@ fn parse_provider(
         default_model,
         default_model_error,
         models,
+        discovery,
+        discovery_source,
     })
+}
+
+/// Adds the discovered models a configured entry does not replace, and a
+/// `default_model` the gateway does not (or not yet) list as an unlisted
+/// model. Returns where the discovered models came from.
+fn add_discovered_models(
+    models: &mut BTreeMap<String, CustomModelConfig>,
+    found: Option<DiscoveredModels>,
+    object: &Map<String, Value>,
+    api_family: ApiFamily,
+) -> Option<DiscoverySource> {
+    let source = found.map(|found| {
+        for model in found.models {
+            models.entry(model.id.clone()).or_insert(model);
+        }
+        found.source
+    });
+    // An unusable default_model is reported by `parse_default_model`.
+    let fallback = default_model_only(object.get("default_model"), "", api_family, &mut Vec::new());
+    for (model_id, model) in fallback.into_iter().flatten() {
+        models.entry(model_id).or_insert(model);
+    }
+    source
+}
+
+/// A discovery provider's gateway root is its `base_url` without `/v1`, so
+/// the `base_url` must end in `/v1` (trailing slashes allowed).
+fn discovery_base_url(base_url: &str) -> bool {
+    Url::parse(base_url).is_ok_and(|url| url.path().trim_end_matches('/').ends_with("/v1"))
 }
 
 fn valid_provider_id(id: &str, warnings: &mut Vec<String>) -> Option<String> {
@@ -592,6 +749,7 @@ fn default_model_only(
         supports_tools: None,
         supports_reasoning: None,
         compat: None,
+        discovered: false,
     };
     Some(BTreeMap::from([(id, model)]))
 }
@@ -654,6 +812,7 @@ fn parse_model(
         supports_tools: bool_field(object, "supports_tools", scope, warnings),
         supports_reasoning: bool_field(object, "supports_reasoning", scope, warnings),
         compat,
+        discovered: false,
         id,
     })
 }
@@ -771,8 +930,13 @@ fn valid_version(version: Option<&Value>, warnings: &mut Vec<String>) -> bool {
     }
 }
 
+/// The `providers.json` model-id rule: not empty, not padded, no `::`.
+pub(crate) fn model_id_is_valid(id: &str) -> bool {
+    !id.is_empty() && id.trim() == id && !id.contains("::")
+}
+
 fn valid_model_id(id: &str, scope: &str, warnings: &mut Vec<String>) -> Option<String> {
-    if id.is_empty() || id.trim() != id || id.contains("::") {
+    if !model_id_is_valid(id) {
         warnings.push(format!(
             "ignored {scope} because model id is empty, padded, or contains `::`"
         ));
@@ -910,7 +1074,7 @@ fn warn_unknown<'a>(
 }
 
 const MODELS_FIX: &str =
-    "list models as [{\"id\": \"<model id>\"}], or omit models and set \"default_model\": \"<model id>\"";
+    "list models as [{\"id\": \"<model id>\"}], omit models and set \"default_model\": \"<model id>\", or set \"discovery\": true";
 const MAX_TOKEN_FIELDS: &[&str] = &["max_completion_tokens", "max_tokens"];
 const REASONING_FORMATS: &[&str] = &[
     "openai_reasoning_effort",
