@@ -24,7 +24,8 @@ pull requests that landed them; deeper design rationale lives in
 - The fixed root instructions ask the model to be concise and to answer a
   greeting or small talk briefly and ask what to work on, without listing its
   capabilities unless asked. The task-completion, verification, and tool
-  rules are kept, and the text is no longer than before.
+  rules are kept, and the text is no longer than before. Child agents
+  without their own system prompt inherit the same text.
   `system_instructions_version` is now `3`, so provenance distinguishes calls
   made under the new text. A session resumed across the update misses the
   provider prompt cache once, because the instruction prefix changed.
