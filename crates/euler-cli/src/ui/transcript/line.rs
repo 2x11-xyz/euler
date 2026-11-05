@@ -290,6 +290,7 @@ mod tests {
                 "fs-write".to_owned(),
                 "network".to_owned(),
             ],
+            ask_rule_notes: Vec::new(),
             selected_option: ApprovalOption::AllowOnce,
         };
 

@@ -2146,6 +2146,165 @@ fn wrapper_is_dangerous(spec: &WrapperSpec, args: &[&str], depth: usize, rule: W
     }
 }
 
+/// One command of a shell line as `shell` permission rules see it (ADR 0027
+/// section 3): its words joined by single spaces. `resolved` is false when
+/// a word, a wrapper's operands, or the line itself cannot be read
+/// statically; `text` is then the command's source with its whitespace
+/// collapsed, and an `allow` rule never covers it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuleSegment {
+    pub text: String,
+    pub resolved: bool,
+}
+
+/// Every command of `command` for `shell` rules: each command of a list or
+/// pipeline, each command substitution as a command of its own, and each
+/// wrapped command in its literal and unwrapped forms (`sudo git push`
+/// yields `sudo git push` and `git push`), through the danger walk's parser
+/// and wrapper table. A line that does not parse is one unresolved segment.
+pub fn rule_segments(command: &str) -> Vec<RuleSegment> {
+    let mut segments = Vec::new();
+    collect_rule_segments(command, 0, &mut segments);
+    segments
+}
+
+fn unresolved_segment(source: &str) -> RuleSegment {
+    RuleSegment {
+        text: source.split_whitespace().collect::<Vec<_>>().join(" "),
+        resolved: false,
+    }
+}
+
+fn collect_rule_segments(script: &str, depth: usize, segments: &mut Vec<RuleSegment>) {
+    let tree = (depth <= MAX_WRAPPER_DEPTH)
+        .then(|| parse_script(script))
+        .flatten()
+        .filter(|tree| !tree.root_node().has_error() && !tree.root_node().is_missing());
+    let Some(tree) = tree else {
+        segments.push(unresolved_segment(script));
+        return;
+    };
+    let found_before = segments.len();
+    let mut stack = vec![tree.root_node()];
+    let mut visits = 0usize;
+    while let Some(node) = stack.pop() {
+        visits += 1;
+        if visits > MAX_NODE_VISITS {
+            segments.push(unresolved_segment(script));
+            return;
+        }
+        let source = || node.utf8_text(script.as_bytes()).unwrap_or(script);
+        match node.kind() {
+            "command" => {
+                let words = rule_words(node, script);
+                match words.into_iter().collect::<Option<Vec<String>>>() {
+                    Some(words) => push_rule_words(&words, depth, segments),
+                    None => segments.push(unresolved_segment(source())),
+                }
+            }
+            // Statements that change the shell or a file without a
+            // `command` node (`export`, `unset`, `PATH=./bin`, `> out.txt`)
+            // are unresolved segments, so a catch-all `deny` still covers
+            // them and no `allow` does (section 10 `ci`).
+            "declaration_command" | "unset_command" => {
+                segments.push(unresolved_segment(source()));
+            }
+            "variable_assignment" | "variable_assignments"
+                if node.parent().is_none_or(|parent| {
+                    !matches!(
+                        parent.kind(),
+                        "command" | "declaration_command" | "variable_assignments"
+                    )
+                }) =>
+            {
+                segments.push(unresolved_segment(source()));
+            }
+            "redirected_statement" if node.child_by_field_name("body").is_none() => {
+                segments.push(unresolved_segment(source()));
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        let children: Vec<Node<'_>> = node.named_children(&mut cursor).collect();
+        // Reversed so segments come out in source order.
+        stack.extend(children.into_iter().rev());
+    }
+    // A line with no command at all (`> out.txt`, `PATH=./bin`) is still
+    // something to run: one unresolved segment.
+    if segments.len() == found_before && !script.trim().is_empty() {
+        segments.push(unresolved_segment(script));
+    }
+}
+
+/// The words of one command node, `None` where a word is dynamic.
+/// Redirections are not words of the command.
+fn rule_words(node: Node<'_>, src: &str) -> Vec<Option<String>> {
+    let mut words = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "command_name" => words.push(
+                child
+                    .named_child(0)
+                    .and_then(|name| literal_word(name, src)),
+            ),
+            kind if kind.ends_with("redirect") => {}
+            _ if !words.is_empty() => words.push(literal_word(child, src)),
+            _ => {}
+        }
+    }
+    words
+}
+
+/// Push one literal command, then whatever its wrapper runs.
+fn push_rule_words(words: &[String], depth: usize, segments: &mut Vec<RuleSegment>) {
+    let Some(first) = words.first() else {
+        return;
+    };
+    let at = segments.len();
+    segments.push(RuleSegment {
+        text: words.join(" "),
+        resolved: true,
+    });
+    let name = first
+        .rsplit_once('/')
+        .map_or(first.as_str(), |(_, base)| base);
+    let Some(spec) = wrapper_spec(&name.to_ascii_lowercase()) else {
+        return;
+    };
+    let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
+    let Some(scan) = scan_wrapper_options(spec, &args) else {
+        // The wrapper's operand layout is unknown, so what it runs is too.
+        segments[at].resolved = false;
+        return;
+    };
+    for script in &scan.scripts {
+        collect_rule_segments(script, depth + 1, segments);
+    }
+    let rest = &args[scan.rest..];
+    match spec.tail {
+        WrapperTail::Shell => {
+            if scan.scripts.is_empty() {
+                // A script read from stdin or a here-document is unreadable.
+                segments[at].resolved = false;
+            }
+        }
+        WrapperTail::Script => {
+            if !rest.is_empty() {
+                collect_rule_segments(&rest.join(" "), depth + 1, segments);
+            }
+        }
+        WrapperTail::Command | WrapperTail::Env => {
+            if depth >= MAX_WRAPPER_DEPTH {
+                segments[at].resolved = false;
+                return;
+            }
+            let rest: Vec<String> = rest.iter().map(|word| (*word).to_owned()).collect();
+            push_rule_words(&rest, depth + 1, segments);
+        }
+    }
+}
+
 /// `NAME=value` prefixes a command with an environment assignment.
 fn is_assignment(word: &str) -> bool {
     let Some((name, _)) = word.split_once('=') else {
@@ -3594,5 +3753,91 @@ mod tests {
                 "expected no sensitive mention: {command}"
             );
         }
+    }
+
+    /// ADR 0027 section 3: each command of a list or pipeline, each
+    /// substitution, and the literal and unwrapped forms of a wrapper are
+    /// segments; redirections are not words; a dynamic word, an unknown
+    /// wrapper option, a stdin script, or a parse error leaves the segment
+    /// unresolved.
+    #[test]
+    fn rule_segments_split_lists_substitutions_and_wrappers() {
+        let segments = |command: &str| -> Vec<(String, bool)> {
+            rule_segments(command)
+                .into_iter()
+                .map(|segment| (segment.text, segment.resolved))
+                .collect()
+        };
+        let resolved = |text: &str| (text.to_owned(), true);
+        let unresolved = |text: &str| (text.to_owned(), false);
+        assert_eq!(
+            segments("cargo build && git push  origin main | tee log > out.txt"),
+            vec![
+                resolved("cargo build"),
+                resolved("git push origin main"),
+                resolved("tee log"),
+            ]
+        );
+        assert_eq!(
+            segments("echo \"$(git push --force)\""),
+            vec![
+                unresolved("echo \"$(git push --force)\""),
+                resolved("git push --force"),
+            ]
+        );
+        assert_eq!(
+            segments("sudo env GIT_TRACE=1 git push"),
+            vec![
+                resolved("sudo env GIT_TRACE=1 git push"),
+                resolved("env GIT_TRACE=1 git push"),
+                resolved("git push"),
+            ]
+        );
+        assert_eq!(
+            segments("bash -c 'rm -r build; ls'"),
+            vec![
+                resolved("bash -c rm -r build; ls"),
+                resolved("rm -r build"),
+                resolved("ls"),
+            ]
+        );
+        assert_eq!(
+            segments("git push $REMOTE"),
+            vec![unresolved("git push $REMOTE")]
+        );
+        assert_eq!(
+            segments("sudo --bogus git push"),
+            vec![unresolved("sudo --bogus git push")]
+        );
+        assert_eq!(segments("bash -s"), vec![unresolved("bash -s")]);
+        assert_eq!(segments("   "), Vec::new());
+        // Lines without a `command` node still yield a segment.
+        assert_eq!(
+            segments("export PATH=./bin:$PATH && cargo test"),
+            vec![
+                unresolved("export PATH=./bin:$PATH"),
+                resolved("cargo test")
+            ]
+        );
+        assert_eq!(segments("unset HOME"), vec![unresolved("unset HOME")]);
+        assert_eq!(segments("> out.txt"), vec![unresolved("> out.txt")]);
+        assert_eq!(segments("PATH=./bin"), vec![unresolved("PATH=./bin")]);
+        assert_eq!(
+            segments("echo hi && > out.txt; FOO=1 BAR=2"),
+            vec![
+                resolved("echo hi"),
+                unresolved("> out.txt"),
+                unresolved("FOO=1 BAR=2"),
+            ]
+        );
+        assert_eq!(
+            segments("FOO=1 cargo test > log"),
+            vec![resolved("cargo test")]
+        );
+        assert_eq!(segments("local x=1"), vec![unresolved("local x=1")]);
+        assert_eq!(
+            segments("git push 'unterminated"),
+            vec![unresolved("git push 'unterminated")]
+        );
     }
 }

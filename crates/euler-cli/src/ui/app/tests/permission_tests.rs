@@ -667,6 +667,71 @@ fn grantless_asks_render_allow_once_deny_and_reason() {
     }
 }
 
+/// A permission rule's ask names the rule and its reason on the panel
+/// (ADR 0027 section 1) and offers allow once and deny only (resolved
+/// question 6).
+#[test]
+fn rule_ask_panel_names_the_rule_and_its_reason() {
+    use euler_core::execution_profile::{
+        PermissionRule, RuleLayerLabel, RuleMatch, RuleState, RuleSurface,
+    };
+    let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
+        .with_command("git push origin main")
+        .with_ask_rule(RuleMatch {
+            surface: RuleSurface::Shell,
+            layer: RuleLayerLabel::Profile,
+            index: 0,
+            rule: PermissionRule {
+                pattern: "git push *".to_owned(),
+                state: RuleState::Ask,
+                access: None,
+                reason: Some("Pushes need review.".to_owned()),
+            },
+        });
+    let mut terminal = Terminal::new(VT100Backend::new(96, 24)).expect("terminal");
+    let mut panel = grantless_panel(&request);
+    terminal.draw(|frame| panel.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(
+        contents.contains("Asked by the shell rule \"git push *\": Pushes need review."),
+        "contents: {contents}"
+    );
+    assert!(contents.contains("y  Allow once"), "contents: {contents}");
+    for absent in ["a  Allow", "p  Allow", "u  Allow"] {
+        assert!(!contents.contains(absent), "{absent}: {contents}");
+    }
+
+    // A file edit a `tools` rule asks about opens the patch panel instead.
+    let edit = PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned())
+        .with_ask_rule(RuleMatch {
+            surface: RuleSurface::Tools,
+            layer: RuleLayerLabel::Profile,
+            index: 0,
+            rule: PermissionRule {
+                pattern: "edit_file".to_owned(),
+                state: RuleState::Ask,
+                access: None,
+                reason: None,
+            },
+        });
+    let mut terminal = Terminal::new(VT100Backend::new(96, 24)).expect("terminal");
+    let mut panel = core();
+    panel.modal = Some(Modal::PatchApproval(PatchApprovalModal {
+        request: edit,
+        preview: PatchPreview::Diff {
+            path: "note.txt".to_owned(),
+            old: "a\n".to_owned(),
+            new: "b\n".to_owned(),
+        },
+    }));
+    terminal.draw(|frame| panel.render(frame)).expect("draw");
+    let contents = terminal.backend().screen_contents();
+    assert!(
+        contents.contains("Asked by the tools rule \"edit_file\""),
+        "contents: {contents}"
+    );
+}
+
 #[test]
 fn grantless_ask_arrows_move_between_allow_once_and_deny() {
     for request in [

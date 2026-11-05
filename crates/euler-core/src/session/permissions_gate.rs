@@ -3,9 +3,11 @@
 //! decision payload builders shared with the companion loop and extension
 //! bridge.
 use super::{EventSink, Session, SessionError, TurnState};
+use crate::execution_profile::{RuleMatch, RuleState};
 use crate::guardian::{self, GuardianRuling, PermissionReviewer};
 use crate::permissions::{
-    ApprovalMode, GrantDecision, PermissionDecider, PermissionDecisionOutcome, PermissionRequest,
+    ApprovalMode, GateRuling, GrantDecision, PermissionDecider, PermissionDecisionOutcome,
+    PermissionRequest,
 };
 use euler_event::{object, EventKind, JsonObject};
 use euler_provider::ToolCall;
@@ -51,12 +53,14 @@ impl<D: PermissionDecider> Session<D> {
     }
 
     /// Resolve an uncovered `ask`/`session-allow`/`always-deny` permission
-    /// decision: emits the `permission.prompt` (for asks) and the
-    /// `permission.decision`, routes asks through the guardian when
-    /// configured (ADR 0011), and reports whether the tool may run.
+    /// decision under `ruling`: emits the `permission.prompt` (for asks) and
+    /// the `permission.decision`, routes asks through the guardian when
+    /// configured (ADR 0011), and reports whether the tool may run. A
+    /// permission rule's own `deny` or `allow` decides without a prompt and
+    /// covers that request only (ADR 0027 sections 2 and 3).
     pub(super) fn decide_uncovered_permission<F>(
         &mut self,
-        request: &PermissionRequest,
+        (request, ruling): (&PermissionRequest, &GateRuling),
         tool_call_event_id: &str,
         sink: &mut EventSink<'_, F>,
         turn_state: &mut TurnState,
@@ -66,7 +70,21 @@ impl<D: PermissionDecider> Session<D> {
         F: FnMut(&euler_event::EventEnvelope),
     {
         let capability = request.capability;
-        let mode = self.permissions.mode_for_request(request);
+        let mode = ruling.mode;
+        if let Some(rule) = ruling.rule.as_ref().filter(|_| !ruling.rule_ask()) {
+            return self.decide_by_rule(
+                request,
+                rule,
+                mode == ApprovalMode::SessionAllow,
+                tool_call_event_id,
+            );
+        }
+        // A rule-caused ask offers allow once and deny only, and names its
+        // rule (ADR 0027 resolved question 6).
+        let request = &match ruling.rule.as_ref().filter(|_| ruling.rule_ask()) {
+            Some(rule) => request.clone().with_ask_rule(rule.clone()),
+            None => request.clone(),
+        };
         let needs_prompt = mode == ApprovalMode::Ask;
         let prompt_id = if needs_prompt {
             let prompt_id = self.emit(
@@ -88,7 +106,7 @@ impl<D: PermissionDecider> Session<D> {
             && guardian::adjudicates_verbatim(request);
         if guardian_consulted {
             if let Some(ruling) = self.guardian_permission_ruling(
-                request,
+                (request, ruling.rule.as_ref()),
                 &decision_parent,
                 sink,
                 turn_state,
@@ -108,7 +126,8 @@ impl<D: PermissionDecider> Session<D> {
             };
         let allowed = decision.allowed();
         let mode_label = approval_mode_str(mode);
-        let payload = permission_decision_payload(&decision, mode_label, mode);
+        let mut payload = permission_decision_payload(&decision, mode_label, mode);
+        insert_rule_fields(&mut payload, request, ruling.rule.as_ref());
         self.emit_with_parent(
             EventKind::PERMISSION_DECISION,
             payload,
@@ -121,27 +140,109 @@ impl<D: PermissionDecider> Session<D> {
             allowed,
         );
         if allowed {
-            Ok(PermissionRuling::Allowed)
-        } else {
-            turn_state.record_denial(capability);
-            let message = if needs_prompt && self.permissions.decider_mut().never_prompts() {
-                never_prompt_denial(
-                    &self.config.execution_profile.name,
-                    request,
-                    self.config.permission_reviewer,
-                    guardian_consulted,
-                )
-            } else {
-                format!(
-                    "permission denied by the user; {} is denied for \
-                     the rest of this turn — do not retry {} commands; \
-                     use a different tool or ask the user",
-                    capability.as_str(),
-                    capability.as_str()
-                )
-            };
-            Ok(PermissionRuling::Denied { message })
+            return Ok(PermissionRuling::Allowed);
         }
+        if !request.capability_is_label {
+            turn_state.record_denial(capability);
+        }
+        let never_prompted = needs_prompt && self.permissions.decider_mut().never_prompts();
+        Ok(PermissionRuling::Denied {
+            message: self.denial_message(request, ruling, never_prompted, guardian_consulted),
+        })
+    }
+
+    /// The tool error for a denied ask: a never-prompt decider's names the
+    /// profile and what would allow the request; a person's denies the
+    /// capability for the rest of the turn.
+    fn denial_message(
+        &self,
+        request: &PermissionRequest,
+        ruling: &GateRuling,
+        never_prompted: bool,
+        guardian_consulted: bool,
+    ) -> String {
+        let capability = request.capability.as_str();
+        if request.capability_is_label && !never_prompted {
+            return format!(
+                "permission denied by the user for this {} call; do not retry it; use a \
+                 different tool or ask the user",
+                request.tool.as_deref().unwrap_or("tool")
+            );
+        }
+        if never_prompted {
+            return never_prompt_denial(
+                &self.config.execution_profile.name,
+                request,
+                ruling.rule.as_ref(),
+                self.config.permission_reviewer,
+                guardian_consulted,
+            );
+        }
+        format!(
+            "permission denied by the user; {capability} is denied for \
+             the rest of this turn; do not retry {capability} commands; \
+             use a different tool or ask the user"
+        )
+    }
+
+    /// The request and ruling for a core tool call that needs no capability
+    /// (ADR 0027 section 3 "Routes"), or `None` when no `tools` rule asks
+    /// or denies it. The request carries `fs-read` as a label only: its ask
+    /// is once-only, so no grant or mode change follows, and no configured
+    /// mode or turn denial of `fs-read` applies to it.
+    pub(super) fn capability_less_ruling(
+        &self,
+        call: &ToolCall,
+    ) -> Option<(PermissionRequest, GateRuling)> {
+        let mut request = PermissionRequest::new(
+            Capability::FsRead,
+            self.tools.permission_reason(&call.name, &call.input),
+        )
+        .with_tool(call.name.as_str());
+        request.capability_is_label = true;
+        let rule = self
+            .permissions
+            .rule_match(&request)
+            .filter(|rule| rule.state() != RuleState::Allow)?;
+        let mode = if rule.state() == RuleState::Deny {
+            ApprovalMode::AlwaysDeny
+        } else {
+            ApprovalMode::Ask
+        };
+        let ruling = GateRuling {
+            mode,
+            rule: Some(rule),
+        };
+        Some((request, ruling))
+    }
+
+    /// Record the decision of a rule that decided on its own, parented to
+    /// the tool call: a `deny` (that request only) or an `allow` (once).
+    fn decide_by_rule(
+        &mut self,
+        request: &PermissionRequest,
+        rule: &RuleMatch,
+        allowed: bool,
+        tool_call_event_id: &str,
+    ) -> Result<PermissionRuling, SessionError> {
+        self.emit_with_parent(
+            EventKind::PERMISSION_DECISION,
+            rule_decision_payload(request, rule, allowed),
+            Some(tool_call_event_id.to_owned()),
+        )?;
+        crate::diagnostics::permission_decision(
+            &self.config.session_id,
+            request.capability.as_str(),
+            "rule",
+            allowed,
+        );
+        Ok(if allowed {
+            PermissionRuling::Allowed
+        } else {
+            PermissionRuling::Denied {
+                message: rule_denial(rule),
+            }
+        })
     }
 
     /// Guardian review for one ask (ADR 0011). Returns `None` on abstain —
@@ -152,7 +253,7 @@ impl<D: PermissionDecider> Session<D> {
     /// interrupts the turn after the denied tool result is recorded.
     fn guardian_permission_ruling<F>(
         &mut self,
-        request: &PermissionRequest,
+        (request, rule): (&PermissionRequest, Option<&RuleMatch>),
         decision_parent: &str,
         sink: &mut EventSink<'_, F>,
         turn_state: &mut TurnState,
@@ -189,9 +290,12 @@ impl<D: PermissionDecider> Session<D> {
         // credential the guardian quotes is surfaced to the user via the
         // credential-exposure warning and removed on demand by the scrub
         // operation, never by silently corrupting the record.
+        let mut payload =
+            guardian::guardian_decision_payload(capability, allowed, &rationale, verdict);
+        insert_rule_fields(&mut payload, request, rule);
         self.emit_with_parent(
             EventKind::PERMISSION_DECISION,
-            guardian::guardian_decision_payload(capability, allowed, &rationale, verdict),
+            payload,
             Some(decision_parent.to_owned()),
         )?;
         sink.flush(self.bus.events());
@@ -247,6 +351,9 @@ pub(crate) fn permission_prompt_payload(request: &PermissionRequest) -> JsonObje
     if request.escalation.is_some() {
         payload.insert("escalated".to_owned(), true.into());
     }
+    if let Some(rule) = &request.ask_rule {
+        payload.insert("rule".to_owned(), rule.record());
+    }
     payload
 }
 
@@ -258,10 +365,18 @@ pub(crate) fn permission_prompt_payload(request: &PermissionRequest) -> JsonObje
 fn never_prompt_denial(
     profile: &str,
     request: &PermissionRequest,
+    rule: Option<&RuleMatch>,
     reviewer: PermissionReviewer,
     guardian_consulted: bool,
 ) -> String {
     let capability = request.capability.as_str();
+    if let Some(rule) = rule {
+        return format!(
+            "permission denied: this run cannot ask anyone, and execution profile `{profile}` \
+             asks before this request ({}). Do not retry it this turn",
+            rule.describe()
+        );
+    }
     if request.dangerous_command {
         return format!(
             "permission denied: this run cannot ask anyone, and command safety flags this \
@@ -298,6 +413,54 @@ fn never_prompt_denial(
     )
 }
 
+/// The tool error for a request a `deny` rule refused (ADR 0027 section 2).
+/// It covers that request only, so the model may carry on with other work.
+pub(crate) fn rule_denial(rule: &RuleMatch) -> String {
+    format!(
+        "permission denied by {} of the execution profile. Do not work around it with another \
+         command or tool; this denial covers this request only, so carry on with other work or \
+         ask the user",
+        rule.describe()
+    )
+}
+
+/// The `permission.decision` for a request a rule decided on its own: a
+/// `deny` rule, or an `allow` rule lifting an ask (allowed once, no grant).
+pub(crate) fn rule_decision_payload(
+    request: &PermissionRequest,
+    rule: &RuleMatch,
+    allowed: bool,
+) -> JsonObject {
+    let mut payload = object([
+        ("capability", request.capability.as_str().into()),
+        ("mode", if allowed { "ask" } else { "always-deny" }.into()),
+        ("allowed", allowed.into()),
+        ("decision", permission_decision_str(allowed).into()),
+        ("decision_source", "rule".into()),
+    ]);
+    if allowed {
+        payload.insert("grant_scope".to_owned(), "once".into());
+    }
+    insert_rule_fields(&mut payload, request, Some(rule));
+    payload
+}
+
+/// Add the rule that set a decision's state, and the tool it matched, to a
+/// `permission.decision` payload (ADR 0027 section 9).
+pub(crate) fn insert_rule_fields(
+    payload: &mut JsonObject,
+    request: &PermissionRequest,
+    rule: Option<&RuleMatch>,
+) {
+    let Some(rule) = rule else {
+        return;
+    };
+    payload.insert("rule".to_owned(), rule.record());
+    if let Some(tool) = &request.tool {
+        payload.insert("tool".to_owned(), tool.clone().into());
+    }
+}
+
 pub(crate) fn approval_mode_str(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Ask => "ask",
@@ -321,8 +484,11 @@ pub(crate) fn permission_request_for_tool(
     input: &Value,
     tools: &crate::tools::ToolRegistry,
 ) -> PermissionRequest {
-    let mut request =
-        PermissionRequest::new(capability, reason.to_owned()).with_workspace_root(tools.root());
+    // An `apply_patch` heredoc sent through `run_shell` is run by core as
+    // `apply_patch`, so `tools` rules name it that way, as its reason does.
+    let mut request = PermissionRequest::new(capability, reason.to_owned())
+        .with_workspace_root(tools.root())
+        .with_tool(tools.reteach_identity(tool_name, input));
     match tool_name {
         "run_shell" => {
             // A refused `escalate` still marks the request an escalation, so
@@ -360,7 +526,7 @@ pub(crate) fn permission_request_for_tool(
         .and_then(|path| tools.workspace_relative_path(&path.to_string_lossy()));
     // Sensitive-basename escalation (deep review P1-b): a tool path naming a
     // categorically sensitive file must not ride a blanket session
-    // allowance — `PermissionGate::mode_for_request` turns SessionAllow into
+    // allowance: `PermissionGate::ruling_for_request` turns SessionAllow into
     // an ask for it. Both the literal argument and the canonicalized form
     // are checked so an innocently named symlink to `.env` cannot evade the
     // list, mirroring the resolved-path check statically-safe shell analysis
@@ -481,18 +647,29 @@ mod tests {
     #[test]
     fn never_prompt_denial_names_the_sandboxed_alternative_for_an_escalation() {
         let request = escalated("gh pr list");
-        let user = never_prompt_denial("workspace", &request, PermissionReviewer::User, false);
+        let user =
+            never_prompt_denial("workspace", &request, None, PermissionReviewer::User, false);
         assert!(user.contains("--permission-reviewer guardian"), "{user}");
         assert!(user.contains("credentials \"pass\""), "{user}");
         assert!(!user.contains("--profile with"), "{user}");
 
-        let abstained =
-            never_prompt_denial("workspace", &request, PermissionReviewer::Guardian, true);
+        let abstained = never_prompt_denial(
+            "workspace",
+            &request,
+            None,
+            PermissionReviewer::Guardian,
+            true,
+        );
         assert!(abstained.contains("the guardian abstained"), "{abstained}");
         assert!(abstained.contains("credentials \"pass\""), "{abstained}");
 
-        let not_consulted =
-            never_prompt_denial("workspace", &request, PermissionReviewer::Guardian, false);
+        let not_consulted = never_prompt_denial(
+            "workspace",
+            &request,
+            None,
+            PermissionReviewer::Guardian,
+            false,
+        );
         assert!(
             not_consulted.contains("the guardian could not review it"),
             "{not_consulted}"
@@ -501,7 +678,13 @@ mod tests {
 
         let sandboxed = PermissionRequest::new(Capability::ShellExec, "tool run_shell")
             .with_command("gh pr list");
-        let other = never_prompt_denial("workspace", &sandboxed, PermissionReviewer::User, false);
+        let other = never_prompt_denial(
+            "workspace",
+            &sandboxed,
+            None,
+            PermissionReviewer::User,
+            false,
+        );
         assert!(
             other.contains("--profile with a profile that allows it"),
             "{other}"

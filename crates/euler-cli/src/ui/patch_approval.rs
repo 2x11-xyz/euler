@@ -232,6 +232,9 @@ pub(crate) fn panel_lines(
         .into_iter()
         .map(panel_row_for_option),
     );
+    if let Some(note) = modal.request.ask_rule_note() {
+        content.push(PanelRow::metadata(note));
+    }
     if let Some(reason) = no_grant_reason(&modal.request) {
         content.push(PanelRow::metadata(reason));
     }

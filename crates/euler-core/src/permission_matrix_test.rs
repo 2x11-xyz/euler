@@ -563,14 +563,14 @@ fn unconfigured_capability_gate_defaults_fail_closed() {
     let mut gate = PermissionGate::new(ProbeDecider { calls: 0 });
     let request = PermissionRequest::new(Network, "extension network request");
 
-    let mode = gate.mode_for_request(&request);
+    let mode = gate.ruling_for_request(&request).mode;
     assert_eq!(mode, AlwaysDeny);
     assert!(!gate.decide_detailed(&request, mode).allowed());
     assert_eq!(gate.decider_mut().calls, 0);
 
     gate.install_grant(Network, GrantScope::Session(ScopePattern::unscoped()))
         .expect("unscoped network grant");
-    assert_eq!(gate.mode_for_request(&request), SessionAllow);
+    assert_eq!(gate.ruling_for_request(&request).mode, SessionAllow);
 }
 
 #[test]
@@ -580,7 +580,7 @@ fn agent_spawn_gate_cells() {
     let request = PermissionRequest::new(AgentSpawn, "extension agent spawn");
 
     let mut gate = PermissionGate::new(ProbeDecider { calls: 0 });
-    let mode = gate.mode_for_request(&request);
+    let mode = gate.ruling_for_request(&request).mode;
     assert_eq!(mode, Ask, "default ask");
     assert_eq!(gate.granted_source(&request), None);
     assert!(!gate.decide_detailed(&request, mode).allowed());
@@ -593,7 +593,7 @@ fn agent_spawn_gate_cells() {
         GrantScope::Session(ScopePattern::new("review").expect("pattern")),
     )
     .expect("scoped agent-spawn grant");
-    assert_eq!(gate.mode_for_request(&request), Ask);
+    assert_eq!(gate.ruling_for_request(&request).mode, Ask);
     assert_eq!(gate.granted_source(&request), None);
     assert!(!gate.decide_detailed(&request, Ask).allowed());
     assert_eq!(gate.decider_mut().calls, 2, "the inert grant still asks");
@@ -604,7 +604,7 @@ fn agent_spawn_gate_cells() {
     gate.set_mode(AgentSpawn, Ask);
     // The dispatcher consults grant coverage before deciding, so a covered
     // ask never reaches the decider.
-    assert_eq!(gate.mode_for_request(&request), Ask);
+    assert_eq!(gate.ruling_for_request(&request).mode, Ask);
     assert_eq!(gate.granted_source(&request), Some(GrantSource::Session));
 
     let mut gate = PermissionGate::new(ProbeDecider { calls: 0 });
@@ -616,7 +616,7 @@ fn agent_spawn_gate_cells() {
     gate.install_grant(AgentSpawn, GrantScope::Session(ScopePattern::unscoped()))
         .expect("unscoped agent-spawn grant");
     gate.set_mode(AgentSpawn, AlwaysDeny);
-    assert_eq!(gate.mode_for_request(&request), AlwaysDeny);
+    assert_eq!(gate.ruling_for_request(&request).mode, AlwaysDeny);
     assert!(!gate.decide_detailed(&request, AlwaysDeny).allowed());
     assert_eq!(gate.decider_mut().calls, 0);
 }

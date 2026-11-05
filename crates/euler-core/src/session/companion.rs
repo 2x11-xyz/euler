@@ -2,15 +2,16 @@
 
 use super::{
     add_provider_error_metadata, approval_mode_str, canvas_snapshot_payload,
-    context_budget_exhausted, elapsed_ms, file_change_payload, file_diff_payload, model_input_item,
-    permission_decision_payload, permission_prompt_payload, permission_request_for_tool,
-    prepare_checkpoint, tool_cancelled_payload, tool_result_payload, validate_model_target_shape,
-    ModelRoundData, ModelTarget, ProviderRuntimeContext, RoundLoop, RoundLoopConfig, RoundLoopIo,
-    RoundOutcome, Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
+    context_budget_exhausted, elapsed_ms, file_change_payload, file_diff_payload,
+    insert_rule_fields, model_input_item, permission_decision_payload, permission_prompt_payload,
+    permission_request_for_tool, prepare_checkpoint, rule_decision_payload, rule_denial,
+    tool_cancelled_payload, tool_result_payload, validate_model_target_shape, ModelRoundData,
+    ModelTarget, ProviderRuntimeContext, RoundLoop, RoundLoopConfig, RoundLoopIo, RoundOutcome,
+    Session, SessionError, TurnState, SYSTEM_INSTRUCTIONS,
 };
 use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
-use crate::execution_profile::ExecutionProfile;
-use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate};
+use crate::execution_profile::{ExecutionProfile, RuleMatch};
+use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate, PermissionRequest};
 use crate::{ProviderRuntimeObserver, ProviderRuntimeScope};
 use euler_agents::{generated_agent_id, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, tool_result_succeeded, EventEnvelope, EventKind, JsonObject};
@@ -436,17 +437,26 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                 self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
                 return Ok(());
             }
-            let request = permission_request_for_tool(
+            let mut request = permission_request_for_tool(
                 capability,
                 &self.tools.permission_reason(&call.name, &call.input),
                 &call.name,
                 &call.input,
                 self.tools,
             );
-            // Request-aware mode: a sensitive-basename path escalates
-            // blanket SessionAllow to Ask (deep review P1-b), mirroring the
-            // root-session gate.
-            let mode = self.permissions.mode_for_request(&request);
+            // Request-aware ruling, mirroring the root-session gate: a
+            // sensitive path asks (deep review P1-b), and rules apply.
+            let ruling = self.permissions.ruling_for_request(&request);
+            let mode = ruling.mode;
+            if let Some(rule) = ruling.rule.as_ref().filter(|_| !ruling.rule_ask()) {
+                let decided = (&request, rule, mode == ApprovalMode::SessionAllow);
+                return self.run_rule_decided_call(call, tool_call_event_id, decided, cancellation);
+            }
+            // A rule-caused ask is once-only and names its rule (ADR 0027
+            // resolved question 6).
+            if let Some(rule) = ruling.rule.as_ref().filter(|_| ruling.rule_ask()) {
+                request = request.with_ask_rule(rule.clone());
+            }
             let needs_prompt = mode == ApprovalMode::Ask && !self.permissions.is_granted(&request);
             let prompt_id = if needs_prompt {
                 Some(
@@ -471,20 +481,9 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
                         return Err(SessionError::Cancelled);
                     }
                 };
-            let allowed = decision.allowed();
-            let mode_label = approval_mode_str(mode);
-            self.append(
-                EventKind::PERMISSION_DECISION,
-                permission_decision_payload(&decision, mode_label, mode),
-                Some(prompt_id.unwrap_or_else(|| tool_call_event_id.clone())),
-            )?;
-            crate::diagnostics::permission_decision(
-                &self.session_id,
-                capability.as_str(),
-                mode_label,
-                allowed,
-            );
-            if !allowed {
+            let parent = prompt_id.unwrap_or_else(|| tool_call_event_id.clone());
+            self.record_decision(&request, &decision, &ruling, parent)?;
+            if !decision.allowed() {
                 self.turn_state.record_denial(capability);
                 self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
                 return Ok(());
@@ -497,6 +496,53 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         }
         self.execute_authorized_tool(call, tool_call_event_id, cancellation)?;
         Ok(())
+    }
+
+    /// Record the `permission.decision` for one child request, with the
+    /// rule that caused its ask, if one did.
+    fn record_decision(
+        &mut self,
+        request: &PermissionRequest,
+        decision: &crate::permissions::GrantDecision,
+        ruling: &crate::permissions::GateRuling,
+        parent: String,
+    ) -> Result<(), SessionError> {
+        let mode_label = approval_mode_str(ruling.mode);
+        let mut payload = permission_decision_payload(decision, mode_label, ruling.mode);
+        insert_rule_fields(&mut payload, request, ruling.rule.as_ref());
+        self.append(EventKind::PERMISSION_DECISION, payload, Some(parent))?;
+        crate::diagnostics::permission_decision(
+            &self.session_id,
+            request.capability.as_str(),
+            mode_label,
+            decision.allowed(),
+        );
+        Ok(())
+    }
+
+    /// Run or refuse a call a rule decided on its own (ADR 0027 section
+    /// 3): a `deny` covers this request only, an `allow` runs it once.
+    fn run_rule_decided_call(
+        &mut self,
+        call: ToolCall,
+        tool_call_event_id: String,
+        (request, rule, allowed): (&PermissionRequest, &RuleMatch, bool),
+        cancellation: &CancellationToken,
+    ) -> Result<(), SessionError> {
+        self.append(
+            EventKind::PERMISSION_DECISION,
+            rule_decision_payload(request, rule, allowed),
+            Some(tool_call_event_id.clone()),
+        )?;
+        if !allowed {
+            return self.emit_tool_failure(
+                call.id,
+                call.name,
+                rule_denial(rule),
+                tool_call_event_id,
+            );
+        }
+        self.execute_authorized_tool(call, tool_call_event_id, cancellation)
     }
 
     fn record_tool_call_batch(

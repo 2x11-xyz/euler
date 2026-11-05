@@ -22,7 +22,10 @@ pub use config::{
     write_interactive_default, ProfileContext, ProfilesConfig, ProjectOverlay, PROFILES_FILE,
     PROJECT_OVERLAY_PATH,
 };
-pub use rules::{PermissionRule, ProfileRules, RuleAccess, RuleLayer, RuleLayerLabel, RuleState};
+pub use rules::{
+    rule_match, PermissionRule, ProfileRules, RuleAccess, RuleLayer, RuleLayerLabel, RuleMatch,
+    RuleState, RuleSurface,
+};
 
 use crate::guardian::PermissionReviewer;
 use crate::permissions::{ApprovalMode, PermissionRequest};
