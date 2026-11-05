@@ -34,6 +34,10 @@ Flags:
   `workspace` it has no effect and Euler prints a one-line notice.
   - `read-only` is the default tier (it applies only under a profile that asks for every command, such as `locked`): file reads are allowed; writes and shell are denied.
   - `trusted-local`: file reads, file writes, and shell are session-allowed.
+- `exec` cannot ask anyone, so a request that would prompt is denied unless
+  the guardian (`--permission-reviewer guardian`) allows it. That denial
+  covers the one request: the agent gets a tool error and carries on, and a
+  later request of the same kind in the same turn is decided again.
 - `--extensions <ids>` enables a comma-separated list. Use `--extensions none`
   for no extensions.
 - `--max-tool-rounds N` sets a positive hard ceiling. Default is unlimited.

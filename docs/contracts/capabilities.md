@@ -240,8 +240,9 @@ or grant-covered asks. Its fields are `sandbox: on`, `network: off`,
   could not review the request), and then a profile with
   `credentials: "pass"` for an escalation, since no profile runs one
   unasked, or `--profile` for another ask. For a dangerous command it says
-  that only a person can approve it. Requests a configured `always-deny`
-  refuses keep their message.
+  that only a person can approve it. The deny covers that request only,
+  and the error says so. Requests a configured `always-deny` refuses keep
+  their message.
 
 With the sandbox on, only these two boundaries are enforced: a profile
 with `network: on` must keep `workspace`'s `tmp`, `caches`, and
@@ -402,11 +403,11 @@ is not tracked.
   with the same label already holds exactly those rules; a lower
   `ask_timeout` and added `extension_reviewers` apply, the recorded ones
   stay, and the summary names the fields joined this way. The gate
-  enforces every rule surface ("Permission rules in the gate" below). This
-  build refuses at startup any profile, overlay, child, or resume that sets
-  `ask_timeout` or `extension_reviewers`, naming the field, because the
-  gate does not enforce them yet; when only the recording sets one, the
-  error names the recorded profile and `--profile`. `tools` patterns are
+  enforces every rule surface ("Permission rules in the gate" below) and
+  `ask_timeout` ("Ask timeout" below). This build refuses at startup any
+  profile, child, or resume that sets `extension_reviewers`, naming the
+  field, because the gate does not enforce it yet; when only the recording
+  sets it, the error names the recorded profile and `--profile`. `tools` patterns are
   checked against the extensions installed in the Euler home (enabled or
   not) when `profiles.json` and the overlay load: a pattern without `.`
   that matches no core tool but matches an installed extension's
@@ -514,6 +515,30 @@ is not tracked.
   turn. An extension operation records an `allow` rule's decisions only
   when it is authorized to run: after the person allows its other
   requests, if any ask.
+- **Ask timeout (ADR 0027 section 4).** `ask_timeout` bounds how long a
+  person's prompt stays open. When it passes, the prompt closes and the ask
+  is denied with `decision_source: "timeout"`; the model gets a tool error
+  and the run continues. `0` asks no person: an ask the guardian does not
+  settle is denied at once the same way. Absent, a prompt waits as before.
+  The first of an answer, the timeout, or a turn cancellation settles the
+  ask: an answer after the timeout is discarded and installs no grant, and
+  a cancellation stays a cancellation. Every ask has its own timer: a
+  root ask, an extension operation's batch (one `timeout` decision per
+  capability), a project-tier extension config write, and a child's ask,
+  which runs at the child's effective `ask_timeout`, the lower of the
+  parent's and its own. A never-prompt decider (headless `euler exec`)
+  has no person to wait for and denies an undecided ask at once whatever
+  `ask_timeout` says, recorded as it always was. The TUI closes the
+  approval panel when the timeout passes. The line-oriented prompt reads
+  a blocking terminal line, so it stays open until answered; an answer
+  given after the timeout is discarded and the ask is denied as a timeout.
+- **Turn scope of a deny (ADR 0027 section 4).** A person's deny and a
+  configured capability `always-deny` (including an auto-approve tier's)
+  deny that capability for the rest of the turn, and later requests for it
+  are refused unasked. Every other deny covers only its request: a `deny`
+  rule, a timeout, an ask under `ask_timeout: 0`, a never-prompt
+  decider's deny, and a guardian deny (bounded by its circuit breaker). A
+  later request of the same capability in the same turn is decided again.
 - **Selection.** `--profile <name>` on `euler` and `euler exec`, then
   `/profile` in the TUI, then the context default in `profiles.json`, then
   the built-in default: `full` for both interactive and headless. An unknown
@@ -629,6 +654,10 @@ use. Rules (normative; enforced in code, not only in the guardian prompt):
   `user_authorization` ≥ medium; critical → deny, not overridable.
 - Fail closed: guardian spawn failure, companion failure, or an unparseable
   verdict is a deny.
+- Each review has a 60-second host deadline covering provider retries (ADR
+  0027 resolved question 18). Expiry cancels the review and is a deny,
+  recorded with `guardian_expired: true`, even while the guardian is still
+  streaming output.
 - `abstain` falls back to the configured decider (the human). `deny` is
   final for the ask; it never falls back.
 - Guardian allows are once-scoped; the guardian never installs session or

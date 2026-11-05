@@ -436,6 +436,49 @@ fn project_write_ask_under_always_deny_is_denied_without_a_prompt() {
     assert!(kind_events(session.events(), EventKind::PERMISSION_PROMPT).is_empty());
 }
 
+/// ADR 0027 section 4: the config-write ask is bounded by `ask_timeout`
+/// like every ask, so under `0` no person is asked and the write is
+/// denied with `decision_source: "timeout"`.
+#[test]
+fn project_write_ask_times_out_under_ask_timeout_zero() {
+    let fixture = Fixture::new();
+    let asks = Arc::new(Mutex::new(Vec::new()));
+    let mut session = fixture.session(
+        Vec::new(),
+        HeadlessDecider {
+            asks: Arc::clone(&asks),
+        },
+        |config| {
+            let mut profile = crate::ExecutionProfile::default();
+            profile.fields.ask_timeout = Some(0);
+            config.set_execution_profile(profile);
+        },
+    );
+
+    let result = session.decide_project_config_write(
+        EXTENSION_ID,
+        COMMAND,
+        ".euler/extensions/config-ext/config.json",
+        None,
+        &CancellationToken::new(),
+    );
+
+    assert!(matches!(
+        result,
+        Err(ExtensionError::CapabilityDenied {
+            capability: Capability::ConfigWrite
+        })
+    ));
+    assert!(asks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_empty());
+    let decisions = kind_events(session.events(), EventKind::PERMISSION_DECISION);
+    assert_eq!(decisions.len(), 1);
+    assert_eq!(decisions[0].payload["decision_source"], "timeout");
+    assert_eq!(decisions[0].payload["extension_id"], EXTENSION_ID);
+}
+
 fn assert_hook_project_write_refused(surface: Surface) {
     let fixture = Fixture::new();
     let extension = ConfigExtension::new(surface, Action::Write(ExtensionConfigTier::Project));

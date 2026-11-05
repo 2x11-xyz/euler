@@ -82,7 +82,8 @@ pub use companion::AgentResultSummary;
 pub use observer::RoundObserverConfig;
 pub(crate) use permissions_gate::{
     approval_mode_str, insert_rule_fields, permission_decision_payload, permission_prompt_payload,
-    permission_request_for_tool, rule_decision_payload, rule_denial, PermissionRuling,
+    permission_request_for_tool, rule_decision_payload, rule_denial, timeout_decision_payload,
+    timeout_denial, PermissionRuling,
 };
 pub(crate) use tool_dispatch::{
     file_change_payload, file_diff_payload, prepare_checkpoint, prepare_checkpoint_for,
@@ -6823,6 +6824,9 @@ fn validate_model_target_shape(target: &ModelTarget) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(test)]
+#[path = "permission_ask_timeout_test.rs"]
+mod permission_ask_timeout_test;
 #[cfg(test)]
 #[path = "permission_matrix_test.rs"]
 mod permission_matrix_test;
