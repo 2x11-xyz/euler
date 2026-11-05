@@ -51,6 +51,7 @@ impl PinnedProjectContext {
             rendered_digest: rendered_digest.into(),
             manifest: CandidateManifest {
                 version: super::manifest::MANIFEST_VERSION,
+                user_instructions: None,
                 sources: Vec::new(),
                 skills: Vec::new(),
                 diagnostics: Vec::new(),
@@ -164,7 +165,7 @@ pub(crate) fn fold_project_context(
                     candidate_digest,
                     rendered,
                     rendered_digest,
-                    manifest: manifest.clone(),
+                    manifest: *manifest,
                 },
             )))
         }
@@ -310,7 +311,7 @@ fn skill_activation_error() -> ProjectContextFoldError {
 enum ValidatedSnapshot {
     Disabled,
     Admitted {
-        manifest: CandidateManifest,
+        manifest: Box<CandidateManifest>,
         candidate_digest: String,
     },
 }
@@ -443,7 +444,7 @@ fn validate_snapshot_payload(
         &summary.reason_counts,
     )?;
     Ok(ValidatedSnapshot::Admitted {
-        manifest,
+        manifest: Box::new(manifest),
         candidate_digest: summary.candidate_digest,
     })
 }
@@ -532,7 +533,7 @@ fn validate_admitted_manifest(
     }
     let manifest = CandidateManifest::from_canonical_json(manifest_json)
         .map_err(|error| ProjectContextFoldError::new(error.to_string()))?;
-    if manifest.sources.is_empty() && manifest.skills.is_empty() {
+    if !manifest.has_model_facing_guidance() {
         return Err(ProjectContextFoldError::new(
             "an admitted manifest contains no model-facing guidance",
         ));

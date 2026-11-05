@@ -135,10 +135,25 @@ euler exec \
   'Say hello without tools.'
 ```
 
+## Personal instructions
+
+Put standing rules you want in every session (your name, writing preferences)
+in `~/.euler/AGENTS.md`, or `$EULER_HOME/AGENTS.md` when `EULER_HOME` is set:
+
+```sh
+printf 'Call me Ada. Keep answers short.\n' > ~/.euler/AGENTS.md
+```
+
+Euler loads it into every new session ahead of project `EULER.md` files, with
+no prompt. Project instructions are more specific and win when the two
+conflict. The file is limited to 32 KiB; a larger one is skipped. Edits apply
+to the next new session.
+
 ## Where data lives
 
 Default local state is under `~/.euler`:
 
+- `~/.euler/AGENTS.md`: optional personal instructions loaded into every session.
 - `~/.euler/auth.json` — ChatGPT OAuth credentials and optional stored API-key credentials.
 - `~/.euler/sessions/<session-id>/events.jsonl` — interactive session event log.
 - `~/.euler/sessions/<session-id>/blobs/` — large payload blobs for that session.

@@ -216,10 +216,15 @@ pub(crate) fn resolve_startup_project_context(
             .unwrap_or(config.compaction_reserve_tokens as u64),
         canvas_budget_bytes: config.auto_compaction.budget_bytes,
     };
-    let user_skills_root = EulerHome::resolve().ok().map(|home| home.skills_dir());
-    euler_core::ProjectContextBootstrap::resolve_with_user_skills(
+    let euler_home = EulerHome::resolve().ok();
+    let user_skills_root = euler_home.as_ref().map(EulerHome::skills_dir);
+    let user_instructions_path = euler_home.as_ref().map(EulerHome::user_instructions_path);
+    euler_core::ProjectContextBootstrap::resolve_with_user_context(
         &config.root,
-        user_skills_root.as_deref(),
+        euler_core::UserContextPaths {
+            skills_root: user_skills_root.as_deref(),
+            instructions_path: user_instructions_path.as_deref(),
+        },
         &redactor,
         options,
         config.project_grant_consent_dir.as_deref(),
@@ -264,9 +269,12 @@ pub(crate) fn session_config(
     let euler_home = EulerHome::resolve()
         .ok()
         .map(|home| home.root().to_path_buf());
-    // Same root the startup bootstrap discovers user skills from, carried in
-    // the config so `/new` re-resolves with user skills intact.
+    // User-owned context the startup bootstrap discovers, carried in the
+    // config so `/new` re-resolves with it intact.
     config.user_skills_root = EulerHome::resolve().ok().map(|home| home.skills_dir());
+    config.user_instructions_path = EulerHome::resolve()
+        .ok()
+        .map(|home| home.user_instructions_path());
     config.project_grant_consent_dir = euler_home.clone();
     config.user_grant_dir = euler_home;
     // User-tier extension config documents (ADR 0022): data, not authority.

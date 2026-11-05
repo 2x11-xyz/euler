@@ -814,6 +814,19 @@ separately by the root object identity recorded on `session.start` and
 verdict next to the path check. The verdict never blocks resume or resets
 grants. Semantics are in `docs/contracts/project-context.md`.
 
+### 2026-10-29 owner amendment: user instructions file
+
+This amendment adds one user-owned source; it does not change repository
+discovery. Euler loads `${EULER_HOME}/AGENTS.md` (normally
+`~/.euler/AGENTS.md`) into every session as user instructions, ahead of
+project instructions. Like user-global skills it is user-owned, needs no
+acknowledgment, stays out of the acknowledgment digest, and is frozen in the
+snapshot. Project instructions are more specific and take precedence on
+conflict. A missing file changes nothing. A repository `AGENTS.md` or
+`CLAUDE.md` fallback and a user-global `EULER.md` remain deferred. Bounds,
+framing, and provenance are in `docs/contracts/project-context.md`, "User
+instructions".
+
 ## Consequences
 
 - Teams can commit one Euler-specific instruction hierarchy and cross-agent

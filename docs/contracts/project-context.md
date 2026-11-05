@@ -17,7 +17,8 @@ relocation consent ("Resume relocation and consent" in full: the relocation
 card, `--accept-relocation`, the `project.context.relocated` event, the
 permission epoch, and the `new_root` projection), skills and `skill_read`
 ("Skills" section, the skill rows of the bounds table, skill fields of the
-snapshot, and the always-on catalog). NOT yet implemented (still bound
+snapshot, and the always-on catalog), and user instructions ("User
+instructions" section in full). NOT yet implemented (still bound
 shape): explicit reload, and guardian/worker `inherit` wiring (the child
 policy field exists, but today every child uses the `none` default — so the
 catalog and `skill_read` are root-driver-only in practice). Issue #180
@@ -34,6 +35,11 @@ enable an extension, expose a secret, bypass the sandbox, widen a child
 envelope, or suppress permission or provenance events. `allowed-tools` in a
 skill has no authorization meaning. Every induced action passes the same
 permission machinery as one suggested by an ordinary user message.
+
+The same substrate also carries user-owned context: user-global skills and
+user instructions. These come from the user's Euler home, not the repository,
+so they need no acknowledgment and never enter the acknowledgment digest. They
+are data, never authority, exactly like repository guidance.
 
 ## Discovery and precedence
 
@@ -91,6 +97,7 @@ Bounds (frozen by this contract; changing one is a contract change):
 | One `SKILL.md` | 64 KiB |
 | Combined frozen skill bodies | 1 MiB |
 | Rendered always-on skill catalog | 16 KiB |
+| User instructions (`<euler home>/AGENTS.md`) | 32 KiB |
 
 Selection and diagnostics are deterministic: lexicographic ordering of
 normalized relative paths, no dependence on filesystem iteration order,
@@ -107,6 +114,49 @@ Omissions and accepted advisories have independent bounded budgets, so a
 warning can never crowd an omission out of provenance.
 The normalized diagnostic identity namespace reserves `user/skills` for the
 user-global skills root. It is not the user's absolute filesystem path.
+
+## User instructions
+
+Euler reads one user-level instructions file, `AGENTS.md` (exact case), from
+the Euler home: `${EULER_HOME}/AGENTS.md`, normally `~/.euler/AGENTS.md`. It
+carries a user's standing rules (name, writing preferences) into every
+session.
+
+- Reads use the same no-follow, stable-read, and redaction rules as an
+  `EULER.md` source. The Euler home must resolve to its canonical path; a
+  symlinked component, a symlinked or non-regular file, invalid UTF-8, or an
+  unstable read omits the file whole with a typed diagnostic.
+- A file larger than 32 KiB, measured before and again after redaction, is
+  omitted whole with `source_too_large`. This bound is separate from the
+  `EULER.md` bounds.
+- A missing file adds nothing: no diagnostic, and the manifest bytes and
+  candidate digest are identical to a session without the feature.
+- The normalized identity is `user/AGENTS.md`. Project discovery never yields
+  an `AGENTS.md` identity, so it cannot name a repository source. Diagnostics
+  with this identity, like `user/skills` ones, stay out of the acknowledgment
+  digest and the acknowledgment card.
+- No acknowledgment: the file is the user's own, in the user's own home. It is
+  admitted under every policy and session kind (`auto`, `on`, `off`, headless,
+  trusted-local), the same as user-global skills, and it never writes or
+  consults an acknowledgment record.
+
+Precedence. Rendering is general to specific: user instructions come first,
+then the skill catalog and project sources. Project instructions are more
+specific, so they take precedence where the two conflict, and the framed text
+says so. Both sit below Euler's fixed instructions and the permission
+machinery.
+
+Provenance. The manifest's optional `user_instructions` record carries
+`path` (`user/AGENTS.md`), `byte_len`, `digest` (the source-content domain over
+identity and content), and the frozen post-redaction `content`. It persists in
+the snapshot like user-global skill bodies, including in repository-disabled,
+declined, and unacknowledged snapshots. The record is omitted when absent, so
+earlier manifests keep their bytes; legacy version-1 manifests cannot carry
+it, and an Euler version that does not know the field rejects it on resume.
+The snapshot is frozen: editing the file affects the next fresh session.
+User instructions are part of the one pinned project-context item, so a child
+agent receives them only under `project_context: inherit`, like the skill
+catalog.
 
 ## Preflight and redaction
 
@@ -206,8 +256,8 @@ per-project trust store.
   scope, relative path, body length, body digest, frozen body). A disabled,
   declined, or unacknowledged project persists no repository-owned body,
   per-source content hash, exact content length, parser excerpt, or other
-  reversible repository content. It may retain admitted user-global skills;
-  otherwise only the portable candidate digest, bounded normalized identities,
+  reversible repository content. It may retain admitted user-global skills
+  and user instructions; otherwise only the portable candidate digest, bounded normalized identities,
   counts, and content-free reason codes remain.
 - The admitted manifest is serialized once as versioned UTF-8 snapshot JSON in
   one top-level payload string. When it exceeds the provenance threshold that
@@ -276,7 +326,8 @@ per-project trust store.
   versions fail safe on the unknown event kind and cannot resume such sessions.
 - The latest snapshot event in durable sequence is authoritative. A latest
   snapshot with a model-facing manifest yields exactly one pinned item,
-  including a repository-disabled snapshot containing user-global skills. A
+  including a repository-disabled snapshot containing user-global skills or
+  user instructions. A
   snapshot without a manifest is a tombstone and yields none. A malformed
   latest snapshot rejects resume or request assembly and never resurrects an
   older manifest.
@@ -454,20 +505,25 @@ and it carries no old-root approvals forward.
 ## Framing and canvas admission
 
 Guidance bytes never enter `ModelRequest.instructions`; that field is
-byte-identical with or without project context or user-global skills. The
+byte-identical with or without project context, user-global skills, or user
+instructions. The
 admitted guidance is a typed, provider-neutral input with a pinned canvas
 projection, rendered below system/developer policy as attributed context.
-Core owns framing on all three admission paths:
+Core owns framing on every admission path:
 
-1. `EULER.md` sources: core-generated header with normalized path and
+1. User instructions: a core-generated `user instructions: user/AGENTS.md`
+   header that states project sources take precedence on conflict, every
+   content line indented, then an end marker. Rendered first, before the
+   skill catalog and project sources, and only when the file was admitted.
+2. `EULER.md` sources: core-generated header with normalized path and
    repository-guidance classification; every content line indented/escaped so
    source text can never occupy a core marker position.
-2. The always-on skill catalog: compact core-framed name, scope, description,
+3. The always-on skill catalog: compact core-framed name, scope, description,
    and source identity only; every admitted skill has exactly one row.
-3. `skill_read` results: the frozen body returns through ordinary
+4. `skill_read` results: the frozen body returns through ordinary
    `tool.call`/`tool.result` events with the same core-framed header (skill
    name, source identity) and indentation rules as startup sources.
-4. Explicit `/skill:<name> [request]` activation: the literal command remains
+5. Explicit `/skill:<name> [request]` activation: the literal command remains
    the durable user content, while core records and projects an exact
    `model_content` expansion from the frozen snapshot. The skill body and live
    arguments use separate core-marked sections, with every source line
@@ -480,9 +536,9 @@ but must not trim, normalize, combine, silently omit, or reorder its content.
 An adapter unable to represent the item fails before dispatch. Core framing is
 versioned and performed once before the rendered-context digest is computed.
 
-Pinned guidance, including a user-skill-only manifest when repository context
-is off, counts against both the canvas byte budget and a known model context
-limit and does not silently vanish under compaction. The
+Pinned guidance, including a user-only manifest (user skills or user
+instructions) when repository context is off, counts against both the canvas
+byte budget and a known model context limit and does not silently vanish under compaction. The
 deterministic context-limit proxy is four rendered UTF-8 bytes per token. At
 snapshot admission, required tokens are
 `ceil((fixed_instruction_bytes + framed_project_context_bytes) / 4) + 1024 +

@@ -11,6 +11,7 @@ const PREFERENCES_FILE: &str = "preferences.json";
 const SESSIONS_DIR: &str = "sessions";
 const EXTENSIONS_DIR: &str = "extensions";
 const SKILLS_DIR: &str = "skills";
+const USER_INSTRUCTIONS_FILE: &str = "AGENTS.md";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EulerHome {
@@ -98,6 +99,12 @@ impl EulerHome {
     /// root; it is not created merely by resolving Euler home.
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join(SKILLS_DIR)
+    }
+
+    /// The user's standing instructions, loaded into every session ahead of
+    /// project instructions. Read-only input; never created by Euler.
+    pub fn user_instructions_path(&self) -> PathBuf {
+        self.root.join(USER_INSTRUCTIONS_FILE)
     }
 
     pub fn ensure(&self) -> Result<(), EulerHomeError> {
@@ -315,6 +322,25 @@ mod tests {
         assert_eq!(
             home.root(),
             fs::canonicalize(override_home).expect("canonical override")
+        );
+    }
+
+    #[test]
+    fn user_instructions_path_follows_the_euler_home_override() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let override_home = temp.path().join("custom-euler-home");
+
+        let home = EulerHome::resolve_from_env(
+            Some(temp.path().into()),
+            Some(override_home.clone().into_os_string()),
+        )
+        .expect("home");
+
+        assert_eq!(
+            home.user_instructions_path(),
+            fs::canonicalize(override_home)
+                .expect("canonical override")
+                .join("AGENTS.md")
         );
     }
 

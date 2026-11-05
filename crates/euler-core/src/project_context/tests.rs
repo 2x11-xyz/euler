@@ -42,6 +42,14 @@ fn user_skills_root(temp: &tempfile::TempDir) -> PathBuf {
         .join("home/skills")
 }
 
+/// User context with only the skills root set.
+fn user_skills_only(skills_root: &Path) -> UserContextPaths<'_> {
+    UserContextPaths {
+        skills_root: Some(skills_root),
+        instructions_path: None,
+    }
+}
+
 fn source_paths(bootstrap: &ProjectContextBootstrap) -> Vec<String> {
     bootstrap.source_identities.clone()
 }
@@ -1133,6 +1141,7 @@ fn symlinked_component_in_the_workspace_path_fails_discovery_closed() {
 #[test]
 fn diagnostic_flood_collapses_to_a_disabled_manifest_with_typed_reason() {
     let flood = super::discovery::DiscoveryOutcome {
+        user_instructions: None,
         sources: vec![],
         skills: vec![],
         diagnostics: (0..MAX_MANIFEST_OMISSION_DIAGNOSTICS + 1)
@@ -1161,6 +1170,7 @@ fn diagnostic_flood_collapses_to_a_disabled_manifest_with_typed_reason() {
 
     // Exactly at the bound nothing collapses.
     let at_bound = super::discovery::DiscoveryOutcome {
+        user_instructions: None,
         sources: vec![],
         skills: vec![],
         diagnostics: (0..MAX_MANIFEST_OMISSION_DIAGNOSTICS)
@@ -1224,6 +1234,7 @@ fn accepted_advisories_do_not_consume_the_omission_diagnostic_budget() {
     );
 
     let (manifest, collapsed) = super::sanitize_preflight(super::discovery::DiscoveryOutcome {
+        user_instructions: None,
         sources: vec![],
         skills,
         diagnostics,
@@ -2040,9 +2051,9 @@ fn project_skills_are_discovered_from_euler_skills_and_require_acknowledgment() 
     );
     let canonical = fs::canonicalize(&root).expect("canonical");
     let consent = temp.path().join("consent");
-    let resolution = ProjectContextBootstrap::resolve_with_user_skills(
+    let resolution = ProjectContextBootstrap::resolve_with_user_context(
         &canonical,
-        None,
+        UserContextPaths::default(),
         &redactor(),
         ProjectContextResolveOptions {
             policy: ProjectContextPolicy::Auto,
@@ -2084,9 +2095,9 @@ fn missing_skill_name_uses_the_valid_parent_directory_name() {
         "---\ndescription: Write focused commits.\n---\nKeep commits focused.\n",
     );
 
-    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
         &root,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
     )
     .expect("preflight");
@@ -2106,9 +2117,9 @@ fn yaml_null_skill_name_uses_the_valid_parent_directory_name() {
         "---\nname: null\ndescription: Write focused commits.\n---\nKeep commits focused.\n",
     );
 
-    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
         &root,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
     )
     .expect("preflight");
@@ -2128,9 +2139,9 @@ fn valid_explicit_skill_name_directory_mismatch_is_admitted_with_one_warning() {
     );
     let canonical = fs::canonicalize(&root).expect("canonical");
     let consent = temp.path().join("consent");
-    let pending = match ProjectContextBootstrap::resolve_with_user_skills(
+    let pending = match ProjectContextBootstrap::resolve_with_user_context(
         &canonical,
-        None,
+        UserContextPaths::default(),
         &redactor(),
         ProjectContextResolveOptions {
             policy: ProjectContextPolicy::Auto,
@@ -2169,9 +2180,9 @@ fn legacy_skill_name_mismatch_counts_as_an_omission_not_a_warning() {
     write(&root.join("EULER.md"), "project guidance\n");
     let canonical = fs::canonicalize(&root).expect("canonical");
     let consent = temp.path().join("consent");
-    let mut pending = match ProjectContextBootstrap::resolve_with_user_skills(
+    let mut pending = match ProjectContextBootstrap::resolve_with_user_context(
         &canonical,
-        None,
+        UserContextPaths::default(),
         &redactor(),
         ProjectContextResolveOptions {
             policy: ProjectContextPolicy::Auto,
@@ -2213,9 +2224,9 @@ fn invalid_explicit_or_derived_skill_names_remain_rejected() {
         "---\ndescription: Invalid derived name.\n---\nbody\n",
     );
 
-    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
         &root,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
     )
     .expect("preflight");
@@ -2245,9 +2256,9 @@ fn derived_and_mismatched_explicit_names_share_the_existing_collision_policy() {
         "---\nname: commit-writing\ndescription: Explicit name.\n---\nexplicit body\n",
     );
 
-    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
         &root,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
     )
     .expect("preflight");
@@ -2281,9 +2292,9 @@ fn catalog_rejection_suppresses_a_name_mismatch_warning() {
         ),
     );
 
-    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
         &root,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
     )
     .expect("preflight");
@@ -2312,9 +2323,9 @@ fn user_skill_mismatch_does_not_enter_project_acknowledgment_counts() {
     );
     let canonical = fs::canonicalize(&root).expect("canonical");
     let consent = temp.path().join("consent");
-    let pending = match ProjectContextBootstrap::resolve_with_user_skills(
+    let pending = match ProjectContextBootstrap::resolve_with_user_context(
         &canonical,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
         ProjectContextResolveOptions {
             policy: ProjectContextPolicy::Auto,
@@ -2351,9 +2362,9 @@ fn skill_description_limit_counts_unicode_scalar_values_after_yaml_decoding() {
     write_skill(&user_skills, "accepted", &accepted, "accepted body\n");
     write_skill(&user_skills, "rejected", &rejected, "rejected body\n");
 
-    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
         &root,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
     )
     .expect("preflight");
@@ -2384,9 +2395,9 @@ fn user_skills_are_admitted_when_project_context_is_off() {
     );
     let canonical = fs::canonicalize(&root).expect("canonical");
     let bootstrap = expect_resolved(
-        ProjectContextBootstrap::resolve_with_user_skills(
+        ProjectContextBootstrap::resolve_with_user_context(
             &canonical,
-            Some(&user_skills),
+            user_skills_only(&user_skills),
             &redactor(),
             ProjectContextResolveOptions {
                 policy: ProjectContextPolicy::Off,
@@ -2423,9 +2434,9 @@ fn duplicate_skill_names_across_scopes_exclude_both() {
         "User GitHub workflow.",
         "user body\n",
     );
-    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
         &root,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
     )
     .expect("preflight");
@@ -2452,16 +2463,18 @@ fn user_skill_changes_do_not_change_project_acknowledgment_digest() {
         "Write focused commits.",
         "first body\n",
     );
-    let first = Preflight::run_with_user_skills(&root, Some(&user_skills), &redactor())
-        .expect("first preflight");
+    let first =
+        Preflight::run_with_user_context(&root, user_skills_only(&user_skills), &redactor())
+            .expect("first preflight");
     write_skill(
         &user_skills,
         "commit-writing",
         "Write focused commits.",
         "changed body\n",
     );
-    let second = Preflight::run_with_user_skills(&root, Some(&user_skills), &redactor())
-        .expect("second preflight");
+    let second =
+        Preflight::run_with_user_context(&root, user_skills_only(&user_skills), &redactor())
+            .expect("second preflight");
 
     assert_eq!(first.acknowledgment_digest, second.acknowledgment_digest);
     assert_ne!(first.candidate_digest, second.candidate_digest);
@@ -2481,12 +2494,14 @@ fn user_skill_path_diagnostics_do_not_change_project_acknowledgment_digest() {
     write(&root.join("EULER.md"), "project rules\n");
     let user_skills = user_skills_root(&temp);
     fs::create_dir_all(&user_skills).expect("user skill root");
-    let first = Preflight::run_with_user_skills(&root, Some(&user_skills), &redactor())
-        .expect("first preflight");
+    let first =
+        Preflight::run_with_user_context(&root, user_skills_only(&user_skills), &redactor())
+            .expect("first preflight");
 
     fs::create_dir(user_skills.join(OsString::from_vec(vec![0xff]))).expect("non-UTF-8 user entry");
-    let second = Preflight::run_with_user_skills(&root, Some(&user_skills), &redactor())
-        .expect("second preflight");
+    let second =
+        Preflight::run_with_user_context(&root, user_skills_only(&user_skills), &redactor())
+            .expect("second preflight");
 
     assert_eq!(first.acknowledgment_digest, second.acknowledgment_digest);
     assert_ne!(first.candidate_digest, second.candidate_digest);
@@ -2510,9 +2525,9 @@ fn rendered_catalog_admits_every_listed_skill_or_reports_its_omission() {
         write_skill(&user_skills, &name, &"description ".repeat(75), "body\n");
     }
 
-    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_skills(
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
         &root,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
     )
     .expect("preflight");
@@ -2567,6 +2582,7 @@ fn persisted_manifest_rejects_an_oversized_rendered_skill_catalog() {
         .collect();
     let manifest = super::manifest::CandidateManifest {
         version: super::manifest::MANIFEST_VERSION,
+        user_instructions: None,
         sources: Vec::new(),
         skills,
         diagnostics: Vec::new(),
@@ -2595,8 +2611,11 @@ fn user_skills_survive_indeterminate_repository_boundary_discovery() {
     );
     let canonical = fs::canonicalize(&root).expect("canonical root");
 
-    let outcome =
-        super::discovery::discover_with_user_skills(&canonical, Some(&user_skills), &redactor());
+    let outcome = super::discovery::discover_with_user_context(
+        &canonical,
+        user_skills_only(&user_skills),
+        &redactor(),
+    );
 
     assert!(outcome.sources.is_empty());
     assert_eq!(
@@ -2702,9 +2721,9 @@ fn user_only_skills_obey_the_admission_budget_when_project_context_is_off() {
         "Keep commits focused.\n",
     );
     let canonical = fs::canonicalize(&root).expect("canonical");
-    let resolution = ProjectContextBootstrap::resolve_with_user_skills(
+    let resolution = ProjectContextBootstrap::resolve_with_user_context(
         &canonical,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
         ProjectContextResolveOptions {
             policy: ProjectContextPolicy::Off,
@@ -2742,9 +2761,9 @@ fn decline_excludes_project_skills_from_frozen_set_and_fold() {
     write_skill(&user_skills, "user-skill", "User skill.", "user body\n");
     let canonical = fs::canonicalize(&root).expect("canonical");
     let consent = temp.path().join("consent");
-    let resolution = ProjectContextBootstrap::resolve_with_user_skills(
+    let resolution = ProjectContextBootstrap::resolve_with_user_context(
         &canonical,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
         ProjectContextResolveOptions {
             policy: ProjectContextPolicy::Auto,
@@ -2801,9 +2820,9 @@ fn fold_rejects_forged_project_scope_skill_in_declined_snapshot() {
     write_skill(&user_skills, "user-skill", "User skill.", "user body\n");
     let canonical = fs::canonicalize(&root).expect("canonical");
     let consent = temp.path().join("consent");
-    let resolution = ProjectContextBootstrap::resolve_with_user_skills(
+    let resolution = ProjectContextBootstrap::resolve_with_user_context(
         &canonical,
-        Some(&user_skills),
+        user_skills_only(&user_skills),
         &redactor(),
         ProjectContextResolveOptions {
             policy: ProjectContextPolicy::Auto,
@@ -2865,4 +2884,283 @@ fn fold_rejects_forged_project_scope_skill_in_declined_snapshot() {
         error.to_string().contains("project-owned guidance"),
         "unexpected error: {error}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// User instructions (`<euler home>/AGENTS.md`)
+// ---------------------------------------------------------------------------
+
+/// The user-level instructions file under a test's temp dir, canonical like
+/// the `EulerHome::user_instructions_path()` production passes.
+fn user_instructions_path(temp: &tempfile::TempDir) -> PathBuf {
+    fs::canonicalize(temp.path())
+        .expect("canonical temp dir")
+        .join("home/AGENTS.md")
+}
+
+fn user_instructions_only(path: &Path) -> UserContextPaths<'_> {
+    UserContextPaths {
+        skills_root: None,
+        instructions_path: Some(path),
+    }
+}
+
+fn admitted_with_user_instructions(root: &Path, path: &Path) -> ProjectContextBootstrap {
+    ProjectContextBootstrap::admitted_for_tests_with_user_context(
+        root,
+        user_instructions_only(path),
+        &redactor(),
+    )
+    .expect("preflight")
+}
+
+fn manifest_user_instructions(
+    bootstrap: &ProjectContextBootstrap,
+) -> Option<&super::manifest::ManifestSource> {
+    bootstrap
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.user_instructions.as_ref())
+}
+
+#[test]
+fn user_instructions_are_loaded_labeled_and_rendered_before_project_sources() {
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    write(&repo.join("EULER.md"), "project rule");
+    let path = user_instructions_path(&temp);
+    write(&path, "Address the user as Ada.\n");
+
+    let bootstrap = admitted_with_user_instructions(&repo, &path);
+
+    let user = manifest_user_instructions(&bootstrap).expect("user instructions");
+    assert_eq!(user.path, "user/AGENTS.md");
+    assert_eq!(user.content, "Address the user as Ada.\n");
+    assert_eq!(source_paths(&bootstrap), vec!["EULER.md"]);
+    let fold = fold_project_context(&bootstrap_events(&bootstrap)).expect("fold");
+    let rendered = &fold.admitted().expect("pinned").rendered;
+    let user_at = rendered
+        .find("[euler.project-context.v1] user instructions: user/AGENTS.md")
+        .expect("user instructions label");
+    let project_at = rendered
+        .find("[euler.project-context.v1] source: EULER.md")
+        .expect("project source label");
+    assert!(user_at < project_at, "user instructions render first");
+    assert!(rendered.contains("    Address the user as Ada."));
+    assert!(
+        rendered.contains("Project EULER.md sources below are more specific and take precedence")
+    );
+}
+
+#[test]
+fn missing_user_instructions_file_changes_nothing() {
+    for create_home in [false, true] {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = temp.path().join("repo");
+        git_dir(&repo);
+        write(&repo.join("EULER.md"), "project rule");
+        let missing = user_instructions_path(&temp);
+        if create_home {
+            fs::create_dir_all(missing.parent().expect("home")).expect("home dir");
+        }
+
+        let with_missing = admitted_with_user_instructions(&repo, &missing);
+        let without = admitted(&repo);
+
+        assert!(with_missing.diagnostics.is_empty(), "home {create_home}");
+        assert!(manifest_user_instructions(&with_missing).is_none());
+        assert_eq!(with_missing.candidate_digest, without.candidate_digest);
+        assert_eq!(with_missing.snapshot_payload(), without.snapshot_payload());
+    }
+}
+
+#[test]
+fn user_instructions_size_bound_omits_the_whole_file_with_a_diagnostic() {
+    for (size, admitted_expected) in [
+        (MAX_USER_INSTRUCTIONS_BYTES, true),
+        (MAX_USER_INSTRUCTIONS_BYTES + 1, false),
+    ] {
+        let temp = tempfile::tempdir().expect("temp");
+        let repo = temp.path().join("repo");
+        git_dir(&repo);
+        let path = user_instructions_path(&temp);
+        write(&path, "x".repeat(size));
+
+        let bootstrap = admitted_with_user_instructions(&repo, &path);
+
+        assert_eq!(
+            manifest_user_instructions(&bootstrap).is_some(),
+            admitted_expected,
+            "size {size}"
+        );
+        let too_large: Vec<_> = bootstrap
+            .diagnostics
+            .iter()
+            .filter(|record| record.reason == "source_too_large")
+            .collect();
+        if admitted_expected {
+            assert!(too_large.is_empty(), "size {size}");
+        } else {
+            assert_eq!(too_large.len(), 1);
+            assert_eq!(too_large[0].path.as_deref(), Some("user/AGENTS.md"));
+            assert_eq!(too_large[0].observed, Some(size as u64));
+        }
+    }
+}
+
+#[test]
+fn user_instructions_are_recorded_and_loaded_without_project_acknowledgment() {
+    // No consent directory: repository guidance cannot be acknowledged under
+    // `auto`, and `off` or trusted-local never admit it. User instructions
+    // load in every case.
+    for (policy, session_kind, trusted_local, status) in [
+        (
+            ProjectContextPolicy::Auto,
+            SessionKind::Interactive,
+            false,
+            ProjectContextStatus::Unacknowledged,
+        ),
+        (
+            ProjectContextPolicy::Auto,
+            SessionKind::NonInteractive,
+            true,
+            ProjectContextStatus::Disabled,
+        ),
+        (
+            ProjectContextPolicy::Off,
+            SessionKind::Interactive,
+            false,
+            ProjectContextStatus::Disabled,
+        ),
+    ] {
+        assert_user_instructions_recorded_and_loaded(policy, session_kind, trusted_local, status);
+    }
+}
+
+fn assert_user_instructions_recorded_and_loaded(
+    policy: ProjectContextPolicy,
+    session_kind: SessionKind,
+    trusted_local: bool,
+    status: ProjectContextStatus,
+) {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write(&root.join("EULER.md"), "project rules");
+    let path = user_instructions_path(&temp);
+    let content = "Address the user as Ada.\n";
+    write(&path, content);
+    let canonical = fs::canonicalize(&root).expect("canonical");
+
+    let bootstrap = expect_resolved(
+        ProjectContextBootstrap::resolve_with_user_context(
+            &canonical,
+            user_instructions_only(&path),
+            &redactor(),
+            ProjectContextResolveOptions {
+                policy,
+                session_kind,
+                trusted_local,
+            },
+            None,
+            generous_budget(),
+        )
+        .expect("resolve"),
+    );
+
+    assert_eq!(bootstrap.status(), status, "{policy:?}");
+    assert!(bootstrap.source_identities.is_empty());
+    let payload = bootstrap.snapshot_payload();
+    let manifest = CandidateManifest::from_canonical_json(
+        payload["manifest"].as_str().expect("manifest string"),
+    )
+    .expect("manifest");
+    let user = manifest
+        .user_instructions
+        .expect("recorded user instructions");
+    assert_eq!(user.path, "user/AGENTS.md");
+    assert_eq!(user.byte_len, content.len() as u64);
+    assert_eq!(
+        user.digest,
+        super::digest::source_digest_v1("user/AGENTS.md", content)
+    );
+    let fold = fold_project_context(&bootstrap_events(&bootstrap)).expect("fold");
+    let rendered = &fold.admitted().expect("pinned").rendered;
+    assert!(rendered.contains("    Address the user as Ada."));
+    assert!(!rendered.contains("project rules"));
+}
+
+#[test]
+fn user_instructions_do_not_change_project_acknowledgment_digest() {
+    let temp = tempfile::tempdir().expect("temp");
+    let root = temp.path().join("repo");
+    git_dir(&root);
+    write(&root.join("EULER.md"), "project rules\n");
+    let path = user_instructions_path(&temp);
+    let without =
+        Preflight::run_with_user_context(&root, user_instructions_only(&path), &redactor())
+            .expect("preflight without file");
+    write(&path, "Address the user as Ada.\n");
+    let with = Preflight::run_with_user_context(&root, user_instructions_only(&path), &redactor())
+        .expect("preflight with file");
+    write(&path, "x".repeat(MAX_USER_INSTRUCTIONS_BYTES + 1));
+    let oversized =
+        Preflight::run_with_user_context(&root, user_instructions_only(&path), &redactor())
+            .expect("preflight with oversized file");
+
+    assert_eq!(without.acknowledgment_digest, with.acknowledgment_digest);
+    assert_ne!(without.candidate_digest, with.candidate_digest);
+    // The omission diagnostic is user-owned too.
+    assert_eq!(
+        without.acknowledgment_digest,
+        oversized.acknowledgment_digest
+    );
+    assert_ne!(without.candidate_digest, oversized.candidate_digest);
+}
+
+#[test]
+fn user_instructions_are_redacted_before_digest_and_snapshot() {
+    let secret = "sk-test-1234567890abcdef1234567890";
+    let temp = tempfile::tempdir().expect("temp");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    let path = user_instructions_path(&temp);
+    write(&path, format!("my token is {secret}\n"));
+    let redactor = SecretRedactor::new();
+    redactor.add_value(secret);
+
+    let bootstrap = ProjectContextBootstrap::admitted_for_tests_with_user_context(
+        &repo,
+        user_instructions_only(&path),
+        &redactor,
+    )
+    .expect("preflight");
+
+    let user = manifest_user_instructions(&bootstrap).expect("user instructions");
+    assert_eq!(user.content, "my token is [redacted-secret]\n");
+    let payload = serde_json::to_string(&bootstrap.snapshot_payload()).expect("payload");
+    assert!(!payload.contains(secret));
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_user_instructions_are_rejected_not_followed() {
+    let temp = tempfile::tempdir().expect("temp");
+    let target = temp.path().join("elsewhere.md");
+    write(&target, "followed through a link");
+    let repo = temp.path().join("repo");
+    git_dir(&repo);
+    let path = user_instructions_path(&temp);
+    fs::create_dir_all(path.parent().expect("home")).expect("home dir");
+    std::os::unix::fs::symlink(&target, &path).expect("symlink");
+
+    let bootstrap = admitted_with_user_instructions(&repo, &path);
+
+    assert!(manifest_user_instructions(&bootstrap).is_none());
+    assert!(bootstrap.diagnostics.iter().any(|record| {
+        record.reason == "symlink_rejected" && record.path.as_deref() == Some("user/AGENTS.md")
+    }));
+    let payload = serde_json::to_string(&bootstrap.snapshot_payload()).expect("payload");
+    assert!(!payload.contains("followed through a link"));
 }

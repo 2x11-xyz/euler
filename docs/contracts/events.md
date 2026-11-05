@@ -1011,8 +1011,10 @@ extension error does not consume the later result.
   the complete canonical UTF-8 manifest JSON as one top-level payload string,
   externalized as one content-addressed blob above the provenance threshold.
   Repository-disabled snapshots may retain a manifest containing only
-  user-global skills; they persist no repository source body, project-skill
-  body, per-source content hash, exact content length, or parser excerpt.
+  user-global skills and user instructions (`<euler home>/AGENTS.md`, the
+  manifest's optional `user_instructions` record); they persist no repository
+  source body, project-skill body, per-source content hash, exact content
+  length, or parser excerpt.
   Version-1 snapshots omit `manifest_admitted` and `skill_count`; their
   admitted status alone controls manifest presence and their legacy manifests
   cannot contain skills. Each schema has an exact key whitelist: v1 records
