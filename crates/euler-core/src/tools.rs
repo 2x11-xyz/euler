@@ -56,6 +56,20 @@ Update an existing file (one or more `@@` hunks; hunk lines start with a space f
  }
 *** End Patch"#;
 
+/// Every core model tool name (`docs/contracts/tools.md`). Profile `tools`
+/// rules without an extension id must match one of them (ADR 0027 section 8).
+pub(crate) const CORE_TOOL_NAMES: [&str; 9] = [
+    "read_file",
+    "edit_file",
+    "write_file",
+    "apply_patch",
+    "run_shell",
+    "git_status",
+    "git_diff",
+    "tool_result_get",
+    "skill_read",
+];
+
 const DEFAULT_MAX_BYTES: usize = 16 * 1024;
 const DEFAULT_MAX_LINES: usize = 400;
 const DEFAULT_SHELL_TIMEOUT_MS: u64 = 120_000;

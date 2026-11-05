@@ -855,7 +855,11 @@ extension error does not consume the later result.
   `tmp`, `caches`, `credentials`, `approvals`, `escalation`,
   `background_jobs`, `reviewer`, the values of the capabilities contract,
   "Execution profiles"); `reviewer` is the reviewer the session uses, so it
-  matches `permission_reviewer`. `fields_sha256` is SHA-256 over the
+  matches `permission_reviewer`. `rules`, `ask_timeout`, and
+  `extension_reviewers` (ADR 0027) appear only when set, so a profile
+  without them records the same `fields` and digest as before; `rules` is
+  the ordered list of layers that apply, each `{ "layer": "profile" |
+  "overlay" | "subagent", "rules": {...} }`. `fields_sha256` is SHA-256 over the
   compact JSON of `fields` with keys sorted (no whitespace), so a reader
   recomputes it from the logged object. Current writers always emit it;
   streams written before this release omit it, which means not recorded:

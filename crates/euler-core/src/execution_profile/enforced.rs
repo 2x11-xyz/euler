@@ -7,7 +7,9 @@
 //! honors `writable_paths` and `credentials`. `escalation` is enforced on
 //! either shape: an escalated command leaves the boundary through the
 //! permission gate, not the sandbox. Any other mix is refused with the
-//! first field this build cannot deliver.
+//! first field this build cannot deliver. A profile that sets a permission
+//! field of ADR 0027 (`NOT_ENFORCED_YET`) is refused too: this build parses
+//! and records those fields but the gate does not enforce them.
 
 use super::{
     full, locked, workspace, ApprovalsSetting, CredentialsSetting, NetworkSetting, ProfileFields,
@@ -16,11 +18,22 @@ use super::{
 use crate::sandbox::{SandboxProfile, SubprocessSandbox, WorkspaceNetworkAccess};
 use std::path::{Path, PathBuf};
 
+/// The ADR 0027 fields this build parses and records but does not enforce.
+pub(super) const NOT_ENFORCED_YET: [&str; 3] = ["rules", "ask_timeout", "extension_reviewers"];
+
 /// The subprocess sandbox for `fields`, or the first field this build cannot
 /// enforce on this host.
 pub(super) fn subprocess_sandbox(
     fields: &ProfileFields,
 ) -> Result<SubprocessSandbox, &'static str> {
+    let permission_fields_set = [
+        !fields.rules.is_empty(),
+        fields.ask_timeout.is_some(),
+        !fields.extension_reviewers.is_empty(),
+    ];
+    if let Some(index) = permission_fields_set.iter().position(|set| *set) {
+        return Err(NOT_ENFORCED_YET[index]);
+    }
     let backend_enforced = match fields.sandbox {
         SandboxSetting::On => true,
         SandboxSetting::Bubblewrap => cfg!(target_os = "linux"),
