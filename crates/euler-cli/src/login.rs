@@ -22,7 +22,9 @@ pub(crate) fn login_args_for_provider(
     // Built-in ids other than chatgpt keep their environment-key setup; any
     // other id names a custom provider from providers.json.
     if canonical_provider_id(&provider_id).is_some() && provider_id != "chatgpt" {
-        return Err(anyhow!("login is only supported with --provider chatgpt"));
+        return Err(anyhow!(
+            "login supports chatgpt and custom providers from providers.json, not built-in provider {provider_id}"
+        ));
     }
     Ok(LoginArgs { provider_id })
 }
@@ -85,7 +87,7 @@ fn run_custom_provider_login(
     AuthStorage::new(&auth_path)?.set(
         provider_id,
         StoredCredential::ApiKey {
-            key: StoredSecretString::new(key),
+            key: StoredSecretString::new(escape_stored_api_key(key)),
         },
     )?;
     writeln!(
@@ -94,6 +96,18 @@ fn run_custom_provider_login(
         auth_path.display()
     )?;
     Ok(())
+}
+
+/// `AuthStorage::resolve_api_key` reads stored keys as config values, where a
+/// leading `$` names an environment variable and a leading `!` a command. A
+/// typed key is a literal, so one starting with either character gets a `$`
+/// escape (`$$...` reads back as `$...`, `$!...` as `!...`).
+fn escape_stored_api_key(key: &str) -> String {
+    if key.starts_with('$') || key.starts_with('!') {
+        format!("${key}")
+    } else {
+        key.to_owned()
+    }
 }
 
 /// Reads the key without echo when stdin is a terminal, and as one line
@@ -353,6 +367,34 @@ mod tests {
                 assert_eq!(key.expose_secret(), "gateway-secret")
             }
             other => panic!("expected api key credential, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_provider_login_stores_keys_starting_with_dollar_or_bang_as_literals() {
+        for key in [
+            "$gateway-secret",
+            "!gateway-secret",
+            "${GATEWAY}",
+            "$$x",
+            "$!x",
+            "$",
+            "!",
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let auth_path = temp.path().join("auth.json");
+
+            let (result, _) = custom_login(BEARER_ENTRY, "gw", key, &auth_path);
+
+            result.expect("login");
+            let resolved = AuthStorage::new(&auth_path)
+                .expect("storage")
+                .resolve_api_key("gw", None);
+            assert_eq!(
+                resolved.as_ref().map(|key| key.expose_secret()),
+                Some(key),
+                "{key}"
+            );
         }
     }
 

@@ -17,7 +17,9 @@ pub(crate) fn logout_args_for_provider(
     }
     // As with login, any id that is not built-in names a custom provider.
     if canonical_provider_id(&provider_id).is_some() && provider_id != "chatgpt" {
-        return Err(anyhow!("logout is only supported with --provider chatgpt"));
+        return Err(anyhow!(
+            "logout supports chatgpt and custom providers from providers.json, not built-in provider {provider_id}"
+        ));
     }
     Ok(LogoutArgs { provider_id })
 }

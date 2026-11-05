@@ -228,7 +228,9 @@ stored key and has none fails with an auth error naming
 
 `euler login --provider <id>`, for an id that is not built-in, stores that
 key for an existing entry: it prompts for the key without echo (or reads one
-line from a non-terminal stdin) and writes it to the auth file. It refuses,
+line from a non-terminal stdin) and writes it to the auth file as a literal
+(a key starting with `$` or `!` gets the `$` escape, so it is never read back
+as an environment or command reference). It refuses,
 storing nothing, when `providers.json` has no loaded entry for the id, when
 the entry sets an `api_key` spec (the error says to remove `api_key` to use a
 stored key), when the entry does not set `auth_header: true` (a stored key

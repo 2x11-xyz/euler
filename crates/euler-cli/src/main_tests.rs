@@ -2173,7 +2173,7 @@ fn login_parse_rejects_invalid_shapes() {
         ),
         (
             &["login", "--provider", "anthropic"],
-            "login is only supported with --provider chatgpt",
+            "login supports chatgpt and custom providers from providers.json, not built-in provider anthropic",
         ),
         (
             &["login", "--provider", "chatgpt", "--auth-file", "auth.json"],
@@ -2227,7 +2227,7 @@ fn logout_parse_rejects_invalid_shapes() {
         ),
         (
             &["logout", "--provider", "anthropic"],
-            "logout is only supported with --provider chatgpt",
+            "logout supports chatgpt and custom providers from providers.json, not built-in provider anthropic",
         ),
         (&["logout"], "logout requires explicit --provider <id>"),
         (

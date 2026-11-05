@@ -11,7 +11,8 @@ pull requests that landed them; deeper design rationale lives in
 - **New**: `euler login --provider <id>` stores an API key for a
   `providers.json` provider that sets `"auth_header": true` and no
   `api_key`, so the key no longer has to live in the environment or the
-  file. The key is read without echo (or from a pipe) and kept in
+  file. The key is read without echo (or from a pipe) and kept as a
+  literal (even when it starts with `$` or `!`) in
   `~/.euler/auth.json`, which seeds the redactor like other stored
   credentials. **New prompt (flagged)**: the hidden `API key:` prompt.
 - An `api_key` spec in the entry wins: login refuses such an entry and says

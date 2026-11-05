@@ -5,12 +5,14 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
-const STORED_KEY: &str = "stored-login-key-0123456789";
+// The leading `!` checks that login stores the key as a literal rather than a
+// command reference.
+const STORED_KEY: &str = "!stored-login-key-0123456789";
 
 fn euler(home: &Path, args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_euler"))
@@ -104,6 +106,19 @@ fn read_request(stream: &mut impl Read) -> String {
     String::from_utf8_lossy(&buffer).into_owned()
 }
 
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir).expect("read dir") {
+        let path = entry.expect("dir entry").path();
+        if path.is_dir() {
+            files.extend(files_under(&path));
+        } else {
+            files.push(path);
+        }
+    }
+    files
+}
+
 #[test]
 fn login_stores_key_that_requests_send_and_logout_removes_it() {
     let home = tempfile::tempdir().expect("home");
@@ -128,8 +143,9 @@ fn login_stores_key_that_requests_send_and_logout_removes_it() {
         "{login_stdout}"
     );
     assert!(!login_stdout.contains(STORED_KEY));
+    assert!(!text(&login.stderr).contains(STORED_KEY));
     let auth = text(&fs::read(home.path().join(".euler/auth.json")).expect("auth.json"));
-    assert!(auth.contains(STORED_KEY));
+    assert!(auth.contains(&format!("${STORED_KEY}")), "{auth}");
 
     let status = euler(home.path(), &["auth", "status"], "");
     let status_stdout = text(&status.stdout);
@@ -149,6 +165,20 @@ fn login_stores_key_that_requests_send_and_logout_removes_it() {
             .contains(&format!("authorization: bearer {STORED_KEY}")),
         "{request}"
     );
+    assert!(!text(&exec.stdout).contains(STORED_KEY));
+    assert!(!text(&exec.stderr).contains(STORED_KEY));
+    let euler_home = home.path().join(".euler");
+    let written = files_under(&euler_home);
+    assert!(
+        written.iter().any(|path| path.ends_with("events.jsonl")),
+        "exec wrote no session events: {written:?}"
+    );
+    for path in written {
+        if path != euler_home.join("auth.json") {
+            let contents = text(&fs::read(&path).expect("read written file"));
+            assert!(!contents.contains(STORED_KEY), "{}", path.display());
+        }
+    }
 
     let logout = euler(home.path(), &["logout", "--provider", "gw"], "");
     assert!(logout.status.success(), "stderr: {}", text(&logout.stderr));
