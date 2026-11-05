@@ -19,6 +19,17 @@ pull requests that landed them; deeper design rationale lives in
 - The session snapshot records the file's label (`user/AGENTS.md`), byte
   length, digest, and redacted content, like user-global skills.
 
+### Root instructions v3: brief replies to greetings
+
+- The fixed root instructions ask the model to be concise and to answer a
+  greeting or small talk briefly and ask what to work on, without listing its
+  capabilities unless asked. The task-completion, verification, and tool
+  rules are kept, and the text is no longer than before. Child agents
+  without their own system prompt inherit the same text.
+  `system_instructions_version` is now `3`, so provenance distinguishes calls
+  made under the new text. A session resumed across the update misses the
+  provider prompt cache once, because the instruction prefix changed.
+
 ### TUI: the first-run profile choice opens inside the app
 
 - **Behavior change**: the first `euler` / `euler tui` launch (or resume)

@@ -39,6 +39,26 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[test]
+fn system_instructions_digest_is_pinned_to_its_version() {
+    // Provenance identifies the instruction text by version. Any edit to
+    // SYSTEM_INSTRUCTIONS must bump SYSTEM_INSTRUCTIONS_VERSION and update
+    // this pin, so two different texts never share a version.
+    assert_eq!(
+        (
+            SYSTEM_INSTRUCTIONS_VERSION,
+            system_instruction_bytes(),
+            system_instructions_sha256().as_str()
+        ),
+        (
+            3,
+            1127,
+            "81028414605b3c651334f0afd1bddd3409a3b4d1d77ac5694cecbe3c8d6510a0"
+        ),
+        "SYSTEM_INSTRUCTIONS changed: bump SYSTEM_INSTRUCTIONS_VERSION and update this pin"
+    );
+}
+
+#[test]
 fn explicit_skill_command_parser_reserves_only_the_byte_zero_prefix() {
     assert_eq!(
         parse_skill_command("/skill:review focus\nmore").expect("valid command"),
