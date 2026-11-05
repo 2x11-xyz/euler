@@ -86,6 +86,97 @@ fn custom_provider_reports_resolved_secrets_to_installed_sink() {
     );
 }
 
+/// A provider with `auth_header: true` and no `api_key`, as written for a key
+/// stored by `euler login --provider <id>`.
+fn stored_key_config(base_url: &str) -> CustomProviderConfig {
+    CustomProviderConfig {
+        auth_header: true,
+        ..custom_config(base_url, None, [])
+    }
+}
+
+fn stored_key_lookup(key: Option<&'static str>) -> crate::custom_provider::StoredApiKeyLookup {
+    Arc::new(move |provider_id: &str| {
+        assert_eq!(provider_id, "local-openai");
+        Ok(key.map(crate::auth::SecretString::new))
+    })
+}
+
+#[test]
+fn custom_provider_without_api_key_sends_and_reports_stored_key() {
+    let (base_url, request_rx) = spawn_sse_server();
+    let provider = CustomOpenAiProvider::from_config(stored_key_config(&base_url))
+        .expect("custom provider")
+        .with_stored_api_key(stored_key_lookup(Some("stored-login-secret")));
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink_seen = Arc::clone(&seen);
+    provider.set_resolved_secret_sink(Arc::new(move |value: &str| {
+        sink_seen.lock().expect("sink lock").push(value.to_owned());
+    }));
+
+    provider.validate_auth().expect("stored key satisfies auth");
+    provider
+        .invoke(model_request("custom-model"))
+        .expect("invoke")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stream");
+
+    let request = request_rx.recv().expect("server request");
+    assert!(request
+        .to_ascii_lowercase()
+        .contains("authorization: bearer stored-login-secret"));
+    assert!(seen
+        .lock()
+        .expect("seen lock")
+        .contains(&"stored-login-secret".to_owned()));
+}
+
+#[test]
+fn custom_provider_api_key_spec_wins_over_stored_key() {
+    let (base_url, request_rx) = spawn_sse_server();
+    let provider =
+        CustomOpenAiProvider::from_config(custom_config(&base_url, Some("configured-secret"), []))
+            .expect("custom provider")
+            .with_stored_api_key(stored_key_lookup(Some("stored-login-secret")));
+
+    provider
+        .invoke(model_request("custom-model"))
+        .expect("invoke")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("stream");
+
+    let request = request_rx
+        .recv()
+        .expect("server request")
+        .to_ascii_lowercase();
+    assert!(request.contains("authorization: bearer configured-secret"));
+    assert!(!request.contains("stored-login-secret"));
+}
+
+#[test]
+fn custom_provider_missing_stored_key_names_login_command() {
+    let provider = CustomOpenAiProvider::from_config(stored_key_config("http://127.0.0.1:9/v1"))
+        .expect("custom provider")
+        .with_stored_api_key(stored_key_lookup(None));
+
+    let validate = provider.validate_auth().expect_err("no key");
+    let invoke = match provider.invoke(model_request("custom-model")) {
+        Ok(_) => panic!("request without a key must fail"),
+        Err(error) => error,
+    };
+
+    for error in [validate, invoke] {
+        assert_eq!(error.category(), ProviderErrorCategory::Auth);
+        assert!(
+            error
+                .message()
+                .contains("run `euler login --provider local-openai`"),
+            "{}",
+            error.message()
+        );
+    }
+}
+
 #[test]
 fn custom_provider_omits_stream_usage_when_disabled() {
     let (base_url, request_rx) = spawn_sse_server();

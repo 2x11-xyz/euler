@@ -215,6 +215,30 @@ output limit, tool and reasoning support, compat), which is how an unlisted
 holds no valid entries, or that omits `models` without a valid string
 `default_model`, is ignored with a warning that names both fixes.
 
+### Stored keys
+
+A provider with `auth_header: true` sends `Authorization: Bearer <key>`. The
+key is its `api_key` spec (see the secrets contract) when the entry sets one,
+otherwise the API-key credential stored in the auth file under the provider
+id. An `api_key` spec always wins. The stored key is read when the provider
+validates its auth at launch or `/model`, and again at each request, so a key
+stored during a session is used by its next request. A provider that needs a
+stored key and has none fails with an auth error naming
+`euler login --provider <id>`.
+
+`euler login --provider <id>`, for an id that is not built-in, stores that
+key for an existing entry: it prompts for the key without echo (or reads one
+line from a non-terminal stdin) and writes it to the auth file. It refuses,
+storing nothing, when `providers.json` has no loaded entry for the id, when
+the entry sets an `api_key` spec (the error says to remove `api_key` to use a
+stored key), when the entry does not set `auth_header: true` (a stored key
+would not be sent), or when the key is empty. It does not edit
+`providers.json` and does not contact the provider. `euler logout --provider
+<id>` removes the stored key, leaves the entry, and says so. `euler auth
+status` lists each stored custom-provider key after the built-in providers,
+without its value. Built-in ids other than `chatgpt` still reject `login` and
+`logout`.
+
 ### API families and endpoints
 
 A provider's `api_family` is `openai_chat_completions`,

@@ -2,8 +2,10 @@ use anyhow::{anyhow, Result};
 use euler_core::auth_storage::{
     AuthStorage, Credential as StoredCredential, SecretString as StoredSecretString,
 };
+use euler_provider::catalog::canonical_provider_id;
 use euler_provider::chatgpt::{ChatGptDeviceCode, ChatGptDeviceLogin, ChatGptLoginCredential};
-use std::io::{self, Write};
+use euler_provider::provider_config::ProviderConfigRegistry;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::Path;
 
 pub(crate) struct LoginArgs {
@@ -17,15 +19,114 @@ pub(crate) fn login_args_for_provider(
     if auth_file_from_cli {
         return Err(anyhow!("--auth-file is not supported with login"));
     }
-    if provider_id != "chatgpt" {
+    // Built-in ids other than chatgpt keep their environment-key setup; any
+    // other id names a custom provider from providers.json.
+    if canonical_provider_id(&provider_id).is_some() && provider_id != "chatgpt" {
         return Err(anyhow!("login is only supported with --provider chatgpt"));
     }
     Ok(LoginArgs { provider_id })
 }
 
-pub(crate) fn login_chatgpt(login: LoginArgs) -> Result<()> {
-    let mut flow = RealChatGptLoginFlow::new();
-    run_chatgpt_login(&login.provider_id, &mut flow, None, io::stdout())
+pub(crate) fn run_login(login: LoginArgs) -> Result<()> {
+    if login.provider_id == "chatgpt" {
+        let mut flow = RealChatGptLoginFlow::new();
+        return run_chatgpt_login(&login.provider_id, &mut flow, None, io::stdout());
+    }
+    let provider_config = crate::provider_config_runtime::resolve_provider_config_path()?;
+    let custom_providers =
+        crate::cli::providers::load_custom_provider_config(Some(&provider_config));
+    run_custom_provider_login(
+        &login.provider_id,
+        &custom_providers,
+        &provider_config,
+        None,
+        read_hidden_key,
+        io::stdout(),
+    )
+}
+
+/// Stores an API key for an existing `providers.json` entry that sends
+/// `Authorization: Bearer` (`auth_header: true`) and sets no `api_key` spec.
+fn run_custom_provider_login(
+    provider_id: &str,
+    custom_providers: &ProviderConfigRegistry,
+    provider_config: &Path,
+    storage_path: Option<&Path>,
+    read_key: impl FnOnce() -> Result<String>,
+    mut output: impl Write,
+) -> Result<()> {
+    let config = provider_config.display();
+    let Some(provider) = custom_providers.provider(provider_id) else {
+        return Err(anyhow!(
+            "no provider {provider_id} in {config}; add an entry with auth_header: true, then run euler login --provider {provider_id}"
+        ));
+    };
+    if provider.api_key.is_some() {
+        return Err(anyhow!(
+            "provider {provider_id} sets api_key in {config}; remove api_key to use a stored key"
+        ));
+    }
+    if !provider.auth_header {
+        return Err(anyhow!(
+            "provider {provider_id} does not set auth_header: true in {config}, so a stored key would not be sent; set auth_header: true"
+        ));
+    }
+    write!(output, "API key: ")?;
+    output.flush()?;
+    let key = read_key()?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(anyhow!("no API key entered; nothing was stored"));
+    }
+    let auth_path = match storage_path {
+        Some(path) => path.to_path_buf(),
+        None => AuthStorage::default_path()?,
+    };
+    AuthStorage::new(&auth_path)?.set(
+        provider_id,
+        StoredCredential::ApiKey {
+            key: StoredSecretString::new(key),
+        },
+    )?;
+    writeln!(
+        output,
+        "Stored the key for {provider_id} in {}.",
+        auth_path.display()
+    )?;
+    Ok(())
+}
+
+/// Reads the key without echo when stdin is a terminal, and as one line
+/// otherwise, so a key can also be piped in.
+fn read_hidden_key() -> Result<String> {
+    let stdin = io::stdin();
+    if !stdin.is_terminal() {
+        let mut line = String::new();
+        stdin.read_line(&mut line)?;
+        return Ok(line);
+    }
+    crossterm::terminal::enable_raw_mode()?;
+    let key = read_key_until_enter(stdin.lock());
+    crossterm::terminal::disable_raw_mode()?;
+    println!();
+    key
+}
+
+/// Raw-mode line reading: Enter ends the key, Backspace deletes, and Ctrl-C
+/// or Ctrl-D cancels.
+fn read_key_until_enter(input: impl BufRead) -> Result<String> {
+    let mut key = Vec::new();
+    for byte in input.bytes() {
+        match byte? {
+            b'\r' | b'\n' => break,
+            0x03 | 0x04 => return Err(anyhow!("login cancelled; nothing was stored")),
+            0x08 | 0x7f => {
+                key.pop();
+            }
+            byte => key.push(byte),
+        }
+    }
+    String::from_utf8(key).map_err(|_| anyhow!("the API key is not valid UTF-8"))
 }
 
 trait ChatGptLoginFlow {
@@ -202,6 +303,94 @@ mod tests {
 
         assert_eq!(error.to_string(), "authorization denied");
         assert!(!auth_path.exists());
+    }
+
+    fn registry(entry: &str) -> ProviderConfigRegistry {
+        let (registry, warnings) =
+            ProviderConfigRegistry::with_json(&format!(r#"{{"providers": {{"gw": {entry}}}}}"#));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        registry
+    }
+
+    const BEARER_ENTRY: &str = r#"{"api_family": "openai_chat_completions", "base_url": "https://gateway.example.com/v1", "auth_header": true, "default_model": "m"}"#;
+
+    fn custom_login(
+        entry: &str,
+        provider_id: &str,
+        key: &str,
+        auth_path: &Path,
+    ) -> (Result<()>, String) {
+        let mut output = Vec::new();
+        let key = key.to_owned();
+        let result = run_custom_provider_login(
+            provider_id,
+            &registry(entry),
+            Path::new("/home/user/.euler/providers.json"),
+            Some(auth_path),
+            move || Ok(key),
+            &mut output,
+        );
+        (result, String::from_utf8(output).expect("utf8"))
+    }
+
+    #[test]
+    fn custom_provider_login_stores_trimmed_key_as_api_key_credential() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let auth_path = temp.path().join("auth.json");
+
+        let (result, output) = custom_login(BEARER_ENTRY, "gw", " gateway-secret\n", &auth_path);
+
+        result.expect("login");
+        assert_eq!(
+            output,
+            format!(
+                "API key: Stored the key for gw in {}.\n",
+                auth_path.display()
+            )
+        );
+        match AuthStorage::new(&auth_path).expect("storage").get("gw") {
+            Some(StoredCredential::ApiKey { key }) => {
+                assert_eq!(key.expose_secret(), "gateway-secret")
+            }
+            other => panic!("expected api key credential, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn custom_provider_login_refusals_store_nothing() {
+        let without_auth_header = r#"{"api_family": "openai_chat_completions", "base_url": "https://gateway.example.com/v1", "default_model": "m"}"#;
+        let cases = [
+            (BEARER_ENTRY, "other", "key", "no provider other in /home/user/.euler/providers.json; add an entry with auth_header: true, then run euler login --provider other"),
+            (without_auth_header, "gw", "key", "provider gw does not set auth_header: true in /home/user/.euler/providers.json, so a stored key would not be sent; set auth_header: true"),
+            (BEARER_ENTRY, "gw", "  \n", "no API key entered; nothing was stored"),
+        ];
+        for (entry, provider_id, key, expected) in cases {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let auth_path = temp.path().join("auth.json");
+
+            let (result, _) = custom_login(entry, provider_id, key, &auth_path);
+
+            assert_eq!(result.expect_err("refused").to_string(), expected);
+            assert!(!auth_path.exists(), "{expected}");
+        }
+    }
+
+    #[test]
+    fn hidden_key_reader_handles_backspace_and_cancel() {
+        assert_eq!(
+            read_key_until_enter(&b"sk-ab\x7fc\rignored"[..]).expect("key"),
+            "sk-ac"
+        );
+        assert_eq!(
+            read_key_until_enter(&b"sk-abc"[..]).expect("key at EOF"),
+            "sk-abc"
+        );
+        assert_eq!(
+            read_key_until_enter(&b"sk-\x03"[..])
+                .expect_err("ctrl-c")
+                .to_string(),
+            "login cancelled; nothing was stored"
+        );
     }
 
     struct FakeLoginFlow {

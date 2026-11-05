@@ -1262,7 +1262,9 @@ fn tui_provider_set_preserves_provider_owned_auth_errors_after_switch() {
         .expect("custom switch"));
     let error = session.run_turn("hello").expect_err("missing api key");
     let message = error.to_string();
-    assert!(message.contains("custom provider `local-openai` api_key is required"));
+    assert!(message.contains(
+        "custom provider `local-openai` has no api_key and no stored key; run `euler login --provider local-openai`"
+    ));
     assert!(!message.contains("provider is not configured"));
 }
 
@@ -2095,6 +2097,23 @@ fn logout_parse_accepts_chatgpt_provider() {
     ));
 }
 
+/// A non-built-in id names a custom provider; `providers.json` is read only
+/// when the command runs.
+#[test]
+fn login_and_logout_parse_accept_custom_provider_id() {
+    let login = parse_args_without_env(["login", "--provider", "My-Gateway"]);
+    let logout = parse_args_without_env(["logout", "--provider", "my-gateway"]);
+
+    assert!(matches!(
+        login.command,
+        Command::Login(LoginArgs { provider_id }) if provider_id == "my-gateway"
+    ));
+    assert!(matches!(
+        logout.command,
+        Command::Logout(LogoutArgs { provider_id }) if provider_id == "my-gateway"
+    ));
+}
+
 #[test]
 fn auth_status_parse_accepts_minimal_command() {
     let args = parse_args_without_env(["auth", "status"]);
@@ -2127,10 +2146,7 @@ fn login_parse_rejects_missing_cli_provider_even_when_env_selects_chatgpt() {
         Err(error) => error,
     };
 
-    assert_eq!(
-        error.to_string(),
-        "login requires explicit --provider chatgpt"
-    );
+    assert_eq!(error.to_string(), "login requires explicit --provider <id>");
 }
 
 #[test]
@@ -2140,11 +2156,11 @@ fn login_and_logout_require_explicit_cli_provider() {
 
     assert_eq!(
         login_error.to_string(),
-        "login requires explicit --provider chatgpt"
+        "login requires explicit --provider <id>"
     );
     assert_eq!(
         logout_error.to_string(),
-        "logout requires explicit --provider chatgpt"
+        "logout requires explicit --provider <id>"
     );
 }
 
@@ -2213,7 +2229,7 @@ fn logout_parse_rejects_invalid_shapes() {
             &["logout", "--provider", "anthropic"],
             "logout is only supported with --provider chatgpt",
         ),
-        (&["logout"], "logout requires explicit --provider chatgpt"),
+        (&["logout"], "logout requires explicit --provider <id>"),
         (
             &[
                 "logout",

@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use euler_core::auth_storage::{AuthSource, AuthState, AuthStorage, Credential};
+use euler_provider::catalog::canonical_provider_id;
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -14,14 +15,40 @@ pub(crate) fn logout_args_for_provider(
     if auth_file_from_cli {
         return Err(anyhow!("--auth-file is not supported with logout"));
     }
-    if provider_id != "chatgpt" {
+    // As with login, any id that is not built-in names a custom provider.
+    if canonical_provider_id(&provider_id).is_some() && provider_id != "chatgpt" {
         return Err(anyhow!("logout is only supported with --provider chatgpt"));
     }
     Ok(LogoutArgs { provider_id })
 }
 
-pub(crate) fn logout_chatgpt(logout: LogoutArgs) -> Result<()> {
-    logout_chatgpt_with_path(&logout.provider_id, None, io::stdout())
+pub(crate) fn run_logout(logout: LogoutArgs) -> Result<()> {
+    if logout.provider_id == "chatgpt" {
+        return logout_chatgpt_with_path(&logout.provider_id, None, io::stdout());
+    }
+    logout_custom_provider_with_path(&logout.provider_id, None, io::stdout())
+}
+
+/// Removes a custom provider's stored key; its `providers.json` entry stays.
+fn logout_custom_provider_with_path(
+    provider_id: &str,
+    storage_path: Option<&Path>,
+    mut output: impl Write,
+) -> Result<()> {
+    let mut storage = match storage_path {
+        Some(path) => AuthStorage::new(path)?,
+        None => AuthStorage::new_default()?,
+    };
+    if !storage.contains_provider_entry(provider_id) {
+        writeln!(output, "{provider_id} has no stored key.")?;
+        return Ok(());
+    }
+    storage.remove(provider_id)?;
+    writeln!(
+        output,
+        "Removed the stored key for {provider_id}. Its providers.json entry is unchanged."
+    )?;
+    Ok(())
 }
 
 fn logout_chatgpt_with_path(
@@ -69,6 +96,12 @@ fn write_auth_status(storage: &AuthStorage, mut output: impl Write) -> Result<()
         &mut output,
     )?;
     write_auth_status_line(storage, "xai", Some("XAI_API_KEY"), &mut output)?;
+    // Custom providers appear once `euler login --provider <id>` stored a key.
+    for provider in storage.list() {
+        if canonical_provider_id(&provider).is_none() {
+            write_auth_status_line(storage, &provider, None, &mut output)?;
+        }
+    }
     Ok(())
 }
 
@@ -301,6 +334,51 @@ mod tests {
         assert!(!output.contains("logout-access-secret"));
         assert!(!output.contains("logout-refresh-secret"));
         assert!(!AuthStorage::new(&path).expect("storage").has("chatgpt"));
+    }
+
+    #[test]
+    fn status_output_lists_stored_custom_provider_keys_without_secrets() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = auth_path(&temp);
+        let mut storage = AuthStorage::new(&path).expect("storage");
+        storage
+            .set("gw", api_key("status-gateway-secret"))
+            .expect("set");
+        let mut output = Vec::new();
+
+        print_auth_status_with_path(Some(&path), &mut output).expect("status");
+        let output = String::from_utf8(output).expect("utf8");
+
+        assert!(
+            output.ends_with("gw: configured=true source=stored status=valid\n"),
+            "{output}"
+        );
+        assert!(!output.contains("status-gateway-secret"));
+    }
+
+    #[test]
+    fn custom_provider_logout_removes_only_that_key() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = auth_path(&temp);
+        let mut storage = AuthStorage::new(&path).expect("storage");
+        storage
+            .set("gw", api_key("logout-gateway-secret"))
+            .expect("set gw");
+        storage
+            .set("chatgpt", oauth("access", "refresh", u64::MAX))
+            .expect("set chatgpt");
+        let mut output = Vec::new();
+
+        logout_custom_provider_with_path("gw", Some(&path), &mut output).expect("logout");
+        logout_custom_provider_with_path("gw", Some(&path), &mut output).expect("logout again");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf8"),
+            "Removed the stored key for gw. Its providers.json entry is unchanged.\ngw has no stored key.\n"
+        );
+        let storage = AuthStorage::new(&path).expect("storage");
+        assert!(!storage.has("gw"));
+        assert!(storage.has("chatgpt"));
     }
 
     #[test]

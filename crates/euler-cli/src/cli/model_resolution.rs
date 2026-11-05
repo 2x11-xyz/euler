@@ -158,12 +158,16 @@ fn resolved_provider_id(
         .unwrap_or_else(|| FIXTURE_PROVIDER_ID.to_owned()))
 }
 
-pub(crate) fn raw_known_provider_id(parsed: &RawArgs) -> Result<String> {
-    parsed
+/// The `--provider` id for login and logout: a built-in provider's canonical
+/// id, or the normalized id of a custom provider, which is checked against
+/// `providers.json` only when the command runs.
+pub(crate) fn raw_auth_provider_id(parsed: &RawArgs) -> Result<String> {
+    let provider = parsed
         .provider
         .as_deref()
-        .ok_or_else(|| anyhow!("missing provider"))
-        .and_then(parse_known_provider_id)
+        .ok_or_else(|| anyhow!("missing provider"))?;
+    let normalized = normalized_provider_id(provider)?;
+    Ok(canonical_provider_id(&normalized).map_or(normalized, str::to_owned))
 }
 
 pub(crate) fn raw_provider_id(
