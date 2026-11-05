@@ -16,6 +16,12 @@ each PR updates its owning contract.
 Amended (2026-10-29): the built-in headless default is `full`, the same as
 interactive, instead of `workspace` (resolved question 11).
 
+Amended by ADR 0027 (2026-10-29): profiles gain `rules`, `ask_timeout`, and
+`extension_reviewers`. A user's `ask` rule prompts even under
+`approvals: never` (section 1), a `deny` rule refuses a request, an
+escalation included, before it reaches the reviewer, and a never-prompt
+decider's deny covers only its request instead of the rest of the turn.
+
 ## Context
 
 Euler has become too restrictive for a research agent. Its value should be
