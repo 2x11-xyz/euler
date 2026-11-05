@@ -373,7 +373,7 @@ is not tracked.
   `escalation: allowed`, and `credentials` set on a sandbox-off profile) are
   startup errors naming the file and field. A missing file means the built-in defaults; an unresolvable
   Euler home reads no file and says so on stderr.
-- **Permission rules (ADR 0027, parsed and recorded, not enforced yet).**
+- **Permission rules (ADR 0027).**
   A profile may set `rules` (an object with ordered `shell`, `path`,
   `outside_workspace`, and `tools` arrays of `{pattern, state, access?,
   reason?}` with `state` `allow`, `ask`, or `deny`), `ask_timeout` (whole
@@ -401,16 +401,70 @@ is not tracked.
   profile's `ask` and `deny` rules join as further layers unless a layer
   with the same label already holds exactly those rules; a lower
   `ask_timeout` and added `extension_reviewers` apply, the recorded ones
-  stay, and the summary names the fields joined this way. This build
-  refuses at startup any profile, overlay, child, or resume that sets one
-  of these fields, naming the field, because the gate does not enforce
-  them yet; when only the recording sets one, the error names the recorded
-  profile and `--profile`. Validation here is syntax only: the ADR 0027
-  section 8 checks that need installed extensions (the hint for a `tools`
-  pattern that matches an extension's model-visible tool name, the notice
-  for an extension id that is not installed, and the error for an
+  stay, and the summary names the fields joined this way. The gate
+  enforces `shell` and `tools` rules ("Permission rules in the gate"
+  below). This build refuses at startup any profile, overlay, child, or
+  resume that sets `ask_timeout`, `extension_reviewers`, or a `path` or
+  `outside_workspace` rule, naming the field (`rules.path`,
+  `rules.outside_workspace`), because the gate does not enforce them yet;
+  when only the recording sets one, the error names the recorded profile
+  and `--profile`. Validation here is syntax only: the ADR 0027 section 8
+  checks that need installed extensions (the hint for a `tools` pattern
+  that matches an extension's model-visible tool name, the notice for an
+  extension id that is not installed, and the error for an
   `extension_reviewers` entry that is not enabled or has no reviewer
-  descriptor) are not implemented, so this refusal stays until they are.
+  descriptor) are not implemented yet, and no ADR 0027 rollout step names
+  the first two; until they land, a `tools` rule naming an extension id
+  that is not installed matches nothing without notice.
+- **Permission rules in the gate (ADR 0027 section 3).** The gate decides
+  a request in this order: a configured `always-deny`; a `deny` rule
+  (`always-deny`, the escalated form of a command included); an
+  escalation (asks where the profile allows escalation, else denied); the
+  floor (a dangerous request asks a human); an `ask` rule; the profile's
+  `approvals` and the sensitive-path ask; then an `allow` rule, which turns
+  an ask from `approvals` or the configured mode into an allow for that
+  request only. An `allow` never lifts a floor or sensitive-path ask and
+  never overrides a configured `always-deny`, including the headless
+  auto-approve tier's. `shell` rules match each command of the full
+  `run_shell` text (or an extension's shell command): each command of a
+  list or pipeline, each command substitution, and the literal and
+  unwrapped form of each wrapper the danger walk unwraps, as words joined
+  by single spaces. A pattern is anchored at both ends, `*` matches any
+  run of characters, and a trailing ` *` also matches nothing. A command
+  is `deny` if any command in it is, else `ask` if any is, else `allow`
+  only if every command is. A command with a dynamic word, an unknown
+  wrapper option, a stdin script, or a parse error is unresolved, as is a
+  declaration (`export`, `declare`, `unset`) and a statement with no
+  command (`> out.txt`, `PATH=./bin`): its source text is matched and no
+  `allow` rule applies to it, so a catch-all `deny` still covers it.
+  `tools` rules match the core tool name or `<extension-id>.<command>`; an
+  `apply_patch` heredoc sent through `run_shell` is matched as
+  `apply_patch`, the tool core runs it as. A `tools` `allow` does not apply
+  to a shell command (`run_shell` or an extension's) with an unresolved
+  command either. Within a surface of one layer the last
+  matching rule wins; surfaces and layers combine by most restrictive. A
+  `deny` rule refuses the request without asking anyone and covers that
+  request only: the capability is not denied for the rest of the turn, and
+  the tool error names the rule and its `reason` and tells the model not to
+  work around it. An `ask` rule prompts under every profile, `full`
+  included; neither static-safe analysis nor a grant settles it, its prompt
+  is once-only (allow once or deny) and names the rule and its `reason`,
+  and an allow installs no grant. A guardian may review it as any ask. An
+  escalated command that matches an `ask` rule takes the escalation ask
+  (section 3 puts escalation first), so an escalation session grant for
+  its first token may cover it later. Rules apply to root and child tool
+  calls, extension model tools and commands (an operation takes its
+  strictest request: one `deny` refuses it before the extension runs, and
+  `ask` requests share one once-only prompt), and lifecycle work, where a
+  `tools` rule that asks or denies is never standing authority. A tool or
+  extension command that needs no capability is gated by its `tools` rule
+  too: its prompt and decision carry `fs-read` (core tools) or
+  `extension-state` (extension commands) as a label only: the ask is
+  once-only, so answering it installs no grant and changes no mode, and a
+  person's deny of it does not deny that capability for the rest of the
+  turn. An extension operation records an `allow` rule's decisions only
+  when it is authorized to run: after the person allows its other
+  requests, if any ask.
 - **Selection.** `--profile <name>` on `euler` and `euler exec`, then
   `/profile` in the TUI, then the context default in `profiles.json`, then
   the built-in default: `full` for both interactive and headless. An unknown

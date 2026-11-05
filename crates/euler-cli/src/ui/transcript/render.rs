@@ -442,6 +442,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                 scope_prefix,
                 user_rule_prefix,
                 no_grant_reason,
+                ask_rule_note,
                 escalation_reason,
                 prior_count,
                 selected_option,
@@ -456,6 +457,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                         scope_prefix: scope_prefix.as_deref(),
                         user_rule_prefix: user_rule_prefix.as_deref(),
                         no_grant_reason: *no_grant_reason,
+                        ask_rule_note: ask_rule_note.as_deref(),
                         escalation_reason: escalation_reason.as_deref(),
                         prior_count: *prior_count,
                         selected_option: *selected_option,
@@ -468,6 +470,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
             TranscriptItem::PermissionBatchAsk {
                 operation,
                 capabilities,
+                ask_rule_notes,
                 selected_option,
             } => {
                 render_permission_batch_ask(
@@ -475,6 +478,7 @@ pub(super) fn render_projected_entries_with_expansion_and_offsets(
                     PermissionBatchAskView {
                         operation,
                         capabilities,
+                        ask_rule_notes,
                         selected_option: *selected_option,
                     },
                     theme,

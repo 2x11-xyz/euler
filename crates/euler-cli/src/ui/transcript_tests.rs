@@ -290,6 +290,7 @@ fn operation_permission_panel_names_the_operation_and_every_capability() {
             "fs-write".to_owned(),
             "network".to_owned(),
         ],
+        ask_rule_notes: Vec::new(),
         selected_option: super::patch_approval::ApprovalOption::AllowOnce,
     }];
 
@@ -303,6 +304,22 @@ fn operation_permission_panel_names_the_operation_and_every_capability() {
     assert!(rendered.contains("n  Deny"));
     assert!(!rendered.contains("Allow all requested capabilities in this project"));
     assert!(!rendered.contains("always"));
+}
+
+#[test]
+fn operation_permission_panel_names_the_rules_that_ask() {
+    let items = vec![TranscriptItem::PermissionBatchAsk {
+        operation: "extension code-swarm.review".to_owned(),
+        capabilities: vec!["network".to_owned()],
+        ask_rule_notes: vec![
+            "Asked by the tools rule \"code-swarm.*\": No paid model reviews.".to_owned(),
+        ],
+        selected_option: super::patch_approval::ApprovalOption::AllowOnce,
+    }];
+
+    let rendered = line_texts(&render_items_for_history(&items, &Theme::default(), 96)).join("\n");
+
+    assert!(rendered.contains("Asked by the tools rule \"code-swarm.*\": No paid model reviews."));
 }
 
 #[test]

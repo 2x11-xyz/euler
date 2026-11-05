@@ -96,6 +96,9 @@ pub(in crate::ui::transcript) struct PermissionAskView<'a> {
     /// once-only): the panel shows only allow-once and deny, plus this
     /// reason as a muted line.
     pub(in crate::ui::transcript) no_grant_reason: Option<&'static str>,
+    /// `Some` when a permission rule caused the ask: the rule and its
+    /// reason, as a muted line (ADR 0027 section 1).
+    pub(in crate::ui::transcript) ask_rule_note: Option<&'a str>,
     /// `Some` for an escalation: the panel names the host run and its
     /// reason, and offers at most a session grant.
     pub(in crate::ui::transcript) escalation_reason: Option<&'a str>,
@@ -107,6 +110,7 @@ pub(in crate::ui::transcript) struct PermissionAskView<'a> {
 pub(in crate::ui::transcript) struct PermissionBatchAskView<'a> {
     pub(in crate::ui::transcript) operation: &'a str,
     pub(in crate::ui::transcript) capabilities: &'a [String],
+    pub(in crate::ui::transcript) ask_rule_notes: &'a [String],
     pub(in crate::ui::transcript) selected_option: crate::ui::patch_approval::ApprovalOption,
 }
 
@@ -224,6 +228,9 @@ pub(in crate::ui::transcript) fn render_permission_ask(
             PermissionPanelRow::body(line.text)
         }
     }));
+    if let Some(note) = ask.ask_rule_note {
+        rows.push(PermissionPanelRow::metadata(note));
+    }
     if let Some(reason) = ask.no_grant_reason {
         rows.push(PermissionPanelRow::metadata(reason));
     }
@@ -253,8 +260,13 @@ pub(in crate::ui::transcript) fn render_permission_batch_ask(
         ),
         PermissionPanelRow::body(ask.operation),
         PermissionPanelRow::metadata(format!("requests: {capabilities}")),
-        PermissionPanelRow::body(String::new()),
     ];
+    rows.extend(
+        ask.ask_rule_notes
+            .iter()
+            .map(|note| PermissionPanelRow::metadata(note.as_str())),
+    );
+    rows.push(PermissionPanelRow::body(String::new()));
     rows.extend(
         [
             (

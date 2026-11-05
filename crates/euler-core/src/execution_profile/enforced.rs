@@ -8,8 +8,9 @@
 //! either shape: an escalated command leaves the boundary through the
 //! permission gate, not the sandbox. Any other mix is refused with the
 //! first field this build cannot deliver. A profile that sets a permission
-//! field of ADR 0027 (`NOT_ENFORCED_YET`) is refused too: this build parses
-//! and records those fields but the gate does not enforce them.
+//! field of ADR 0027 the gate does not enforce yet (`NOT_ENFORCED_YET`) is
+//! refused too: `ask_timeout`, `extension_reviewers`, and `path` or
+//! `outside_workspace` rules. `shell` and `tools` rules are enforced.
 
 use super::{
     full, locked, workspace, ApprovalsSetting, CredentialsSetting, NetworkSetting, ProfileFields,
@@ -18,12 +19,16 @@ use super::{
 use crate::sandbox::{SandboxProfile, SubprocessSandbox, WorkspaceNetworkAccess};
 use std::path::{Path, PathBuf};
 
-/// The ADR 0027 fields this build parses and records but does not enforce.
-/// Their validation checks syntax only; the ADR 0027 section 8 checks that
-/// need installed extensions (extension tool name hint, unknown extension id
-/// notice, enabled `extension_reviewers` with a descriptor) must land before
-/// a field leaves this list.
-pub(super) const NOT_ENFORCED_YET: [&str; 3] = ["rules", "ask_timeout", "extension_reviewers"];
+/// The ADR 0027 fields and rule surfaces this build parses and records but
+/// does not enforce. `extension_reviewers` validation checks syntax only;
+/// the check for an enabled reviewer with a descriptor must land before it
+/// leaves this list.
+pub(super) const NOT_ENFORCED_YET: [&str; 4] = [
+    "rules.path",
+    "rules.outside_workspace",
+    "ask_timeout",
+    "extension_reviewers",
+];
 
 /// The subprocess sandbox for `fields`, or the first field this build cannot
 /// enforce on this host.
@@ -31,7 +36,14 @@ pub(super) fn subprocess_sandbox(
     fields: &ProfileFields,
 ) -> Result<SubprocessSandbox, &'static str> {
     let permission_fields_set = [
-        !fields.rules.is_empty(),
+        fields
+            .rules
+            .iter()
+            .any(|layer| !layer.rules.path.is_empty()),
+        fields
+            .rules
+            .iter()
+            .any(|layer| !layer.rules.outside_workspace.is_empty()),
         fields.ask_timeout.is_some(),
         !fields.extension_reviewers.is_empty(),
     ];

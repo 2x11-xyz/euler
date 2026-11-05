@@ -4708,6 +4708,7 @@ impl AppCore {
                     scope_prefix,
                     user_rule_prefix: self.modal_user_rule_prefix(),
                     no_grant_reason: patch_approval::no_grant_reason(request),
+                    ask_rule_note: request.ask_rule_note(),
                     escalation_reason: request.escalation.clone(),
                     companion_name: self.in_flight_companion_name.clone(),
                 })
@@ -4717,6 +4718,11 @@ impl AppCore {
                 capabilities: batch
                     .capabilities()
                     .map(|capability| capability.as_str().to_owned())
+                    .collect(),
+                ask_rule_notes: batch
+                    .ask_rules()
+                    .into_iter()
+                    .map(euler_core::execution_profile::RuleMatch::ask_note)
                     .collect(),
                 selected_option: self.approval_selection,
             }),

@@ -1,7 +1,8 @@
 use super::{
-    approval_mode_str, elapsed_ms, permission_decision_payload, ExtensionExecutionError, Session,
-    SessionError,
+    approval_mode_str, elapsed_ms, insert_rule_fields, permission_decision_payload,
+    rule_decision_payload, rule_denial, ExtensionExecutionError, Session, SessionError,
 };
+use crate::execution_profile::{RuleMatch, RuleState};
 use crate::extensions::{
     ExtensionHost, ExtensionHostError, ExtensionInvocationOrigin, ExtensionSpawner,
     ProjectConfigWriteApprover, QueuedExtensionEvents,
@@ -13,7 +14,7 @@ use crate::permissions::{
     PermissionRequestBatch,
 };
 use euler_agents::{AgentBudget, AgentError, AgentTask};
-use euler_event::{object, EventKind};
+use euler_event::{object, EventKind, JsonObject};
 use euler_sdk::{
     AgentOutcome, CancellationToken, Capability, Extension, ExtensionError, Invocation,
     SpawnAgentTask,
@@ -115,6 +116,15 @@ impl ExtensionExecutionError {
 /// session thread while the extension command executes. The command blocks
 /// synchronously inside each host call, so the `RefCell` borrow can never be
 /// contended.
+/// One extension operation's permission requests before its prompt: those
+/// that still need an answer, each with the rule that caused its ask, and
+/// those an `allow` rule covers once, recorded only if the operation goes
+/// ahead.
+struct ExtensionPermissionBatch {
+    pending: Vec<(PermissionRequest, Option<RuleMatch>)>,
+    rule_allowed: Vec<(PermissionRequest, RuleMatch)>,
+}
+
 struct SessionSpawner<'s, D> {
     session: RefCell<&'s mut Session<D>>,
     queue: Arc<QueuedExtensionEvents>,
@@ -217,6 +227,39 @@ impl<D: PermissionDecider> ProjectConfigWriteApprover for SessionSpawner<'_, D> 
             &self.cancellation,
         )
     }
+}
+
+/// The `permission.prompt` of one extension operation's batch, with the
+/// rules whose asks it carries (ADR 0027 section 9).
+fn batch_prompt_payload(
+    batch: &PermissionRequestBatch,
+    extension_id: &str,
+    command: &str,
+) -> JsonObject {
+    let capabilities = Value::Array(
+        batch
+            .capabilities()
+            .map(|capability| capability.as_str().to_owned().into())
+            .collect(),
+    );
+    let mut prompt = object([
+        ("capability", batch.requests()[0].capability.as_str().into()),
+        ("capabilities", capabilities),
+        ("reason", batch.operation().to_owned().into()),
+        ("operation", batch.operation().to_owned().into()),
+        ("batch", true.into()),
+        ("extension_id", extension_id.into()),
+        ("command", command.into()),
+    ]);
+    let asked_rules = batch
+        .ask_rules()
+        .into_iter()
+        .map(RuleMatch::record)
+        .collect::<Vec<_>>();
+    if !asked_rules.is_empty() {
+        prompt.insert("rules".to_owned(), Value::Array(asked_rules));
+    }
+    prompt
 }
 
 fn outcome_from_summary(summary: super::AgentResultSummary) -> AgentOutcome {
@@ -411,23 +454,52 @@ impl<D> Session<D> {
         )
     }
 
+    /// The requests of one extension operation that still need an answer,
+    /// each with the rule that caused its ask, if one did, and the requests
+    /// an `allow` rule covers once (ADR 0027 section 3). A `deny` rule
+    /// records its decision here and refuses the whole operation before the
+    /// extension runs.
     fn extension_permission_batch(
-        &self,
+        &mut self,
         operation: String,
+        tool: &str,
         required: &[Capability],
         shell_command: Option<&str>,
-    ) -> Result<Option<PermissionRequestBatch>, ExtensionExecutionError>
+    ) -> Result<ExtensionPermissionBatch, ExtensionExecutionError>
     where
         D: crate::permissions::PermissionDecider,
     {
-        let mut pending = Vec::new();
+        let mut pending: Vec<(PermissionRequest, Option<RuleMatch>)> = Vec::new();
+        let mut rule_allowed: Vec<(PermissionRequest, RuleMatch)> = Vec::new();
+        if required.is_empty() {
+            // A `tools` rule applies to a command that needs no capability
+            // too. Its prompt and decision carry `extension-state` as a
+            // label only: the ask is once-only, so no grant or mode change
+            // follows.
+            let mut request = PermissionRequest::new(Capability::ExtensionState, operation.clone())
+                .with_tool(tool);
+            request.capability_is_label = true;
+            if let Some(rule) = self.permissions.rule_match(&request) {
+                match rule.state() {
+                    RuleState::Deny => return Err(self.rule_denied(&request, &rule)),
+                    RuleState::Ask => {
+                        pending.push((request.with_ask_rule(rule.clone()), Some(rule)));
+                    }
+                    RuleState::Allow => {}
+                }
+            }
+            return Ok(ExtensionPermissionBatch {
+                pending,
+                rule_allowed,
+            });
+        }
         for &capability in required {
             // The request is built BEFORE the mode is consulted, so the
             // danger walk runs on every path — under a blanket
             // `session-allow` too. Building it inside the `ask` arm let an
             // extension invoked with `{"command": "rm -rf scratch"}` run
             // unprompted while `run_shell` with the same string asked.
-            let mut request = PermissionRequest::new(capability, operation.clone());
+            let mut request = PermissionRequest::new(capability, operation.clone()).with_tool(tool);
             if capability == Capability::ShellExec {
                 match shell_command {
                     // Walked exactly as `run_shell` is.
@@ -444,28 +516,80 @@ impl<D> Session<D> {
                 .permissions
                 .configured_mode(capability)
                 .unwrap_or(ApprovalMode::Ask);
-            // `PermissionGate::mode_for_request` on the configured mode:
+            // `PermissionGate::ruling_for_request` on the configured mode:
             // `always-deny` still denies, the execution profile's override
             // applies, and a dangerous or sensitive request rides no
             // blanket allowance (ADR 0021 decision D).
-            let mode = self.permissions.effective_mode(configured, &request);
-            match mode {
-                ApprovalMode::SessionAllow => {}
-                ApprovalMode::AlwaysDeny => {
+            let ruling = self.permissions.effective_ruling(configured, &request);
+            match (ruling.mode, ruling.rule) {
+                (ApprovalMode::AlwaysDeny, Some(rule)) => {
+                    return Err(self.rule_denied(&request, &rule));
+                }
+                (ApprovalMode::AlwaysDeny, None) => {
                     return Err(ExtensionExecutionError::CapabilityDenied { capability });
                 }
-                ApprovalMode::Ask => {
-                    if self.permissions.granted_source(&request).is_none()
+                (ApprovalMode::SessionAllow, Some(rule)) => rule_allowed.push((request, rule)),
+                (ApprovalMode::SessionAllow, None) => {}
+                (ApprovalMode::Ask, rule) => {
+                    // A rule-caused ask is covered by no grant (ADR 0027
+                    // resolved question 6).
+                    if (rule.is_some() || self.permissions.granted_source(&request).is_none())
                         && !pending
                             .iter()
-                            .any(|request: &PermissionRequest| request.capability == capability)
+                            .any(|(request, _)| request.capability == capability)
                     {
-                        pending.push(request);
+                        let request = match &rule {
+                            Some(rule) => request.with_ask_rule(rule.clone()),
+                            None => request,
+                        };
+                        pending.push((request, rule));
                     }
                 }
             }
         }
-        Ok((!pending.is_empty()).then(|| PermissionRequestBatch::new(operation, pending)))
+        Ok(ExtensionPermissionBatch {
+            pending,
+            rule_allowed,
+        })
+    }
+
+    /// Record the `allow` rule decisions of an extension operation that
+    /// goes ahead, with the fields its batch decisions carry.
+    fn record_extension_rule_allows(
+        &mut self,
+        rule_allowed: &[(PermissionRequest, RuleMatch)],
+        (operation, extension_id, command): (&str, &str, &str),
+    ) -> Result<(), ExtensionExecutionError>
+    where
+        D: crate::permissions::PermissionDecider,
+    {
+        for (request, rule) in rule_allowed {
+            let mut payload = rule_decision_payload(request, rule, true);
+            payload.insert("operation".to_owned(), operation.into());
+            payload.insert("extension_id".to_owned(), extension_id.into());
+            payload.insert("command".to_owned(), command.into());
+            self.emit(EventKind::PERMISSION_DECISION, payload)?;
+        }
+        Ok(())
+    }
+
+    /// Record a `deny` rule's decision for one request of an extension
+    /// operation and return the error that refuses the operation.
+    fn rule_denied(
+        &mut self,
+        request: &PermissionRequest,
+        rule: &RuleMatch,
+    ) -> ExtensionExecutionError
+    where
+        D: crate::permissions::PermissionDecider,
+    {
+        if let Err(error) = self.emit(
+            EventKind::PERMISSION_DECISION,
+            rule_decision_payload(request, rule, false),
+        ) {
+            return error.into();
+        }
+        ExtensionExecutionError::RuleDenied(rule_denial(rule))
     }
 
     pub(super) fn approve_extension_capabilities_cancellable(
@@ -486,34 +610,24 @@ impl<D> Session<D> {
             return Err(ExtensionExecutionError::Cancelled);
         }
         let operation = format!("extension {extension_id}.{command}");
-        let Some(batch) = self.extension_permission_batch(operation, required, shell_command)?
-        else {
-            return if cancellation.is_cancelled() {
-                Err(ExtensionExecutionError::Cancelled)
-            } else {
-                Ok(())
-            };
-        };
+        let tool = format!("{extension_id}.{command}");
+        let ExtensionPermissionBatch {
+            pending,
+            rule_allowed,
+        } = self.extension_permission_batch(operation.clone(), &tool, required, shell_command)?;
+        let (pending, rules): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
+        if pending.is_empty() {
+            if cancellation.is_cancelled() {
+                return Err(ExtensionExecutionError::Cancelled);
+            }
+            return self
+                .record_extension_rule_allows(&rule_allowed, (&operation, extension_id, command));
+        }
+        let batch = PermissionRequestBatch::new(operation, pending);
         let primary = batch.requests()[0].capability;
-        let capabilities = Value::Array(
-            batch
-                .capabilities()
-                .map(|capability| capability.as_str().to_owned().into())
-                .collect(),
-        );
+        let prompt = batch_prompt_payload(&batch, extension_id, command);
         let prompt_id = self
-            .emit(
-                EventKind::PERMISSION_PROMPT,
-                object([
-                    ("capability", primary.as_str().into()),
-                    ("capabilities", capabilities),
-                    ("reason", batch.operation().to_owned().into()),
-                    ("operation", batch.operation().to_owned().into()),
-                    ("batch", true.into()),
-                    ("extension_id", extension_id.into()),
-                    ("command", command.into()),
-                ]),
-            )
+            .emit(EventKind::PERMISSION_PROMPT, prompt)
             .map_err(|_| ExtensionExecutionError::CapabilityDenied {
                 capability: primary,
             })?;
@@ -530,12 +644,13 @@ impl<D> Session<D> {
             .iter()
             .find(|decision| !decision.allowed())
             .map(|decision| decision.capability);
-        for decision in &decisions {
+        for ((decision, request), rule) in decisions.iter().zip(batch.requests()).zip(&rules) {
             let mut payload = permission_decision_payload(
                 decision,
                 approval_mode_str(ApprovalMode::Ask),
                 ApprovalMode::Ask,
             );
+            insert_rule_fields(&mut payload, request, rule.as_ref());
             payload.insert("batch".to_owned(), true.into());
             payload.insert("operation".to_owned(), batch.operation().to_owned().into());
             payload.insert("extension_id".to_owned(), extension_id.into());
@@ -557,7 +672,7 @@ impl<D> Session<D> {
         if let Some(capability) = denied {
             return Err(ExtensionExecutionError::CapabilityDenied { capability });
         }
-        Ok(())
+        self.record_extension_rule_allows(&rule_allowed, (batch.operation(), extension_id, command))
     }
 
     /// Ask a human to approve one project-tier extension config write started
@@ -868,19 +983,21 @@ mod tests {
     #[test]
     fn extension_shell_request_without_a_command_is_never_grant_covered() {
         let temp = tempfile::tempdir().expect("temp");
-        let session = session_with_unscoped_shell_grant(temp.path());
+        let mut session = session_with_unscoped_shell_grant(temp.path());
 
         // A walkable, harmless command still rides the unscoped grant:
         // nothing pending, no prompt.
         let covered = session
             .extension_permission_batch(
                 "extension ext.run".to_owned(),
+                "ext.run",
                 &[Capability::ShellExec],
                 Some("ls -la"),
             )
-            .expect("batch");
+            .expect("batch")
+            .pending;
         assert!(
-            covered.is_none(),
+            covered.is_empty(),
             "a walked, harmless command should ride the unscoped grant"
         );
 
@@ -889,12 +1006,15 @@ mod tests {
         let pending = session
             .extension_permission_batch(
                 "extension ext.run".to_owned(),
+                "ext.run",
                 &[Capability::ShellExec],
                 None,
             )
             .expect("batch")
+            .pending;
+        let (request, _) = pending
+            .first()
             .expect("an unwalkable shell request must reach a prompt");
-        let request = &pending.requests()[0];
         assert!(request.dangerous_command);
         assert!(session.permissions.granted_source(request).is_none());
     }
@@ -913,24 +1033,30 @@ mod tests {
             let pending = session
                 .extension_permission_batch(
                     "extension ext.run".to_owned(),
+                    "ext.run",
                     &[Capability::ShellExec],
                     command,
                 )
                 .expect("batch")
+                .pending;
+            let (request, _) = pending
+                .first()
                 .expect("a dangerous or unreadable command must reach a prompt");
-            assert!(pending.requests()[0].dangerous_command, "{command:?}");
+            assert!(request.dangerous_command, "{command:?}");
         }
 
         // An ordinary command still rides the mode.
         let allowed = session
             .extension_permission_batch(
                 "extension ext.run".to_owned(),
+                "ext.run",
                 &[Capability::ShellExec],
                 Some("ls -la"),
             )
-            .expect("batch");
+            .expect("batch")
+            .pending;
         assert!(
-            allowed.is_none(),
+            allowed.is_empty(),
             "session-allow still allows ordinary work"
         );
     }
