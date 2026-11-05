@@ -194,6 +194,28 @@ Rules, enforced at load with warnings for anything malformed:
   `models` is present but empty or not an array (even with `default_model`
   set), is ignored with a warning.
 
+### Gateway setup with `euler login`
+
+`euler login --provider <id>` adds a gateway without editing
+`providers.json` (see the [quickstart](quickstart.md)). It reads the base URL
+and the key as one line each from a non-terminal stdin, so a provisioning
+script can run it once per machine:
+
+```sh
+printf '%s\n%s\n' https://litellm.example.com "$LITELLM_API_KEY" |
+  euler login --provider litellm
+```
+
+Login verifies the URL and key by listing the gateway's models and exits
+non-zero, storing nothing, when that fails for a new id. For an existing
+entry whose URL is kept (an empty first line, or the same URL), a failure
+other than a rejected key instead asks whether to save the key without
+discovery, and end of input answers yes. On success it writes the key to the auth file, the
+entry (with `"discovery": true`) to `providers.json`, and the model list to
+the discovery cache, so the next headless launch routes from the cache
+without a network wait. To keep the key out of the auth file, write the
+entry by hand with an `api_key` spec instead.
+
 ### One gateway, several API families
 
 A gateway such as a LiteLLM proxy serves Claude models natively over

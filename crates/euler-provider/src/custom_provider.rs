@@ -1,7 +1,7 @@
 //! Runtime provider construction for custom `providers.json` entries.
 
 use crate::auth::SecretString;
-use crate::gateway_discovery::GatewayDiscovery;
+use crate::gateway_discovery::{DiscoveryError, GatewayDiscovery};
 use crate::provider_config::{ApiFamily, CustomProviderConfig, DiscoverySource};
 use crate::{
     observed_http_agent, ModelProvider, ModelRequest, ProviderError, ProviderStream,
@@ -75,14 +75,19 @@ impl CustomOpenAiProvider {
 
     /// Runs gateway discovery (ADR 0025) with this provider's resolved key
     /// and header specs, the way a model request resolves them.
-    pub fn discover_models(&self) -> Result<GatewayDiscovery, String> {
-        let resolved = self.resolve_headers().map_err(|error| error.to_string())?;
+    pub fn discover_models(&self) -> Result<GatewayDiscovery, DiscoveryError> {
+        let resolved = self
+            .resolve_headers()
+            .map_err(|error| DiscoveryError::from(error.to_string()))?;
         crate::gateway_discovery::discover(
             &self.config.base_url,
             self.config.api_family,
             &resolved.headers,
         )
-        .map_err(|error| scrub_secrets(error, &resolved.secrets))
+        .map_err(|error| DiscoveryError {
+            message: scrub_secrets(error.message, &resolved.secrets),
+            key_rejected: error.key_rejected,
+        })
     }
 
     fn report_resolved_secret(&self, value: &SecretString) {

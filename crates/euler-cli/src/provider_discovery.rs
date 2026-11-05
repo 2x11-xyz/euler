@@ -93,7 +93,7 @@ impl CachedDiscovery {
 
 /// Writes a successful discovery atomically, owner-only. Concurrent writers
 /// are last-writer-wins.
-fn write_cache(
+pub(crate) fn write_cache(
     cache_dir: &Path,
     provider_id: &str,
     base_url: &str,
@@ -133,7 +133,7 @@ fn write_cache(
     written.with_context(|| format!("could not write {}", target.display()))
 }
 
-fn create_private_dir(dir: &Path) -> Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -159,7 +159,8 @@ pub(crate) fn refresh_provider(
     let discovery = CustomOpenAiProvider::from_config(provider.clone())
         .map_err(|error| error.to_string())?
         .with_stored_api_key(Arc::new(crate::cli::providers::stored_custom_api_key))
-        .discover_models()?;
+        .discover_models()
+        .map_err(|error| error.message)?;
     let previous = read_cache(cache_dir, &provider.id, &provider.base_url)
         .map(|cache| model_ids(&cache.discovered.models))
         .unwrap_or_default();

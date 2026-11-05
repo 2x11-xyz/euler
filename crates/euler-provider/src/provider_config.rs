@@ -522,13 +522,23 @@ fn discovery_base_url(base_url: &str) -> bool {
     Url::parse(base_url).is_ok_and(|url| url.path().trim_end_matches('/').ends_with("/v1"))
 }
 
+/// The rule a `providers.json` provider id must follow, as printed in errors.
+pub const CUSTOM_PROVIDER_ID_RULE: &str =
+    "custom provider ids must be lowercase ASCII letters, numbers, '-' or '_'";
+
+/// Whether `id` follows [`CUSTOM_PROVIDER_ID_RULE`]. Built-in ids pass this
+/// check and are reserved separately.
+pub fn custom_provider_id_is_valid(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
 fn valid_provider_id(id: &str, warnings: &mut Vec<String>) -> Option<String> {
-    let valid_chars = id
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
-    if id.is_empty() || id.trim() != id || id != id.to_ascii_lowercase() || !valid_chars {
+    if !custom_provider_id_is_valid(id) {
         warnings.push(format!(
-            "ignored provider `{id}` because custom provider ids must be lowercase ASCII letters, numbers, '-' or '_'"
+            "ignored provider `{id}` because {CUSTOM_PROVIDER_ID_RULE}"
         ));
         return None;
     }
@@ -587,6 +597,42 @@ struct ProviderRoute<'a> {
     base_url: &'a str,
 }
 
+/// Normalizes a gateway URL typed at `euler login` to `<root>/v1` (ADR 0025
+/// section 1): trailing slashes and a trailing `/v1` removed, then `/v1`
+/// appended. A URL ending in a family endpoint path is refused, and so is one
+/// `providers.json` would ignore, so login never writes an ignored entry.
+/// Errors never echo the input, which may be a key sent on the wrong line or
+/// a URL with embedded credentials.
+pub fn login_base_url(input: &str) -> Result<String, String> {
+    let mut url = Url::parse(input.trim()).map_err(|_| {
+        "the base URL is not a valid URL; enter one such as https://gateway.example.com".to_owned()
+    })?;
+    let path = url.path().trim_end_matches('/').to_owned();
+    if let Some(suffix) = ApiFamily::ALL
+        .into_iter()
+        .map(ApiFamily::endpoint_suffix)
+        .find(|suffix| path.ends_with(suffix))
+    {
+        return Err(format!(
+            "the base URL ends in the endpoint path {suffix}; enter the gateway's base URL without it"
+        ));
+    }
+    url.set_path(&format!("{}/v1", path.strip_suffix("/v1").unwrap_or(&path)));
+    match valid_base_url(url.as_str()) {
+        Ok(()) => Ok(url.to_string()),
+        Err(NON_LOOPBACK_HTTP) => {
+            let mut https = url.clone();
+            let _ = https.set_scheme("https");
+            Err(format!(
+                "the base URL uses HTTP to a non-loopback host, so the key would travel unencrypted; use {https}"
+            ))
+        }
+        Err(reason) => Err(format!("the base URL {reason}")),
+    }
+}
+
+const NON_LOOPBACK_HTTP: &str = "uses non-loopback HTTP";
+
 fn valid_base_url(url: &str) -> Result<(), &'static str> {
     let parsed = Url::parse(url).map_err(|_| "must be a valid absolute http or https URL")?;
     if parsed.query().is_some() || parsed.fragment().is_some() {
@@ -602,7 +648,7 @@ fn valid_base_url(url: &str) -> Result<(), &'static str> {
         return Err("must not include embedded credentials");
     }
     if parsed.scheme() == "http" && !loopback_host(parsed.host().expect("checked host")) {
-        return Err("uses non-loopback HTTP");
+        return Err(NON_LOOPBACK_HTTP);
     }
     Ok(())
 }

@@ -228,16 +228,54 @@ stored during a session is used by its next request. A provider that needs a
 stored key and has none fails with an auth error naming
 `euler login --provider <id>`.
 
-`euler login --provider <id>`, for an id that is not built-in, stores that
-key for an existing entry: it prompts for the key without echo (or reads one
-line from a non-terminal stdin) and writes it to the auth file as a literal
-(a key starting with `$` or `!` gets the `$` escape, so it is never read back
-as an environment or command reference). It refuses,
-storing nothing, when `providers.json` has no loaded entry for the id, when
-the entry sets an `api_key` spec (the error says to remove `api_key` to use a
-stored key), when the entry does not set `auth_header: true` (a stored key
-would not be sent), or when the key is empty. It does not edit
-`providers.json` and does not contact the provider. `euler logout --provider
+`euler login --provider <id>`, for an id that is not built-in, sets up a
+gateway (ADR 0025 section 1). It prompts for the base URL (visible) and the
+key (without echo; a non-terminal stdin supplies one line each), so a new
+user needs no file edit:
+
+- **No entry for the id:** the base URL is required. It is normalized to
+  `<root>/v1` (trailing slashes and a trailing `/v1` removed, then `/v1`
+  appended) and printed. A URL ending in a family endpoint path
+  (`/chat/completions`, `/messages`, `/responses`) is refused, and so is
+  one this file would ignore, including HTTP to a non-loopback host (the
+  error suggests the `https` URL). Login then runs gateway discovery with
+  the typed key. On success it stores the key, then adds the entry
+  `{"api_family": "openai_chat_completions", "base_url": "<root>/v1",
+  "auth_header": true, "discovery": true}`, then writes the discovery
+  cache, and prints the model counts per family. On failure it stores
+  nothing and names the endpoint and the status or transport error; when
+  every request answered HTTP 401 or 403, the error says the key was
+  rejected.
+- **An entry with `auth_header: true` and no `api_key`:** the prompt shows
+  the current `base_url` as the default (Enter keeps it), and the same
+  normalization, verification, and writes apply; login sets `base_url` and
+  `discovery: true` and leaves every other field as written. When
+  discovery fails for a reason other than a rejected key (the gateway lists
+  no models or cannot be reached) and the typed base URL normalizes to the
+  entry's own (Enter, or the same URL in another form), login prints the
+  error and asks "Save the key without model discovery? [Y/n]" (Enter or
+  end of input means yes); yes stores the key unverified, leaves the entry unchanged, and
+  names the `base_url` the key is sent to; no stores nothing.
+
+Login refuses, storing nothing and before any prompt, an id that breaks the
+`providers.json` id rule (lowercase ASCII letters, numbers, `-`, `_`). Base
+URL errors name the problem but never echo the typed text, which may be a
+key sent on the wrong line or a URL with embedded credentials. Login also
+refuses, storing nothing, when the entry sets an `api_key` spec (the
+error says to remove `api_key` to use a stored key), when it does not set
+`auth_header: true` (a stored key would not be sent), when `providers.json`
+has an entry for the id that failed to load, when `providers.json` is not
+valid JSON (the file is left untouched and the error names it), or when the
+URL or key is empty. Keys are stored as literals (a key starting with `$`
+or `!` gets the `$` escape, so it is never read back as an environment or
+command reference). The key is written before the entry so a provider never
+points at a missing key; if the entry write fails, login restores the
+credential the key replaced (or removes it) and reports the error. A failed
+cache write is a warning, and the next launch fetches. `providers.json` is
+updated by parsing it, changing the one entry, keeping every other entry and
+field, and replacing the file atomically with its permissions preserved
+(owner-only for a new file); it is rewritten as formatted JSON with object
+keys in sorted order. `euler logout --provider
 <id>` removes the stored key, leaves the entry, and says so. `euler auth
 status` lists each stored custom-provider key after the built-in providers,
 without its value. Built-in ids other than `chatgpt` still reject `login` and
@@ -259,7 +297,8 @@ Requests go to the gateway root (`base_url` without trailing slashes and
 request. Redirects are not followed, each request has a 5-second deadline,
 one discovery run has a 10-second overall deadline, and a body over 4 MiB
 fails the request. Failure messages name the endpoint and the status or
-transport error, never a response body.
+transport error, never a response body, and begin "the key was rejected"
+when every request answered HTTP 401 or 403.
 
 1. `GET <root>/model/info`. A 200 whose `data` (or bare list) holds rows
    with a string `model_name` is the source. A wildcard route (a
@@ -324,9 +363,9 @@ per provider, its model count per family, the ids added and removed, and
 mapping notes; a failed provider keeps its cache, is reported, and makes the
 command fail after the others run. `euler models` reads the cache and lists
 discovered models with their provider, family, and `"source":
-"discovered"`. `euler login --provider <id>` refreshes a discovery
-provider's cache after it stores the key, so a key change takes effect at
-once. `/model` lists discovered models from the cache too. Known limit: the
+"discovered"`. `euler login --provider <id>` writes a discovery
+provider's cache from the discovery that verified the key, so a key change
+takes effect at once. `/model` lists discovered models from the cache too. Known limit: the
 running session keeps the provider list it launched with, so after a
 background refresh `/model` can offer an id that this session sends as an
 unlisted model (the provider family, no `model_source`) until the next

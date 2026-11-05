@@ -1,7 +1,8 @@
 //! Gateway discovery for a `providers.json` entry with `"discovery": true`
 //! (ADR 0025 rollout step 2): the first launch fetches the gateway's models,
 //! routes a Claude model to Messages, records `model_source`, and
-//! `euler models` lists the discovered models.
+//! `euler models` lists the discovered models. First-run login (rollout step
+//! 3) adds the entry, the key, and the cache in one command.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -214,7 +215,7 @@ fn first_launch_discovers_routes_claude_to_messages_and_records_the_model_source
 }
 
 #[test]
-fn login_refreshes_the_discovery_cache_with_the_stored_key() {
+fn login_for_an_existing_entry_writes_the_discovery_cache_with_the_stored_key() {
     let home = tempfile::tempdir().expect("home");
     let (base_url, requests) = spawn_gateway();
     let euler_home = write_providers(
@@ -228,14 +229,14 @@ fn login_refreshes_the_discovery_cache_with_the_stored_key() {
     let login = euler_with_stdin(
         home.path(),
         &["login", "--provider", "gw"],
-        "stored-gateway-key\n",
+        "\nstored-gateway-key\n",
     );
 
     assert!(login.status.success(), "stderr: {}", text(&login.stderr));
     let stdout = text(&login.stdout);
     assert!(
         stdout.contains(
-            "gw: discovered 2 models from /model/info: 1 anthropic_messages, 1 openai_chat_completions\n  added: claude-sonnet, gpt-4o\n"
+            "Found 2 models from /model/info: 1 anthropic_messages, 1 openai_chat_completions.\nUpdated provider gw in "
         ),
         "{stdout}"
     );
@@ -245,4 +246,70 @@ fn login_refreshes_the_discovery_cache_with_the_stored_key() {
     let cache = fs::read_to_string(euler_home.join("cache/provider-discovery/gw.json"))
         .expect("discovery cache");
     assert!(!cache.contains("stored-gateway-key"));
+}
+
+#[test]
+fn first_run_login_adds_a_gateway_whose_models_list_and_route_with_no_file_edits() {
+    let home = tempfile::tempdir().expect("home");
+    fs::create_dir_all(home.path().join(".git")).expect("repository marker");
+    let (base_url, requests) = spawn_gateway();
+    let root = base_url.trim_end_matches("/v1");
+
+    let login = euler_with_stdin(
+        home.path(),
+        &["login", "--provider", "gw"],
+        &format!("{root}/\nfirst-run-gateway-key\n"),
+    );
+
+    assert!(login.status.success(), "stderr: {}", text(&login.stderr));
+    let euler_home = home.path().join(".euler");
+    let stdout = text(&login.stdout);
+    assert!(
+        stdout.starts_with(&format!(
+            "Base URL: Using {base_url}\nAPI key: Found 2 models from /model/info: 1 anthropic_messages, 1 openai_chat_completions.\nAdded provider gw to "
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("/.euler/providers.json.\nStored the key for gw in "),
+        "{stdout}"
+    );
+    assert!(stdout.ends_with("/.euler/auth.json.\n"), "{stdout}");
+    let providers: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(euler_home.join("providers.json")).expect("providers.json"),
+    )
+    .expect("providers json");
+    assert_eq!(
+        providers,
+        serde_json::json!({"providers": {"gw": {
+            "api_family": "openai_chat_completions", "base_url": base_url,
+            "auth_header": true, "discovery": true
+        }}})
+    );
+    assert_eq!(requests.try_iter().count(), 1);
+
+    let models = euler(home.path(), &["models"]);
+    assert!(models.status.success(), "stderr: {}", text(&models.stderr));
+    let listing: serde_json::Value = serde_json::from_slice(&models.stdout).expect("models json");
+    let gateway = listing["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["id"] == "gw")
+        .expect("gw listed");
+    assert_eq!(gateway["models"].as_array().map(Vec::len), Some(2));
+
+    let exec = euler(
+        home.path(),
+        &["exec", "--model", "gw::claude-sonnet", "hello"],
+    );
+    assert!(exec.status.success(), "stderr: {}", text(&exec.stderr));
+    // The launch routes from the cache login wrote, so the only request is
+    // the Messages call.
+    let lines = requests.try_iter().collect::<Vec<_>>();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].starts_with("POST /v1/messages "), "{lines:?}");
+    for output in [&login.stdout, &login.stderr, &exec.stdout, &exec.stderr] {
+        assert!(!text(output).contains("first-run-gateway-key"));
+    }
 }

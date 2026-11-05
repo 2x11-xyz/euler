@@ -372,9 +372,39 @@ fn discovery_follows_no_redirect_and_names_endpoints_and_statuses_without_bodies
         .expect_err("failure");
 
     assert_eq!(
-        error,
+        error.message,
         format!("GET {root}/v1/models returned HTTP 500 (GET {root}/model/info returned HTTP 302)")
     );
+    assert!(!error.key_rejected);
+}
+
+#[test]
+fn discovery_says_the_key_was_rejected_only_when_every_request_answered_401_or_403() {
+    let (base_url, _requests) = spawn_gateway(vec![
+        ("/model/info", 403, "{}".to_owned()),
+        ("/v1/models", 401, "{}".to_owned()),
+    ]);
+    let root = base_url.trim_end_matches("/v1/");
+
+    let error = discovery_provider(&base_url)
+        .discover_models()
+        .expect_err("rejected");
+
+    assert_eq!(
+        error.message,
+        format!("the key was rejected: GET {root}/v1/models returned HTTP 401 (GET {root}/model/info returned HTTP 403)")
+    );
+    assert!(error.key_rejected);
+
+    let (base_url, _requests) = spawn_gateway(vec![
+        ("/model/info", 404, "{}".to_owned()),
+        ("/v1/models", 401, "{}".to_owned()),
+    ]);
+    let error = discovery_provider(&base_url)
+        .discover_models()
+        .expect_err("not found then rejected");
+    assert!(!error.key_rejected, "{error}");
+    assert!(!error.message.contains("rejected"), "{error}");
 }
 
 #[test]
@@ -394,7 +424,9 @@ fn discovery_refuses_a_body_over_4_mib() {
         .expect_err("oversized");
 
     assert!(
-        error.starts_with(&format!("GET {root}/v1/models returned a body over 4 MiB")),
+        error
+            .message
+            .starts_with(&format!("GET {root}/v1/models returned a body over 4 MiB")),
         "{error}"
     );
 }
@@ -419,7 +451,9 @@ fn discovery_refuses_a_body_over_4_mib_without_a_content_length() {
         .expect_err("oversized");
 
     assert!(
-        error.starts_with(&format!("GET {root}/v1/models returned a body over 4 MiB")),
+        error
+            .message
+            .starts_with(&format!("GET {root}/v1/models returned a body over 4 MiB")),
         "{error}"
     );
 }

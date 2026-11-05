@@ -1,6 +1,6 @@
 use crate::provider_config::{
-    parse_discovered_models, referenced_env_names, ApiFamily, CustomModelConfig, DiscoveredModels,
-    DiscoverySource, ProviderConfigRegistry,
+    login_base_url, parse_discovered_models, referenced_env_names, ApiFamily, CustomModelConfig,
+    DiscoveredModels, DiscoverySource, ProviderConfigRegistry,
 };
 
 #[test]
@@ -1152,4 +1152,76 @@ fn discovered_model_entries_round_trip_through_the_cache_shape() {
     let parsed = parse_discovered_models(&[model.entry_json(), messages.entry_json(), no_family]);
 
     assert_eq!(parsed, [model, messages]);
+}
+
+#[test]
+fn login_base_url_normalizes_to_v1_and_refuses_endpoint_paths_and_urls_providers_json_ignores() {
+    for (typed, expected) in [
+        (
+            "https://gateway.example.com",
+            "https://gateway.example.com/v1",
+        ),
+        (
+            "https://gateway.example.com/",
+            "https://gateway.example.com/v1",
+        ),
+        (
+            " https://gateway.example.com/v1/ ",
+            "https://gateway.example.com/v1",
+        ),
+        (
+            "https://gateway.example.com/proxy/v1",
+            "https://gateway.example.com/proxy/v1",
+        ),
+        ("http://127.0.0.1:4000", "http://127.0.0.1:4000/v1"),
+        ("http://localhost:4000/v1", "http://localhost:4000/v1"),
+    ] {
+        assert_eq!(login_base_url(typed).as_deref(), Ok(expected), "{typed}");
+    }
+    // No error echoes the input: a key piped on the URL line, or a URL with
+    // embedded credentials, must not reach the terminal.
+    for (typed, expected) in [
+        (
+            "https://gateway.example.com/v1/chat/completions",
+            "the base URL ends in the endpoint path /chat/completions; enter the gateway's base URL without it",
+        ),
+        (
+            "https://gateway.example.com/v1/messages/",
+            "the base URL ends in the endpoint path /messages; enter the gateway's base URL without it",
+        ),
+        (
+            "https://gateway.example.com/v1/responses",
+            "the base URL ends in the endpoint path /responses; enter the gateway's base URL without it",
+        ),
+        (
+            "https://user:url-secret@gateway.example.com/v1/responses",
+            "the base URL ends in the endpoint path /responses; enter the gateway's base URL without it",
+        ),
+        (
+            "http://gateway.example.com",
+            "the base URL uses HTTP to a non-loopback host, so the key would travel unencrypted; use https://gateway.example.com/v1",
+        ),
+        (
+            "sk-key-secret-123",
+            "the base URL is not a valid URL; enter one such as https://gateway.example.com",
+        ),
+        (
+            "sk:key-secret-123",
+            "the base URL must use http or https",
+        ),
+        (
+            "https://user:url-secret@gateway.example.com",
+            "the base URL must not include embedded credentials",
+        ),
+        (
+            "https://gateway.example.com?team=a",
+            "the base URL must not include query strings or fragments",
+        ),
+        (
+            "https://gateway.example.com/#frag",
+            "the base URL must not include query strings or fragments",
+        ),
+    ] {
+        assert_eq!(login_base_url(typed), Err(expected.to_owned()), "{typed}");
+    }
 }
