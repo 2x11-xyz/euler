@@ -712,9 +712,10 @@ impl<D> Session<D> {
                 capability: request.capability,
             })?;
         }
-        Err(ExtensionExecutionError::CapabilityDenied {
-            capability: batch.requests()[0].capability,
-        })
+        Err(ExtensionExecutionError::AskTimedOut(super::timeout_denial(
+            &self.config.execution_profile.name,
+            self.permissions.execution_profile().ask_timeout,
+        )))
     }
 
     /// Ask a human to approve one project-tier extension config write started

@@ -11,18 +11,19 @@ pull requests that landed them; deeper design rationale lives in
 - **New**: `ask_timeout` is enforced (ADR 0027, rollout step 5). When it
   passes, the TUI approval panel closes and the ask is denied with
   `decision_source: "timeout"`; the agent gets a tool error and carries on.
-  `0` asks no person. A child's ask runs at the lower of the parent's and
-  the child's timeout. The line-oriented prompt stays open until answered,
-  and an answer given after the timeout is discarded (the ask is a timeout
-  deny).
+  `0` asks no person. A timeout and an `ask_timeout: 0` deny cover that one
+  request, so the same capability is asked again later in the turn. A
+  child's ask runs at the lower of the parent's and the child's timeout.
+  The line-oriented prompt stays open until answered, and an answer given
+  after the timeout is discarded (the ask is a timeout deny).
 - **Changed**: each guardian review has a 60-second deadline. A review
   still running then, even one that keeps streaming, is cancelled and
   denies, recorded with `guardian_expired: true`.
 - **Changed (behavior change for headless `exec`)**: a deny from a run that
-  cannot ask anyone, a timeout, and an `ask_timeout: 0` deny cover that one
-  request. A later request of the same capability in the same turn is
-  decided again instead of being denied unasked. A person's deny and a
-  configured `always-deny` still hold for the rest of the turn.
+  cannot ask anyone covers that one request. A later request of the same
+  capability in the same turn is decided again instead of being denied
+  unasked. A person's deny and a configured `always-deny` still hold for
+  the rest of the turn.
 - New blocks: timed-out asks and expired guardian reviews deny. No new
   prompts.
 

@@ -354,6 +354,54 @@ fn a_child_ask_times_out_at_the_lower_timeout_for_that_request_only() {
     }
 }
 
+/// Section 4 and section 6: a child's ask answered by a never-prompt
+/// decider is denied for that request only, so the child's next request of
+/// the same capability is decided again.
+#[test]
+fn a_never_prompt_deny_of_a_child_ask_covers_that_request_only() {
+    let temp = tempfile::tempdir().expect("temp");
+    let mut config = SessionConfig::new(temp.path());
+    config.set_execution_profile(full_asking_printf(None));
+    let mut child = full_asking_printf(None);
+    child.name = "helper".to_owned();
+    config.subagent_profile = Some(child);
+    let provider = ScriptedProvider::new(vec![
+        FixtureResponse::ToolCalls(vec![
+            shell_call("call-one", "printf one"),
+            shell_call("call-two", "printf two"),
+        ]),
+        FixtureResponse::Assistant("done".to_owned()),
+    ]);
+    let writer = ProvenanceWriter::new(temp.path().join("events.jsonl")).expect("writer");
+    let mut session =
+        Session::new(config, provider, Waiting::never_prompting()).with_provenance(writer);
+    let summary = session
+        .spawn_companion(
+            AgentTask::new_inheriting_target("print", "default")
+                .expect("task")
+                .with_capabilities([Capability::ShellExec]),
+        )
+        .expect("companion");
+
+    assert_eq!(
+        session.permissions.decider_mut().asked,
+        2,
+        "the child's second request is decided again"
+    );
+    let events = session.events();
+    let decisions = of_kind(events, EventKind::PERMISSION_DECISION);
+    assert_eq!(decisions.len(), 2, "each child request is decided");
+    for decision in decisions {
+        assert_eq!(decision.payload.get("decision_source"), None);
+        assert_eq!(decision.payload["allowed"], json!(false));
+        assert_eq!(decision.agent, summary.child_agent_id);
+    }
+    for id in ["call-one", "call-two"] {
+        let error = error_of(result_for(events, id));
+        assert!(!error.contains("denied earlier this turn"), "{error}");
+    }
+}
+
 /// Section 4: an answer a decider returns after the timeout passed is
 /// discarded, even from a decider that never looks at its token (a
 /// blocking terminal read), and installs no grant.
@@ -448,7 +496,11 @@ fn an_extension_batch_ask_times_out_as_one_ask() {
         "run",
         &[Capability::FsWrite, Capability::Network],
     );
-    assert!(result.is_err(), "{result:?}");
+    let Err(crate::ExtensionExecutionError::AskTimedOut(message)) = result else {
+        panic!("a timed-out batch is an ask timeout: {result:?}");
+    };
+    assert!(message.contains("sets ask_timeout 0"), "{message}");
+    assert!(message.contains("covers this request only"), "{message}");
     assert_eq!(session.permissions.decider_mut().asked, 0);
     let events = session.events();
     let prompt = &of_kind(events, EventKind::PERMISSION_PROMPT)[0];

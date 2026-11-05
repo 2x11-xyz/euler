@@ -596,6 +596,11 @@ pub enum ExtensionExecutionError {
     /// the rule, so it is safe to surface verbatim.
     #[error("{0}")]
     RuleDenied(String),
+    /// The execution profile's `ask_timeout` denied the call's ask: nobody
+    /// answered in time, or `0` asked no person (ADR 0027 section 4). The
+    /// message is host-generated and says the deny covers this request only.
+    #[error("{0}")]
+    AskTimedOut(String),
     /// Host-side validation rejected the command input before execution. The
     /// message is host-generated (never raw extension error text), so unlike
     /// the sibling variants it is safe to surface verbatim.
