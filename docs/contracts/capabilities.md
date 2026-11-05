@@ -415,9 +415,11 @@ is not tracked.
   in the session's profile or in `defaults.subagent` whose extension id
   (the part before the first `.`, when it has no `*`) names no installed
   extension keeps the rule and prints a startup notice naming the profile
-  or overlay, the rule's index and pattern, and the installed ids. The
-  `extension_reviewers` check for an entry that is not enabled or has no
-  reviewer descriptor is not implemented yet.
+  or overlay, the rule's index and pattern, and the installed ids. An
+  extension registry that cannot be read fails profile loading with an
+  error naming the registry and saying it was read to check `tools` rules.
+  The `extension_reviewers` check for an entry that is not
+  enabled or has no reviewer descriptor is not implemented yet.
 - **Permission rules in the gate (ADR 0027 section 3).** The gate decides
   a request in this order: a configured `always-deny`; a `deny` rule
   (`always-deny`, the escalated form of a command included); an

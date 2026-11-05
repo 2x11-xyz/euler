@@ -166,15 +166,15 @@ pub(crate) fn install_in_app_resume_profile(
         .install(config, events)
 }
 
-/// The user's `profiles.json` when an interactive launch names no
-/// `--profile`: where the first-run picker (ADR 0026 section 5) looks for
-/// `defaults.interactive` and saves the choice. `None` for headless runs, for
-/// `--profile`, and when the Euler home does not resolve.
-pub(crate) fn first_run_profiles_file(request: ProfileRequest<'_>) -> Option<PathBuf> {
+/// The user's Euler home when an interactive launch names no `--profile`:
+/// its `profiles.json` is where the first-run picker (ADR 0026 section 5)
+/// looks for `defaults.interactive` and saves the choice. `None` for headless
+/// runs, for `--profile`, and when the Euler home does not resolve.
+pub(crate) fn first_run_profile_home(request: ProfileRequest<'_>) -> Option<EulerHome> {
     if request.context != ProfileContext::Interactive || request.profile.is_some() {
         return None;
     }
-    EulerHome::resolve().ok().map(|home| home.profiles_path())
+    EulerHome::resolve().ok()
 }
 
 /// The line-oriented first-run picker: on a terminal (stdin and stderr),
@@ -182,14 +182,14 @@ pub(crate) fn first_run_profiles_file(request: ProfileRequest<'_>) -> Option<Pat
 /// session starts and save the choice. The TUI shows the picker in the app
 /// instead.
 pub(crate) fn prompt_first_run_profile_on_terminal(request: ProfileRequest<'_>) -> Result<()> {
-    let Some(file) = first_run_profiles_file(request) else {
+    let Some(home) = first_run_profile_home(request) else {
         return Ok(());
     };
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Ok(());
     }
-    if ProfilesConfig::load(&file, &installed_extensions_in_user_home()?)?.has_interactive_default()
-    {
+    let file = home.profiles_path();
+    if ProfilesConfig::load(&file, &installed_extensions(&home)?)?.has_interactive_default() {
         return Ok(());
     }
     let choice = prompt_first_run_profile(&file)?;
@@ -263,13 +263,14 @@ pub(crate) struct ProfileSources {
 
 impl ProfileSources {
     pub(crate) fn load(root: &Path) -> Result<Self> {
-        Self::load_file(EulerHome::resolve()?.profiles_path(), root)
+        Self::load_in(&EulerHome::resolve()?, root)
     }
 
-    /// Read `file` as the user's `profiles.json`, with the overlay under
-    /// `root`.
-    pub(crate) fn load_file(file: PathBuf, root: &Path) -> Result<Self> {
-        let installed = installed_extensions_in_user_home()?;
+    /// Read the `profiles.json` in `home`, with the overlay under `root`,
+    /// checking `tools` rules against the extensions installed in `home`.
+    pub(crate) fn load_in(home: &EulerHome, root: &Path) -> Result<Self> {
+        let installed = installed_extensions(home)?;
+        let file = home.profiles_path();
         Ok(Self {
             profiles: ProfilesConfig::load(&file, &installed)?,
             overlay: ProjectOverlay::load(root, &installed)?,
@@ -369,17 +370,15 @@ fn load_profile_sources(root: &Path) -> Result<ProfileSourcesAtStartup> {
 /// The extensions installed in `home`, which `tools` rules are checked
 /// against (ADR 0027 section 8).
 fn installed_extensions(home: &EulerHome) -> Result<InstalledExtensions> {
-    let linked = ExtensionRegistry::open_read_only(home.clone()).linked_extensions()?;
+    let linked = ExtensionRegistry::open_read_only(home.clone())
+        .linked_extensions()
+        .with_context(|| {
+            format!(
+                "reading the extension registry in {} to check tools rules",
+                home.extensions_dir().display()
+            )
+        })?;
     Ok(InstalledExtensions::from_linked(&linked))
-}
-
-/// [`installed_extensions`] in the user's Euler home; none when it does not
-/// resolve.
-fn installed_extensions_in_user_home() -> Result<InstalledExtensions> {
-    match EulerHome::resolve() {
-        Ok(home) => installed_extensions(&home),
-        Err(_) => Ok(InstalledExtensions::default()),
-    }
 }
 
 /// The startup notices for `tools` rules naming an extension that is not
@@ -408,31 +407,68 @@ mod tests {
     /// Only an interactive launch without `--profile` asks the first-run
     /// question; `--profile` and `euler exec` never do.
     #[test]
-    fn first_run_profiles_file_is_only_for_interactive_launches_without_a_profile() {
+    fn first_run_profile_home_is_only_for_interactive_launches_without_a_profile() {
         let request = |profile, context| ProfileRequest {
             profile,
             reviewer: None,
             context,
         };
         assert_eq!(
-            first_run_profiles_file(request(Some("locked"), ProfileContext::Interactive)),
+            first_run_profile_home(request(Some("locked"), ProfileContext::Interactive)),
             None
         );
         assert_eq!(
-            first_run_profiles_file(request(None, ProfileContext::Headless)),
+            first_run_profile_home(request(None, ProfileContext::Headless)),
             None
         );
         let _env_lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
         let home = tempfile::tempdir().expect("euler home");
         let previous = std::env::var_os("EULER_HOME");
         std::env::set_var("EULER_HOME", home.path());
-        let file = first_run_profiles_file(request(None, ProfileContext::Interactive));
+        let file = first_run_profile_home(request(None, ProfileContext::Interactive))
+            .map(|home| home.profiles_path());
         match previous {
             Some(value) => std::env::set_var("EULER_HOME", value),
             None => std::env::remove_var("EULER_HOME"),
         }
         let home_root = home.path().canonicalize().expect("canonical euler home");
         assert!(file.expect("interactive asks").starts_with(home_root));
+    }
+
+    /// `ProfileSources` (what `/profile` and the first-run picker read)
+    /// checks `tools` rules against the registry of the home it reads
+    /// `profiles.json` from, not the one `EULER_HOME` names, and a registry
+    /// it cannot read says why.
+    #[test]
+    fn profile_sources_read_the_extension_registry_of_their_home() {
+        let broken_root = tempfile::tempdir().expect("broken euler home");
+        let broken = EulerHome::from_root(broken_root.path()).expect("broken home");
+        std::fs::create_dir_all(broken.extensions_dir()).expect("extensions dir");
+        std::fs::write(broken.extensions_dir().join("links.json"), "not json")
+            .expect("write links.json");
+        let clean_root = tempfile::tempdir().expect("clean euler home");
+        let clean = EulerHome::from_root(clean_root.path()).expect("clean home");
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let _env_lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+        let previous = std::env::var_os("EULER_HOME");
+        std::env::set_var("EULER_HOME", broken_root.path());
+        let from_clean = ProfileSources::load_in(&clean, workspace.path()).map(|_| ());
+        let from_broken = ProfileSources::load_in(&broken, workspace.path()).map(|_| ());
+        match previous {
+            Some(value) => std::env::set_var("EULER_HOME", value),
+            None => std::env::remove_var("EULER_HOME"),
+        }
+
+        from_clean.expect("the clean home loads");
+        let error = from_broken.expect_err("the broken registry fails");
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "reading the extension registry in {} to check tools rules",
+                broken.extensions_dir().display()
+            )),
+            "{error:#}"
+        );
     }
 
     #[test]

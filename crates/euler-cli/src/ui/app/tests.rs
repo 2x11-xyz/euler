@@ -5875,7 +5875,7 @@ fn first_run_core(root: &Path, profile: &str, resumed: bool) -> AppCore {
         channels,
         AppOptions {
             first_run_profile: Some(FirstRunProfile {
-                profiles_file: root.join("profiles.json"),
+                euler_home: euler_core::EulerHome::from_root(root).expect("euler home"),
                 resumed,
             }),
             ..AppOptions::default()

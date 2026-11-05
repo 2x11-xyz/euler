@@ -769,12 +769,12 @@ fn picker_parts(spec: PickerSpec) -> (PickerKind, String, Vec<PickerItem>) {
         ),
         PickerSpec::FirstRunProfile {
             choices,
-            profiles_file,
+            euler_home,
             ..
         } => (
             PickerKind::FirstRunProfile,
             "Welcome to Euler. How should it run commands?".to_owned(),
-            first_run_profile_items(choices, &profiles_file),
+            first_run_profile_items(choices, &euler_home),
         ),
         PickerSpec::PermissionsAdvanced(choices) => (
             PickerKind::PermissionsAdvanced,
@@ -952,7 +952,10 @@ fn profile_items(choices: Vec<ProfileChoice>) -> Vec<PickerItem> {
         .collect()
 }
 
-fn first_run_profile_items(choices: Vec<ProfileChoice>, profiles_file: &Path) -> Vec<PickerItem> {
+fn first_run_profile_items(
+    choices: Vec<ProfileChoice>,
+    euler_home: &euler_core::EulerHome,
+) -> Vec<PickerItem> {
     choices
         .into_iter()
         .map(|choice| PickerItem {
@@ -964,7 +967,7 @@ fn first_run_profile_items(choices: Vec<ProfileChoice>, profiles_file: &Path) ->
             current: choice.current,
             action: CommandAction::ChooseFirstRunProfile {
                 name: choice.name,
-                profiles_file: profiles_file.to_path_buf(),
+                euler_home: euler_home.clone(),
             },
         })
         .collect()

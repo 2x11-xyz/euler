@@ -18,11 +18,11 @@ pull requests that landed them; deeper design rationale lives in
   (such as `code_swarm.*` for `code-swarm`) prints a startup notice naming
   the rule and listing the installed extension ids. The rule is kept and
   the session runs, so a shared profile can deny an extension some machines
-  never install. No new prompts or blocks.
-- Project overlay rules and child agent rule layers (ADR 0027 sections 6
-  and 7) are covered end to end: an overlay `deny` refuses a command and
-  records the `overlay` layer, and a child under a named `defaults.subagent`
-  profile runs under the session's layers plus its own `subagent` layer.
+  never install. No new prompts.
+- **Changed**: loading profiles now reads the extension registry, so a
+  registry that Euler cannot read also fails `/profile`, the first-run picker,
+  and in-app `/resume`, with an error saying the registry was read to
+  check `tools` rules. Launch and `euler exec` already failed on it.
 
 ### Execution profiles: `path` and `outside_workspace` permission rules are enforced
 

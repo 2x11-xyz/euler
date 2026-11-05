@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::auth_validation::validate_provider_auth;
 use crate::companion_run::execute_headless_companion_run;
 use crate::execution_profile_runtime::{
-    first_run_profiles_file, launch_profile, print_notices, prompt_first_run_profile_on_terminal,
+    first_run_profile_home, launch_profile, print_notices, prompt_first_run_profile_on_terminal,
     resolve_resume_profile, ProfileRequest, ResolvedResumeProfile,
 };
 use crate::extension_cli::resolve_round_observer;
@@ -1103,9 +1103,9 @@ fn print_background_job_lines(jobs: &[String]) {
 /// The TUI's first-run profile picker for this launch or resume: the app
 /// shows it when the profiles file has no `defaults.interactive`.
 fn first_run_profile(run: &RunArgs, resumed: bool) -> Option<FirstRunProfile> {
-    first_run_profiles_file(run_profile_request(run, ProfileContext::Interactive)).map(
-        |profiles_file| FirstRunProfile {
-            profiles_file,
+    first_run_profile_home(run_profile_request(run, ProfileContext::Interactive)).map(
+        |euler_home| FirstRunProfile {
+            euler_home,
             resumed,
         },
     )
