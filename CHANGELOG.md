@@ -6,6 +6,16 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: permission rules parse and record
+
+- **New**: `profiles.json` profiles accept `rules`, `ask_timeout`, and
+  `extension_reviewers` (ADR 0027, rollout step 1). They are validated with
+  errors naming the file, profile, surface, and index, and recorded as
+  layers in `execution_profile` and its digest. The gate does not enforce
+  them yet, so a profile or project overlay that sets one is a startup
+  error naming the field. Profiles without them behave and record exactly
+  as before.
+
 ### Project context: personal instructions from `~/.euler/AGENTS.md`
 
 - **New**: Euler loads `AGENTS.md` from your Euler home (`$EULER_HOME`,

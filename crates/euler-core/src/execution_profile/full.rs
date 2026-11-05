@@ -25,6 +25,9 @@ pub(super) fn fields() -> ProfileFields {
         escalation: EscalationSetting::NotAllowed,
         background_jobs: BackgroundJobsSetting::Outlive,
         reviewer: PermissionReviewer::User,
+        rules: Vec::new(),
+        ask_timeout: None,
+        extension_reviewers: Vec::new(),
     }
 }
 
