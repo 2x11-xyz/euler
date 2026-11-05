@@ -6,7 +6,7 @@ fn cancelled_active_permission_modal_closes_without_reply() {
     let cancellation = euler_sdk::CancellationSource::new();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.open_permission_envelope(PermissionPromptEnvelope {
-        prompt: PermissionPrompt::Request(PermissionRequest::new(Capability::FsWrite, "edit file")),
+        prompt: PermissionPrompt::from(PermissionRequest::new(Capability::FsWrite, "edit file")),
         cancellation: cancellation.token(),
         reply_tx,
     });
@@ -28,7 +28,7 @@ fn cancelled_permission_preserves_modal_text_once_without_a_stashed_draft() {
     let cancellation = euler_sdk::CancellationSource::new();
     let (reply_tx, reply_rx) = mpsc::channel();
     core.open_permission_envelope(PermissionPromptEnvelope {
-        prompt: PermissionPrompt::Request(PermissionRequest::new(Capability::FsWrite, "edit file")),
+        prompt: PermissionPrompt::from(PermissionRequest::new(Capability::FsWrite, "edit file")),
         cancellation: cancellation.token(),
         reply_tx,
     });
@@ -677,7 +677,7 @@ fn rule_ask_panel_names_the_rule_and_its_reason() {
     };
     let request = PermissionRequest::new(Capability::ShellExec, "tool run_shell".to_owned())
         .with_command("git push origin main")
-        .with_ask_rule(RuleMatch {
+        .with_ask_rule(RuleMatch::Rule {
             surface: RuleSurface::Shell,
             layer: RuleLayerLabel::Profile,
             index: 0,
@@ -703,7 +703,7 @@ fn rule_ask_panel_names_the_rule_and_its_reason() {
 
     // A file edit a `tools` rule asks about opens the patch panel instead.
     let edit = PermissionRequest::new(Capability::FsWrite, "tool edit_file".to_owned())
-        .with_ask_rule(RuleMatch {
+        .with_ask_rule(RuleMatch::Rule {
             surface: RuleSurface::Tools,
             layer: RuleLayerLabel::Profile,
             index: 0,

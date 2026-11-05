@@ -9,6 +9,7 @@
 //! Every failure path (spawn failure, companion failure, missing or
 //! unparseable verdict) resolves to deny.
 
+use crate::execution_profile::RuleMatch;
 use crate::permissions::PermissionRequest;
 use euler_agents::{AgentBudget, AgentError, AgentResult, AgentTask};
 use euler_event::{object, JsonObject};
@@ -239,6 +240,12 @@ pub(crate) fn adjudicates_verbatim(request: &PermissionRequest) -> bool {
         // flagged command must reach a human (or be denied under a
         // never-prompt policy), or "never auto-approved in any mode"
         // becomes "unless an LLM says otherwise" (ADR 0021 decision D).
+        return false;
+    }
+    if request.ask_rule.as_ref().is_some_and(RuleMatch::human_only) {
+        // An unresolved path where a `deny` rule applies: the guardian
+        // cannot tell whether it is the denied case (ADR 0027 resolved
+        // question 3).
         return false;
     }
     if request

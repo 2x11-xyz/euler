@@ -25,6 +25,20 @@ pull requests that landed them; deeper design rationale lives in
   save-without-discovery `[Y/n]` question when an existing entry's gateway
   lists no models. No new block.
 
+### Execution profiles: `path` and `outside_workspace` permission rules are enforced
+
+- **New**: profiles may now use `path` and `outside_workspace` rules (ADR
+  0027, rollout step 3), with an optional `access` of `read`, `write`, or
+  `any`. They cover the files structured tools read and write, the
+  workspace `git_status` and `git_diff` read, and the paths a `run_shell`
+  command names: redirection targets, the destinations of copy, move, link,
+  and in-place edit commands, and the operands of other commands. A
+  command is denied or asks if any path it names is, and is allowed only
+  if every path it names is allowed. A path Euler cannot resolve (a
+  variable, a glob, `~`, the operands `xargs` reads) asks wherever a rule
+  on its surface asks or denies, a person only when a rule there denies.
+  `ask_timeout` and `extension_reviewers` are still refused at startup.
+
 ### Execution profiles: `shell` and `tools` permission rules are enforced
 
 - **New**: profiles may now use `shell` and `tools` rules (ADR 0027,

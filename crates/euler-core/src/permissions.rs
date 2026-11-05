@@ -1,7 +1,7 @@
-use crate::command_safety::{CommandSegment, RuleSegment};
+use crate::command_safety::{CommandSegment, PathTarget, RuleSegment};
 use crate::execution_profile::{
     profile_mode_override, rule_match, EscalationSetting, ExecutionProfile, ProfileFields,
-    RuleMatch, RuleState,
+    RequestPaths, RuleMatch, RuleState,
 };
 use crate::grants::{
     bound_command, bound_instruction, ActiveGrant, GrantList, GrantScope, ProjectGrantError,
@@ -92,6 +92,14 @@ pub struct PermissionRequest {
     /// read them ([`crate::command_safety::rule_segments`]), split once in
     /// [`Self::with_command`]. Empty for a request without a command.
     pub rule_segments: Vec<RuleSegment>,
+    /// The paths this request names, as `path` and `outside_workspace`
+    /// permission rules read them (ADR 0027 section 1), resolved against
+    /// `workspace_root`: a structured tool's path, the workspace a `git_*`
+    /// tool reads, or the path operands of a `run_shell` command's full
+    /// text ([`crate::command_safety::shell_path_targets`]). Set by
+    /// `permission_request_for_tool`; path rules read nothing without a
+    /// workspace root.
+    pub path_targets: Vec<PathTarget>,
     /// The permission rule whose `ask` this request is (ADR 0027 resolved
     /// question 6). Set with [`Self::with_ask_rule`], which also makes the
     /// request once-only; approval surfaces show the rule and its reason
@@ -142,6 +150,7 @@ impl PermissionRequest {
             tool: None,
             capability_is_label: false,
             rule_segments: Vec::new(),
+            path_targets: Vec::new(),
             ask_rule: None,
         }
     }
@@ -673,7 +682,8 @@ impl<D> PermissionGate<D> {
     /// 1. `always-deny` wins.
     /// 2. A `deny` rule denies, the escalated form included.
     /// 3. An escalation asks when the profile allows escalation and is
-    ///    denied otherwise.
+    ///    denied otherwise. Its ask carries a human-only unresolved-path
+    ///    rule match, if any, so the guardian refuses it.
     /// 4. A dangerous or unreadable command asks, since under ADR 0021
     ///    decision D the danger veto holds in EVERY mode.
     /// 5. An `ask` rule asks.
@@ -698,13 +708,16 @@ impl<D> PermissionGate<D> {
             };
         }
         // An escalation always asks, and only a profile that allows it may
-        // ask at all (ADR 0026 section 3).
+        // ask at all (ADR 0026 section 3). A human-only rule ask rides along,
+        // so the guardian never takes it (ADR 0027 resolved question 3).
         if request.escalation.is_some() {
-            return GateRuling::mode(if self.profile.escalation == EscalationSetting::Allowed {
-                ApprovalMode::Ask
-            } else {
-                ApprovalMode::AlwaysDeny
-            });
+            if self.profile.escalation != EscalationSetting::Allowed {
+                return GateRuling::mode(ApprovalMode::AlwaysDeny);
+            }
+            return GateRuling {
+                mode: ApprovalMode::Ask,
+                rule: rule.filter(RuleMatch::human_only),
+            };
         }
         if request.dangerous_command {
             return GateRuling::mode(ApprovalMode::Ask);
@@ -731,14 +744,27 @@ impl<D> PermissionGate<D> {
     }
 
     /// The permission rule state of `request` under the profile's rule
-    /// layers, before any other check: the `shell` surface over its command
+    /// layers, before any other check: the `shell` surface over its command,
+    /// the `path` and `outside_workspace` surfaces over the paths it names,
     /// and the `tools` surface over its tool.
     pub fn rule_match(&self, request: &PermissionRequest) -> Option<RuleMatch> {
         let segments = request
             .command
             .is_some()
             .then_some(request.rule_segments.as_slice());
-        rule_match(&self.profile.rules, segments, request.tool.as_deref())
+        let paths = request
+            .workspace_root
+            .as_deref()
+            .map(|workspace_root| RequestPaths {
+                targets: &request.path_targets,
+                workspace_root,
+            });
+        rule_match(
+            &self.profile.rules,
+            segments,
+            paths,
+            request.tool.as_deref(),
+        )
     }
 
     pub fn configured_capabilities(&self) -> impl Iterator<Item = Capability> + '_ {

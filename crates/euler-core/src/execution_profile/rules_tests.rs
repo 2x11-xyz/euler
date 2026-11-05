@@ -132,9 +132,14 @@ fn profile_rules_parse_into_one_profile_layer_and_unenforced_parts_are_refused()
         .expect("shell and tools rules are enforced");
     assert_eq!(enforced.fields.rules.len(), 1);
 
+    // Every rule surface is enforced (ADR 0027 rollout step 3).
+    let outside = config
+        .resolve(Some("outside"), ProfileContext::Headless, None)
+        .expect("outside_workspace rules are enforced");
+    assert_eq!(outside.fields.rules.len(), 1);
+
     for (name, field) in [
-        ("agent", "rules.path"),
-        ("outside", "rules.outside_workspace"),
+        ("agent", "ask_timeout"),
         ("timeout", "ask_timeout"),
         ("reviewed", "extension_reviewers"),
     ] {
@@ -159,11 +164,11 @@ fn profile_rules_parse_into_one_profile_layer_and_unenforced_parts_are_refused()
 }
 
 #[test]
-fn a_subagent_default_with_path_rules_is_refused_at_startup() {
+fn a_subagent_default_with_an_unenforced_field_is_refused_at_startup() {
     let config = parse(
         r#"{"defaults": {"subagent": "helper"}, "profiles": {
-            "helper": {"extends": "full", "rules": {"path": [{"pattern": "src/**", "state": "deny"}]}},
-            "shell": {"extends": "full", "rules": {"shell": [{"pattern": "rm *", "state": "deny"}]}}
+            "helper": {"extends": "full", "ask_timeout": 30,
+                       "rules": {"path": [{"pattern": "src/**", "state": "deny"}]}}
         }}"#,
     )
     .expect("parses");
@@ -171,7 +176,7 @@ fn a_subagent_default_with_path_rules_is_refused_at_startup() {
         config.resolve_subagent(None),
         Err(ProfileError::Unenforced {
             profile: "helper".to_owned(),
-            field: "rules.path",
+            field: "ask_timeout",
         })
     );
 }
@@ -778,16 +783,50 @@ fn resume_that_keeps_the_recorded_profile_joins_policy_fields() {
 
     // `full` is looser than the recorded `locked` fields, so the recorded
     // profile applies, and its rules stay even though the resolved profile
-    // has none and the overlay sets only a timeout.
-    // `path` rules are recorded but not enforced yet, so they stand for
-    // any recorded field this build refuses.
-    let recorded = locked_with(
-        vec![path_layer(
-            RuleLayerLabel::Profile,
-            vec![rule("secrets/**", RuleState::Deny)],
-        )],
-        None,
+    // has none.
+    let recorded_layer = path_layer(
+        RuleLayerLabel::Profile,
+        vec![rule("secrets/**", RuleState::Deny)],
     );
+    let kept = ResumeProfile::choose(
+        Some(locked_with(vec![recorded_layer.clone()], None)),
+        ExecutionProfile {
+            name: "dev".to_owned(),
+            fields: full::fields(),
+        },
+        false,
+        None,
+    )
+    .expect("path rules are enforced");
+    assert_eq!(kept.profile.name, "careful");
+    assert_eq!(kept.profile.fields.rules, vec![recorded_layer.clone()]);
+
+    // A deny rule added to the resolved profile joins the kept recorded
+    // profile as a further layer.
+    let added_layer = path_layer(
+        RuleLayerLabel::Profile,
+        vec![rule("build/**", RuleState::Deny)],
+    );
+    let joined = ResumeProfile::choose(
+        Some(locked_with(vec![recorded_layer.clone()], None)),
+        ExecutionProfile {
+            name: "dev".to_owned(),
+            fields: ProfileFields {
+                rules: vec![added_layer.clone()],
+                ..full::fields()
+            },
+        },
+        false,
+        None,
+    )
+    .expect("path rules are enforced");
+    assert_eq!(joined.profile.name, "careful");
+    assert_eq!(
+        joined.profile.fields.rules,
+        vec![recorded_layer, added_layer]
+    );
+    assert_eq!(joined.joined_fields, vec!["rules"]);
+
     let resolved = ExecutionProfile {
         name: "dev".to_owned(),
         fields: ProfileFields {
@@ -795,45 +834,6 @@ fn resume_that_keeps_the_recorded_profile_joins_policy_fields() {
             ..full::fields()
         },
     };
-    assert_eq!(
-        ResumeProfile::choose(
-            Some(recorded),
-            resolved.clone(),
-            false,
-            Some(&lower_timeout)
-        ),
-        Err(ProfileError::RecordedUnenforced {
-            profile: "careful".to_owned(),
-            field: "rules.path",
-        })
-    );
-
-    // A deny rule added to the resolved profile joins the kept recorded
-    // profile, so the refusal names path rules (not only the timeout) and the
-    // resolved profile that set them, not the recording.
-    let with_deny = ExecutionProfile {
-        fields: ProfileFields {
-            rules: vec![path_layer(
-                RuleLayerLabel::Profile,
-                vec![rule("build/**", RuleState::Deny)],
-            )],
-            ..resolved.fields.clone()
-        },
-        ..resolved.clone()
-    };
-    assert_eq!(
-        ResumeProfile::choose(
-            Some(locked_with(Vec::new(), None)),
-            with_deny,
-            false,
-            Some(&lower_timeout)
-        ),
-        Err(ProfileError::Unenforced {
-            profile: "dev".to_owned(),
-            field: "rules.path",
-        })
-    );
-
     // `resolved` stands for a profile whose timeout the overlay already
     // lowered to 120. A recorded 60 does not make the overlay's 120 an
     // error, and the join keeps the recorded 60, which the refusal names.

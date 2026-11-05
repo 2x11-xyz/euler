@@ -6850,6 +6850,9 @@ fn validate_model_target_shape(target: &ModelTarget) -> Result<(), String> {
 #[path = "permission_matrix_test.rs"]
 mod permission_matrix_test;
 #[cfg(test)]
+#[path = "permission_path_rules_test.rs"]
+mod permission_path_rules_test;
+#[cfg(test)]
 #[path = "permission_rules_test.rs"]
 mod permission_rules_test;
 #[cfg(test)]

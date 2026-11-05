@@ -23,8 +23,8 @@ pub use config::{
     PROJECT_OVERLAY_PATH,
 };
 pub use rules::{
-    rule_match, PermissionRule, ProfileRules, RuleAccess, RuleLayer, RuleLayerLabel, RuleMatch,
-    RuleState, RuleSurface,
+    rule_match, PermissionRule, ProfileRules, RequestPaths, RuleAccess, RuleLayer, RuleLayerLabel,
+    RuleMatch, RuleState, RuleSurface,
 };
 
 use crate::guardian::PermissionReviewer;
