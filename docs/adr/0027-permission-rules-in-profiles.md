@@ -190,7 +190,8 @@ rules of section 10, `tee /opt/result /tmp/result` asks for `/opt/result`
 although `/tmp` is allowed. A target Euler cannot resolve counts as `ask` in
 this reduction when its surface has any `ask` or `deny` rule, and as no rule
 state otherwise (resolved question 3), so it never hides a known `deny` on
-another target and a known `allow` never covers it.
+another target and a known `allow` never covers it (amended 2026-11-06, see
+resolved question 3).
 
 Each layer is evaluated on its own, last match wins within its own lists,
 and the layers' states combine by most restrictive: the user profile's
@@ -700,6 +701,31 @@ Entries marked **changed** differ from the proposal in the draft.
    cannot tell whether it is the denied case. With only `allow` rules it has
    no rule state and keeps the profile's mode. An `allow` never applies to
    it. As proposed.
+
+   **Amended 2026-11-06.** Counting every dynamic operand as unresolved made
+   any profile with a `path` deny turn `ls src/*.rs`, `echo $HOME`, and
+   `git commit -m "$MSG"` into human-only asks, so headless `exec` denied
+   them. A dynamic word is now read as far as its fixed text goes. A
+   leading `~` or `~/` is `HOME`, a known path, and an unquoted escape is
+   the literal character. A glob, expansion, or brace is bounded by its
+   fixed directory (the text before its first such part, up to the last
+   `/`); a word that starts with an expansion or a brace, or whose later
+   part can climb out (`..`, a glob such as `.*`, a fixed `.` beside a
+   variable, a brace whose body has a `.` or `/`), may name any path, and
+   a `..` inside a variable's value or a symlink under the fixed directory
+   is not seen. Such a word counts in a redirect and in the recognized
+   positions above, and in an operand of unknown direction only where it
+   looks like a path (contains `/`, or starts with `.` or `~`) and does
+   not follow an option word (the option's value, though a flag that
+   takes none hides the word after it too); an option with an attached value (`--title=$X`) is never a path.
+   So an unknown-direction command with a bare variable operand
+   (`python x.py $OUT`) is not inspected, consistent with this not being a
+   shell effects interpreter. An unresolved target counts as `ask`
+   only when a path it may name could match an `ask` or `deny` rule of its
+   surface that covers its direction, and the ask is human-only only when
+   one such rule is a `deny`; otherwise it adds no rule state. A dynamic
+   command name, a wrapper with a dynamic word, and a parse error still
+   count as a target that may name any path.
 4. **May an `allow` rule silence a sensitive-path ask?** No. Grants still
    cover sensitive-path asks, and `approvals: never` drops them; a rule does
    not, so a broad `allow` cannot hide `.env` access under `workspace`. As

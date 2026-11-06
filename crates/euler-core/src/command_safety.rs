@@ -79,7 +79,7 @@ use std::path::{Component, Path};
 use tree_sitter::{Node, Parser, Tree};
 
 mod path_operands;
-pub use path_operands::{PathAccess, PathTarget};
+pub use path_operands::{PathAccess, PathTarget, TargetPath};
 
 /// Recursion cap for wrapper unwrapping in both parsers (Codex uses the
 /// same bound). Exceeding it fails closed: not provable for the prove-safe
@@ -2175,8 +2175,10 @@ pub fn rule_segments(command: &str) -> Vec<RuleSegment> {
 /// `outside_workspace` permission rules (ADR 0027 resolved question 3),
 /// over the same commands [`rule_segments`] yields: redirection targets and
 /// the operands of each literal command, a wrapper's through the command it
-/// runs. A command with a dynamic word, an unreadable wrapper, or a line
-/// that does not parse is one unresolved target.
+/// runs. A dynamic word is bounded by its fixed text where it sits in a
+/// path position (ADR 0027 resolved question 3, amended 2026-11-06); a
+/// dynamic command name, an unreadable wrapper, or a line that does not
+/// parse is one target that may be any path.
 pub fn shell_path_targets(command: &str) -> Vec<PathTarget> {
     let mut walk = RuleWalk::default();
     collect_rule_segments(command, 0, &mut walk);
@@ -2231,7 +2233,10 @@ fn collect_rule_segments(script: &str, depth: usize, walk: &mut RuleWalk) {
                 let words = rule_words(node, script);
                 match words.into_iter().collect::<Option<Vec<String>>>() {
                     Some(words) => push_rule_words(&words, depth, walk),
-                    None => walk.push_unresolved(source()),
+                    None => {
+                        walk.segments.push(unresolved_segment(source()));
+                        walk.paths.extend(dynamic_command_targets(node, script));
+                    }
                 }
             }
             "file_redirect" => walk
@@ -2290,6 +2295,41 @@ fn rule_words(node: Node<'_>, src: &str) -> Vec<Option<String>> {
         }
     }
     words
+}
+
+/// The paths a command with a dynamic word names: its operands as the path
+/// parse reads them (ADR 0027 resolved question 3, amended 2026-11-06),
+/// unless its name is dynamic or it runs another command, which leaves one
+/// target that may be any path.
+fn dynamic_command_targets(node: Node<'_>, src: &str) -> Vec<PathTarget> {
+    let mut words = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "command_name" => words.push(
+                child
+                    .named_child(0)
+                    .map(|name| path_operands::operand_word(name, src))
+                    .unwrap_or_default(),
+            ),
+            kind if kind.ends_with("redirect") => {}
+            _ if !words.is_empty() => words.push(path_operands::operand_word(child, src)),
+            _ => {}
+        }
+    }
+    let readable = words.first().is_some_and(|name| {
+        let name = name
+            .rsplit_once('/')
+            .map_or(name.as_str(), |(_, base)| base);
+        !name.is_empty()
+            && !path_operands::is_dynamic(name)
+            && wrapper_spec(&name.to_ascii_lowercase()).is_none()
+    });
+    if readable {
+        path_operands::command_targets(&words)
+    } else {
+        vec![PathTarget::unresolved()]
+    }
 }
 
 /// Push one literal command and the paths it names, then whatever its

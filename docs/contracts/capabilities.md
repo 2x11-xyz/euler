@@ -484,14 +484,34 @@ is not tracked.
   matches targets of that direction and of unknown direction. Within a
   surface each target takes its last matching rule, and the surface is
   `deny` if any target is, else `ask` if any is, else `allow` only if every
-  target on it is. A command with a dynamic word, an unreadable wrapper,
-  or a parse error is an unresolved target (a word with `$`, `~`, or a
-  glob is dynamic): where its surface has an `ask` or `deny` rule it counts
-  as `ask` and records `{surface, unresolved: true}`, so it never hides a
-  known `deny` and no `allow` covers it, and where that surface has a
-  `deny` rule the ask is human-only (the guardian never reviews it, and an
-  escalation's ask carries it so the guardian refuses that too); with
-  only `allow` rules it has no rule state. Extension shell commands and
+  target on it is. A leading unquoted `~` or `~/` in a shell word is
+  `HOME`, so it is a known path, and an unquoted escape is the literal
+  character (`\.\.` is `..`). A word with a glob, a variable, a
+  substitution, or a brace is an unresolved target bounded by its fixed
+  directory, the text before its first such part up to the last `/`
+  (`src/*.rs` names paths under `src/`, `~/.ssh/$K` under `~/.ssh/`); it
+  may name any path when it starts with an expansion or a brace
+  (`$HOME/.ssh/x`, `{~,x}/.ssh`) or a later part can climb out (`..`, a
+  glob like `.*`, a fixed `.` beside a variable as in `.$D`, or a brace
+  whose body has a `.` or `/` as in `{..,x}`). A value with `..` inside a variable,
+  and a symlink under the fixed directory, are not seen. Such a word in a
+  redirect or an operand of a command listed above is a target in that
+  position; in a command of unknown direction it is a target only where it
+  looks like a path (contains `/`, or starts with `.` or `~`) and does not
+  follow an option word (the option's value: `-m "$MSG"`), so `echo $HOME`
+  and `python x.py $OUT` name no path, and an option with an attached value
+  (`--title=$X`) is never a target. Which options take a value is not
+  known, so a dynamic path after a flag (`tool -v "$DIR"/x`) is not seen
+  either. A dynamic command name, a wrapper with
+  a dynamic word, an unreadable wrapper, or a parse error is one
+  unresolved target that may name any path. An unresolved target counts as
+  `ask` where a path it may name could match an `ask` or `deny` rule of its
+  surface whose `access` covers it, and records `{surface, unresolved:
+  true}`, so it never hides a known `deny` and no `allow` covers it; where
+  one such rule is a `deny` the ask is human-only (the guardian never
+  reviews it, and an escalation's ask carries it so the guardian refuses
+  that too). Otherwise, as with only `allow` rules, it has no rule state.
+  Extension shell commands and
   extension operations name no paths, so path rules do not apply to
   them. Within a surface of one layer the last matching rule wins;
   surfaces and layers combine by most restrictive. A

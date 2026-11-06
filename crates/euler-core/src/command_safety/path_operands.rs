@@ -5,8 +5,13 @@
 //! of a short list of readers; operands of any other command have unknown
 //! direction. This is not a shell effects interpreter: a program that
 //! writes a path it was not given in a recognized position is not seen.
+//!
+//! A word the shell expands (a variable, a substitution, a glob) is read as
+//! far as its fixed text goes (resolved question 3, amended 2026-11-06): a
+//! leading `~` is `HOME`, and the directory written before the first
+//! expansion bounds the paths the word can name.
 
-use super::{edits_in_place, literal_word};
+use super::edits_in_place;
 use tree_sitter::Node;
 
 /// The direction in which a request uses a path. `Unknown` matches `read`,
@@ -18,29 +23,254 @@ pub enum PathAccess {
     Unknown,
 }
 
-/// One path a request names. `path` is as written (workspace-relative or
-/// absolute), or `None` when Euler cannot resolve it statically: a dynamic
-/// word, an unreadable wrapper, or a line that does not parse.
+/// What Euler knows statically about one path a request names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TargetPath {
+    /// The path as written: workspace-relative or absolute, with a shell
+    /// `~` already expanded to `HOME`.
+    Literal(String),
+    /// A word the shell expands at run time (a variable, a substitution, a
+    /// glob) that names only paths under this directory, as written (`""`
+    /// is the workspace root). A value containing `..` is not seen.
+    Under(String),
+    /// A word that may name any path: one that starts with an expansion, a
+    /// dynamic command name, an unreadable wrapper, or a line that does not
+    /// parse.
+    Anywhere,
+}
+
+/// One path a request names and the direction in which it uses it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PathTarget {
-    pub path: Option<String>,
+    pub path: TargetPath,
     pub access: PathAccess,
 }
 
 impl PathTarget {
     pub fn new(path: impl Into<String>, access: PathAccess) -> Self {
         Self {
-            path: Some(path.into()),
+            path: TargetPath::Literal(path.into()),
             access,
         }
     }
 
     pub(super) fn unresolved() -> Self {
         Self {
-            path: None,
+            path: TargetPath::Anywhere,
             access: PathAccess::Unknown,
         }
     }
+}
+
+/// Stands in, in the text [`operand_word`] reads, for a shell expansion: a
+/// variable, a substitution, or a `~` that is not `HOME`. The text it
+/// stands for may be anything, an absolute path too.
+const EXPANSION: char = '\0';
+/// Stands in for a glob character: the shell matches names, so the word
+/// stays under the directory written before it.
+const GLOB: char = '\u{1}';
+/// Stand in for an unquoted `{` and `}`: brace expansion is static text,
+/// so a brace whose body has no `.` or `/` cannot climb out of the
+/// directory written before it.
+const BRACE_OPEN: char = '\u{2}';
+const BRACE_CLOSE: char = '\u{3}';
+/// Stands in for quoted text Euler does not decode (`$'\x2e'`): it may be
+/// any path, and may climb out of any directory.
+const OPAQUE: char = '\u{4}';
+const DYNAMIC: [char; 5] = [EXPANSION, GLOB, BRACE_OPEN, BRACE_CLOSE, OPAQUE];
+
+/// The text of one shell word as the path parse reads it: literal parts as
+/// the program receives them, a leading unquoted `~` or `~/` replaced by
+/// `HOME`, unquoted escapes removed, and each expansion, unquoted glob
+/// character, or unquoted brace replaced by [`EXPANSION`], [`GLOB`],
+/// [`BRACE_OPEN`], or [`BRACE_CLOSE`], and `$'...'` text with an escape
+/// replaced by [`OPAQUE`].
+pub(super) fn operand_word(node: Node<'_>, src: &str) -> String {
+    let mut text = String::new();
+    push_word(node, src, true, &mut text);
+    text
+}
+
+fn push_word(node: Node<'_>, src: &str, first: bool, text: &mut String) {
+    let Ok(raw) = node.utf8_text(src.as_bytes()) else {
+        text.push(EXPANSION);
+        return;
+    };
+    match node.kind() {
+        "word" | "number" if node.named_child_count() == 0 => push_unquoted(raw, first, text),
+        "raw_string" => match raw
+            .strip_prefix('\'')
+            .and_then(|raw| raw.strip_suffix('\''))
+        {
+            Some(content) => text.push_str(content),
+            None => text.push(EXPANSION),
+        },
+        "ansi_c_string" => match raw
+            .strip_prefix("$'")
+            .and_then(|raw| raw.strip_suffix('\''))
+        {
+            Some(content) if !content.contains('\\') => text.push_str(content),
+            _ => text.push(OPAQUE),
+        },
+        // A sequence such as `{1..3}` (zsh also reads `{-../}`).
+        "brace_expression" => push_unquoted(raw, false, text),
+        "string" => push_double_quoted(node, src, text),
+        "concatenation" => {
+            let mut cursor = node.walk();
+            let mut end = node.start_byte();
+            for part in node.named_children(&mut cursor) {
+                if part.start_byte() != end {
+                    // Text no named part covers: read it as an expansion.
+                    text.push(EXPANSION);
+                }
+                push_word(part, src, first && end == node.start_byte(), text);
+                end = part.end_byte();
+            }
+            if end != node.end_byte() {
+                text.push(EXPANSION);
+            }
+        }
+        _ => text.push(EXPANSION),
+    }
+}
+
+/// An unquoted word: `~` and `~/` at the start of the whole word are
+/// `HOME` (`~user` is not read), `=` there is zsh equals expansion, an
+/// escaped character is literal, and the shell may rewrite globs, braces,
+/// and later `~`s.
+fn push_unquoted(raw: &str, first: bool, text: &mut String) {
+    let mut rest = raw;
+    if first {
+        if let Some(after) = rest.strip_prefix('~') {
+            match std::env::var("HOME") {
+                Ok(home) if !home.is_empty() && (after.is_empty() || after.starts_with('/')) => {
+                    text.push_str(&home);
+                    rest = after;
+                }
+                _ => {
+                    text.push(EXPANSION);
+                    return;
+                }
+            }
+        } else if rest.starts_with('=') {
+            text.push(EXPANSION);
+            return;
+        }
+    }
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        text.push(match c {
+            // Escape removal is static: `\.\.` is a literal `..`.
+            '\\' => match chars.next() {
+                Some(escaped) if escaped != '\n' => escaped,
+                _ => EXPANSION,
+            },
+            '*' | '?' | '[' | ']' | '^' | '#' => GLOB,
+            '{' => BRACE_OPEN,
+            '}' => BRACE_CLOSE,
+            '$' | '`' | '~' => EXPANSION,
+            c => c,
+        });
+    }
+}
+
+/// A double-quoted string: its literal content, with each expansion (and
+/// any `$`, backquote, or escape the parse left in the content) replaced by
+/// [`EXPANSION`]. Quotes suppress globbing.
+fn push_double_quoted(node: Node<'_>, src: &str, text: &mut String) {
+    let literal = |content: &str, text: &mut String| {
+        text.extend(content.chars().map(|c| match c {
+            '$' | '`' | '\\' => EXPANSION,
+            c => c,
+        }));
+    };
+    let (start, end) = (node.start_byte() + 1, node.end_byte().saturating_sub(1));
+    if start > end || src.get(start - 1..start) != Some("\"") || src.get(end..=end) != Some("\"") {
+        text.push(EXPANSION);
+        return;
+    }
+    let mut at = start;
+    let mut cursor = node.walk();
+    for part in node.named_children(&mut cursor) {
+        literal(src.get(at..part.start_byte()).unwrap_or_default(), text);
+        if part.kind() == "string_content" {
+            literal(part.utf8_text(src.as_bytes()).unwrap_or_default(), text);
+        } else {
+            text.push(EXPANSION);
+        }
+        at = part.end_byte();
+    }
+    literal(src.get(at..end).unwrap_or_default(), text);
+}
+
+/// Whether an [`operand_word`] text has an expansion or a brace (not only
+/// globs).
+fn has_expansion(word: &str) -> bool {
+    word.contains([EXPANSION, BRACE_OPEN, BRACE_CLOSE, OPAQUE])
+}
+
+/// Whether an [`operand_word`] text has an expansion, a glob, or a brace.
+pub(super) fn is_dynamic(word: &str) -> bool {
+    word.contains(DYNAMIC)
+}
+
+/// The target an [`operand_word`] text names with `access`. A word with no
+/// expansion, glob, or brace is a literal path. Any other word is bounded
+/// by the directory written before its first such part, unless it starts
+/// with an expansion or a brace (`{~,x}` and `{/etc,x}` name any path), has
+/// [`OPAQUE`] text, or a later part [`climbs_out`] of that directory.
+fn operand_target(word: &str, access: PathAccess) -> PathTarget {
+    let Some(first_dynamic) = word.find(DYNAMIC) else {
+        return PathTarget::new(word, access);
+    };
+    let dir_len = word[..first_dynamic]
+        .rfind('/')
+        .map_or(0, |slash| slash + 1);
+    let path = if word.starts_with([EXPANSION, BRACE_OPEN])
+        || word.contains(OPAQUE)
+        || climbs_out(&word[dir_len..])
+    {
+        TargetPath::Anywhere
+    } else {
+        TargetPath::Under(word[..dir_len].to_owned())
+    };
+    PathTarget { path, access }
+}
+
+/// Whether the part of an [`operand_word`] text after its fixed directory
+/// can yield a `..` component. A brace body with a `.` or `/` can. Its
+/// other literal text cannot help form `..`, so each component is judged by
+/// its text outside braces plus the expansions and globs inside them: it
+/// climbs when that text starts with `..`, starts with `.` beside a glob
+/// (`.*` matches `..`) or an expansion (`.$D` with `D=.`), or is only dots
+/// and expansions (`$D.`). A `..` inside a variable's value is not seen.
+fn climbs_out(rest: &str) -> bool {
+    let climbs = |outside: &str| {
+        outside.starts_with("..")
+            || (outside.starts_with('.') && outside.contains([GLOB, EXPANSION]))
+            || (outside.contains('.')
+                && outside.contains(EXPANSION)
+                && outside.chars().all(|c| matches!(c, '.' | EXPANSION)))
+    };
+    let mut depth = 0usize;
+    let mut outside = String::new();
+    for c in rest.chars().chain(['/']) {
+        match c {
+            BRACE_OPEN => depth += 1,
+            BRACE_CLOSE => depth = depth.saturating_sub(1),
+            '.' | '/' if depth > 0 => return true,
+            '/' => {
+                if climbs(&outside) {
+                    return true;
+                }
+                outside.clear();
+            }
+            EXPANSION | GLOB => outside.push(c),
+            _ if depth > 0 => {}
+            c => outside.push(c),
+        }
+    }
+    false
 }
 
 /// The targets of one `file_redirect` node. Its first destination word is
@@ -49,7 +279,7 @@ impl PathTarget {
 /// also hangs every later word of the command on the redirect as further
 /// destinations (`cat > out /etc/shadow`); those are operands of the
 /// command, so each is its own target of unknown direction. A dynamic word
-/// is unresolved.
+/// is read as [`operand_target`] reads it.
 pub(super) fn redirect_targets(node: Node<'_>, src: &str) -> Vec<PathTarget> {
     let mut cursor = node.walk();
     let Some(operator) = node
@@ -62,32 +292,26 @@ pub(super) fn redirect_targets(node: Node<'_>, src: &str) -> Vec<PathTarget> {
     let mut cursor = node.walk();
     let mut words = node
         .children_by_field_name("destination", &mut cursor)
-        .map(|word| literal_word(word, src));
+        .map(|word| operand_word(word, src));
     let mut targets = Vec::new();
-    match words.next() {
-        None => {}
-        Some(None) => targets.push(PathTarget::unresolved()),
-        Some(Some(destination)) => {
-            let duplicates_descriptor = matches!(operator, "<&" | ">&")
-                && (destination == "-" || destination.bytes().all(|byte| byte.is_ascii_digit()));
-            if !destination.is_empty() && !duplicates_descriptor && !operator.ends_with("&-") {
-                let access = if operator.starts_with('<') {
-                    PathAccess::Read
-                } else {
-                    PathAccess::Write
-                };
-                targets.push(PathTarget::new(destination, access));
-            }
+    if let Some(destination) = words.next() {
+        let duplicates_descriptor = matches!(operator, "<&" | ">&")
+            && (destination == "-" || destination.bytes().all(|byte| byte.is_ascii_digit()));
+        if !destination.is_empty() && !duplicates_descriptor && !operator.ends_with("&-") {
+            let access = if operator.starts_with('<') {
+                PathAccess::Read
+            } else {
+                PathAccess::Write
+            };
+            targets.push(operand_target(&destination, access));
         }
     }
-    targets.extend(words.map(|word| match word {
-        Some(operand) => PathTarget::new(operand, PathAccess::Unknown),
-        None => PathTarget::unresolved(),
-    }));
+    targets.extend(words.map(|word| operand_target(&word, PathAccess::Unknown)));
     targets
 }
 
-/// The path operands of one literal command (`words[0]` is its name).
+/// The path operands of one command whose name is literal (`words[0]`),
+/// each word a literal or an [`operand_word`] text.
 pub(super) fn command_targets(words: &[String]) -> Vec<PathTarget> {
     let Some((name, args)) = words.split_first() else {
         return Vec::new();
@@ -100,7 +324,7 @@ pub(super) fn command_targets(words: &[String]) -> Vec<PathTarget> {
     let all = |access| {
         operands(&args)
             .into_iter()
-            .map(|operand| PathTarget::new(operand, access))
+            .map(|operand| operand_target(operand, access))
             .collect()
     };
     match name.as_str() {
@@ -121,18 +345,44 @@ pub(super) fn command_targets(words: &[String]) -> Vec<PathTarget> {
             .iter()
             .filter_map(|arg| {
                 if let Some(path) = arg.strip_prefix("of=") {
-                    Some(PathTarget::new(path, PathAccess::Write))
+                    Some(operand_target(path, PathAccess::Write))
                 } else {
                     arg.strip_prefix("if=")
-                        .map(|path| PathTarget::new(path, PathAccess::Read))
+                        .map(|path| operand_target(path, PathAccess::Read))
                 }
             })
-            .filter(|target| target.path.as_deref() != Some(""))
+            .filter(|target| target.path != TargetPath::Literal(String::new()))
             .collect(),
         "curl" => output_targets(&args, 'o', "--output"),
         "wget" => output_targets(&args, 'O', "--output-document"),
-        _ => all(PathAccess::Unknown),
+        _ => unknown_targets(&args),
     }
+}
+
+/// The operands of a command whose direction is unknown. A word with an
+/// expansion names a path only where it looks like one (it contains `/` or
+/// starts with `.`; a leading `~` already reads as `HOME`, which contains
+/// `/`) and is not the value of the option before it,
+/// so `echo $HOME`, `git commit -m "$MSG"`, and `python x.py $OUT` name no
+/// path (resolved question 3, amended 2026-11-06).
+fn unknown_targets(args: &[&str]) -> Vec<PathTarget> {
+    let mut targets = Vec::new();
+    let mut options_end = false;
+    let mut after_option = false;
+    for &arg in args {
+        if !options_end && arg.starts_with('-') {
+            options_end = arg == "--";
+            // `--title=$X` carries its own value.
+            after_option = arg.len() > 1 && !options_end && !arg.contains('=');
+            continue;
+        }
+        let looks_like_path = arg.contains('/') || arg.starts_with('.');
+        if !has_expansion(arg) || (looks_like_path && !after_option) {
+            targets.push(operand_target(arg, PathAccess::Unknown));
+        }
+        after_option = false;
+    }
+    targets
 }
 
 /// The operands of `args`: every word that is not an option, and every word
@@ -184,17 +434,17 @@ fn copy_targets(args: &[&str], target_option: bool) -> Vec<PathTarget> {
             }
         }
     }
-    let read = |operand: &&str| PathTarget::new(*operand, PathAccess::Read);
+    let read = |operand: &&str| operand_target(operand, PathAccess::Read);
     let targets: Vec<PathTarget> = match (target, rest.as_slice()) {
-        (Some(target), _) => std::iter::once(PathTarget::new(target, PathAccess::Write))
+        (Some(target), _) => std::iter::once(operand_target(target, PathAccess::Write))
             .chain(rest.iter().map(read))
             .collect(),
-        (None, [only]) => vec![PathTarget::new(*only, PathAccess::Unknown)],
+        (None, [only]) => vec![operand_target(only, PathAccess::Unknown)],
         (None, [sources @ .., destination]) => sources
             .iter()
             .map(read)
-            .chain(std::iter::once(PathTarget::new(
-                *destination,
+            .chain(std::iter::once(operand_target(
+                destination,
                 PathAccess::Write,
             )))
             .collect(),
@@ -230,11 +480,11 @@ fn output_targets(args: &[&str], short: char, long: &str) -> Vec<PathTarget> {
         let arg = args[index];
         index += 1;
         if options_end || arg == "-" || !arg.starts_with('-') {
-            targets.push(PathTarget::new(arg, PathAccess::Read));
+            targets.push(operand_target(arg, PathAccess::Read));
         } else if arg == "--" {
             options_end = true;
         } else if let Some(value) = option_value(args, &mut index, arg, short, long) {
-            targets.push(PathTarget::new(value, PathAccess::Write));
+            targets.push(operand_target(value, PathAccess::Write));
         }
     }
     targets
@@ -272,9 +522,9 @@ fn option_value<'a>(
 #[cfg(test)]
 mod tests {
     use super::super::shell_path_targets;
-    use super::{PathAccess, PathTarget};
+    use super::{PathAccess, PathTarget, TargetPath};
 
-    type Target = (Option<String>, PathAccess);
+    type Target = (TargetPath, PathAccess);
 
     fn targets(command: &str) -> Vec<Target> {
         shell_path_targets(command)
@@ -284,18 +534,26 @@ mod tests {
     }
 
     fn read(path: &str) -> Target {
-        (Some(path.to_owned()), PathAccess::Read)
+        (TargetPath::Literal(path.to_owned()), PathAccess::Read)
     }
 
     fn write(path: &str) -> Target {
-        (Some(path.to_owned()), PathAccess::Write)
+        (TargetPath::Literal(path.to_owned()), PathAccess::Write)
     }
 
     fn unknown(path: &str) -> Target {
-        (Some(path.to_owned()), PathAccess::Unknown)
+        (TargetPath::Literal(path.to_owned()), PathAccess::Unknown)
     }
 
-    const UNRESOLVED: Target = (None, PathAccess::Unknown);
+    fn under(dir: &str, access: PathAccess) -> Target {
+        (TargetPath::Under(dir.to_owned()), access)
+    }
+
+    fn anywhere(access: PathAccess) -> Target {
+        (TargetPath::Anywhere, access)
+    }
+
+    const UNRESOLVED: Target = (TargetPath::Anywhere, PathAccess::Unknown);
 
     /// Resolved question 3: the write positions, their reads, the readers,
     /// and unknown direction for any other command.
@@ -425,7 +683,7 @@ mod tests {
             ("echo x 2>&1 foo", vec![unknown("x"), unknown("foo")]),
             (
                 "echo x > out $Y",
-                vec![unknown("x"), write("out"), UNRESOLVED],
+                vec![unknown("x"), write("out"), anywhere(PathAccess::Unknown)],
             ),
             ("sudo cp a /etc/x", vec![read("a"), write("/etc/x")]),
             ("bash -c 'tee /opt/y'", vec![write("/opt/y")]),
@@ -437,14 +695,120 @@ mod tests {
                 "ls | xargs -n 1 cp -t /dst",
                 vec![UNRESOLVED, write("/dst")],
             ),
-            ("echo $(cat secret)", vec![UNRESOLVED, read("secret")]),
-            ("cat $FILE", vec![UNRESOLVED]),
-            ("cat ~/.ssh/config", vec![UNRESOLVED]),
-            ("rm *.o", vec![UNRESOLVED]),
-            ("echo x > \"$OUT\"", vec![unknown("x"), UNRESOLVED]),
+            ("echo $(cat secret)", vec![read("secret")]),
+            ("cat $FILE", vec![anywhere(PathAccess::Read)]),
+            ("rm *.o", vec![under("", PathAccess::Write)]),
+            (
+                "echo x > \"$OUT\"",
+                vec![unknown("x"), anywhere(PathAccess::Write)],
+            ),
             ("bash -s", vec![UNRESOLVED]),
             ("cat 'unterminated", vec![UNRESOLVED]),
             ("export A=1 && cargo test", vec![unknown("test")]),
+        ];
+        for (command, expected) in cases {
+            assert_eq!(targets(command), expected, "{command}");
+        }
+    }
+
+    /// Resolved question 3, amended 2026-11-06: a leading `~` is `HOME`; a
+    /// glob or an expansion is bounded by the directory written before it,
+    /// or may be any path when it starts the word or a later part climbs
+    /// out; recognized positions read every dynamic word, while a command of
+    /// unknown direction reads one only where it looks like a path and is
+    /// not an option's value; a dynamic command name or wrapper stays one
+    /// target that may be any path.
+    #[test]
+    fn dynamic_words_are_bounded_by_their_fixed_text() {
+        let home = std::env::var("HOME").expect("HOME");
+        let read_home = |rest: &str| read(&format!("{home}{rest}"));
+        let cases: Vec<(&str, Vec<Target>)> = vec![
+            ("cat ~/notes.txt", vec![read_home("/notes.txt")]),
+            ("ls ~", vec![read_home("")]),
+            (
+                "cat '~/x' ~user/x",
+                vec![read("~/x"), anywhere(PathAccess::Read)],
+            ),
+            (
+                "cp x ~/.ssh/",
+                vec![read("x"), write(&format!("{home}/.ssh/"))],
+            ),
+            ("cat \"$HOME\"/.ssh/*", vec![anywhere(PathAccess::Read)]),
+            ("ls src/*.rs", vec![under("src/", PathAccess::Read)]),
+            ("ls *.rs", vec![under("", PathAccess::Read)]),
+            (
+                "cat ~/.ssh/*",
+                vec![under(&format!("{home}/.ssh/"), PathAccess::Read)],
+            ),
+            ("cat src/$X/y", vec![under("src/", PathAccess::Read)]),
+            ("cat /etc/\"$X\"", vec![under("/etc/", PathAccess::Read)]),
+            ("cat src/*/../../x", vec![anywhere(PathAccess::Read)]),
+            ("cat src/.*/x", vec![anywhere(PathAccess::Read)]),
+            ("cat {/etc/passwd,x}", vec![anywhere(PathAccess::Read)]),
+            // A brace or an escape that can form `..` climbs out; one that
+            // cannot stays under the fixed directory.
+            ("cat ~/x/{..,y}/.ssh/id", vec![anywhere(PathAccess::Read)]),
+            ("cat src/{a/..,b}/x", vec![anywhere(PathAccess::Read)]),
+            ("cat src/{x,}../y", vec![anywhere(PathAccess::Read)]),
+            ("cat src/.{x,}.", vec![anywhere(PathAccess::Read)]),
+            ("cat src/.{*,x}", vec![anywhere(PathAccess::Read)]),
+            ("cat src/{x,$D}.", vec![anywhere(PathAccess::Read)]),
+            ("cat {~,x}/.ssh/id", vec![anywhere(PathAccess::Read)]),
+            ("cat src/{a,b}.rs", vec![under("src/", PathAccess::Read)]),
+            ("cat src/{1..3}/x", vec![anywhere(PathAccess::Read)]),
+            ("cat src/$'..'/x", vec![read("src/../x")]),
+            ("cat src/$'\\x2e\\x2e'/x", vec![anywhere(PathAccess::Read)]),
+            ("cat src/{a,b}/./x", vec![under("src/", PathAccess::Read)]),
+            ("cat ~/x/\\.\\./.ssh/id", vec![read_home("/x/../.ssh/id")]),
+            ("cat ~/x/.\\./.ssh/id", vec![read_home("/x/../.ssh/id")]),
+            ("cat src/\\*.rs", vec![read("src/*.rs")]),
+            ("cat \\~/x", vec![read("~/x")]),
+            // A fixed `.` beside a variable may form `..`.
+            ("cat ~/x/.$D/.ssh/id", vec![anywhere(PathAccess::Read)]),
+            ("cat src/$D./y", vec![anywhere(PathAccess::Read)]),
+            ("cat src/$NAME.rs", vec![under("src/", PathAccess::Read)]),
+            ("rm -rf $DIR", vec![anywhere(PathAccess::Write)]),
+            (
+                "echo hi > $OUT",
+                vec![unknown("hi"), anywhere(PathAccess::Write)],
+            ),
+            (
+                "curl -o \"$OUT\" https://example.com",
+                vec![anywhere(PathAccess::Write), read("https://example.com")],
+            ),
+            (
+                "dd if=$IN of=out.img",
+                vec![anywhere(PathAccess::Read), write("out.img")],
+            ),
+            // Unknown direction: a bare expansion or an option's value
+            // names no path; one that looks like a path does.
+            ("echo $HOME", vec![]),
+            ("python x.py $OUT", vec![unknown("x.py")]),
+            ("git commit -m \"$MSG\"", vec![unknown("commit")]),
+            (
+                "gh pr create --title=$X --body \"$B/x\"",
+                vec![unknown("pr"), unknown("create")],
+            ),
+            (
+                "python x.py \"$DIR\"/out ./$X",
+                vec![
+                    unknown("x.py"),
+                    anywhere(PathAccess::Unknown),
+                    under("./", PathAccess::Unknown),
+                ],
+            ),
+            (
+                "python x.py -- -$X/y",
+                vec![unknown("x.py"), under("", PathAccess::Unknown)],
+            ),
+            (
+                "cargo fmt -- *.rs",
+                vec![unknown("fmt"), under("", PathAccess::Unknown)],
+            ),
+            // A dynamic command name or a wrapper with a dynamic word.
+            ("$EDITOR notes.txt", vec![UNRESOLVED]),
+            ("sudo cat $F", vec![UNRESOLVED]),
+            ("xargs rm $F", vec![UNRESOLVED]),
         ];
         for (command, expected) in cases {
             assert_eq!(targets(command), expected, "{command}");
