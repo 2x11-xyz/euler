@@ -62,8 +62,8 @@ A team can share one `profiles.json`: keep it in a repository and copy it to
 `~/.euler/profiles.json` (or `$EULER_HOME/profiles.json`). A profile extends a
 preset (`full`, `workspace`, or `locked`) and may add permission `rules` and
 an `ask_timeout`. Each repository can tighten it further with
-`.euler/profile-overlay.json`, which may add `ask` and `deny` rules and a lower
-`ask_timeout`, never an `allow`.
+`.euler/profile-overlay.json`, which may add `ask` and `deny` rules and an
+`ask_timeout` no higher than the profile's, never an `allow`.
 
 ```json
 {
@@ -154,14 +154,18 @@ How rules decide:
 The three profiles:
 
 - `dev` is `full` at the keyboard with three hard stops and one review
-  point: `git push` asks, while force pushes and `terraform apply` are
-  denied.
+  point: `git push` asks, while force pushes, `terraform apply`, and writes
+  under `~/.euler` are denied. Because `path` has a `deny` rule, a shell
+  command with an operand Euler cannot resolve (`ls src/*.rs`,
+  `git commit -m "$MSG"`) also asks you (see below).
 - `agent` is the default for `euler exec`. Under `full` nothing asks except
-  Euler's built-in asks and the `ask` rules. An ask goes to the guardian,
-  which may allow it once; plain `exec` cannot ask a person, so an ask the
-  guardian does not settle is denied at once. Run interactively (`euler
-  --profile agent`) and left unattended, an ask waits 300 seconds for a
-  person and is then denied. Either way the deny covers that one request.
+  Euler's built-in asks, the `ask` rules, and shell commands with an operand
+  Euler cannot resolve. An ask goes to the guardian, which may allow it
+  once (an unresolved operand's ask skips the guardian, see below); plain
+  `exec` cannot ask a person, so an ask the guardian does not settle is
+  denied at once. Run interactively (`euler --profile agent`) and left
+  unattended, an ask waits 300 seconds for a person and is then denied.
+  Either way the deny covers that one request.
   `kubectl` is denied except `kubectl get`. A write outside the workspace
   asks, except under `/tmp` and `~/.cache`. Writes under `~/.euler` (the
   default Euler home) are denied, so the agent cannot edit its own rules
@@ -175,7 +179,10 @@ The three profiles:
   an `allow`. Where its surface has an `ask` or `deny` rule it asks, so
   `cat ~/.ssh/id_ed25519` in a shell command asks rather than slipping past
   the `~/.ssh` deny. Where that surface has a `deny` rule only a person can
-  answer (the guardian does not), so under plain `exec` it is denied.
+  answer (the guardian does not), so under plain `exec` it is denied. In
+  `dev` and `agent` this covers everyday commands such as `ls src/*.rs`,
+  `echo $HOME`, and `git commit -m "$MSG"`. For `agent` under plain `exec`,
+  have the agent use literal paths and `git commit -F <file>`.
 - `ci` is `workspace` (sandboxed, network on so cargo can fetch crates) with
   a catch-all shell `deny` followed by `allow` carve-outs, so only the listed
   cargo commands run. Every other shell command is denied, including a
@@ -184,11 +191,11 @@ The three profiles:
   `euler exec --profile ci`. The `code-swarm.*` deny keeps paid model reviews
   out of CI; when that extension is not installed, startup prints a notice
   and keeps the rule.
-- Use `workspace`, not `locked`, for a catch-all CI profile. `locked` asks
-  for every command, so under `exec` the `--auto-approve` tier applies, and
-  its default tier sets shell commands to always-deny. A configured
-  always-deny is checked before any rule, so the `allow` carve-outs would
-  never run a command.
+- Use `workspace`, not `locked`, for a catch-all CI profile. `locked` has
+  `approvals: always`, so under `exec` the `--auto-approve` tier applies,
+  and its default tier sets shell commands to always-deny (ADR 0027,
+  resolved question 17). A configured always-deny is checked before any
+  rule, so the `allow` carve-outs would never run a command.
 
 Extension reviewers (`extension_reviewers`, ADR 0027) are not available yet:
 this version refuses at startup a profile that sets them, naming the field.

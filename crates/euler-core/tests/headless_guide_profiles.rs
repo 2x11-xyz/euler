@@ -209,6 +209,35 @@ fn guide_agent_path_rules_decide_as_described() {
     ));
 }
 
+/// The guide says only a person (never the guardian) can answer the ask for
+/// a `dev` or `agent` shell command with an operand Euler cannot resolve,
+/// because their `path` surface has a `deny` rule, so plain `exec` denies
+/// it. It suggests literal paths and `git commit -F <file>` instead.
+#[test]
+fn guide_dev_and_agent_unresolved_shell_operands_are_human_only() {
+    let config = guide_config();
+    let dev = resolve(&config, Some("dev"), ProfileContext::Interactive);
+    let agent = resolve(&config, Some("agent"), ProfileContext::Headless);
+    let workspace = tempfile::tempdir().expect("workspace");
+    let root = workspace.path();
+    for profile in [&dev, &agent] {
+        for command in ["ls src/*.rs", "echo $HOME", "git commit -m \"$MSG\""] {
+            assert!(
+                matches!(
+                    run_shell(profile, command, root),
+                    Some(RuleMatch::Unresolved {
+                        human_only: true,
+                        ..
+                    })
+                ),
+                "{}: {command}",
+                profile.name
+            );
+        }
+        assert_eq!(shell(profile, "git commit -F msg.txt", root), None);
+    }
+}
+
 #[test]
 fn guide_ci_allows_only_the_listed_cargo_commands() {
     let config = guide_config();
