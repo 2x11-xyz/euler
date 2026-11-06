@@ -138,9 +138,14 @@ fn profile_rules_parse_into_one_profile_layer_and_unenforced_parts_are_refused()
         .expect("outside_workspace rules are enforced");
     assert_eq!(outside.fields.rules.len(), 1);
 
+    // `ask_timeout` is enforced (ADR 0027 rollout step 5).
+    let timeout = config
+        .resolve(Some("timeout"), ProfileContext::Headless, None)
+        .expect("ask_timeout is enforced");
+    assert_eq!(timeout.fields.ask_timeout, Some(0));
+
     for (name, field) in [
-        ("agent", "ask_timeout"),
-        ("timeout", "ask_timeout"),
+        ("agent", "extension_reviewers"),
         ("reviewed", "extension_reviewers"),
     ] {
         let error = config
@@ -168,6 +173,7 @@ fn a_subagent_default_with_an_unenforced_field_is_refused_at_startup() {
     let config = parse(
         r#"{"defaults": {"subagent": "helper"}, "profiles": {
             "helper": {"extends": "full", "ask_timeout": 30,
+                       "extension_reviewers": ["policy-check.review"],
                        "rules": {"path": [{"pattern": "src/**", "state": "deny"}]}}
         }}"#,
     )
@@ -176,7 +182,7 @@ fn a_subagent_default_with_an_unenforced_field_is_refused_at_startup() {
         config.resolve_subagent(None),
         Err(ProfileError::Unenforced {
             profile: "helper".to_owned(),
-            field: "ask_timeout",
+            field: "extension_reviewers",
         })
     );
 }
@@ -491,18 +497,15 @@ fn overlay_rules_join_as_an_overlay_layer_and_only_tighten() {
     let mut plain = config.named("plain").expect("named");
     tightening.apply(&mut plain).expect("overlay tightens");
     assert_eq!(plain.fields.ask_timeout, Some(60));
-    // The overlay, not the profile, carries the unenforced timeout.
-    assert_eq!(
-        config.resolve(
+    // The overlay's timeout is enforced (ADR 0027 rollout step 5).
+    let resolved = config
+        .resolve(
             Some("plain"),
             ProfileContext::Interactive,
-            Some(&tightening)
-        ),
-        Err(ProfileError::OverlayUnenforced {
-            profile: "plain".to_owned(),
-            field: "ask_timeout",
-        })
-    );
+            Some(&tightening),
+        )
+        .expect("the overlay's timeout is enforced");
+    assert_eq!(resolved.fields.ask_timeout, Some(60));
 
     let overlay_file = temp.path().join(PROJECT_OVERLAY_PATH);
     for (text, expected) in [
@@ -740,32 +743,49 @@ fn resume_keeps_recorded_layers_and_joins_added_ask_and_deny_rules() {
     );
 
     // This build refuses the joined profile rather than running without
-    // the recorded timeout.
+    // the recorded extension reviewers.
     assert_eq!(
         ResumeProfile::choose(Some(recorded.clone()), resolved.clone(), false, None),
         Err(ProfileError::Unenforced {
             profile: "dev".to_owned(),
-            field: "ask_timeout",
+            field: "extension_reviewers",
         })
     );
-    // A resolved profile without a timeout still keeps the recorded one,
+    // A resolved profile without reviewers still keeps the recorded ones,
     // and the refusal names the recording rather than asking the user to
     // remove a field their profile does not set.
-    let error = ResumeProfile::choose(Some(recorded), with_rules("dev", Vec::new()), false, None)
-        .expect_err("the recorded timeout is refused");
+    let error = ResumeProfile::choose(
+        Some(recorded.clone()),
+        with_rules("dev", Vec::new()),
+        false,
+        None,
+    )
+    .expect_err("the recorded reviewers are refused");
     assert_eq!(
         error,
         ProfileError::RecordedUnenforced {
             profile: "dev".to_owned(),
-            field: "ask_timeout",
+            field: "extension_reviewers",
         }
     );
     assert_eq!(
         error.to_string(),
-        "this session recorded profile \"dev\" with ask_timeout, which this version parses and \
-         records but does not enforce yet, and resume keeps the recorded ask_timeout; pass \
-         --profile to resume under a profile without it"
+        "this session recorded profile \"dev\" with extension_reviewers, which this version \
+         parses and records but does not enforce yet, and resume keeps the recorded \
+         extension_reviewers; pass --profile to resume under a profile without it"
     );
+    // A recorded timeout is enforced (ADR 0027 rollout step 5): resume
+    // keeps the lower one.
+    let timed = ExecutionProfile {
+        fields: ProfileFields {
+            extension_reviewers: Vec::new(),
+            ..recorded.fields
+        },
+        name: "dev".to_owned(),
+    };
+    let kept = ResumeProfile::choose(Some(timed), with_rules("dev", Vec::new()), false, None)
+        .expect("ask_timeout is enforced");
+    assert_eq!(kept.profile.fields.ask_timeout, Some(120));
 }
 
 #[test]
@@ -836,15 +856,12 @@ fn resume_that_keeps_the_recorded_profile_joins_policy_fields() {
     };
     // `resolved` stands for a profile whose timeout the overlay already
     // lowered to 120. A recorded 60 does not make the overlay's 120 an
-    // error, and the join keeps the recorded 60, which the refusal names.
+    // error, and the join keeps the recorded 60.
     let recorded = locked_with(Vec::new(), Some(60));
-    assert_eq!(
-        ResumeProfile::choose(Some(recorded), resolved, false, Some(&lower_timeout)),
-        Err(ProfileError::RecordedUnenforced {
-            profile: "careful".to_owned(),
-            field: "ask_timeout",
-        })
-    );
+    let kept = ResumeProfile::choose(Some(recorded), resolved, false, Some(&lower_timeout))
+        .expect("ask_timeout is enforced");
+    assert_eq!(kept.profile.name, "careful");
+    assert_eq!(kept.profile.fields.ask_timeout, Some(60));
 }
 
 #[test]

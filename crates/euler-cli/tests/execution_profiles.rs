@@ -628,15 +628,15 @@ fn malformed_profiles_json_names_the_file_and_field() {
     );
 }
 
-/// ADR 0027: every rule surface is enforced, so a profile or overlay with
-/// rules starts; a profile or overlay that sets a field the gate does not
-/// enforce yet is refused at startup.
+/// ADR 0027: every rule surface and `ask_timeout` are enforced, so a
+/// profile or overlay with them starts; a profile that sets a field the
+/// gate does not enforce yet is refused at startup.
 #[test]
 fn unenforced_permission_fields_are_refused_at_startup() {
     let workspace = workspace();
     write_profiles(
         &workspace,
-        r#"{"profiles": {"agent": {"extends": "full", "rules": {
+        r#"{"profiles": {"agent": {"extends": "full", "ask_timeout": 300, "rules": {
             "shell": [{"pattern": "git push *", "state": "ask"}],
             "path": [{"pattern": "secrets/**", "state": "deny"}]
         }}}}"#,
@@ -646,7 +646,8 @@ fn unenforced_permission_fields_are_refused_at_startup() {
 
     write_profiles(
         &workspace,
-        r#"{"profiles": {"agent": {"extends": "full", "ask_timeout": 300}}}"#,
+        r#"{"profiles": {"agent": {"extends": "full",
+            "extension_reviewers": ["policy-check.review"]}}}"#,
     );
     std::fs::remove_file(&workspace.log).ok();
     let output = exec_new(&workspace, &["--profile", "agent"]);
@@ -654,8 +655,8 @@ fn unenforced_permission_fields_are_refused_at_startup() {
     let message = stderr(&output);
     assert!(
         message.contains(
-            "profile \"agent\" sets ask_timeout, which this version parses and records but \
-             does not enforce yet; remove ask_timeout to run this profile"
+            "profile \"agent\" sets extension_reviewers, which this version parses and records \
+             but does not enforce yet; remove extension_reviewers to run this profile"
         ),
         "{message}"
     );
@@ -666,24 +667,10 @@ fn unenforced_permission_fields_are_refused_at_startup() {
 
     write_overlay(
         &workspace,
-        r#"{"rules": {"outside_workspace": [{"pattern": "/tmp", "state": "deny"}]}}"#,
+        r#"{"ask_timeout": 60, "rules": {"outside_workspace": [{"pattern": "/tmp", "state": "deny"}]}}"#,
     );
     let output = exec_new(&workspace, &["--profile", "full"]);
     assert!(output.status.success(), "{}", stderr(&output));
-
-    write_overlay(&workspace, r#"{"ask_timeout": 60}"#);
-    std::fs::remove_file(&workspace.log).ok();
-    let output = exec_new(&workspace, &["--profile", "full"]);
-    assert!(!output.status.success());
-    let message = stderr(&output);
-    assert!(
-        message.contains(
-            "the project overlay .euler/profile-overlay.json sets ask_timeout on profile \
-             \"full\", which this version parses and records but does not enforce yet; remove \
-             ask_timeout from the overlay"
-        ),
-        "{message}"
-    );
 }
 
 #[test]

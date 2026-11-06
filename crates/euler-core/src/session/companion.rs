@@ -11,7 +11,9 @@ use super::{
 };
 use crate::canvas::{assemble_canvas_prefolded, AutoCompactionPolicy};
 use crate::execution_profile::{ExecutionProfile, RuleMatch};
-use crate::permissions::{ApprovalMode, PermissionDecider, PermissionGate, PermissionRequest};
+use crate::permissions::{
+    ApprovalMode, PermissionDecider, PermissionDecisionOutcome, PermissionGate, PermissionRequest,
+};
 use crate::{ProviderRuntimeObserver, ProviderRuntimeScope};
 use euler_agents::{generated_agent_id, AgentResult, AgentTask, SpawnedAgent};
 use euler_event::{object, tool_result_succeeded, EventEnvelope, EventKind, JsonObject};
@@ -43,6 +45,8 @@ pub struct AgentResultSummary {
 struct CompanionLoop<'a, D> {
     session_id: String,
     agent_id: String,
+    /// The child's execution profile, named in a timed-out ask's error.
+    profile_name: String,
     target: ModelTarget,
     task: AgentTask,
     redactor: crate::redaction::SecretRedactor,
@@ -325,6 +329,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             session_id: session.config.session_id.clone(),
             redactor: session.redactor.clone(),
             agent_id,
+            profile_name: profile.name,
             target,
             task,
             workspace_root: session.config.root.clone(),
@@ -470,21 +475,29 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             } else {
                 None
             };
-            let decision =
-                match self
-                    .permissions
-                    .decide_detailed_cancellable(&request, mode, cancellation)
-                {
-                    crate::permissions::PermissionDecisionOutcome::Decided(decision) => decision,
-                    crate::permissions::PermissionDecisionOutcome::Cancelled => {
-                        self.emit_cancelled_tool_result(call, tool_call_event_id, None)?;
-                        return Err(SessionError::Cancelled);
-                    }
-                };
             let parent = prompt_id.unwrap_or_else(|| tool_call_event_id.clone());
+            let outcome =
+                self.permissions
+                    .decide_detailed_cancellable(&request, mode, cancellation);
+            let decision = match outcome {
+                PermissionDecisionOutcome::Decided(decision) => decision,
+                PermissionDecisionOutcome::Cancelled => {
+                    self.emit_cancelled_tool_result(call, tool_call_event_id, None)?;
+                    return Err(SessionError::Cancelled);
+                }
+                PermissionDecisionOutcome::TimedOut => {
+                    let decided = (ruling.rule.as_ref(), parent);
+                    return self.refuse_timed_out_call(call, tool_call_event_id, &request, decided);
+                }
+            };
             self.record_decision(&request, &decision, &ruling, parent)?;
             if !decision.allowed() {
-                self.turn_state.record_denial(capability);
+                // A never-prompt decider's deny covers this request only
+                // (ADR 0027 section 4).
+                let never_prompted = needs_prompt && self.permissions.decider_mut().never_prompts();
+                if !never_prompted {
+                    self.turn_state.record_denial(capability);
+                }
                 self.emit_permission_denied_tool_result(call, tool_call_event_id)?;
                 return Ok(());
             }
@@ -518,6 +531,34 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             decision.allowed(),
         );
         Ok(())
+    }
+
+    /// Refuse a call whose ask its `ask_timeout` denied: the child's
+    /// effective timeout, the lower of the parent's and its own (ADR 0027
+    /// section 6). The deny covers this request only.
+    fn refuse_timed_out_call(
+        &mut self,
+        call: ToolCall,
+        tool_call_event_id: String,
+        request: &PermissionRequest,
+        (rule, parent): (Option<&RuleMatch>, String),
+    ) -> Result<(), SessionError> {
+        self.append(
+            EventKind::PERMISSION_DECISION,
+            super::timeout_decision_payload(request, rule),
+            Some(parent),
+        )?;
+        crate::diagnostics::permission_decision(
+            &self.session_id,
+            request.capability.as_str(),
+            "timeout",
+            false,
+        );
+        let message = super::timeout_denial(
+            &self.profile_name,
+            self.permissions.execution_profile().ask_timeout,
+        );
+        self.emit_tool_failure(call.id, call.name, message, tool_call_event_id)
     }
 
     /// Run or refuse a call a rule decided on its own (ADR 0027 section

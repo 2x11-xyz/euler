@@ -1,6 +1,7 @@
 use super::{
     approval_mode_str, elapsed_ms, insert_rule_fields, permission_decision_payload,
-    rule_decision_payload, rule_denial, ExtensionExecutionError, Session, SessionError,
+    rule_decision_payload, rule_denial, timeout_decision_payload, ExtensionExecutionError, Session,
+    SessionError,
 };
 use crate::execution_profile::{RuleMatch, RuleState};
 use crate::extensions::{
@@ -639,6 +640,14 @@ impl<D> Session<D> {
             PermissionDecisionOutcome::Cancelled => {
                 return Err(ExtensionExecutionError::Cancelled);
             }
+            PermissionDecisionOutcome::TimedOut => {
+                return self.refuse_timed_out_batch(
+                    &batch,
+                    &rules,
+                    (extension_id, command),
+                    &prompt_id,
+                );
+            }
         };
         let denied = decisions
             .iter()
@@ -673,6 +682,40 @@ impl<D> Session<D> {
             return Err(ExtensionExecutionError::CapabilityDenied { capability });
         }
         self.record_extension_rule_allows(&rule_allowed, (batch.operation(), extension_id, command))
+    }
+
+    /// Record a batch's ask its `ask_timeout` denied: one `timeout` decision
+    /// per request, parented to the shared prompt, and no grant (ADR 0027
+    /// section 4).
+    fn refuse_timed_out_batch(
+        &mut self,
+        batch: &PermissionRequestBatch,
+        rules: &[Option<RuleMatch>],
+        (extension_id, command): (&str, &str),
+        prompt_id: &str,
+    ) -> Result<(), ExtensionExecutionError>
+    where
+        D: PermissionDecider,
+    {
+        for (request, rule) in batch.requests().iter().zip(rules) {
+            let mut payload = timeout_decision_payload(request, rule.as_ref());
+            payload.insert("batch".to_owned(), true.into());
+            payload.insert("operation".to_owned(), batch.operation().to_owned().into());
+            payload.insert("extension_id".to_owned(), extension_id.into());
+            payload.insert("command".to_owned(), command.into());
+            self.emit_with_parent(
+                EventKind::PERMISSION_DECISION,
+                payload,
+                Some(prompt_id.to_owned()),
+            )
+            .map_err(|_| ExtensionExecutionError::CapabilityDenied {
+                capability: request.capability,
+            })?;
+        }
+        Err(ExtensionExecutionError::AskTimedOut(super::timeout_denial(
+            &self.config.execution_profile.name,
+            self.permissions.execution_profile().ask_timeout,
+        )))
     }
 
     /// Ask a human to approve one project-tier extension config write started
@@ -716,13 +759,18 @@ impl<D> Session<D> {
             )
             .map_err(|_| denied())?;
         let request = PermissionRequest::new(capability, reason).with_once_only();
-        let verdict = match self
-            .permissions
-            .decider_mut()
-            .decide_cancellable(&request, cancellation)
-        {
+        let verdict = match self.permissions.ask_decider_once(&request, cancellation) {
             PermissionDecisionOutcome::Decided(verdict) => verdict,
             PermissionDecisionOutcome::Cancelled => return Err(ExtensionError::Cancelled),
+            PermissionDecisionOutcome::TimedOut => {
+                let mut payload = timeout_decision_payload(&request, None);
+                payload.insert("operation".to_owned(), operation.into());
+                payload.insert("extension_id".to_owned(), extension_id.into());
+                payload.insert("command".to_owned(), command.into());
+                self.emit_with_parent(EventKind::PERMISSION_DECISION, payload, Some(prompt_id))
+                    .map_err(|_| denied())?;
+                return Err(denied());
+            }
         };
         // Whatever scope the human picked, this approval covers this write
         // only: installing a grant would let a later write skip the human.

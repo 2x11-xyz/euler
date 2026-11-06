@@ -9,8 +9,8 @@
 //! permission gate, not the sandbox. Any other mix is refused with the
 //! first field this build cannot deliver. A profile that sets a permission
 //! field of ADR 0027 the gate does not enforce yet (`NOT_ENFORCED_YET`) is
-//! refused too: `ask_timeout` and `extension_reviewers`. Every rule surface
-//! is enforced.
+//! refused too: `extension_reviewers`. Every rule surface and
+//! `ask_timeout` are enforced.
 
 use super::{
     full, locked, workspace, ApprovalsSetting, CredentialsSetting, NetworkSetting, ProfileFields,
@@ -22,17 +22,14 @@ use std::path::{Path, PathBuf};
 /// The ADR 0027 fields this build parses and records but does not enforce.
 /// `extension_reviewers` validation checks syntax only; the check for an
 /// enabled reviewer with a descriptor must land before it leaves this list.
-pub(super) const NOT_ENFORCED_YET: [&str; 2] = ["ask_timeout", "extension_reviewers"];
+pub(super) const NOT_ENFORCED_YET: [&str; 1] = ["extension_reviewers"];
 
 /// The subprocess sandbox for `fields`, or the first field this build cannot
 /// enforce on this host.
 pub(super) fn subprocess_sandbox(
     fields: &ProfileFields,
 ) -> Result<SubprocessSandbox, &'static str> {
-    let permission_fields_set = [
-        fields.ask_timeout.is_some(),
-        !fields.extension_reviewers.is_empty(),
-    ];
+    let permission_fields_set = [!fields.extension_reviewers.is_empty()];
     if let Some(index) = permission_fields_set.iter().position(|set| *set) {
         return Err(NOT_ENFORCED_YET[index]);
     }

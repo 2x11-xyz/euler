@@ -553,6 +553,10 @@ pub trait PermissionDecider {
 pub enum PermissionDecisionOutcome<T> {
     Decided(T),
     Cancelled,
+    /// The profile's `ask_timeout` passed before an answer, or is `0`: a
+    /// deny of that request only, recorded with `decision_source:
+    /// "timeout"`. It installs no grant (ADR 0027 section 4).
+    TimedOut,
 }
 
 #[derive(Debug)]
@@ -1106,10 +1110,64 @@ impl<D: PermissionDecider> PermissionGate<D> {
     ) -> GrantDecision {
         match self.decide_detailed_cancellable(request, mode, &CancellationToken::new()) {
             PermissionDecisionOutcome::Decided(decision) => decision,
+            PermissionDecisionOutcome::TimedOut => GrantDecision::deny(request.capability, None),
             PermissionDecisionOutcome::Cancelled => {
                 unreachable!("a private never-cancelled permission decision cannot cancel")
             }
         }
+    }
+
+    /// Ask the decider, bounded by the profile's `ask_timeout` (ADR 0027
+    /// section 4): absent waits as long as the decider does, `0` asks no
+    /// one, and otherwise the decider's wait is cancelled when the timeout
+    /// passes, which closes its prompt. A turn cancellation stays a
+    /// cancellation; an answer the decider returns after the timeout
+    /// passed is discarded here, whatever the decider does with its token.
+    /// A never-prompt decider has no person to wait for, so it decides as
+    /// it does without a timeout.
+    fn ask_within_timeout<T>(
+        &mut self,
+        cancellation: &CancellationToken,
+        ask: impl FnOnce(&mut D, &CancellationToken) -> PermissionDecisionOutcome<T>,
+    ) -> PermissionDecisionOutcome<T> {
+        if cancellation.is_cancelled() {
+            return PermissionDecisionOutcome::Cancelled;
+        }
+        let timeout = self
+            .profile
+            .ask_timeout
+            .filter(|_| !self.decider.never_prompts());
+        let Some(seconds) = timeout else {
+            return ask(&mut self.decider, cancellation);
+        };
+        if seconds == 0 {
+            return PermissionDecisionOutcome::TimedOut;
+        }
+        let deadline = crate::deadline::DeadlineCancellation::start(
+            cancellation.clone(),
+            std::time::Duration::from_secs(seconds.into()),
+        );
+        let outcome = ask(&mut self.decider, deadline.token());
+        let expired = deadline.finish();
+        if cancellation.is_cancelled() {
+            PermissionDecisionOutcome::Cancelled
+        } else if expired {
+            PermissionDecisionOutcome::TimedOut
+        } else {
+            outcome
+        }
+    }
+
+    /// One human-only ask that installs nothing (a project-tier extension
+    /// config write), bounded by `ask_timeout` like every ask.
+    pub(crate) fn ask_decider_once(
+        &mut self,
+        request: &PermissionRequest,
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<DeciderVerdict> {
+        self.ask_within_timeout(cancellation, |decider, token| {
+            decider.decide_cancellable(request, token)
+        })
     }
 
     /// Cancellation-aware form of [`Self::decide_detailed`]. A cancelled ask
@@ -1138,10 +1196,13 @@ impl<D: PermissionDecider> PermissionGate<D> {
                         GrantScope::Once,
                     ));
                 }
-                let verdict = match self.decider.decide_cancellable(request, cancellation) {
+                let verdict = match self.ask_decider_once(request, cancellation) {
                     PermissionDecisionOutcome::Decided(verdict) => verdict,
                     PermissionDecisionOutcome::Cancelled => {
                         return PermissionDecisionOutcome::Cancelled;
+                    }
+                    PermissionDecisionOutcome::TimedOut => {
+                        return PermissionDecisionOutcome::TimedOut;
                     }
                 };
                 if cancellation.is_cancelled() {
@@ -1227,11 +1288,14 @@ impl<D: PermissionDecider> PermissionGate<D> {
         if cancellation.is_cancelled() {
             return PermissionDecisionOutcome::Cancelled;
         }
-        let verdict = match self.decider.decide_batch_cancellable(batch, cancellation) {
+        let verdict = match self.ask_within_timeout(cancellation, |decider, token| {
+            decider.decide_batch_cancellable(batch, token)
+        }) {
             PermissionDecisionOutcome::Decided(verdict) => verdict,
             PermissionDecisionOutcome::Cancelled => {
                 return PermissionDecisionOutcome::Cancelled;
             }
+            PermissionDecisionOutcome::TimedOut => return PermissionDecisionOutcome::TimedOut,
         };
         if cancellation.is_cancelled() {
             return PermissionDecisionOutcome::Cancelled;

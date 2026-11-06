@@ -82,7 +82,8 @@ pub use companion::AgentResultSummary;
 pub use observer::RoundObserverConfig;
 pub(crate) use permissions_gate::{
     approval_mode_str, insert_rule_fields, permission_decision_payload, permission_prompt_payload,
-    permission_request_for_tool, rule_decision_payload, rule_denial, PermissionRuling,
+    permission_request_for_tool, rule_decision_payload, rule_denial, timeout_decision_payload,
+    timeout_denial, PermissionRuling,
 };
 pub(crate) use tool_dispatch::{
     file_change_payload, file_diff_payload, prepare_checkpoint, prepare_checkpoint_for,
@@ -595,6 +596,11 @@ pub enum ExtensionExecutionError {
     /// the rule, so it is safe to surface verbatim.
     #[error("{0}")]
     RuleDenied(String),
+    /// The execution profile's `ask_timeout` denied the call's ask: nobody
+    /// answered in time, or `0` asked no person (ADR 0027 section 4). The
+    /// message is host-generated and says the deny covers this request only.
+    #[error("{0}")]
+    AskTimedOut(String),
     /// Host-side validation rejected the command input before execution. The
     /// message is host-generated (never raw extension error text), so unlike
     /// the sibling variants it is safe to surface verbatim.
@@ -6846,6 +6852,9 @@ fn validate_model_target_shape(target: &ModelTarget) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(test)]
+#[path = "permission_ask_timeout_test.rs"]
+mod permission_ask_timeout_test;
 #[cfg(test)]
 #[path = "permission_matrix_test.rs"]
 mod permission_matrix_test;

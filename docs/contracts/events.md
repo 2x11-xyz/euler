@@ -554,6 +554,16 @@ extension error does not consume the later result.
     guardian's read of user authorization, present when the verdict parsed.
   - `rationale`: short guardian rationale for the outcome (also present on
     fail-closed denials, where it names the failure instead of a verdict).
+  - `guardian_expired`: `true` when the review passed its host deadline and
+    was cancelled; the decision is then a deny.
+
+  Additive optional field for asks settled by `ask_timeout` (ADR 0027
+  section 4, capabilities contract "Ask timeout"):
+  - `decision_source`: `"timeout"` when the profile's `ask_timeout` passed
+    before an answer, or is `0`: `mode: "ask"`, `allowed: false`, parented
+    to the `permission.prompt`. It denies that request only. A
+    never-prompt decider's deny is recorded without `decision_source`, as
+    before.
 
   Additive optional fields for permission rules (ADR 0027, capabilities
   contract "Permission rules in the gate"):

@@ -124,6 +124,9 @@ impl<D: PermissionDecider> Session<D> {
             {
                 PermissionDecisionOutcome::Decided(decision) => decision,
                 PermissionDecisionOutcome::Cancelled => return Err(SessionError::Cancelled),
+                PermissionDecisionOutcome::TimedOut => {
+                    return self.decide_by_timeout(request, ruling.rule.as_ref(), decision_parent);
+                }
             };
         let allowed = decision.allowed();
         let mode_label = approval_mode_str(mode);
@@ -143,18 +146,21 @@ impl<D: PermissionDecider> Session<D> {
         if allowed {
             return Ok(PermissionRuling::Allowed);
         }
-        if !request.capability_is_label {
+        // A person's deny and a configured `always-deny` deny the capability
+        // for the rest of the turn; a never-prompt decider's deny covers
+        // this request only (ADR 0027 section 4).
+        let never_prompted = needs_prompt && self.permissions.decider_mut().never_prompts();
+        if !request.capability_is_label && !never_prompted {
             turn_state.record_denial(capability);
         }
-        let never_prompted = needs_prompt && self.permissions.decider_mut().never_prompts();
         Ok(PermissionRuling::Denied {
             message: self.denial_message(request, ruling, never_prompted, guardian_consulted),
         })
     }
 
     /// The tool error for a denied ask: a never-prompt decider's names the
-    /// profile and what would allow the request; a person's denies the
-    /// capability for the rest of the turn.
+    /// profile and what would allow the request and covers that request
+    /// only; a person's denies the capability for the rest of the turn.
     fn denial_message(
         &self,
         request: &PermissionRequest,
@@ -246,6 +252,33 @@ impl<D: PermissionDecider> Session<D> {
         })
     }
 
+    /// Record the deny of an ask its `ask_timeout` settled, parented to the
+    /// prompt. It covers that request only (ADR 0027 section 4).
+    fn decide_by_timeout(
+        &mut self,
+        request: &PermissionRequest,
+        rule: Option<&RuleMatch>,
+        decision_parent: String,
+    ) -> Result<PermissionRuling, SessionError> {
+        self.emit_with_parent(
+            EventKind::PERMISSION_DECISION,
+            timeout_decision_payload(request, rule),
+            Some(decision_parent),
+        )?;
+        crate::diagnostics::permission_decision(
+            &self.config.session_id,
+            request.capability.as_str(),
+            "timeout",
+            false,
+        );
+        Ok(PermissionRuling::Denied {
+            message: timeout_denial(
+                &self.config.execution_profile.name,
+                self.permissions.execution_profile().ask_timeout,
+            ),
+        })
+    }
+
     /// Guardian review for one ask (ADR 0011). Returns `None` on abstain —
     /// the configured decider then resolves the ask. Every failure path
     /// (task build, spawn, companion failure, unparseable verdict) resolves
@@ -264,15 +297,40 @@ impl<D: PermissionDecider> Session<D> {
         F: FnMut(&euler_event::EventEnvelope),
     {
         let capability = request.capability;
-        let ruling = match guardian::guardian_task(request) {
-            Ok(task) => match self.spawn_companion_with_cancel(task, cancellation.clone()) {
-                Ok(summary) => guardian::ruling_for_result(&summary.result),
-                Err(SessionError::Cancelled) => return Err(SessionError::Cancelled),
-                Err(error) => {
-                    guardian::deny_failure(format!("guardian review failed to run: {error}"))
+        let (ruling, expired) = match guardian::guardian_task(request) {
+            Ok(task) => {
+                // The review runs against a host deadline, so a guardian
+                // that keeps streaming never holds the ask open (ADR 0027
+                // resolved question 18). A review that ends first keeps its
+                // ruling.
+                let deadline = crate::deadline::DeadlineCancellation::start(
+                    cancellation.clone(),
+                    guardian::review_deadline(),
+                );
+                let review = self.spawn_companion_with_cancel(task, deadline.token().clone());
+                let expired = deadline.finish();
+                match review {
+                    Ok(summary) => (guardian::ruling_for_result(&summary.result), false),
+                    Err(SessionError::Cancelled) if cancellation.is_cancelled() || !expired => {
+                        return Err(SessionError::Cancelled);
+                    }
+                    Err(_) if expired => (
+                        guardian::deny_failure(format!(
+                            "guardian review passed its {}-second deadline",
+                            guardian::review_deadline().as_secs()
+                        )),
+                        true,
+                    ),
+                    Err(error) => (
+                        guardian::deny_failure(format!("guardian review failed to run: {error}")),
+                        false,
+                    ),
                 }
-            },
-            Err(error) => guardian::deny_failure(format!("guardian task rejected: {error}")),
+            }
+            Err(error) => (
+                guardian::deny_failure(format!("guardian task rejected: {error}")),
+                false,
+            ),
         };
         sink.flush(self.bus.events());
         let (allowed, rationale, verdict) = match &ruling {
@@ -293,6 +351,9 @@ impl<D: PermissionDecider> Session<D> {
         // operation, never by silently corrupting the record.
         let mut payload =
             guardian::guardian_decision_payload(capability, allowed, &rationale, verdict);
+        if expired {
+            payload.insert("guardian_expired".to_owned(), true.into());
+        }
         insert_rule_fields(&mut payload, request, rule);
         self.emit_with_parent(
             EventKind::PERMISSION_DECISION,
@@ -374,7 +435,8 @@ fn never_prompt_denial(
     if let Some(rule) = rule {
         return format!(
             "permission denied: this run cannot ask anyone, and execution profile `{profile}` \
-             asks before this request ({}). Do not retry it this turn",
+             asks before this request ({}). Do not retry it; this denial covers this request \
+             only, so carry on with other work",
             rule.describe()
         );
     }
@@ -410,7 +472,8 @@ fn never_prompt_denial(
     };
     format!(
         "permission denied: this run cannot ask anyone, and execution profile `{profile}` asks \
-         before {what}; {allow}. Do not retry {capability} commands this turn"
+         before {what}; {allow}. Do not retry it; this denial covers this request only, so \
+         carry on with other work"
     )
 }
 
@@ -422,6 +485,43 @@ pub(crate) fn rule_denial(rule: &RuleMatch) -> String {
          command or tool; this denial covers this request only, so carry on with other work or \
          ask the user",
         rule.describe()
+    )
+}
+
+/// The `permission.decision` for an ask its `ask_timeout` denied (ADR 0027
+/// section 4): `decision_source: "timeout"`, with the rule that caused the
+/// ask, if one did.
+pub(crate) fn timeout_decision_payload(
+    request: &PermissionRequest,
+    rule: Option<&RuleMatch>,
+) -> JsonObject {
+    let mut payload = permission_decision_payload(
+        &GrantDecision::deny(request.capability, None),
+        approval_mode_str(ApprovalMode::Ask),
+        ApprovalMode::Ask,
+    );
+    payload.insert("decision_source".to_owned(), "timeout".into());
+    insert_rule_fields(&mut payload, request, rule);
+    payload
+}
+
+/// The tool error for an ask its `ask_timeout` denied. It covers that
+/// request only, so the model may carry on with other work.
+pub(crate) fn timeout_denial(profile: &str, ask_timeout: Option<u32>) -> String {
+    let why = match ask_timeout {
+        Some(0) => format!(
+            "execution profile `{profile}` sets ask_timeout 0, so no person is asked and an ask \
+             no reviewer settles is denied"
+        ),
+        Some(seconds) => format!(
+            "nobody answered within the {seconds}-second ask_timeout of execution profile \
+             `{profile}`"
+        ),
+        None => format!("the ask of execution profile `{profile}` timed out"),
+    };
+    format!(
+        "permission denied: {why}. This denial covers this request only, so carry on with \
+         other work or ask the user"
     )
 }
 

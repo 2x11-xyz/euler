@@ -50,6 +50,25 @@ pub(crate) const GUARDIAN_PERSONA: &str = "guardian";
 pub(crate) const MAX_CONSECUTIVE_GUARDIAN_DENIALS_PER_TURN: u32 = 3;
 pub(crate) const GUARDIAN_TURN_INTERRUPT_MESSAGE: &str =
     "turn interrupted: 3 consecutive guardian permission denials";
+/// The host deadline for one guardian review, provider retries included
+/// (ADR 0027 resolved question 18). Expiry cancels the review and denies.
+const REVIEW_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(test)]
+thread_local! {
+    /// A shorter review deadline for tests on this thread.
+    pub(crate) static REVIEW_DEADLINE_FOR_TEST: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn review_deadline() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(deadline) = REVIEW_DEADLINE_FOR_TEST.with(std::cell::Cell::get) {
+        return deadline;
+    }
+    REVIEW_DEADLINE
+}
+
 /// Upper bound on verdict rationale text retained in events and teaching
 /// messages; guardian output beyond this is model verbosity, not signal.
 const MAX_RATIONALE_BYTES: usize = 512;

@@ -426,7 +426,9 @@ legible via glyphs and weight (see glyph fallbacks in the Warm Ledger plan).
   blocked compatibility provider.
 - A permission ask observes the same signal. Cancellation closes the active
   prompt without converting it into denial, installs no grant, and cannot let a
-  stale modal reply satisfy a later ask. Write tools recheck cancellation at
+  stale modal reply satisfy a later ask. A profile's `ask_timeout` closes the
+  prompt the same way when it passes; the core records that ask as a timeout
+  deny (capabilities contract, "Ask timeout"). Write tools recheck cancellation at
   their final filesystem-mutation boundary.
 - Explicit companion runs and managed-process extension commands observe the
   same signal. The host makes a best-effort protocol cancellation notification

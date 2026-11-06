@@ -99,8 +99,8 @@ impl TuiDecider {
     fn decide_prompt(&mut self, prompt: PermissionPrompt) -> DeciderVerdict {
         match self.decide_prompt_cancellable(prompt, CancellationToken::new()) {
             PermissionDecisionOutcome::Decided(verdict) => verdict,
-            PermissionDecisionOutcome::Cancelled => {
-                unreachable!("a private never-cancelled TUI prompt cannot cancel")
+            PermissionDecisionOutcome::Cancelled | PermissionDecisionOutcome::TimedOut => {
+                unreachable!("a private never-cancelled TUI prompt cannot cancel or time out")
             }
         }
     }
@@ -385,6 +385,139 @@ mod tests {
         let (cancelled, next) = handle.join().expect("join");
         assert_eq!(cancelled, PermissionDecisionOutcome::Cancelled);
         assert_eq!(next, DeciderVerdict::Deny);
+    }
+
+    /// A gate whose execution profile sets `ask_timeout` (ADR 0027 section
+    /// 4), asking through `decider`.
+    fn timed_gate<D: PermissionDecider>(
+        decider: D,
+        ask_timeout: Option<u32>,
+    ) -> euler_core::permissions::PermissionGate<D> {
+        let mut fields = euler_core::ExecutionProfile::default().fields;
+        fields.ask_timeout = ask_timeout;
+        let mut gate = euler_core::permissions::PermissionGate::new(decider);
+        gate.set_execution_profile(fields, false);
+        gate
+    }
+
+    fn ask(
+        gate: &mut euler_core::permissions::PermissionGate<impl PermissionDecider>,
+        cancellation: &CancellationToken,
+    ) -> PermissionDecisionOutcome<bool> {
+        match gate.decide_detailed_cancellable(
+            &request(),
+            euler_core::ApprovalMode::Ask,
+            cancellation,
+        ) {
+            PermissionDecisionOutcome::Decided(decision) => {
+                PermissionDecisionOutcome::Decided(decision.allowed())
+            }
+            PermissionDecisionOutcome::Cancelled => PermissionDecisionOutcome::Cancelled,
+            PermissionDecisionOutcome::TimedOut => PermissionDecisionOutcome::TimedOut,
+        }
+    }
+
+    fn wait_until_closed(prompt: &PermissionPromptEnvelope) {
+        let start = std::time::Instant::now();
+        while !prompt.cancellation.is_cancelled() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "prompt never closed"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// ADR 0027 section 4: when `ask_timeout` passes, the prompt closes and
+    /// the ask times out. An answer after that is discarded, installs no
+    /// grant, and cannot answer the next prompt.
+    #[test]
+    fn a_timeout_closes_the_prompt_and_a_late_answer_is_discarded() {
+        let (decider, channels) = TuiDecider::new();
+        let handle = thread::spawn(move || {
+            let mut gate = timed_gate(decider, Some(1));
+            let turn = CancellationToken::new();
+            let timed_out = ask(&mut gate, &turn);
+            let next = ask(&mut gate, &turn);
+            (timed_out, next, gate.is_granted(&request()))
+        });
+
+        let stale = next_prompt(&channels);
+        wait_until_closed(&stale);
+        let next = channels
+            .request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("next prompt after the timeout");
+        assert!(
+            stale
+                .reply_tx
+                .send(PermissionReply::AllowSessionScope(String::new()))
+                .is_err(),
+            "the timed-out prompt's one-shot receiver must be gone"
+        );
+        assert!(!next.cancellation.is_cancelled());
+        next.reply_tx
+            .send(PermissionReply::AllowOnce)
+            .expect("reply to the current prompt");
+
+        let (timed_out, next, granted) = handle.join().expect("join");
+        assert_eq!(timed_out, PermissionDecisionOutcome::TimedOut);
+        assert_eq!(next, PermissionDecisionOutcome::Decided(true));
+        assert!(!granted, "the late session answer installed no grant");
+    }
+
+    /// A cancellation before the timeout stays a cancellation, and closes
+    /// the prompt.
+    #[test]
+    fn a_cancellation_before_the_timeout_stays_a_cancellation() {
+        let (decider, channels) = TuiDecider::new();
+        let cancellation = euler_sdk::CancellationSource::new();
+        let turn = cancellation.token();
+        let handle = thread::spawn(move || ask(&mut timed_gate(decider, Some(60)), &turn));
+
+        let prompt = next_prompt(&channels);
+        cancellation.cancel();
+        wait_until_closed(&prompt);
+        assert_eq!(
+            handle.join().expect("join"),
+            PermissionDecisionOutcome::Cancelled
+        );
+    }
+
+    /// Section 4: each pending ask has its own timer at its own effective
+    /// timeout. One child's ask times out at its 1 second; the next child's
+    /// ask, with no timeout, stays open past that and takes its own answer,
+    /// not the late answer to the first.
+    #[test]
+    fn another_childs_ask_keeps_its_own_timer() {
+        let (mut decider, channels) = TuiDecider::new();
+        let handle = thread::spawn(move || {
+            let turn = CancellationToken::new();
+            let first = ask(&mut timed_gate(&mut decider, Some(1)), &turn);
+            let second = ask(&mut timed_gate(&mut decider, None), &turn);
+            (first, second)
+        });
+
+        let first = next_prompt(&channels);
+        wait_until_closed(&first);
+        let second = channels
+            .request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second child's prompt");
+        thread::sleep(Duration::from_millis(1500));
+        assert!(
+            !second.cancellation.is_cancelled(),
+            "the first ask's timer does not close the second prompt"
+        );
+        assert!(first.reply_tx.send(PermissionReply::AllowOnce).is_err());
+        second
+            .reply_tx
+            .send(PermissionReply::Deny)
+            .expect("reply to the second prompt");
+
+        let (first, second) = handle.join().expect("join");
+        assert_eq!(first, PermissionDecisionOutcome::TimedOut);
+        assert_eq!(second, PermissionDecisionOutcome::Decided(false));
     }
 
     #[test]

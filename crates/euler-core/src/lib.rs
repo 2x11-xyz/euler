@@ -11,6 +11,7 @@ pub mod canvas;
 pub mod checkpoints;
 pub mod command_safety;
 pub mod compaction;
+mod deadline;
 mod diagnostics;
 mod durability;
 pub mod execution_profile;
