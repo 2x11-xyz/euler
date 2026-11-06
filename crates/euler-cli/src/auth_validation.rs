@@ -49,14 +49,29 @@ impl StoredApiKeyAuth {
         }
     }
 
-    fn open_storage(&self) -> Result<AuthStorage, AuthError> {
-        match &self.source {
-            ApiKeyAuthSource::Default => AuthStorage::new_default(),
-            ApiKeyAuthSource::AuthFile(path) => {
-                fs::metadata(path).map_err(AuthError::Io)?;
-                AuthStorage::new_auth_file(path)
+    fn open_storage(
+        &self,
+        provider_id: &str,
+        env_key_name: &str,
+    ) -> Result<AuthStorage, ProviderError> {
+        let opened = match &self.source {
+            ApiKeyAuthSource::Default => {
+                let path = AuthStorage::default_path()
+                    .map_err(|error| default_auth_path_error(provider_id, error))?;
+                AuthStorage::new(path)
             }
-        }
+            ApiKeyAuthSource::AuthFile(path) => fs::metadata(path)
+                .map_err(AuthError::Io)
+                .and_then(|_| AuthStorage::new_auth_file(path)),
+        };
+        opened.map_err(|error| {
+            map_stored_api_key_auth_error(
+                provider_id,
+                env_key_name,
+                self.uses_explicit_auth_file(),
+                error,
+            )
+        })
     }
 
     fn uses_explicit_auth_file(&self) -> bool {
@@ -83,14 +98,7 @@ impl ApiKeyAuth for StoredApiKeyAuth {
         env_key_name: &'static str,
         display_name: &'static str,
     ) -> Result<ProviderSecretString, ProviderError> {
-        let storage = self.open_storage().map_err(|error| {
-            map_stored_api_key_auth_error(
-                provider_id,
-                env_key_name,
-                self.uses_explicit_auth_file(),
-                error,
-            )
-        })?;
+        let storage = self.open_storage(provider_id, env_key_name)?;
         let stored_entry_exists = storage.contains_provider_entry(provider_id);
         let env_key = if self.uses_explicit_auth_file() || stored_entry_exists {
             None
@@ -138,17 +146,19 @@ impl StoredChatGptAuth {
         self.load().map(|_| ())
     }
 
-    fn open_storage(&self) -> Result<AuthStorage, AuthError> {
-        match &self.storage_path {
-            Some(path) => AuthStorage::new(path),
-            None => AuthStorage::new_default(),
-        }
+    fn open_storage(&self) -> Result<AuthStorage, ProviderError> {
+        let path = match &self.storage_path {
+            Some(path) => path.clone(),
+            None => AuthStorage::default_path()
+                .map_err(|error| default_auth_path_error("chatgpt", error))?,
+        };
+        AuthStorage::new(path).map_err(map_stored_chatgpt_auth_error)
     }
 }
 
 impl ChatGptStoredAuth for StoredChatGptAuth {
     fn load(&self) -> Result<ChatGptStoredCredential, ProviderError> {
-        let mut storage = self.open_storage().map_err(map_stored_chatgpt_auth_error)?;
+        let mut storage = self.open_storage()?;
         let credential = storage
             .refresh_oauth_if_needed("chatgpt", (self.clock)(), |refresh| {
                 let refreshed = (self.refresh)(refresh.expose_secret())
@@ -230,6 +240,18 @@ fn map_stored_chatgpt_auth_error(error: AuthError) -> ProviderError {
         AuthError::Invalid(_) => chatgpt_auth_error("stored credential is invalid"),
         AuthError::Io(_) => chatgpt_auth_error("stored auth file could not be read"),
     }
+}
+
+/// The default auth path fails only when the Euler home cannot be resolved
+/// (for example a relative `EULER_HOME`). Its message names that cause and
+/// holds no credential, so it is shown as-is instead of a generic storage
+/// error.
+fn default_auth_path_error(provider_id: &str, error: AuthError) -> ProviderError {
+    let detail = match error {
+        AuthError::Invalid(detail) => detail,
+        other => other.to_string(),
+    };
+    ProviderError::auth(format!("Authentication failed for {provider_id}: {detail}"))
 }
 
 fn map_stored_api_key_auth_error(

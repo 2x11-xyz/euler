@@ -21,7 +21,7 @@ pull requests that landed them; deeper design rationale lives in
 
 ### Auth file follows EULER_HOME
 
-- **Fixed**: `euler login`, `euler logout`, `euler auth status`, and stored
+- **Fix**: `euler login`, `euler logout`, `euler auth status`, and stored
   key resolution for built-in and custom providers use
   `$EULER_HOME/auth.json` when `EULER_HOME` is set, as `providers.json` and
   `preferences.json` already do. Before, they always used
@@ -33,7 +33,10 @@ pull requests that landed them; deeper design rationale lives in
   relative `EULER_HOME`) fails with that error instead of using `~/.euler`.
 - **Behavior change**: a key stored under `~/.euler/auth.json` is not read
   when `EULER_HOME` points elsewhere. Run `euler login` again under that
-  home, or copy the file there.
+  home, or copy the file there. An `euler` that the model starts as a host
+  command gets a private Euler home, so it no longer reads the user's
+  stored keys, and the Config-Edit Guardrail now guards the auth file
+  actually in use under `EULER_HOME`.
 
 ### Execution profiles: dynamic shell operands ask only near a rule
 
