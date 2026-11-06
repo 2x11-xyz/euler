@@ -197,9 +197,11 @@ The three profiles:
   resolved question 17). A configured always-deny is checked before any
   rule, so the `allow` carve-outs would never run a command.
 
-Extension reviewers (`extension_reviewers`, ADR 0027) are not available yet:
-this version refuses at startup a profile that sets them, naming the field.
-Add them once a release lists them as enforced.
+Extension reviewers (`extension_reviewers`, ADR 0027) name extension
+commands that review each ask before the guardian or a person. A reviewer can
+deny or defer, never allow, and a named reviewer that is not installed and
+enabled is a startup error that names the fix. Asks raised by child agents do
+not reach them yet (#299).
 
 ## Brief-file pattern
 

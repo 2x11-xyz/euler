@@ -125,21 +125,18 @@ fn guide_team_profiles_parse_and_resolve_to_enforced_profiles() {
         .is_none());
 }
 
-/// The guide says extension reviewers are not available yet: a profile that
-/// sets them is refused at startup, naming the field. When they ship, this
-/// fails and the guide's paragraph needs updating.
+/// The guide documents `extension_reviewers` as enforced: a profile that sets
+/// them parses and resolves with the reviewers recorded in its fields.
 #[test]
-fn guide_example_with_extension_reviewers_is_refused_naming_the_field() {
+fn guide_example_with_extension_reviewers_resolves_with_the_reviewers() {
     let mut example: serde_json::Value =
         serde_json::from_str(&guide_example()).expect("example is JSON");
     example["profiles"]["agent"]["extension_reviewers"] =
         serde_json::json!(["policy-check.review"]);
     let config = parse(&example.to_string()).expect("extension_reviewers parses");
-    let error = config
-        .resolve(None, ProfileContext::Headless, None)
-        .expect_err("extension_reviewers is not enforced yet")
-        .to_string();
-    assert!(error.contains("extension_reviewers"), "{error}");
+    let agent = resolve(&config, Some("agent"), ProfileContext::Headless);
+    let recorded = serde_json::to_string(&agent.fields).expect("fields serialize");
+    assert!(recorded.contains("policy-check.review"), "{recorded}");
 }
 
 #[test]
