@@ -146,8 +146,16 @@ fn run_custom_provider_login(
         .discover_models();
     match discovery {
         Ok(discovery) => {
-            set_provider_entry(&mut document, provider_id, &base_url);
-            save_verified_login(login, &key, &document, &discovery, output, warnings)
+            let picked = login_default_model(existing, &discovery);
+            let default_model = set_provider_entry(&mut document, provider_id, &base_url, picked);
+            save_verified_login(login, &key, &document, &discovery, &mut output, warnings)?;
+            if let Some(model) = default_model {
+                writeln!(
+                    output,
+                    "Default model: {model} (change with --model or /model)"
+                )?;
+            }
+            Ok(())
         }
         Err(error)
             if !error.key_rejected
@@ -175,6 +183,26 @@ fn run_custom_provider_login(
             "could not verify provider {provider_id}: {error}; nothing was stored"
         )),
     }
+}
+
+/// The model login sets as `default_model`, picked from the discovered
+/// models with the entry's configured `models` replacing a discovered one
+/// whole, as a launch lists them.
+fn login_default_model<'a>(
+    existing: Option<&'a CustomProviderConfig>,
+    discovery: &'a GatewayDiscovery,
+) -> Option<&'a str> {
+    let mut models = discovery
+        .models
+        .iter()
+        .map(|model| (model.id.as_str(), model))
+        .collect::<BTreeMap<_, _>>();
+    let configured = existing
+        .into_iter()
+        .flat_map(|provider| provider.models.values())
+        .filter(|model| !model.discovered);
+    models.extend(configured.map(|model| (model.id.as_str(), model)));
+    crate::provider_discovery::pick_default_model(models.values().copied())
 }
 
 /// The loaded entry login updates, or `None` for a new id. Refuses an entry
@@ -340,8 +368,15 @@ fn read_provider_document(path: &Path) -> Result<Value> {
 }
 
 /// Adds the entry login writes, or sets `base_url` and `discovery: true` on an
-/// existing entry and leaves its other fields as written.
-fn set_provider_entry(document: &mut Value, provider_id: &str, base_url: &str) {
+/// existing entry and leaves its other fields as written. An entry without a
+/// `default_model` gets `picked_model`; an existing one is never replaced.
+/// Returns the `default_model` it set.
+fn set_provider_entry<'a>(
+    document: &mut Value,
+    provider_id: &str,
+    base_url: &str,
+    picked_model: Option<&'a str>,
+) -> Option<&'a str> {
     let providers = document
         .as_object_mut()
         .expect("read_provider_document checks the root")
@@ -349,13 +384,14 @@ fn set_provider_entry(document: &mut Value, provider_id: &str, base_url: &str) {
         .or_insert_with(|| json!({}))
         .as_object_mut()
         .expect("read_provider_document checks providers");
-    match providers
+    let entry = match providers
         .get_mut(provider_id)
         .and_then(Value::as_object_mut)
     {
         Some(entry) => {
             entry.insert("base_url".to_owned(), json!(base_url));
             entry.insert("discovery".to_owned(), json!(true));
+            entry
         }
         None => {
             providers.insert(
@@ -367,8 +403,17 @@ fn set_provider_entry(document: &mut Value, provider_id: &str, base_url: &str) {
                     "discovery": true,
                 }),
             );
+            providers[provider_id]
+                .as_object_mut()
+                .expect("the entry just inserted")
         }
+    };
+    if entry.contains_key("default_model") {
+        return None;
     }
+    let model = picked_model?;
+    entry.insert("default_model".to_owned(), json!(model));
+    Some(model)
 }
 
 /// Replaces `providers.json` atomically through a temp file in the same
@@ -767,7 +812,7 @@ mod tests {
         assert_eq!(
             output,
             format!(
-                "Base URL: Using {root}/v1\nAPI key: Found 2 models from /model/info: 1 anthropic_messages, 1 openai_chat_completions.\nAdded provider gw to {}.\nStored the key for gw in {}.\n",
+                "Base URL: Using {root}/v1\nAPI key: Found 2 models from /model/info: 1 anthropic_messages, 1 openai_chat_completions.\nAdded provider gw to {}.\nStored the key for gw in {}.\nDefault model: claude-sonnet (change with --model or /model)\n",
                 home.providers_path.display(),
                 home.auth_path.display()
             )
@@ -776,7 +821,7 @@ mod tests {
             home.providers(),
             json!({"version": 1, "providers": {
                 "other": {"api_family": "openai_chat_completions", "base_url": "https://other.example.com/v1", "api_key": "$OTHER_KEY", "default_model": "m"},
-                "gw": {"api_family": "openai_chat_completions", "base_url": format!("{root}/v1"), "auth_header": true, "discovery": true}
+                "gw": {"api_family": "openai_chat_completions", "base_url": format!("{root}/v1"), "auth_header": true, "discovery": true, "default_model": "claude-sonnet"}
             }})
         );
         assert_eq!(home.stored_key("gw").as_deref(), Some("gateway-secret"));
@@ -805,6 +850,7 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("Updated provider gw in "), "{output}");
+        assert!(!output.contains("Default model:"), "{output}");
         assert_eq!(
             home.providers(),
             json!({"providers": {"gw": {
@@ -813,6 +859,35 @@ mod tests {
             }}})
         );
         assert_eq!(home.stored_key("gw").as_deref(), Some("gateway-secret"));
+    }
+
+    #[test]
+    fn custom_provider_login_keeps_an_unlisted_default_model_and_never_picks_a_responses_model() {
+        static ROUTES: &[(&str, u16, &str)] = &[("/model/info", 200, MODEL_INFO)];
+        let (root, _requests) = spawn_gateway(ROUTES);
+        let unlisted = LoginHome::new(Some(leak(format!(
+            r#"{{"providers": {{"gw": {{"api_family": "openai_chat_completions", "base_url": "{root}/v1", "auth_header": true, "discovery": true, "default_model": "retired-model"}}}}}}"#
+        ))));
+        // The configured entry moves claude-sonnet to Responses, and gpt-4o
+        // declares no tool support, so no model qualifies.
+        let overridden = LoginHome::new(Some(leak(format!(
+            r#"{{"providers": {{"gw": {{"api_family": "openai_chat_completions", "base_url": "{root}/v1", "auth_header": true, "models": [{{"id": "claude-sonnet", "api_family": "openai_responses"}}]}}}}}}"#
+        ))));
+
+        for home in [&unlisted, &overridden] {
+            let (result, output, _) = home.login("gw", vec!["\n", "gateway-secret\n"]);
+
+            result.expect("login");
+            assert!(output.contains("Updated provider gw in "), "{output}");
+            assert!(!output.contains("Default model:"), "{output}");
+        }
+        assert_eq!(
+            unlisted.providers()["providers"]["gw"]["default_model"],
+            "retired-model"
+        );
+        assert!(overridden.providers()["providers"]["gw"]
+            .get("default_model")
+            .is_none());
     }
 
     #[test]

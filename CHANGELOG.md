@@ -38,6 +38,23 @@ pull requests that landed them; deeper design rationale lives in
   stored keys, and the Config-Edit Guardrail now guards the auth file
   actually in use under `EULER_HOME`.
 
+### Gateway login: a default model
+
+- **Changed**: `euler login --provider <id>` for a gateway now sets
+  `default_model` when the entry has none and a discovered model
+  qualifies, and prints `Default model: <id> (change with --model or
+  /model)`, so `euler --provider <id>` and `euler exec --provider <id>`
+  work right after login instead of failing with "has no default_model;
+  pass --model" (ADR 0025, note of 2026-11-06). It picks the newest
+  `anthropic_messages` model whose id contains `sonnet` (ignoring case,
+  preferring a `claude-sonnet` prefix, comparing digit runs numerically,
+  and preferring an undated alias over a dated snapshot), else the newest
+  `anthropic_messages` model (preferring a `claude` prefix), else the
+  newest chat completions model that declares tool support, and never a
+  Responses model. An existing `default_model` is never replaced. A
+  hand-written discovery entry without `default_model` starts on the same
+  pick with a one-line notice on stderr.
+
 ### Execution profiles: dynamic shell operands ask only near a rule
 
 - **Changed**: a `path` or `outside_workspace` rule no longer turns every

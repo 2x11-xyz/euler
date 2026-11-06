@@ -106,6 +106,18 @@ pub(crate) fn default_model_for_provider(
             return Err(anyhow!("{error}"));
         }
         let provider_id = &provider.id;
+        // A hand-written discovery entry starts on the model login would
+        // have set (ADR 0025 resolved question 2, note of 2026-11-06).
+        if provider.discovery {
+            if let Some(model) =
+                crate::provider_discovery::pick_default_model(provider.models.values())
+            {
+                eprintln!(
+                    "note: provider {provider_id} has no default_model; using {model} (change with --model or /model)"
+                );
+                return Ok(model.to_owned());
+            }
+        }
         return Err(anyhow!(
             "provider `{provider_id}` has no default_model; pass --model"
         ));
