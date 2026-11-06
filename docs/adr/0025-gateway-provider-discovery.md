@@ -352,11 +352,13 @@ the proposal in the draft.
    entry left as written.
    Note (2026-11-06): login sets `default_model` on an entry that has none,
    so the first `euler --provider <id>` after login needs no `--model`. It
-   picks, in sorted id order, the first `anthropic_messages` model whose id
-   contains `sonnet` (ignoring case), else the first `anthropic_messages`
-   model, else the first chat completions model that declares tool
-   support, never a Responses model, and prints the pick; when no model
-   qualifies it sets none. An existing `default_model` is never replaced.
+   picks the newest `anthropic_messages` model whose id contains `sonnet`
+   (ignoring case), else the newest `anthropic_messages` model, else the
+   newest chat completions model that declares tool support, never a
+   Responses model, and prints the pick. Newest prefers an id starting with
+   `claude-sonnet` (then `claude`), then the highest id in numeric-aware
+   order with a trailing 8-digit date ignored, then the shorter id, then
+   the later date; when no model qualifies it sets none. An existing `default_model` is never replaced.
    A launch that needs the default of a discovery provider without one (a
    hand-written entry) picks by the same rule and prints a one-line notice
    instead of failing; with no qualifying model it fails as before.

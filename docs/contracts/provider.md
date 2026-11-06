@@ -261,13 +261,19 @@ user needs no file edit:
 When login writes or updates an entry that has no `default_model`, it sets
 `default_model` to a model picked from the discovered list (a configured
 `models` entry replaces a discovered one with its id, as at launch) and
-prints `Default model: <id> (change with --model or /model)`. The pick
-takes the models in sorted id order: the first `anthropic_messages` model whose id
-contains `sonnet` (ignoring case), else the first `anthropic_messages`
-model, else the first `openai_chat_completions` model that declares tool
-support; a Responses model is never picked, and when none qualifies no
-`default_model` is set. An entry's existing `default_model` is never
-replaced.
+prints `Default model: <id> (change with --model or /model)`. The pick is
+the newest `anthropic_messages` model whose id contains `sonnet` (ignoring
+case), else the newest `anthropic_messages` model, else the newest
+`openai_chat_completions` model that declares tool support; a Responses
+model is never picked, and when none qualifies no `default_model` is set.
+Newest, independent of list order: an id that starts with the tier's prefix
+(`claude-sonnet`, then `claude`, none for chat completions, ignoring case)
+wins; then the highest id in natural order (digit runs compare as numbers,
+so `claude-sonnet-5-10` is above `claude-sonnet-5-9`), ignoring a trailing
+`-` segment of 8 digits; then the shorter id, so `claude-sonnet-5-5` wins
+over `claude-sonnet-5-5-20261001`; then the higher full id, so the later of
+two dated snapshots wins; then the lower id in byte order. An entry's
+existing `default_model` is never replaced.
 
 Login refuses, storing nothing and before any prompt, an id that breaks the
 `providers.json` id rule (lowercase ASCII letters, numbers, `-`, `_`). Base

@@ -242,6 +242,32 @@ fn launch_without_a_default_model_starts_a_hand_written_discovery_provider_on_th
 }
 
 #[test]
+fn launch_without_a_default_model_fails_when_no_discovered_model_qualifies() {
+    let home = tempfile::tempdir().expect("home");
+    let (base_url, _requests) = spawn_gateway();
+    // The configured entry moves claude-sonnet to Responses, and gpt-4o
+    // declares no tool support, so no model qualifies.
+    write_providers(
+        home.path(),
+        &format!(
+            r#"{{"api_family": "openai_chat_completions", "base_url": "{base_url}",
+            "api_key": "gateway-key", "auth_header": true, "discovery": true,
+            "models": [{{"id": "claude-sonnet", "api_family": "openai_responses"}}]}}"#
+        ),
+    );
+
+    let exec = euler(home.path(), &["exec", "--provider", "gw", "hello"]);
+
+    let stderr = text(&exec.stderr);
+    assert!(!exec.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("provider `gw` has no default_model; pass --model"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("note: provider gw"), "{stderr}");
+}
+
+#[test]
 fn login_for_an_existing_entry_writes_the_discovery_cache_with_the_stored_key() {
     let home = tempfile::tempdir().expect("home");
     let (base_url, requests) = spawn_gateway();

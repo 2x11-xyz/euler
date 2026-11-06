@@ -71,7 +71,7 @@ only then stores the key in `~/.euler/auth.json` and adds the provider to
 `~/.euler/providers.json` with `"discovery": true` (both files live in
 `$EULER_HOME` instead when it is set). The models then appear in
 `/model` and `euler models`, each routed to its API family. Login also picks
-a default model, preferring a Claude Sonnet model on the Messages API, so
+a default model, preferring the newest Claude Sonnet model on the Messages API, so
 `euler --provider litellm` works right away; an entry that already sets
 `default_model` keeps it. When the gateway lists no Messages model and no
 chat model that declares tool support, login sets no default, and you pass

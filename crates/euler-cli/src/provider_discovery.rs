@@ -210,28 +210,92 @@ pub(crate) fn family_counts(discovery: &GatewayDiscovery) -> String {
     )
 }
 
-/// The model a discovery provider without a `default_model` starts on, from
-/// `models` in their order (sorted by id at both callers): the first
-/// `anthropic_messages` model whose id contains `sonnet` (ignoring case),
-/// else the first `anthropic_messages` model, else the first
-/// `openai_chat_completions` model that declares tool support. A Responses
-/// model is never picked.
+/// The model a discovery provider without a `default_model` starts on: the
+/// newest `anthropic_messages` model whose id contains `sonnet` (ignoring
+/// case), preferring ids that start with `claude-sonnet`; else the newest
+/// `anthropic_messages` model, preferring ids that start with `claude`; else
+/// the newest `openai_chat_completions` model that declares tool support. A
+/// Responses model is never picked. See [`newest_model`] for "newest".
 pub(crate) fn pick_default_model<'a>(
     models: impl Iterator<Item = &'a CustomModelConfig> + Clone,
 ) -> Option<&'a str> {
     let messages = |model: &&CustomModelConfig| model.api_family == ApiFamily::AnthropicMessages;
-    models
+    let sonnet = models
         .clone()
         .filter(messages)
-        .find(|model| model.id.to_ascii_lowercase().contains("sonnet"))
-        .or_else(|| models.clone().find(messages))
+        .filter(|model| model.id.to_ascii_lowercase().contains("sonnet"));
+    newest_model(sonnet, "claude-sonnet")
+        .or_else(|| newest_model(models.clone().filter(messages), "claude"))
         .or_else(|| {
-            models.clone().find(|model| {
+            let tool_chat = models.clone().filter(|model| {
                 model.api_family == ApiFamily::OpenAiChatCompletions
                     && model.supports_tools == Some(true)
-            })
+            });
+            newest_model(tool_chat, "")
         })
         .map(|model| model.id.as_str())
+}
+
+/// The newest of `models`, independent of their order: an id starting with
+/// `prefix` (ignoring case) wins over one that does not; then the highest id
+/// in natural order (digit runs compare as numbers, so `5-10` is above
+/// `5-9`), with a trailing `-` segment of 8 digits (a date) ignored; then
+/// the shorter id, so an undated alias wins over its dated snapshot; then
+/// the higher full id in natural order, so the later of two dated snapshots
+/// wins; then the lower id in byte order, which keeps the pick deterministic.
+fn newest_model<'a>(
+    models: impl Iterator<Item = &'a CustomModelConfig>,
+    prefix: &str,
+) -> Option<&'a CustomModelConfig> {
+    models.max_by_key(|model| {
+        let id = model.id.to_ascii_lowercase();
+        (
+            id.starts_with(prefix),
+            natural_id_key(undated_id(&id)),
+            std::cmp::Reverse(model.id.len()),
+            natural_id_key(&id),
+            std::cmp::Reverse(model.id.as_str()),
+        )
+    })
+}
+
+/// `id` without a trailing `-` segment of exactly 8 ASCII digits.
+fn undated_id(id: &str) -> &str {
+    match id.rsplit_once('-') {
+        Some((head, tail)) if tail.len() == 8 && tail.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => id,
+    }
+}
+
+/// One run of an id for natural ordering. A `Number` compares by digit
+/// count without leading zeros, then by those digits, so any length works.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum IdRun {
+    Text(String),
+    Number { digits: usize, value: String },
+}
+
+fn natural_id_key(id: &str) -> Vec<IdRun> {
+    let mut runs = Vec::new();
+    let mut rest = id;
+    while let Some(first) = rest.chars().next() {
+        let is_digit = first.is_ascii_digit();
+        let end = rest
+            .find(|c: char| c.is_ascii_digit() != is_digit)
+            .unwrap_or(rest.len());
+        let (run, tail) = rest.split_at(end);
+        runs.push(if is_digit {
+            let value = run.trim_start_matches('0');
+            IdRun::Number {
+                digits: value.len(),
+                value: value.to_owned(),
+            }
+        } else {
+            IdRun::Text(run.to_owned())
+        });
+        rest = tail;
+    }
+    runs
 }
 
 pub(crate) fn failure_warning(provider_id: &str, error: &str) -> String {
@@ -652,7 +716,8 @@ mod tests {
     }
 
     #[test]
-    fn pick_default_model_prefers_a_messages_sonnet_then_messages_then_a_tool_chat_model() {
+    fn pick_default_model_prefers_the_newest_messages_sonnet_then_messages_then_a_tool_chat_model()
+    {
         let model =
             |id: &str, api_family: ApiFamily, supports_tools: Option<bool>| CustomModelConfig {
                 id: id.to_owned(),
@@ -673,8 +738,11 @@ mod tests {
         let haiku = model("claude-haiku", ApiFamily::AnthropicMessages, None);
         let sonnet = model("claude-Sonnet-4", ApiFamily::AnthropicMessages, None);
         let chat_sonnet = model("chat-sonnet", ApiFamily::OpenAiChatCompletions, Some(true));
-        let sonnet_a = model("claude-sonnet-a", ApiFamily::AnthropicMessages, None);
-        let sonnet_b = model("claude-sonnet-b", ApiFamily::AnthropicMessages, None);
+        let messages = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| model(id, ApiFamily::AnthropicMessages, None))
+                .collect::<Vec<_>>()
+        };
 
         assert_eq!(
             pick(&[
@@ -694,9 +762,52 @@ mod tests {
             pick(&[chat_no_tools.clone(), responses.clone(), chat_tools.clone()]).as_deref(),
             Some("c-gpt")
         );
+        // The newest Sonnet, whatever the input order: an id starting with
+        // `claude-sonnet` beats `cyber-claude-...` and `claude-3-7-sonnet-...`,
+        // digit runs compare as numbers, an undated alias beats its dated
+        // snapshot, and the later of two snapshots wins.
         assert_eq!(
-            pick(&[chat_tools, sonnet_a, sonnet_b]).as_deref(),
-            Some("claude-sonnet-a")
+            pick(&messages(&[
+                "cyber-claude-sonnet-5-5",
+                "claude-sonnet-5-5",
+                "claude-sonnet-5",
+                "claude-sonnet-4-6",
+                "claude-3-7-sonnet-20250219",
+            ]))
+            .as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(
+            pick(&messages(&["claude-sonnet-5-10", "claude-sonnet-5-9"])).as_deref(),
+            Some("claude-sonnet-5-10")
+        );
+        assert_eq!(
+            pick(&messages(&[
+                "claude-sonnet-5-5-20261001",
+                "claude-sonnet-5-5"
+            ]))
+            .as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(
+            pick(&messages(&[
+                "claude-sonnet-5-5",
+                "claude-sonnet-5-5-20261001"
+            ]))
+            .as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        assert_eq!(
+            pick(&messages(&[
+                "claude-3-5-sonnet-20241022",
+                "claude-3-5-sonnet-20240620"
+            ]))
+            .as_deref(),
+            Some("claude-3-5-sonnet-20241022")
+        );
+        assert_eq!(
+            pick(&messages(&["cyber-claude-haiku-9", "claude-haiku-4"])).as_deref(),
+            Some("claude-haiku-4")
         );
         assert_eq!(pick(&[chat_no_tools, responses]), None);
     }
