@@ -31,6 +31,15 @@ pull requests that landed them; deeper design rationale lives in
   such reviewer (before, any profile with `extension_reviewers` was
   refused as not enforced). No new prompts.
 
+### Execution profiles: a shareable team `profiles.json`
+
+- **Docs**: the headless guide has a Team profiles section (ADR 0027,
+  rollout step 7) with an interactive `dev` profile, a headless `agent`
+  profile with rules and `ask_timeout`, and a `ci` profile on `workspace`
+  with a catch-all shell deny and cargo carve-outs. A test parses the
+  example with the real `profiles.json` parser and checks the decisions the
+  guide describes. The quickstart links to it. No new blocks or prompts.
+
 ### Execution profiles: `ask_timeout`, a guardian deadline, and request-scoped denies
 
 - **New**: `ask_timeout` is enforced (ADR 0027, rollout step 5). When it
