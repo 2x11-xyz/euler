@@ -4,7 +4,7 @@ All notable changes to Euler are documented here. Entries reference the
 pull requests that landed them; deeper design rationale lives in
 `docs/contracts/` and the GitHub issue ledger.
 
-## Unreleased
+## 0.1.7 (2026-11-06)
 
 ### Command safety: variable arguments of harmless git subcommands
 
