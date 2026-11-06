@@ -5,6 +5,47 @@ use tempfile::TempDir;
 fn auth_path(temp: &TempDir) -> PathBuf {
     temp.path().join(".euler").join("auth.json")
 }
+#[test]
+fn default_path_uses_euler_home_when_set() {
+    let home = TempDir::new().expect("home");
+    let euler_home = TempDir::new().expect("euler home");
+
+    let path = AuthStorage::default_path_from_env(
+        Some(home.path().into()),
+        Some(euler_home.path().into()),
+    )
+    .expect("default path");
+
+    let canonical_euler_home = fs::canonicalize(euler_home.path()).expect("canonical");
+    assert_eq!(path, canonical_euler_home.join("auth.json"));
+    assert!(!home.path().join(".euler").exists());
+}
+#[test]
+fn default_path_rejects_a_relative_euler_home_without_falling_back() {
+    let home = TempDir::new().expect("home");
+
+    let error =
+        AuthStorage::default_path_from_env(Some(home.path().into()), Some("relative".into()))
+            .expect_err("relative EULER_HOME");
+
+    assert!(
+        error
+            .to_string()
+            .contains("EULER_HOME must be an absolute path"),
+        "{error}"
+    );
+    assert!(!home.path().join(".euler").exists());
+}
+#[test]
+fn default_path_falls_back_to_home_euler_dir() {
+    let home = TempDir::new().expect("home");
+
+    let path =
+        AuthStorage::default_path_from_env(Some(home.path().into()), None).expect("default path");
+
+    let canonical_home = fs::canonicalize(home.path()).expect("canonical");
+    assert_eq!(path, canonical_home.join(".euler").join("auth.json"));
+}
 fn api_key(value: &str) -> Credential {
     Credential::ApiKey {
         key: SecretString::new(value),

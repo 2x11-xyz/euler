@@ -258,7 +258,7 @@ fn map_stored_api_key_auth_error(
         AuthError::RefreshFailed => "credential refresh failed",
     };
     ProviderError::auth(format!(
-        "Authentication failed for {provider_id}: {problem}.\nSet {env_key_name} or add an api_key credential to ~/.euler/auth.json"
+        "Authentication failed for {provider_id}: {problem}.\nSet {env_key_name} or add an api_key credential to auth.json in the Euler home (~/.euler, or $EULER_HOME when set)"
     ))
 }
 

@@ -39,7 +39,7 @@ x-secret = "!op read 'op://vault/item/secret'"
 
 Some providers, especially the first ChatGPT subscription provider, obtain OAuth-style tokens through Euler rather than user-supplied API-key references. A custom provider's API key may also be stored there by `euler login --provider <id>`, as an API-key credential under the provider id.
 
-These credentials are stored in a dedicated local auth file, such as `~/.euler/auth.json`, with restrictive file permissions. They are secret-tainted and follow all redaction rules in this contract. Provider refresh is handled inside the provider layer.
+These credentials are stored in a dedicated local auth file, `auth.json` in the Euler home (`$EULER_HOME/auth.json` when `EULER_HOME` is set, otherwise `$HOME/.euler/auth.json`), with restrictive file permissions. `euler login`, `euler logout`, `euler auth status`, and credential resolution for built-in and custom providers all use that file; a run with a built-in provider reads an explicit `--auth-file` or `EULER_AUTH_FILE` override in its place. A file under `$HOME/.euler` is not read when `EULER_HOME` points elsewhere. When the Euler home cannot be resolved (for example a relative `EULER_HOME`), commands that need the default auth file fail with the resolution error rather than falling back to `$HOME/.euler`. They are secret-tainted and follow all redaction rules in this contract. Provider refresh is handled inside the provider layer.
 
 A custom provider with `auth_header: true` and no `api_key` uses its stored key; an `api_key` spec in `providers.json` wins, so a stored key never silently overrides configuration. `euler logout --provider <id>` removes only the stored key.
 

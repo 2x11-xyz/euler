@@ -19,6 +19,22 @@ pull requests that landed them; deeper design rationale lives in
   `--shallow-file` now count as `git` global options with a value, so
   `git --attr-source HEAD clean -fdx` is read as `git clean`.
 
+### Auth file follows EULER_HOME
+
+- **Fixed**: `euler login`, `euler logout`, `euler auth status`, and stored
+  key resolution for built-in and custom providers use
+  `$EULER_HOME/auth.json` when `EULER_HOME` is set, as `providers.json` and
+  `preferences.json` already do. Before, they always used
+  `$HOME/.euler/auth.json`, so a relocated or throwaway home read and wrote
+  the real auth file. `--auth-file` and `EULER_AUTH_FILE` still select an
+  explicit file for a built-in provider run. The hint for an unreadable
+  stored key now says the file lives in the Euler home (`~/.euler`, or
+  `$EULER_HOME` when set). An unresolvable Euler home (for example a
+  relative `EULER_HOME`) fails with that error instead of using `~/.euler`.
+- **Behavior change**: a key stored under `~/.euler/auth.json` is not read
+  when `EULER_HOME` points elsewhere. Run `euler login` again under that
+  home, or copy the file there.
+
 ### Execution profiles: dynamic shell operands ask only near a rule
 
 - **Changed**: a `path` or `outside_workspace` rule no longer turns every

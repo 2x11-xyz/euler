@@ -102,6 +102,28 @@ fn default_api_key_auth_uses_env_when_stored_entry_is_absent() {
 }
 
 #[test]
+fn default_api_key_auth_reads_the_auth_file_under_euler_home() {
+    let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+    let temp = TempDir::new().expect("temp dir");
+    let euler_home = TempDir::new().expect("euler home");
+    fs::write(euler_home.path().join("auth.json"), "not json").expect("seed");
+    let _home = EnvGuard::set_path("HOME", temp.path());
+    let _euler_home = EnvGuard::set_path("EULER_HOME", euler_home.path());
+    let _env = EnvGuard::set("ANTHROPIC_API_KEY", "fallback-anthropic-secret");
+    let auth = StoredApiKeyAuth::new_default();
+
+    let error = load_anthropic_api_key(&auth).expect_err("invalid euler home auth file");
+
+    assert_eq!(
+        error,
+        ProviderError::auth(
+            "Authentication failed for anthropic: auth storage is invalid.\nSet ANTHROPIC_API_KEY or add an api_key credential to auth.json in the Euler home (~/.euler, or $EULER_HOME when set)"
+        )
+    );
+    assert!(!temp.path().join(".euler").exists());
+}
+
+#[test]
 fn default_api_key_auth_stored_entry_blocks_env_fallback_when_unresolved() {
     let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
     let temp = TempDir::new().expect("temp dir");
