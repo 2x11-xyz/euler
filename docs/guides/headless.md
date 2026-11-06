@@ -155,13 +155,13 @@ The three profiles:
 
 - `dev` is `full` at the keyboard with three hard stops and one review
   point: `git push` asks, while force pushes, `terraform apply`, and writes
-  under `~/.euler` are denied. Because `path` has a `deny` rule, a shell
-  command with an operand Euler cannot resolve (`ls src/*.rs`,
-  `git commit -m "$MSG"`) also asks you (see below).
+  under `~/.euler` are denied. A shell command whose operand Euler cannot
+  resolve asks you only if it could write under `~/.euler` (see below).
 - `agent` is the default for `euler exec`. Under `full` nothing asks except
   Euler's built-in asks, the `ask` rules, and shell commands with an operand
-  Euler cannot resolve. An ask goes to the guardian, which may allow it
-  once (an unresolved operand's ask skips the guardian, see below); plain
+  Euler cannot resolve that could reach a rule. An ask goes to the guardian,
+  which may allow it once (an unresolved operand's ask skips the guardian
+  when it could reach a deny, see below); plain
   `exec` cannot ask a person, so an ask the guardian does not settle is
   denied at once. Run interactively (`euler --profile agent`) and left
   unattended, an ask waits 300 seconds for a person and is then denied.
@@ -175,14 +175,19 @@ The three profiles:
   `git push --force` and `--force-with-lease` are denied, but `git push -f`
   still only asks and `git -C dir push --force` matches no rule. Add a
   pattern per spelling you want covered.
-- A shell word Euler cannot resolve (a variable, `~`, a glob) never matches
-  an `allow`. Where its surface has an `ask` or `deny` rule it asks, so
-  `cat ~/.ssh/id_ed25519` in a shell command asks rather than slipping past
-  the `~/.ssh` deny. Where that surface has a `deny` rule only a person can
-  answer (the guardian does not), so under plain `exec` it is denied. In
-  `dev` and `agent` this covers everyday commands such as `ls src/*.rs`,
-  `echo $HOME`, and `git commit -m "$MSG"`. For `agent` under plain `exec`,
-  have the agent use literal paths and `git commit -F <file>`.
+- A shell `~` is your home directory, so `cat ~/.ssh/id_ed25519` hits the
+  `~/.ssh` deny. A glob or a variable is read up to its fixed directory:
+  `ls src/*.rs` names paths under `src/`, which no rule above reaches, so
+  it runs without an ask. A word that starts with a variable
+  (`cat $HOME/.ssh/*`, `rm -rf $DIR`) could be any path. Such a word never
+  matches an `allow`; where it could reach an `ask` or `deny` rule it asks,
+  and where it could reach a `deny` only a person can answer (the guardian
+  does not), so under plain `exec` it is denied. Variables that are not
+  paths, such as `echo $HOME`, `git commit -m "$MSG"`, or
+  `python x.py $OUT`, add nothing: for commands other than the readers and
+  writers Euler knows, a variable counts as a path only when it contains
+  `/` or starts with `.` or `~`. For `agent` under plain `exec`, have the
+  agent write literal paths where it can.
 - `ci` is `workspace` (sandboxed, network on so cargo can fetch crates) with
   a catch-all shell `deny` followed by `allow` carve-outs, so only the listed
   cargo commands run. Every other shell command is denied, including a

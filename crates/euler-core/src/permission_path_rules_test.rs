@@ -159,10 +159,11 @@ fn shell_operands_are_targets_and_the_strictest_target_wins() {
 }
 
 /// Section 3 and resolved question 3: a target Euler cannot resolve counts
-/// as `ask` where its surface has an `ask` or `deny` rule, so it never
-/// hides a known `deny` on another target and a known `allow` never covers
-/// it. Beside a `deny` rule its ask is human-only. With only `allow` rules
-/// it has no rule state.
+/// as `ask` where a path it may name could match an `ask` or `deny` rule of
+/// its surface, so it never hides a known `deny` on another target and a
+/// known `allow` never covers it. Overlapping a `deny` rule its ask is
+/// human-only. A fixed directory no such rule can reach, or only `allow`
+/// rules, leave it no rule state (amended 2026-11-06).
 #[test]
 fn an_unresolved_operand_asks_and_never_hides_a_known_deny_or_rides_an_allow() {
     let workspace = tempfile::tempdir().expect("workspace");
@@ -170,11 +171,24 @@ fn an_unresolved_operand_asks_and_never_hides_a_known_deny_or_rides_an_allow() {
 
     let outside = locked_gate(outside_writes_ask());
     assert_eq!(
-        ruled(&outside, &shell(&tools, "tee /tmp/a; echo \"$OUT\"")),
+        ruled(&outside, &shell(&tools, "tee /tmp/a; touch \"$OUT\"")),
         (
             ApprovalMode::Ask,
             Cause::Unresolved("outside_workspace", false)
         )
+    );
+    // A fixed directory outside the workspace reaches the `/` ask; one
+    // inside the workspace is not on that surface.
+    assert_eq!(
+        ruled(&outside, &shell(&tools, "touch /opt/$NAME")),
+        (
+            ApprovalMode::Ask,
+            Cause::Unresolved("outside_workspace", false)
+        )
+    );
+    assert_eq!(
+        ruled(&outside, &shell(&tools, "touch notes/$NAME")),
+        (ApprovalMode::Ask, Cause::None)
     );
 
     let secrets = locked_gate(ProfileRules {
@@ -193,9 +207,21 @@ fn an_unresolved_operand_asks_and_never_hides_a_known_deny_or_rides_an_allow() {
         (ApprovalMode::Ask, Cause::Unresolved("path", true))
     );
     assert_eq!(
-        ruled(&secrets, &shell(&tools, "cat notes/a")),
-        (ApprovalMode::Ask, Cause::None)
+        ruled(&secrets, &shell(&tools, "cat secrets/$NAME")),
+        (ApprovalMode::Ask, Cause::Unresolved("path", true))
     );
+    for command in [
+        "cat notes/a",
+        "cat notes/$NAME",
+        "ls notes/*.md",
+        "echo $FILE",
+    ] {
+        assert_eq!(
+            ruled(&secrets, &shell(&tools, command)),
+            (ApprovalMode::Ask, Cause::None),
+            "{command}"
+        );
+    }
 
     let allow_only = locked_gate(ProfileRules {
         path: vec![rule("**", None, RuleState::Allow)],
@@ -536,7 +562,7 @@ fn an_unresolved_operand_beside_a_deny_rule_is_a_human_only_ask() {
         vec![call(
             "call-cat",
             "run_shell",
-            json!({"command": "printf %s \"$EULER_TEST_UNSET\""}),
+            json!({"command": "cat \"$EULER_TEST_UNSET\""}),
         )],
     );
     session.run_turn("read").expect("turn");

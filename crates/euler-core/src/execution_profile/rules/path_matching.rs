@@ -7,13 +7,16 @@
 //! components (`*` within one, `**` zero or more), relative to the
 //! workspace root unless absolute or `~/`. `outside_workspace` patterns are
 //! directory prefixes matched component by component, against targets that
-//! resolve outside the workspace root.
+//! resolve outside the workspace root. A word the shell expands names any
+//! path under its fixed directory (ADR 0027 resolved question 3, amended
+//! 2026-11-06): it counts as `ask` only where such a path could match an
+//! `ask` or `deny` pattern.
 
 use super::{
-    glob_matches, reduce_targets, RequestPaths, RuleAccess, RuleLayer, RuleMatch, RuleState,
-    RuleSurface,
+    glob_matches, reduce_targets, PermissionRule, RequestPaths, RuleAccess, RuleLayer, RuleMatch,
+    RuleState, RuleSurface,
 };
-use crate::command_safety::PathAccess;
+use crate::command_safety::{PathAccess, TargetPath};
 use std::path::{Component, Path, PathBuf};
 
 /// A request's targets, resolved once for every layer.
@@ -21,16 +24,35 @@ pub(super) struct ResolvedPaths {
     root: PathBuf,
     canonical_root: PathBuf,
     home: Option<PathBuf>,
-    /// `None` for a target Euler cannot resolve.
-    targets: Vec<Option<ResolvedTarget>>,
+    targets: Vec<ResolvedTarget>,
 }
 
-struct ResolvedTarget {
+/// One target as rules match it.
+enum ResolvedTarget {
+    /// A path.
+    Path(ResolvedPath),
+    /// Any path under this directory.
+    Under(ResolvedPath),
+    /// Any path at all.
+    Anywhere(PathAccess),
+}
+
+struct ResolvedPath {
     /// The literal (lexically normalized) and canonical absolute forms.
     forms: [PathBuf; 2],
     /// Whether the canonical form lies outside the workspace root.
     outside: bool,
     access: PathAccess,
+}
+
+impl ResolvedTarget {
+    /// Whether the target may lie outside the workspace root.
+    fn may_be_outside(&self) -> bool {
+        match self {
+            Self::Path(path) | Self::Under(path) => path.outside,
+            Self::Anywhere(_) => true,
+        }
+    }
 }
 
 impl ResolvedPaths {
@@ -41,13 +63,20 @@ impl ResolvedPaths {
             .targets
             .iter()
             .map(|target| {
-                let joined = root.join(target.path.as_deref()?);
-                let canonical = canonical(&joined);
-                Some(ResolvedTarget {
-                    outside: !canonical.starts_with(&canonical_root),
-                    forms: [lexical(&joined), canonical],
-                    access: target.access,
-                })
+                let resolve = |path: &str| {
+                    let joined = root.join(path);
+                    let canonical = canonical(&joined);
+                    ResolvedPath {
+                        outside: !canonical.starts_with(&canonical_root),
+                        forms: [lexical(&joined), canonical],
+                        access: target.access,
+                    }
+                };
+                match &target.path {
+                    TargetPath::Literal(path) => ResolvedTarget::Path(resolve(path)),
+                    TargetPath::Under(dir) => ResolvedTarget::Under(resolve(dir)),
+                    TargetPath::Anywhere => ResolvedTarget::Anywhere(target.access),
+                }
             })
             .collect();
         Self {
@@ -61,8 +90,9 @@ impl ResolvedPaths {
     /// The state of `surface` (`path` or `outside_workspace`) in `layer`: the
     /// last matching rule for each target on the surface, reduced as a
     /// command's segments are. A target Euler cannot resolve counts as `ask`
-    /// when the surface has an `ask` or `deny` rule (human-only with a
-    /// `deny`), and as no rule state otherwise.
+    /// when a path it may name could match an `ask` or `deny` rule of the
+    /// surface (human-only when one such rule is a `deny`), and as no rule
+    /// state otherwise.
     pub(super) fn surface_match(
         &self,
         layer: &RuleLayer,
@@ -76,13 +106,11 @@ impl ResolvedPaths {
         if rules.is_empty() {
             return None;
         }
-        let restrictive = rules.iter().any(|rule| rule.state != RuleState::Allow);
-        let human_only = rules.iter().any(|rule| rule.state == RuleState::Deny);
         let patterns: Vec<Vec<PathBuf>> = rules
             .iter()
             .map(|rule| self.pattern_forms(&rule.pattern))
             .collect();
-        let matches = |target: &ResolvedTarget, form: &Path| {
+        let matches = |target: &ResolvedPath, form: &Path| {
             rules.iter().zip(&patterns).rposition(|(rule, patterns)| {
                 covers(rule.access, target.access)
                     && patterns.iter().any(|pattern| match surface {
@@ -94,15 +122,24 @@ impl ResolvedPaths {
         let results = self
             .targets
             .iter()
-            .filter(|target| {
-                surface == RuleSurface::Path || target.as_ref().is_none_or(|target| target.outside)
-            })
+            .filter(|target| surface == RuleSurface::Path || target.may_be_outside())
             .map(|target| match target {
-                None => restrictive.then_some(RuleMatch::Unresolved {
-                    surface,
-                    human_only,
-                }),
-                Some(target) => target
+                ResolvedTarget::Anywhere(access) => {
+                    unresolved_match(rules, &patterns, surface, *access, |_| true)
+                }
+                ResolvedTarget::Under(dir) => {
+                    unresolved_match(rules, &patterns, surface, dir.access, |patterns| {
+                        dir.forms.iter().any(|form| {
+                            patterns.iter().any(|pattern| match surface {
+                                RuleSurface::OutsideWorkspace => {
+                                    form.starts_with(pattern) || pattern.starts_with(form)
+                                }
+                                _ => glob_prefix_matches(pattern, form).contains(&true),
+                            })
+                        })
+                    })
+                }
+                ResolvedTarget::Path(target) => target
                     .forms
                     .iter()
                     .filter_map(|form| matches(target, form))
@@ -156,6 +193,32 @@ impl ResolvedPaths {
     }
 }
 
+/// The state of a target Euler cannot resolve that uses its paths with
+/// `access`: `ask` when `reaches` says it may name a path matching the
+/// patterns of an `ask` or `deny` rule covering `access`, human-only when
+/// one such rule is a `deny`, and no rule state otherwise. An `allow` never
+/// applies to it.
+fn unresolved_match(
+    rules: &[PermissionRule],
+    patterns: &[Vec<PathBuf>],
+    surface: RuleSurface,
+    access: PathAccess,
+    reaches: impl Fn(&[PathBuf]) -> bool,
+) -> Option<RuleMatch> {
+    let reached: Vec<RuleState> = rules
+        .iter()
+        .zip(patterns)
+        .filter(|(rule, patterns)| {
+            rule.state != RuleState::Allow && covers(rule.access, access) && reaches(patterns)
+        })
+        .map(|(rule, _)| rule.state)
+        .collect();
+    (!reached.is_empty()).then(|| RuleMatch::Unresolved {
+        surface,
+        human_only: reached.contains(&RuleState::Deny),
+    })
+}
+
 /// Whether a rule with `access` covers a target used with `access`: `any`
 /// covers every target, and a target of unknown direction matches every
 /// rule.
@@ -173,6 +236,13 @@ fn covers(rule: Option<RuleAccess>, target: PathAccess) -> bool {
 /// component: `**` matches zero or more components and any other component
 /// is a [`glob_matches`] pattern for one component.
 fn glob_path_matches(pattern: &Path, path: &Path) -> bool {
+    glob_prefix_matches(pattern, path).last() == Some(&true)
+}
+
+/// For each count of leading `pattern` components, from none to all,
+/// whether those components match all of `path`. Some entry is true exactly
+/// when a path at or under `path` can match `pattern`.
+fn glob_prefix_matches(pattern: &Path, path: &Path) -> Vec<bool> {
     let path: Vec<_> = path
         .components()
         .map(|component| component.as_os_str().to_string_lossy())
@@ -180,6 +250,7 @@ fn glob_path_matches(pattern: &Path, path: &Path) -> bool {
     // `reachable[n]`: the pattern so far can match the first `n` components.
     let mut reachable = vec![false; path.len() + 1];
     reachable[0] = true;
+    let mut matches_all = vec![path.is_empty()];
     for part in pattern.components() {
         let part = part.as_os_str().to_string_lossy();
         let mut next = vec![false; path.len() + 1];
@@ -195,8 +266,9 @@ fn glob_path_matches(pattern: &Path, path: &Path) -> bool {
             }
         }
         reachable = next;
+        matches_all.push(reachable[path.len()]);
     }
-    reachable[path.len()]
+    matches_all
 }
 
 /// `path` with `.` removed and `..` applied lexically.

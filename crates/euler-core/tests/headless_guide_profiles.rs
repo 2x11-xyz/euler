@@ -199,40 +199,58 @@ fn guide_agent_path_rules_decide_as_described() {
         write_file(&agent, &home().join(".ssh/config"), root),
         Some(RuleState::Deny)
     );
-    // A `~` operand is dynamic, so it is unresolved and asks.
-    assert!(matches!(
-        run_shell(&agent, "cat ~/.ssh/id_ed25519", root),
-        Some(RuleMatch::Unresolved { .. })
-    ));
+    // A shell `~` is `HOME`, so the `~/.ssh` deny applies to it.
+    assert_eq!(
+        shell(&agent, "cat ~/.ssh/id_ed25519", root),
+        Some(RuleState::Deny)
+    );
+    assert_eq!(shell(&agent, "cp x ~/.ssh/", root), Some(RuleState::Deny));
 }
 
-/// The guide says only a person (never the guardian) can answer the ask for
-/// a `dev` or `agent` shell command with an operand Euler cannot resolve,
-/// because their `path` surface has a `deny` rule, so plain `exec` denies
-/// it. It suggests literal paths and `git commit -F <file>` instead.
+/// The guide says everyday commands with a glob, a variable, or `~` run
+/// under `dev` and `agent` without an ask, while a dynamic operand that
+/// could reach a denied path asks a person (never the guardian), so plain
+/// `exec` denies it.
 #[test]
-fn guide_dev_and_agent_unresolved_shell_operands_are_human_only() {
+fn guide_dev_and_agent_dynamic_shell_operands_ask_only_near_a_rule() {
     let config = guide_config();
     let dev = resolve(&config, Some("dev"), ProfileContext::Interactive);
     let agent = resolve(&config, Some("agent"), ProfileContext::Headless);
     let workspace = tempfile::tempdir().expect("workspace");
     let root = workspace.path();
+    let human_only = |profile: &ExecutionProfile, command: &str| {
+        matches!(
+            run_shell(profile, command, root),
+            Some(RuleMatch::Unresolved {
+                human_only: true,
+                ..
+            })
+        )
+    };
     for profile in [&dev, &agent] {
-        for command in ["ls src/*.rs", "echo $HOME", "git commit -m \"$MSG\""] {
-            assert!(
-                matches!(
-                    run_shell(profile, command, root),
-                    Some(RuleMatch::Unresolved {
-                        human_only: true,
-                        ..
-                    })
-                ),
+        for command in [
+            "ls src/*.rs",
+            "echo $HOME",
+            "git commit -m \"$MSG\"",
+            "cat ~/notes.txt",
+        ] {
+            assert_eq!(
+                shell(profile, command, root),
+                None,
                 "{}: {command}",
                 profile.name
             );
         }
-        assert_eq!(shell(profile, "git commit -F msg.txt", root), None);
+        // Euler cannot tell where `$DIR` points, and it could be under the
+        // denied `~/.euler`.
+        assert!(human_only(profile, "rm -rf $DIR"), "{}", profile.name);
     }
+    // `$HOME/.ssh/*` could reach the `~/.ssh` deny.
+    assert!(human_only(&agent, "cat $HOME/.ssh/*"));
+    // A command of unknown direction: a bare variable is not read as a
+    // path, one that looks like a path is.
+    assert_eq!(shell(&agent, "python3 x.py $OUT", root), None);
+    assert!(human_only(&agent, "python3 x.py \"$OUT\"/result"));
 }
 
 #[test]

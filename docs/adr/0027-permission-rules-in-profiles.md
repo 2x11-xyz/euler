@@ -700,6 +700,29 @@ Entries marked **changed** differ from the proposal in the draft.
    cannot tell whether it is the denied case. With only `allow` rules it has
    no rule state and keeps the profile's mode. An `allow` never applies to
    it. As proposed.
+
+   **Amended 2026-11-06.** Counting every dynamic operand as unresolved made
+   any profile with a `path` deny turn `ls src/*.rs`, `echo $HOME`, and
+   `git commit -m "$MSG"` into human-only asks, so headless `exec` denied
+   them. A dynamic word is now read as far as its fixed text goes. A
+   leading `~` or `~/` is `HOME`, a known path. A glob or expansion is
+   bounded by its fixed directory (the text before its first glob or
+   expansion, up to the last `/`); a word that starts with an expansion,
+   or whose later part can climb out (`..`, a glob such as `.*`), may name
+   any path, and a `..` inside a variable's value is not seen. Such a word
+   counts in a redirect and in the recognized positions above, and in an
+   operand of unknown direction only where it looks like a path (contains
+   `/`, or starts with `.` or `~`) and does not follow an option word (the
+   option's value, though a flag that takes none hides the word after it
+   too); an option with an attached value (`--title=$X`) is never a path.
+   So an unknown-direction command with a bare variable operand
+   (`python x.py $OUT`) is not inspected, consistent with this not being a
+   shell effects interpreter. An unresolved target counts as `ask`
+   only when a path it may name could match an `ask` or `deny` rule of its
+   surface that covers its direction, and the ask is human-only only when
+   one such rule is a `deny`; otherwise it adds no rule state. A dynamic
+   command name, a wrapper with a dynamic word, and a parse error still
+   count as a target that may name any path.
 4. **May an `allow` rule silence a sensitive-path ask?** No. Grants still
    cover sensitive-path asks, and `approvals: never` drops them; a rule does
    not, so a broad `allow` cannot hide `.env` access under `workspace`. As

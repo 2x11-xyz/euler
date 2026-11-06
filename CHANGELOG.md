@@ -6,6 +6,22 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: dynamic shell operands ask only near a rule
+
+- **Changed**: a `path` or `outside_workspace` rule no longer turns every
+  shell command with a glob, variable, or `~` into an ask (ADR 0027
+  resolved question 3, amended). A shell `~` is `HOME`, and a glob or
+  variable counts only up to its fixed directory, so under a profile with a
+  path deny `ls src/*.rs`, `echo $HOME`, `git commit -m "$MSG"`, and
+  `cat ~/notes.txt` run without an ask, and headless `exec` no longer
+  denies them. A dynamic operand still asks where it could reach an `ask`
+  or `deny` rule (a person only for a deny): `rm -rf $DIR` and
+  `cat $HOME/.ssh/*` beside a `~/.ssh` deny ask as before, and
+  `cat ~/.ssh/id_ed25519` is now denied by that rule. For commands other
+  than the known readers and writers, a variable counts as a path only when
+  it contains `/` or starts with `.` or `~`, so `python x.py $OUT` is not
+  inspected.
+
 ### Execution profiles: extension reviewers
 
 - **New**: a profile's `extension_reviewers` is enforced (ADR 0027, rollout
