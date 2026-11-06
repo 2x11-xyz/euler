@@ -586,6 +586,10 @@ pub struct PermissionGate<D> {
     /// Whether the session's sandbox backend is enforced. The profile lifts
     /// command and write asks only then.
     sandbox_enforced: bool,
+    /// True while an extension permission reviewer runs: an ask raised by
+    /// its host calls or by agents it spawns is denied without review, and
+    /// no one is asked (ADR 0027 resolved question 8).
+    no_review: bool,
     decider: D,
 }
 
@@ -611,6 +615,7 @@ impl<D> PermissionGate<D> {
             escalation_grants: GrantList::new(),
             profile: ExecutionProfile::default().fields,
             sandbox_enforced: false,
+            no_review: false,
             decider,
         }
     }
@@ -627,6 +632,7 @@ impl<D> PermissionGate<D> {
             escalation_grants: GrantList::new(),
             profile: ExecutionProfile::default().fields,
             sandbox_enforced: false,
+            no_review: false,
             decider,
         }
     }
@@ -650,6 +656,14 @@ impl<D> PermissionGate<D> {
 
     pub fn sandbox_enforced(&self) -> bool {
         self.sandbox_enforced
+    }
+
+    pub(crate) fn set_no_review(&mut self, no_review: bool) {
+        self.no_review = no_review;
+    }
+
+    pub(crate) fn no_review(&self) -> bool {
+        self.no_review
     }
 
     /// Explicitly configured mode, if any. Unconfigured capabilities read as
@@ -1092,6 +1106,13 @@ impl<D: PermissionDecider + ?Sized> PermissionDecider for &mut D {
 }
 
 impl<D: PermissionDecider> PermissionGate<D> {
+    /// Whether an ask is denied without asking anyone: the decider never
+    /// prompts (headless `exec`), or an extension reviewer is running. Such
+    /// a deny covers its request only (ADR 0027 section 4).
+    pub(crate) fn never_prompts(&self) -> bool {
+        self.no_review || self.decider.never_prompts()
+    }
+
     /// Resolve a permission request under the mode the caller already
     /// observed via [`PermissionGate::mode`]. One lookup drives prompt
     /// emission, the recorded decision, and the gate state transition;
@@ -1124,14 +1145,18 @@ impl<D: PermissionDecider> PermissionGate<D> {
     /// cancellation; an answer the decider returns after the timeout
     /// passed is discarded here, whatever the decider does with its token.
     /// A never-prompt decider has no person to wait for, so it decides as
-    /// it does without a timeout.
-    fn ask_within_timeout<T>(
+    /// it does without a timeout. While an extension reviewer runs, the ask
+    /// is denied without asking anyone.
+    fn ask_within_timeout(
         &mut self,
         cancellation: &CancellationToken,
-        ask: impl FnOnce(&mut D, &CancellationToken) -> PermissionDecisionOutcome<T>,
-    ) -> PermissionDecisionOutcome<T> {
+        ask: impl FnOnce(&mut D, &CancellationToken) -> PermissionDecisionOutcome<DeciderVerdict>,
+    ) -> PermissionDecisionOutcome<DeciderVerdict> {
         if cancellation.is_cancelled() {
             return PermissionDecisionOutcome::Cancelled;
+        }
+        if self.no_review {
+            return PermissionDecisionOutcome::Decided(DeciderVerdict::Deny);
         }
         let timeout = self
             .profile

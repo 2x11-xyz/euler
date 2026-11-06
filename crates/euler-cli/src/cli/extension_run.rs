@@ -54,7 +54,12 @@ fn parse_live_extension_reference(reference: &str) -> Result<(String, String)> {
 /// Attach every enabled linked package that declares generic root-session
 /// contributions. Wiring is inert: descriptor reads revalidate consent, and no
 /// managed process starts until an approved command actually executes.
-pub(crate) fn wire_session_extensions<D: PermissionDecider>(session: &mut Session<D>) {
+/// Wire the session's enabled extensions, then refuse a profile whose
+/// `extension_reviewers` names a reviewer none of them provides (ADR 0027
+/// resolved question 16).
+pub(crate) fn wire_session_extensions<D: PermissionDecider>(
+    session: &mut Session<D>,
+) -> Result<()> {
     let enabled = session
         .extensions_enabled()
         .iter()
@@ -73,6 +78,9 @@ pub(crate) fn wire_session_extensions<D: PermissionDecider>(session: &mut Sessio
             }
         }
     }
+    let profile = session.execution_profile().clone();
+    session.check_extension_reviewers(&profile)?;
+    Ok(())
 }
 
 /// Refusal text for an agent-only command reached through a control line.

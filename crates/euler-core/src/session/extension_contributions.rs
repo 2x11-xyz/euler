@@ -899,7 +899,7 @@ impl<D: PermissionDecider> Session<D> {
     /// Terminal-idle work is implicit lifecycle work: it may consume standing
     /// authority but must never ask the user for new authority. Explicit model
     /// tools keep using the ordinary operation-scoped permission braid.
-    fn implicit_capabilities_preauthorized(
+    pub(super) fn implicit_capabilities_preauthorized(
         &self,
         extension_id: &str,
         command: &str,
@@ -1135,7 +1135,8 @@ fn safe_execution_error(error: &ExtensionExecutionError) -> String {
         }
         ExtensionExecutionError::InvalidInput(message)
         | ExtensionExecutionError::RuleDenied(message)
-        | ExtensionExecutionError::AskTimedOut(message) => message.clone(),
+        | ExtensionExecutionError::AskTimedOut(message)
+        | ExtensionExecutionError::ReviewerDenied(message) => message.clone(),
         ExtensionExecutionError::RegistrationFailed => "extension registration failed".to_owned(),
         ExtensionExecutionError::RegistrationPanicked => {
             "extension registration panicked".to_owned()
@@ -1153,7 +1154,8 @@ fn contribution_failure(error: &ExtensionExecutionError) -> &'static str {
         ExtensionExecutionError::Disabled { .. } => "disabled",
         ExtensionExecutionError::CapabilityDenied { .. }
         | ExtensionExecutionError::RuleDenied(_)
-        | ExtensionExecutionError::AskTimedOut(_) => "capability-denied",
+        | ExtensionExecutionError::AskTimedOut(_)
+        | ExtensionExecutionError::ReviewerDenied(_) => "capability-denied",
         ExtensionExecutionError::InvalidInput(_) => "invalid-input",
         ExtensionExecutionError::RegistrationFailed => "registration",
         ExtensionExecutionError::RegistrationPanicked => "panic",

@@ -1,3 +1,5 @@
+use super::extension_reviewers::{insert_degraded_reviewers, reviewer_denial};
+use super::permissions_gate::reviewer_decision_payload;
 use super::{
     approval_mode_str, elapsed_ms, insert_rule_fields, permission_decision_payload,
     rule_decision_payload, rule_denial, timeout_decision_payload, ExtensionExecutionError, Session,
@@ -64,6 +66,21 @@ impl<'a> ExtensionCommandBoundary<'a> {
             provenance_cutoff: None,
             origin: ExtensionInvocationOrigin::ModelTool,
             tool_call_event_id: Some(tool_call_event_id),
+            cancellation,
+        }
+    }
+
+    /// An extension permission reviewer: it runs like a lifecycle hook, so
+    /// it never prompts and its project-tier config writes are refused.
+    pub(super) fn permission_reviewer(
+        extension_id: &'a str,
+        cancellation: &'a CancellationToken,
+    ) -> Self {
+        Self {
+            extension_id: Some(extension_id),
+            provenance_cutoff: None,
+            origin: ExtensionInvocationOrigin::LifecycleHook,
+            tool_call_event_id: None,
             cancellation,
         }
     }
@@ -632,6 +649,12 @@ impl<D> Session<D> {
             .map_err(|_| ExtensionExecutionError::CapabilityDenied {
                 capability: primary,
             })?;
+        let degraded = self.review_extension_batch(
+            (&batch, &rules),
+            (extension_id, command),
+            &prompt_id,
+            cancellation,
+        )?;
         let decisions = match self
             .permissions
             .decide_batch_detailed_cancellable(&batch, cancellation)
@@ -642,8 +665,7 @@ impl<D> Session<D> {
             }
             PermissionDecisionOutcome::TimedOut => {
                 return self.refuse_timed_out_batch(
-                    &batch,
-                    &rules,
+                    (&batch, &rules, &degraded),
                     (extension_id, command),
                     &prompt_id,
                 );
@@ -660,6 +682,7 @@ impl<D> Session<D> {
                 ApprovalMode::Ask,
             );
             insert_rule_fields(&mut payload, request, rule.as_ref());
+            insert_degraded_reviewers(&mut payload, &degraded);
             payload.insert("batch".to_owned(), true.into());
             payload.insert("operation".to_owned(), batch.operation().to_owned().into());
             payload.insert("extension_id".to_owned(), extension_id.into());
@@ -689,8 +712,7 @@ impl<D> Session<D> {
     /// section 4).
     fn refuse_timed_out_batch(
         &mut self,
-        batch: &PermissionRequestBatch,
-        rules: &[Option<RuleMatch>],
+        (batch, rules, degraded): (&PermissionRequestBatch, &[Option<RuleMatch>], &[String]),
         (extension_id, command): (&str, &str),
         prompt_id: &str,
     ) -> Result<(), ExtensionExecutionError>
@@ -699,6 +721,7 @@ impl<D> Session<D> {
     {
         for (request, rule) in batch.requests().iter().zip(rules) {
             let mut payload = timeout_decision_payload(request, rule.as_ref());
+            insert_degraded_reviewers(&mut payload, degraded);
             payload.insert("batch".to_owned(), true.into());
             payload.insert("operation".to_owned(), batch.operation().to_owned().into());
             payload.insert("extension_id".to_owned(), extension_id.into());
@@ -718,12 +741,63 @@ impl<D> Session<D> {
         )))
     }
 
+    /// Ask the profile's extension reviewers about a batch, which is one
+    /// ask: they see each of its requests, and a deny of one denies the
+    /// batch (ADR 0027 section 3). A deny is recorded as one `reviewer`
+    /// decision per request, parented to the shared prompt, with no grant,
+    /// and covers this request only (section 4). Otherwise the reviewers
+    /// that deferred because they failed are returned.
+    fn review_extension_batch(
+        &mut self,
+        (batch, rules): (&PermissionRequestBatch, &[Option<RuleMatch>]),
+        (extension_id, command): (&str, &str),
+        prompt_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, ExtensionExecutionError>
+    where
+        D: PermissionDecider,
+    {
+        let reviewed = batch
+            .requests()
+            .iter()
+            .zip(rules)
+            .map(|(request, rule)| (request, rule.as_ref()))
+            .collect::<Vec<_>>();
+        let review = match self.review_with_extension_reviewers(&reviewed, cancellation) {
+            Ok(review) => review,
+            Err(SessionError::Cancelled) => return Err(ExtensionExecutionError::Cancelled),
+            Err(error) => return Err(error.into()),
+        };
+        let Some(denial) = &review.denial else {
+            return Ok(review.degraded);
+        };
+        for (request, rule) in reviewed {
+            let mut payload = reviewer_decision_payload(request, rule, denial, &review.degraded);
+            payload.insert("batch".to_owned(), true.into());
+            payload.insert("operation".to_owned(), batch.operation().to_owned().into());
+            payload.insert("extension_id".to_owned(), extension_id.into());
+            payload.insert("command".to_owned(), command.into());
+            self.emit_with_parent(
+                EventKind::PERMISSION_DECISION,
+                payload,
+                Some(prompt_id.to_owned()),
+            )
+            .map_err(|_| ExtensionExecutionError::CapabilityDenied {
+                capability: request.capability,
+            })?;
+        }
+        Err(ExtensionExecutionError::ReviewerDenied(reviewer_denial(
+            denial,
+        )))
+    }
+
     /// Ask a human to approve one project-tier extension config write started
-    /// by an agent-invoked model tool (ADR 0022). The configured decider is
-    /// asked directly: no session allowance or grant covers the request, the
-    /// guardian never adjudicates it, and no grant is installed, so every
-    /// write asks again. A decider that cannot prompt (headless) denies.
-    /// `always-deny` still denies without a prompt.
+    /// by an agent-invoked model tool (ADR 0022). The profile's extension
+    /// reviewers see it first and may deny it (ADR 0027 section 5); then the
+    /// configured decider is asked directly: no session allowance or grant
+    /// covers the request, the guardian never adjudicates it, and no grant is
+    /// installed, so every write asks again. A decider that cannot prompt
+    /// (headless) denies. `always-deny` still denies without a prompt.
     pub(super) fn decide_project_config_write(
         &mut self,
         extension_id: &str,
@@ -759,11 +833,26 @@ impl<D> Session<D> {
             )
             .map_err(|_| denied())?;
         let request = PermissionRequest::new(capability, reason).with_once_only();
+        let review = match self.review_with_extension_reviewers(&[(&request, None)], cancellation) {
+            Ok(review) => review,
+            Err(SessionError::Cancelled) => return Err(ExtensionError::Cancelled),
+            Err(_) => return Err(denied()),
+        };
+        if let Some(denial) = &review.denial {
+            let mut payload = reviewer_decision_payload(&request, None, denial, &review.degraded);
+            payload.insert("operation".to_owned(), operation.into());
+            payload.insert("extension_id".to_owned(), extension_id.into());
+            payload.insert("command".to_owned(), command.into());
+            self.emit_with_parent(EventKind::PERMISSION_DECISION, payload, Some(prompt_id))
+                .map_err(|_| denied())?;
+            return Err(denied());
+        }
         let verdict = match self.permissions.ask_decider_once(&request, cancellation) {
             PermissionDecisionOutcome::Decided(verdict) => verdict,
             PermissionDecisionOutcome::Cancelled => return Err(ExtensionError::Cancelled),
             PermissionDecisionOutcome::TimedOut => {
                 let mut payload = timeout_decision_payload(&request, None);
+                insert_degraded_reviewers(&mut payload, &review.degraded);
                 payload.insert("operation".to_owned(), operation.into());
                 payload.insert("extension_id".to_owned(), extension_id.into());
                 payload.insert("command".to_owned(), command.into());
@@ -784,6 +873,7 @@ impl<D> Session<D> {
             approval_mode_str(ApprovalMode::Ask),
             ApprovalMode::Ask,
         );
+        insert_degraded_reviewers(&mut payload, &review.degraded);
         payload.insert("operation".to_owned(), operation.into());
         payload.insert("extension_id".to_owned(), extension_id.into());
         payload.insert("command".to_owned(), command.into());

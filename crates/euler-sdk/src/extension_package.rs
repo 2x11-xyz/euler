@@ -1,6 +1,6 @@
 use crate::{
     validate_model_tool_descriptor, ArgSpec, ArgValueKind, Capability, IdleContributionDescriptor,
-    ModelToolDescriptor, RequestTickDescriptor, MAX_MODEL_TARGETS,
+    ModelToolDescriptor, PermissionReviewerDescriptor, RequestTickDescriptor, MAX_MODEL_TARGETS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -46,6 +46,8 @@ pub struct StaticExtensionDescriptor {
     pub idle_contribution: Option<IdleContributionDescriptor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_tick: Option<RequestTickDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_reviewer: Option<PermissionReviewerDescriptor>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -309,15 +311,12 @@ pub fn parse_extension_manifest_bytes(
             "observer",
             "idle_contribution",
             "request_tick",
+            "permission_reviewer",
         ],
         "manifest",
     )?;
 
-    let version = root
-        .get("version")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| invalid("manifest version must be integer 1"))?;
-    if version != 1 {
+    if root.get("version").and_then(Value::as_u64) != Some(1) {
         return Err(invalid("manifest version must be integer 1"));
     }
     let id = required_identifier(root, "id", "manifest id")?;
@@ -341,6 +340,7 @@ pub fn parse_extension_manifest_bytes(
     let observer = parse_observer(root, &commands)?;
     let idle_contribution = parse_idle_contribution(root, &commands)?;
     let request_tick = parse_request_tick(root, &commands)?;
+    let permission_reviewer = parse_permission_reviewer(root, &commands)?;
     let envelope = capabilities.iter().cloned().collect::<BTreeSet<_>>();
     for command in &commands {
         for capability in &command.required_capabilities {
@@ -363,6 +363,7 @@ pub fn parse_extension_manifest_bytes(
         observer,
         idle_contribution,
         request_tick,
+        permission_reviewer,
     })
 }
 
@@ -593,56 +594,59 @@ fn parse_idle_contribution(
     root: &Map<String, Value>,
     commands: &[StaticCommandDescriptor],
 ) -> Result<Option<IdleContributionDescriptor>, ExtensionPackageError> {
-    let Some(value) = root.get("idle_contribution") else {
-        return Ok(None);
-    };
-    let object = value
-        .as_object()
-        .ok_or_else(|| invalid("manifest idle_contribution must be an object"))?;
-    validate_fields(object, &["command"], "manifest idle_contribution")?;
-    let command = required_identifier(object, "command", "manifest idle_contribution command")?;
-    let descriptor = commands
-        .iter()
-        .find(|descriptor| descriptor.name == command)
-        .ok_or_else(|| {
-            invalid(format!(
-                "manifest idle_contribution command `{command}` is not registered"
-            ))
-        })?;
-    if !descriptor.invocation.is_agent_only() {
-        return Err(invalid(format!(
-            "manifest idle_contribution command `{command}` must be agent-only"
-        )));
-    }
-    Ok(Some(IdleContributionDescriptor { command }))
+    Ok(
+        agent_only_command_field(root, commands, "idle_contribution")?
+            .map(|command| IdleContributionDescriptor { command }),
+    )
 }
 
 fn parse_request_tick(
     root: &Map<String, Value>,
     commands: &[StaticCommandDescriptor],
 ) -> Result<Option<RequestTickDescriptor>, ExtensionPackageError> {
-    let Some(value) = root.get("request_tick") else {
+    Ok(agent_only_command_field(root, commands, "request_tick")?
+        .map(|command| RequestTickDescriptor { command }))
+}
+
+fn parse_permission_reviewer(
+    root: &Map<String, Value>,
+    commands: &[StaticCommandDescriptor],
+) -> Result<Option<PermissionReviewerDescriptor>, ExtensionPackageError> {
+    Ok(
+        agent_only_command_field(root, commands, "permission_reviewer")?
+            .map(|command| PermissionReviewerDescriptor { command }),
+    )
+}
+
+/// The command a top-level `{"command": ...}` field nominates, which must
+/// be a registered `agent-only` command.
+fn agent_only_command_field(
+    root: &Map<String, Value>,
+    commands: &[StaticCommandDescriptor],
+    field: &str,
+) -> Result<Option<String>, ExtensionPackageError> {
+    let Some(value) = root.get(field) else {
         return Ok(None);
     };
     let object = value
         .as_object()
-        .ok_or_else(|| invalid("manifest request_tick must be an object"))?;
-    validate_fields(object, &["command"], "manifest request_tick")?;
-    let command = required_identifier(object, "command", "manifest request_tick command")?;
+        .ok_or_else(|| invalid(format!("manifest {field} must be an object")))?;
+    validate_fields(object, &["command"], &format!("manifest {field}"))?;
+    let command = required_identifier(object, "command", &format!("manifest {field} command"))?;
     let descriptor = commands
         .iter()
         .find(|descriptor| descriptor.name == command)
         .ok_or_else(|| {
             invalid(format!(
-                "manifest request_tick command `{command}` is not registered"
+                "manifest {field} command `{command}` is not registered"
             ))
         })?;
     if !descriptor.invocation.is_agent_only() {
         return Err(invalid(format!(
-            "manifest request_tick command `{command}` must be agent-only"
+            "manifest {field} command `{command}` must be agent-only"
         )));
     }
-    Ok(Some(RequestTickDescriptor { command }))
+    Ok(Some(command))
 }
 
 fn parse_commands(

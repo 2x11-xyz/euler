@@ -397,17 +397,15 @@ is not tracked.
   keeps its rules as layers, never merged: `profile`, then `overlay`. A
   named `defaults.subagent` child gets the parent's layers and its own
   (`profile` relabeled `subagent`) with every `allow` removed, the lower
-  `ask_timeout`, and the parent's `extension_reviewers`; under `inherit` it
-  gets the parent's. On resume the recorded layers stay, and the resolved
+  `ask_timeout`, and no `extension_reviewers`; under `inherit` it gets the
+  parent's, without `extension_reviewers`. On resume the recorded layers stay, and the resolved
   profile's `ask` and `deny` rules join as further layers unless a layer
   with the same label already holds exactly those rules; a lower
   `ask_timeout` and added `extension_reviewers` apply, the recorded ones
   stay, and the summary names the fields joined this way. The gate
   enforces every rule surface ("Permission rules in the gate" below) and
-  `ask_timeout` ("Ask timeout" below). This build refuses at startup any
-  profile, child, or resume that sets `extension_reviewers`, naming the
-  field, because the gate does not enforce it yet; when only the recording
-  sets it, the error names the recorded profile and `--profile`. `tools` patterns are
+  `ask_timeout` ("Ask timeout" below), and asks the named extension
+  reviewers ("Extension reviewers" below). `tools` patterns are
   checked against the extensions installed in the Euler home (enabled or
   not) when `profiles.json` and the overlay load: a pattern without `.`
   that matches no core tool but matches an installed extension's
@@ -419,8 +417,12 @@ is not tracked.
   or overlay, the rule's index and pattern, and the installed ids. An
   extension registry that cannot be read fails profile loading with an
   error naming the registry and saying it was read to check `tools` rules.
-  The `extension_reviewers` check for an entry that is not
-  enabled or has no reviewer descriptor is not implemented yet.
+  A session whose profile names an extension reviewer whose extension is
+  not installed and enabled, could not be loaded, or declares no
+  permission reviewer command of that name, is refused at startup, at resume, and on a
+  profile change, with an error naming the profile, the reviewer, why,
+  and the fixes (install or enable the extension, pass `--profile`, or
+  change the default profile).
 - **Permission rules in the gate (ADR 0027 section 3).** The gate decides
   a request in this order: a configured `always-deny`; a `deny` rule
   (`always-deny`, the escalated form of a command included); an
@@ -536,9 +538,32 @@ is not tracked.
   configured capability `always-deny` (including an auto-approve tier's)
   deny that capability for the rest of the turn, and later requests for it
   are refused unasked. Every other deny covers only its request: a `deny`
-  rule, a timeout, an ask under `ask_timeout: 0`, a never-prompt
-  decider's deny, and a guardian deny (bounded by its circuit breaker). A
-  later request of the same capability in the same turn is decided again.
+  rule, an extension reviewer's deny, a timeout, an ask under
+  `ask_timeout: 0`, a never-prompt decider's deny, and a guardian deny
+  (bounded by its circuit breaker). A later request of the same capability
+  in the same turn is decided again.
+- **Extension reviewers (ADR 0027 section 5).** An uncovered ask on the
+  root session's routes (a core tool call, an extension operation's
+  batch, and a project-tier extension config write) goes first to each reviewer named in `extension_reviewers`, in
+  order, whether `reviewer` is `user` or `guardian` and including
+  human-only floor asks, then to the guardian, then to the person. A reviewer is an extension's
+  agent-only command nominated by its permission reviewer descriptor
+  (extension SDK contract, "Permission Reviewer v0"). It returns `deny`
+  with a reason or `defer`; it can never allow. The first deny ends the
+  ask: the request is denied for that request only, recorded with
+  `decision_source: "reviewer"`, and the tool error names the reviewer and
+  its reason. A batch is one ask: the reviewers see each of its requests,
+  and a deny of one denies the batch. A reviewer runs with standing
+  authority only and never prompts; each run (one reviewer, one request)
+  has a 10-second host budget and all of one ask's runs share 30 seconds,
+  and expiry cancels its work. While it runs, an ask its host calls or the agents it spawns raise
+  is denied at once without review and without asking anyone. A reviewer
+  that is not running in the session, lacks standing authority, fails,
+  passes its budget, or returns a malformed verdict defers; the decision
+  that settles the ask lists it in `reviewers_degraded`. A child agent's
+  asks go to the session's decider directly and are not sent to extension
+  reviewers or the guardian in this build (ADR 0027 section 6 amendment),
+  so a child's profile lists no `extension_reviewers`.
 - **Selection.** `--profile <name>` on `euler` and `euler exec`, then
   `/profile` in the TUI, then the context default in `profiles.json`, then
   the built-in default: `full` for both interactive and headless. An unknown
@@ -549,8 +574,8 @@ is not tracked.
   included) tightened field by field against the session's current profile:
   a field looser than the session's takes the session's value, so a child
   never runs looser than its parent. Unset or `inherit` is the session's
-  profile. The child keeps the session's `reviewer`, since its asks go to
-  the session's reviewer. A child with capabilities whose profile differs
+  profile. The child keeps the session's `reviewer` and lists no
+  `extension_reviewers` ("Extension reviewers" above). A child with capabilities whose profile differs
   from the session's gets its own boundary, structured-write scope, and
   escalation; jobs its sandboxed or escalated commands leave running end
   when the child ends, and host background jobs it starts are listed at
@@ -1155,7 +1180,8 @@ write started by an agent-invoked model tool always asks a human, once per
 write: the host asks the configured decider directly, so no session
 allowance, `session-allow` mode, or session, project, or user grant covers it,
 the guardian never adjudicates it, and no grant is installed whatever scope
-the human picks. A decider that cannot prompt denies it, so unattended runs
+the human picks. The profile's extension reviewers see it first and may deny
+it ("Extension reviewers" above). A decider that cannot prompt denies it, so unattended runs
 (headless `euler exec`) cannot commit a shared config change; they can still
 propose one as an artifact. A configured `always-deny` denies without a
 prompt. Lifecycle hooks (terminal idle, request tick, observer) never prompt,

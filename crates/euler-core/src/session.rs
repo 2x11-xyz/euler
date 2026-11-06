@@ -58,6 +58,7 @@ mod compaction_worker;
 mod companion;
 mod extension_bridge;
 mod extension_contributions;
+mod extension_reviewers;
 pub use extension_bridge::MAX_SPAWNS_PER_COMMAND;
 mod observer;
 mod parallel_spawn;
@@ -437,6 +438,16 @@ pub enum SessionError {
     InvalidSessionName { name: String },
     #[error("an execution profile change waits for the active run to finish")]
     ProfileChangeDuringRun,
+    #[error(
+        "profile \"{profile}\" names extension reviewer {reviewer}, but {why}; install or enable \
+         the extension, pass --profile to run another profile, or change the default profile in \
+         profiles.json"
+    )]
+    ExtensionReviewerUnavailable {
+        profile: String,
+        reviewer: String,
+        why: String,
+    },
     #[error("invalid skill command; usage: /skill:<name> [request]")]
     InvalidSkillCommand,
     #[error("skill is not available in this session: {name}")]
@@ -601,6 +612,12 @@ pub enum ExtensionExecutionError {
     /// message is host-generated and says the deny covers this request only.
     #[error("{0}")]
     AskTimedOut(String),
+    /// An extension reviewer of the execution profile denied the call's ask
+    /// (ADR 0027 section 5). The message is host-generated around the
+    /// reviewer's redacted, bounded reason and says the deny covers this
+    /// request only.
+    #[error("{0}")]
+    ReviewerDenied(String),
     /// Host-side validation rejected the command input before execution. The
     /// message is host-generated (never raw extension error text), so unlike
     /// the sibling variants it is safe to surface verbatim.
@@ -2013,6 +2030,7 @@ impl<D> Session<D> {
         if self.active_run.is_some() {
             return Err(SessionError::ProfileChangeDuringRun);
         }
+        self.check_extension_reviewers(&profile)?;
         self.persist_new_events()?;
         self.record_resumed_profile_change()?;
         // Jobs started under a sandboxed profile, escalated ones included,
@@ -6855,6 +6873,9 @@ fn validate_model_target_shape(target: &ModelTarget) -> Result<(), String> {
 #[cfg(test)]
 #[path = "permission_ask_timeout_test.rs"]
 mod permission_ask_timeout_test;
+#[cfg(test)]
+#[path = "permission_extension_reviewers_test.rs"]
+mod permission_extension_reviewers_test;
 #[cfg(test)]
 #[path = "permission_matrix_test.rs"]
 mod permission_matrix_test;

@@ -493,6 +493,7 @@ fn linked_extension(
             observer: None,
             idle_contribution: None,
             request_tick: None,
+            permission_reviewer: None,
         },
         broken_reason,
     }
@@ -707,6 +708,62 @@ fn manifest_rejects_user_model_tools_and_invalid_idle_commands() {
     assert!(error
         .to_string()
         .contains("idle_contribution command `update` must be agent-only"));
+}
+
+/// ADR 0027 section 5: a manifest nominates one registered agent-only
+/// command as its permission reviewer.
+#[test]
+fn manifest_permission_reviewer_names_a_registered_agent_only_command() {
+    let manifest = |invocation: &str, reviewer: Value| {
+        json!({
+            "version": 1,
+            "id": "policy-check",
+            "display_name": "Policy check",
+            "extension_version": "0.1.0",
+            "runtime_kind": "native-rust",
+            "capabilities": [],
+            "commands": [{
+                "name": "review",
+                "display_name": "Review",
+                "summary": "Review a permission ask.",
+                "required_capabilities": [],
+                "invocation": invocation
+            }],
+            "permission_reviewer": reviewer
+        })
+    };
+    let parse = |manifest: Value| {
+        parse_extension_manifest_bytes(&serde_json::to_vec(&manifest).expect("manifest json"))
+    };
+
+    let descriptor =
+        parse(manifest("agent-only", json!({"command": "review"}))).expect("valid reviewer");
+    assert_eq!(
+        descriptor.permission_reviewer,
+        Some(crate::PermissionReviewerDescriptor {
+            command: "review".to_owned()
+        })
+    );
+    for (invocation, reviewer, message) in [
+        (
+            "agent-only",
+            json!({"command": "audit"}),
+            "permission_reviewer command `audit` is not registered",
+        ),
+        (
+            "user",
+            json!({"command": "review"}),
+            "permission_reviewer command `review` must be agent-only",
+        ),
+        (
+            "agent-only",
+            json!({"command": "review", "allow": true}),
+            "unknown field",
+        ),
+    ] {
+        let error = parse(manifest(invocation, reviewer)).expect_err(message);
+        assert!(error.to_string().contains(message), "{error}");
+    }
 }
 
 #[test]

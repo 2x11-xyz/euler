@@ -313,6 +313,14 @@ pub struct RequestTickDescriptor {
     pub command: String,
 }
 
+/// The command a profile's `extension_reviewers` may name as a deny-only
+/// permission reviewer (ADR 0027 section 5).
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PermissionReviewerDescriptor {
+    pub command: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ArgSpec {
     pub flag: String,
@@ -711,6 +719,9 @@ pub trait Extension: Send + Sync {
         None
     }
     fn request_tick(&self) -> Option<RequestTickDescriptor> {
+        None
+    }
+    fn permission_reviewer(&self) -> Option<PermissionReviewerDescriptor> {
         None
     }
 }

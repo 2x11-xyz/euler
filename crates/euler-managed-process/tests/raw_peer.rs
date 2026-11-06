@@ -71,6 +71,7 @@ fn managed_adapter_preserves_session_contribution_descriptors() {
         observer: None,
         idle_contribution: Some(idle.clone()),
         request_tick: Some(request_tick.clone()),
+        permission_reviewer: None,
     };
 
     let extension = ManagedProcessExtension::new(
@@ -1179,6 +1180,7 @@ fn extension(
         observer: None,
         idle_contribution: None,
         request_tick: None,
+        permission_reviewer: None,
     };
     ManagedProcessExtension::new(
         package_dir,

@@ -191,7 +191,7 @@ impl AppCore {
         if let Some((_, extension)) = observer {
             session.set_observer_extension(extension);
         }
-        crate::cli::extension_run::wire_session_extensions(&mut session);
+        crate::cli::extension_run::wire_session_extensions(&mut session)?;
         let events = session.events().to_vec();
         let events_replayed = outcome.events_folded;
         Ok((

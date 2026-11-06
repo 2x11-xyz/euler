@@ -12,8 +12,8 @@ use euler_sdk::{
     DiagnosticsPage, EventFeedCheckpoint, Extension, ExtensionCommand, ExtensionConfigDocuments,
     ExtensionConfigTier, ExtensionError, ExtensionManifest, HostAgentRecord, HostAgentResult,
     HostAgentTask, HostApi, IdleContributionDescriptor, LoadedExtensionPackage,
-    ManagedProcessEntrypoint, PlanPresentation, ProvenancePage, RequestTickDescriptor,
-    SpawnAgentTask, StaticExtensionDescriptor,
+    ManagedProcessEntrypoint, PermissionReviewerDescriptor, PlanPresentation, ProvenancePage,
+    RequestTickDescriptor, SpawnAgentTask, StaticExtensionDescriptor,
 };
 use io::{finish_io_thread, spawn_stderr_drain, spawn_stdin_writer, spawn_stdout_reader, IoThread};
 use serde::Deserialize;
@@ -121,6 +121,7 @@ pub struct ManagedProcessExtension {
     commands: Vec<CommandDescriptor>,
     idle_contribution: Option<IdleContributionDescriptor>,
     request_tick: Option<RequestTickDescriptor>,
+    permission_reviewer: Option<PermissionReviewerDescriptor>,
     limits: ManagedProcessLimits,
 }
 
@@ -188,6 +189,7 @@ impl ManagedProcessExtension {
             commands,
             idle_contribution: descriptor.idle_contribution.clone(),
             request_tick: descriptor.request_tick.clone(),
+            permission_reviewer: descriptor.permission_reviewer.clone(),
             limits: ManagedProcessLimits::default(),
         })
     }
@@ -231,6 +233,10 @@ impl Extension for ManagedProcessExtension {
 
     fn request_tick(&self) -> Option<RequestTickDescriptor> {
         self.request_tick.clone()
+    }
+
+    fn permission_reviewer(&self) -> Option<PermissionReviewerDescriptor> {
+        self.permission_reviewer.clone()
     }
 }
 

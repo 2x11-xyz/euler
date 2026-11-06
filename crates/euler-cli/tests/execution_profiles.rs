@@ -629,10 +629,11 @@ fn malformed_profiles_json_names_the_file_and_field() {
 }
 
 /// ADR 0027: every rule surface and `ask_timeout` are enforced, so a
-/// profile or overlay with them starts; a profile that sets a field the
-/// gate does not enforce yet is refused at startup.
+/// profile or overlay with them starts; a profile naming an extension
+/// reviewer that is not installed and enabled is refused at startup
+/// (resolved question 16).
 #[test]
-fn unenforced_permission_fields_are_refused_at_startup() {
+fn permission_fields_start_and_a_missing_extension_reviewer_is_refused() {
     let workspace = workspace();
     write_profiles(
         &workspace,
@@ -655,8 +656,9 @@ fn unenforced_permission_fields_are_refused_at_startup() {
     let message = stderr(&output);
     assert!(
         message.contains(
-            "profile \"agent\" sets extension_reviewers, which this version parses and records \
-             but does not enforce yet; remove extension_reviewers to run this profile"
+            "profile \"agent\" names extension reviewer policy-check.review, but extension \
+             policy-check is not installed and enabled; install or enable the extension, pass \
+             --profile to run another profile, or change the default profile in profiles.json"
         ),
         "{message}"
     );

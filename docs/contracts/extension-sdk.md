@@ -325,8 +325,10 @@ parented to the model's `tool.call`, carrying `operation`, `extension_id`,
 and `command`, and one child `permission.decision`. An allow is recorded and
 applied as `grant_scope: "once"` whatever scope the human picked; no grant is
 installed. The request is marked `once_only`, so approval surfaces offer only
-allow-once for it. A configured `always-deny` for `config-write` denies
-without a prompt. A denial reaches the extension as a `config-write`
+allow-once for it. The profile's extension reviewers see the ask before
+the human, and a reviewer's deny settles it (ADR 0027 section 5). A
+configured `always-deny` for `config-write` denies without a prompt. A
+denial reaches the extension as a `config-write`
 capability denial.
 The command is already running when it asks, so resume closes a call
 interrupted at this ask as one whose side effects may have occurred, not as
@@ -611,6 +613,54 @@ Authoritative provenance failure retains the ordinary fatal writer fence. If
 no live writer or durable tail is available, the optional tick point is
 skipped before its contributor discovery rather than making the root request
 depend on observer read I/O.
+
+## Permission Reviewer v0
+
+`Extension::permission_reviewer()` may nominate one registered `agent-only`
+command as a deny-only permission reviewer (ADR 0027 section 5). Managed
+manifests declare the same shape at top level:
+
+```json
+{"permission_reviewer":{"command":"command-id"}}
+```
+
+A nominated command that is not registered or not `agent-only` fails the
+manifest or the registration. Core runs a reviewer only for a session
+profile that names it in `extension_reviewers` as
+`<extension-id>.<command>` (capabilities contract, "Extension reviewers");
+an enabled package with a reviewer is wired at session start like one with
+a model tool. Core supplies one closed input per request of an uncovered
+ask, each text redacted under the secrets contract and bounded to 2048
+bytes:
+
+```json
+{"capability":"shell-exec","tool":"run_shell","reason":"tool run_shell",
+ "command":"git push origin main","rule":{"surface":"shell","index":0,
+ "pattern":"git push *","state":"ask","layer":"profile"},"profile":"agent"}
+```
+
+`tool`, `command` (with `command_truncated: true` when the retained text was
+cut), `path`, `escalation` (the agent's stated reason for leaving the
+sandbox), and `rule` appear only when the request has them. The result must
+be exactly one of:
+
+```json
+{"verdict":"deny","reason":"bounded UTF-8 text"}
+{"verdict":"defer"}
+```
+
+`defer` may carry a string `reason`, which core ignores. A reviewer cannot allow.
+Any other shape, a command error, a panic, missing standing authority, or a
+run past the host budget (10 seconds per reviewer run on one request, 30 seconds per ask) is
+a deferral that core records in `reviewers_degraded`; budget expiry cancels
+the command through the ordinary cancellation seam. Core redacts a deny's
+reason and bounds it to 512 bytes before recording it and showing it to
+the model. The reviewer runs like a lifecycle hook: it never prompts,
+needs standing authority for its required capabilities under the same rule
+as terminal idle, has project-tier config writes refused, and any ask its
+host calls or spawned agents raise is denied at once without review. A
+reviewer whose extension is disabled during the session defers the same
+way.
 
 ## Managed Process Runtime v0
 
