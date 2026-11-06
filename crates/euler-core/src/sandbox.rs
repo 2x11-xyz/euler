@@ -2827,7 +2827,7 @@ mod tests {
         };
 
         assert_eq!(runtime.cargo_home().as_deref(), Some(cargo.as_path()));
-        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        assert!(configured_roots(&runtime).is_empty(), "{runtime:?}");
     }
 
     /// Cargo accepts a registry token in `config.toml` too, which is not
@@ -2973,7 +2973,7 @@ token = \"secret\"\n",
 
         // No second mount — the workspace bind carries it — but the variable
         // and PATH survive, already at their bound path.
-        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        assert!(configured_roots(&runtime).is_empty(), "{runtime:?}");
         let exported = sandbox_environment(&runtime, &[]);
         assert!(
             exported.contains(&(
@@ -3005,7 +3005,7 @@ token = \"secret\"\n",
         }
         .excluding(Path::new("/home/example/project"));
 
-        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        assert!(configured_roots(&runtime).is_empty(), "{runtime:?}");
         assert!(runtime.variables.is_empty(), "{runtime:?}");
         assert!(runtime.path_entries.is_empty(), "{runtime:?}");
     }
@@ -3015,6 +3015,21 @@ token = \"secret\"\n",
     /// An explicit variable naming one of the profile's own mount points
     /// would bind over the private `/tmp` the sandbox home, cache and TMPDIR
     /// live in, and the resulting probe failure would be blamed on /usr.
+    /// The roots a test configured, without system toolchain roots that only
+    /// exist on some hosts (for example `/nix/store` where Nix is installed).
+    fn configured_roots(runtime: &RuntimeRoots) -> Vec<PathBuf> {
+        runtime
+            .roots
+            .iter()
+            .filter(|root| {
+                !SYSTEM_TOOLCHAIN_ROOTS
+                    .iter()
+                    .any(|system| root.as_path() == Path::new(system))
+            })
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn a_toolchain_variable_may_not_name_a_profile_mount_point() {
         for mount in ["/tmp", "/proc", "/dev"] {
@@ -3031,7 +3046,7 @@ token = \"secret\"\n",
             |name| (name == "GOPATH").then(|| OsString::from("/tmp")),
             None,
         );
-        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        assert!(configured_roots(&runtime).is_empty(), "{runtime:?}");
         assert!(runtime.variables.is_empty(), "{runtime:?}");
 
         // The predicate itself, not `usable_runtime_root`: these paths do not
@@ -3074,7 +3089,7 @@ token = \"secret\"\n",
         .excluding(&workspace);
 
         // No second mount: the workspace bind already carries it.
-        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        assert!(configured_roots(&runtime).is_empty(), "{runtime:?}");
         let exported = sandbox_environment(&runtime, &[]);
         assert!(
             exported.contains(&(
@@ -3111,7 +3126,7 @@ token = \"secret\"\n",
         let cargo = cargo.canonicalize().expect("canonical cargo home");
         let rustup = rustup.canonicalize().expect("canonical rustup home");
 
-        assert_eq!(runtime.roots, vec![cargo.clone()]);
+        assert_eq!(configured_roots(&runtime), vec![cargo.clone()]);
         assert!(runtime
             .variables
             .contains(&(OsString::from("CARGO_HOME"), cargo.into_os_string())));
@@ -3356,7 +3371,7 @@ token = \"secret\"\n",
         )
         .excluding(&workspace.canonicalize().expect("canonical workspace"));
 
-        assert!(runtime.roots.is_empty(), "{runtime:?}");
+        assert!(configured_roots(&runtime).is_empty(), "{runtime:?}");
     }
 
     #[test]
