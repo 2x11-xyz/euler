@@ -1030,6 +1030,12 @@ It **must
 never be used to prove safety**. It fails closed on a parse error, on a
 dynamic command name, on a dynamic argument of a dangerous or wrapper
 command, on an unrecognized `env` option, and past a wrapper depth of eight;
+a dynamic argument the table never reads is a plain word: one after a
+literal `git` subcommand with no destructive form (`git commit -m "$MSG"`,
+`git add "$F"`) is not danger, while one among `git`'s global options or
+in its subcommand slot (`git $SUB`, `git -C $DIR clean`), or after a
+subcommand the table inspects (`git reset $MODE`), still fails closed (an
+alias is judged by its literal name, as with literal arguments);
 both walks are iterative and node-bounded, so nesting cannot exhaust the
 stack.
 
