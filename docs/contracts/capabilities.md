@@ -485,13 +485,16 @@ is not tracked.
   surface each target takes its last matching rule, and the surface is
   `deny` if any target is, else `ask` if any is, else `allow` only if every
   target on it is. A leading unquoted `~` or `~/` in a shell word is
-  `HOME`, so it is a known path. A word with a glob, a variable, a
-  substitution, a brace, or an escape is an unresolved target bounded by
-  its fixed directory, the text before its first such part up to the last
-  `/` (`src/*.rs` names paths under `src/`, `~/.ssh/$K` under
-  `~/.ssh/`); it may name any path when it starts with an expansion
-  (`$HOME/.ssh/x`) or a later part can climb out (`..`, or a glob like
-  `.*`). A value with `..` inside a variable is not seen. Such a word in a
+  `HOME`, so it is a known path, and an unquoted escape is the literal
+  character (`\.\.` is `..`). A word with a glob, a variable, a
+  substitution, or a brace is an unresolved target bounded by its fixed
+  directory, the text before its first such part up to the last `/`
+  (`src/*.rs` names paths under `src/`, `~/.ssh/$K` under `~/.ssh/`); it
+  may name any path when it starts with an expansion or a brace
+  (`$HOME/.ssh/x`, `{~,x}/.ssh`) or a later part can climb out (`..`, a
+  glob like `.*`, a fixed `.` beside a variable as in `.$D`, or a brace
+  whose body has a `.` or `/` as in `{..,x}`). A value with `..` inside a variable,
+  and a symlink under the fixed directory, are not seen. Such a word in a
   redirect or an operand of a command listed above is a target in that
   position; in a command of unknown direction it is a target only where it
   looks like a path (contains `/`, or starts with `.` or `~`) and does not

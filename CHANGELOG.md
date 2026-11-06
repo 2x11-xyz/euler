@@ -17,7 +17,9 @@ pull requests that landed them; deeper design rationale lives in
   denies them. A dynamic operand still asks where it could reach an `ask`
   or `deny` rule (a person only for a deny): `rm -rf $DIR` and
   `cat $HOME/.ssh/*` beside a `~/.ssh` deny ask as before, and
-  `cat ~/.ssh/id_ed25519` is now denied by that rule. For commands other
+  `cat ~/.ssh/id_ed25519` is now denied by that rule, as is the escaped
+  `cat ~/x/\.\./.ssh/id_ed25519`; a brace that can form `..`
+  (`cat ~/x/{..,y}/.ssh/id_ed25519`) still asks. For commands other
   than the known readers and writers, a variable counts as a path only when
   it contains `/` or starts with `.` or `~`, so `python x.py $OUT` is not
   inspected.

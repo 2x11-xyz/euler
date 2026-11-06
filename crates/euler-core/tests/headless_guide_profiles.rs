@@ -247,6 +247,15 @@ fn guide_dev_and_agent_dynamic_shell_operands_ask_only_near_a_rule() {
     }
     // `$HOME/.ssh/*` could reach the `~/.ssh` deny.
     assert!(human_only(&agent, "cat $HOME/.ssh/*"));
+    // A brace or a `.` beside a variable can climb out of `~/x` to `~/.ssh`;
+    // an escaped `..` is literal, so the deny names it.
+    assert!(human_only(&agent, "cat ~/x/{..,y}/.ssh/id_ed25519"));
+    assert!(human_only(&agent, "cat ~/x/.$D/.ssh/id_ed25519"));
+    assert!(human_only(&dev, "rm -rf ~/x/{..,y}/.euler/sessions"));
+    assert_eq!(
+        shell(&agent, "cat ~/Library/\\.\\./.ssh/id_ed25519", root),
+        Some(RuleState::Deny)
+    );
     // A command of unknown direction: a bare variable is not read as a
     // path, one that looks like a path is.
     assert_eq!(shell(&agent, "python3 x.py $OUT", root), None);

@@ -190,7 +190,8 @@ rules of section 10, `tee /opt/result /tmp/result` asks for `/opt/result`
 although `/tmp` is allowed. A target Euler cannot resolve counts as `ask` in
 this reduction when its surface has any `ask` or `deny` rule, and as no rule
 state otherwise (resolved question 3), so it never hides a known `deny` on
-another target and a known `allow` never covers it.
+another target and a known `allow` never covers it (amended 2026-11-06, see
+resolved question 3).
 
 Each layer is evaluated on its own, last match wins within its own lists,
 and the layers' states combine by most restrictive: the user profile's
@@ -705,16 +706,18 @@ Entries marked **changed** differ from the proposal in the draft.
    any profile with a `path` deny turn `ls src/*.rs`, `echo $HOME`, and
    `git commit -m "$MSG"` into human-only asks, so headless `exec` denied
    them. A dynamic word is now read as far as its fixed text goes. A
-   leading `~` or `~/` is `HOME`, a known path. A glob or expansion is
-   bounded by its fixed directory (the text before its first glob or
-   expansion, up to the last `/`); a word that starts with an expansion,
-   or whose later part can climb out (`..`, a glob such as `.*`), may name
-   any path, and a `..` inside a variable's value is not seen. Such a word
-   counts in a redirect and in the recognized positions above, and in an
-   operand of unknown direction only where it looks like a path (contains
-   `/`, or starts with `.` or `~`) and does not follow an option word (the
-   option's value, though a flag that takes none hides the word after it
-   too); an option with an attached value (`--title=$X`) is never a path.
+   leading `~` or `~/` is `HOME`, a known path, and an unquoted escape is
+   the literal character. A glob, expansion, or brace is bounded by its
+   fixed directory (the text before its first such part, up to the last
+   `/`); a word that starts with an expansion or a brace, or whose later
+   part can climb out (`..`, a glob such as `.*`, a fixed `.` beside a
+   variable, a brace whose body has a `.` or `/`), may name any path, and
+   a `..` inside a variable's value or a symlink under the fixed directory
+   is not seen. Such a word counts in a redirect and in the recognized
+   positions above, and in an operand of unknown direction only where it
+   looks like a path (contains `/`, or starts with `.` or `~`) and does
+   not follow an option word (the option's value, though a flag that
+   takes none hides the word after it too); an option with an attached value (`--title=$X`) is never a path.
    So an unknown-direction command with a bare variable operand
    (`python x.py $OUT`) is not inspected, consistent with this not being a
    shell effects interpreter. An unresolved target counts as `ask`
