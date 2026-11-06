@@ -13,8 +13,8 @@ use euler_event::{object, EventEnvelope, EventKind};
 use euler_sdk::{
     valid_checkpoint_name, validate_model_tool_descriptor, validate_plan_presentation,
     EventFeedCheckpoint, EventFeedCheckpointError, IdleContributionDescriptor, Invocation,
-    PlanItemStatus, PlanPresentation, PlanPresentationItem, PlanPresentationStatus,
-    RequestTickDescriptor, MAX_EVENT_FEED_CHECKPOINT_BYTES,
+    PermissionReviewerDescriptor, PlanItemStatus, PlanPresentation, PlanPresentationItem,
+    PlanPresentationStatus, RequestTickDescriptor, MAX_EVENT_FEED_CHECKPOINT_BYTES,
 };
 use euler_sdk::{AgentOutcome, SpawnAgentTask};
 use euler_sdk::{ArtifactRecord, ArtifactWrite, Capability, CommandContext, CommandRegistrar};
@@ -168,6 +168,7 @@ pub(crate) struct ExtensionDeclaration {
     pub(crate) commands: BTreeMap<String, CommandDescriptor>,
     pub(crate) idle_contribution: Option<IdleContributionDescriptor>,
     pub(crate) request_tick: Option<RequestTickDescriptor>,
+    pub(crate) permission_reviewer: Option<PermissionReviewerDescriptor>,
 }
 
 impl ExtensionHost {
@@ -1973,49 +1974,48 @@ pub(crate) fn extension_declaration(
         commands.insert(name, descriptor);
     }
 
+    let nomination = |nominated: Option<&String>, kind: &str| {
+        let Some(nominated) = nominated else {
+            return Ok(());
+        };
+        match commands.get(nominated) {
+            None => Err(registration_message(
+                &id,
+                format!("{kind} command `{nominated}` is not registered"),
+            )),
+            Some(command) if !command.invocation.is_agent_only() => Err(registration_message(
+                &id,
+                format!("{kind} command `{nominated}` must be agent-only"),
+            )),
+            Some(_) => Ok(()),
+        }
+    };
     let idle_contribution = catch_extension_unwind(|| extension.idle_contribution())
         .map_err(|_| ExtensionHostError::RegistrationPanic(Some(id.clone())))?;
-    if let Some(idle) = &idle_contribution {
-        let Some(command) = commands.get(&idle.command) else {
-            return Err(registration_message(
-                &id,
-                format!(
-                    "idle contribution command `{}` is not registered",
-                    idle.command
-                ),
-            ));
-        };
-        if !command.invocation.is_agent_only() {
-            return Err(registration_message(
-                &id,
-                format!(
-                    "idle contribution command `{}` must be agent-only",
-                    idle.command
-                ),
-            ));
-        }
-    }
+    nomination(
+        idle_contribution.as_ref().map(|idle| &idle.command),
+        "idle contribution",
+    )?;
     let request_tick = catch_extension_unwind(|| extension.request_tick())
         .map_err(|_| ExtensionHostError::RegistrationPanic(Some(id.clone())))?;
-    if let Some(tick) = &request_tick {
-        let Some(command) = commands.get(&tick.command) else {
-            return Err(registration_message(
-                &id,
-                format!("request tick command `{}` is not registered", tick.command),
-            ));
-        };
-        if !command.invocation.is_agent_only() {
-            return Err(registration_message(
-                &id,
-                format!("request tick command `{}` must be agent-only", tick.command),
-            ));
-        }
-    }
+    nomination(
+        request_tick.as_ref().map(|tick| &tick.command),
+        "request tick",
+    )?;
+    let permission_reviewer = catch_extension_unwind(|| extension.permission_reviewer())
+        .map_err(|_| ExtensionHostError::RegistrationPanic(Some(id.clone())))?;
+    nomination(
+        permission_reviewer
+            .as_ref()
+            .map(|reviewer| &reviewer.command),
+        "permission reviewer",
+    )?;
     Ok(ExtensionDeclaration {
         id,
         commands,
         idle_contribution,
         request_tick,
+        permission_reviewer,
     })
 }
 

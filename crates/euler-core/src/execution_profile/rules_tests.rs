@@ -62,7 +62,7 @@ fn with_rules(name: &str, rules: Vec<RuleLayer>) -> ExecutionProfile {
 }
 
 #[test]
-fn profile_rules_parse_into_one_profile_layer_and_unenforced_parts_are_refused() {
+fn profile_rules_parse_into_one_profile_layer_and_every_field_is_enforced() {
     let config = parse(
         r#"{"profiles": {
             "agent": {
@@ -144,32 +144,22 @@ fn profile_rules_parse_into_one_profile_layer_and_unenforced_parts_are_refused()
         .expect("ask_timeout is enforced");
     assert_eq!(timeout.fields.ask_timeout, Some(0));
 
-    for (name, field) in [
-        ("agent", "extension_reviewers"),
-        ("reviewed", "extension_reviewers"),
-    ] {
-        let error = config
+    // `extension_reviewers` is enforced (ADR 0027 rollout step 6); a
+    // reviewer that is not enabled is refused when the session wires its
+    // extensions.
+    for name in ["agent", "reviewed"] {
+        let reviewed = config
             .resolve(Some(name), ProfileContext::Headless, None)
-            .expect_err("not enforced");
+            .expect("extension_reviewers is enforced");
         assert_eq!(
-            error,
-            ProfileError::Unenforced {
-                profile: name.to_owned(),
-                field,
-            }
-        );
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "profile \"{name}\" sets {field}, which this version parses and records but does \
-                 not enforce yet; remove {field} to run this profile"
-            )
+            reviewed.fields.extension_reviewers,
+            vec!["policy-check.review".to_owned()]
         );
     }
 }
 
 #[test]
-fn a_subagent_default_with_an_unenforced_field_is_refused_at_startup() {
+fn a_subagent_default_with_every_permission_field_resolves() {
     let config = parse(
         r#"{"defaults": {"subagent": "helper"}, "profiles": {
             "helper": {"extends": "full", "ask_timeout": 30,
@@ -178,13 +168,11 @@ fn a_subagent_default_with_an_unenforced_field_is_refused_at_startup() {
         }}"#,
     )
     .expect("parses");
-    assert_eq!(
-        config.resolve_subagent(None),
-        Err(ProfileError::Unenforced {
-            profile: "helper".to_owned(),
-            field: "extension_reviewers",
-        })
-    );
+    let helper = config
+        .resolve_subagent(None)
+        .expect("resolves")
+        .expect("named subagent");
+    assert_eq!(helper.fields.ask_timeout, Some(30));
 }
 
 #[test]
@@ -606,10 +594,9 @@ fn a_named_child_keeps_only_ask_and_deny_layers_and_the_lower_timeout() {
         ]
     );
     assert_eq!(child.fields.ask_timeout, Some(60));
-    assert_eq!(
-        child.fields.extension_reviewers,
-        vec!["policy-check.review".to_owned()]
-    );
+    // A child's asks do not reach the extension reviewers in this build
+    // (ADR 0027 section 6 amendment), so its record lists none.
+    assert!(child.fields.extension_reviewers.is_empty());
     assert_eq!(ExecutionProfile::from_record(&child.record()), Ok(child));
 
     // An absent timeout is no limit, so the other side's applies.
@@ -625,8 +612,11 @@ fn a_named_child_keeps_only_ask_and_deny_layers_and_the_lower_timeout() {
         Some(300)
     );
 
-    // `inherit` is the parent's profile, allow rules included.
-    assert_eq!(parent.child_profile(None), parent);
+    // `inherit` is the parent's profile, allow rules included, without
+    // its extension reviewers.
+    let mut inherited = parent.clone();
+    inherited.fields.extension_reviewers.clear();
+    assert_eq!(parent.child_profile(None), inherited);
 }
 
 #[test]
@@ -739,40 +729,25 @@ fn resume_keeps_recorded_layers_and_joins_added_ask_and_deny_rules() {
     // The joined profile is the one resume records, and it round trips.
     assert_eq!(
         ExecutionProfile::from_record(&recorded_record).map(|profile| profile.fields),
-        Ok(joined)
+        Ok(joined.clone())
     );
 
-    // This build refuses the joined profile rather than running without
-    // the recorded extension reviewers.
-    assert_eq!(
-        ResumeProfile::choose(Some(recorded.clone()), resolved.clone(), false, None),
-        Err(ProfileError::Unenforced {
-            profile: "dev".to_owned(),
-            field: "extension_reviewers",
-        })
-    );
-    // A resolved profile without reviewers still keeps the recorded ones,
-    // and the refusal names the recording rather than asking the user to
-    // remove a field their profile does not set.
-    let error = ResumeProfile::choose(
+    // Resume applies the joined profile: the recorded extension reviewers
+    // stay (ADR 0027 rollout step 6), so does a resolved profile without
+    // any.
+    let chosen = ResumeProfile::choose(Some(recorded.clone()), resolved.clone(), false, None)
+        .expect("extension_reviewers is enforced");
+    assert_eq!(chosen.profile.fields, joined);
+    let kept = ResumeProfile::choose(
         Some(recorded.clone()),
         with_rules("dev", Vec::new()),
         false,
         None,
     )
-    .expect_err("the recorded reviewers are refused");
+    .expect("the recorded reviewers stay");
     assert_eq!(
-        error,
-        ProfileError::RecordedUnenforced {
-            profile: "dev".to_owned(),
-            field: "extension_reviewers",
-        }
-    );
-    assert_eq!(
-        error.to_string(),
-        "this session recorded profile \"dev\" with extension_reviewers, which this version \
-         parses and records but does not enforce yet, and resume keeps the recorded \
-         extension_reviewers; pass --profile to resume under a profile without it"
+        kept.profile.fields.extension_reviewers,
+        vec!["a.review".to_owned()]
     );
     // A recorded timeout is enforced (ADR 0027 rollout step 5): resume
     // keeps the lower one.

@@ -565,6 +565,22 @@ extension error does not consume the later result.
     never-prompt decider's deny is recorded without `decision_source`, as
     before.
 
+  Additive optional fields for extension reviewers (ADR 0027 section 5,
+  capabilities contract "Extension reviewers"):
+  - `decision_source`: `"reviewer"` when an extension reviewer denied the
+    ask: `mode: "ask"`, `allowed: false`, parented to the
+    `permission.prompt`. It denies that request only. An extension
+    operation's batch records one per request, with `batch`, `operation`,
+    `extension_id`, and `command`; a project-tier extension config write
+    records one with `operation`, `extension_id`, and `command`.
+  - `reviewer`: `{ "name": "<extension-id>.<command>", "reason" }`, the
+    reviewer that denied and its redacted reason, at most 512 bytes.
+  - `reviewers_degraded`: the `<extension-id>.<command>` names of the
+    reviewers that deferred because they were not running, lacked standing
+    authority, failed, passed their budget, or returned a malformed
+    verdict. Present on the decision that settles the ask, whoever settled
+    it, when any did.
+
   Additive optional fields for permission rules (ADR 0027, capabilities
   contract "Permission rules in the gate"):
   - `decision_source`: `"rule"` when a permission rule decided on its own:

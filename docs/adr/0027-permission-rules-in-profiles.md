@@ -90,6 +90,11 @@ provenance; extensions get only a seam that can make a decision stricter.
    `defaults.subagent` profile field by field against the parent and keeps
    the parent's `reviewer`, because a child's asks go to the session's
    reviewer.
+
+   Amendment (2026-11-05, rollout step 6, #299): this overstated the
+   reviewer coverage. A child's asks go to the session's decider, but a
+   companion child asks it directly and never consults the guardian. See
+   the section 6 amendment.
 10. **Project overlay.** `.euler/profile-overlay.json`
     (`PROJECT_OVERLAY_PATH`) may only tighten, needs no trust
     acknowledgment, and may not set `reviewer` (`ProfileOverrides::tighten`).
@@ -366,6 +371,15 @@ as no limit, and the parent's wait uses that value. The child's
 `execution_profile` on `agent.spawn` records its rule layers as they apply
 (section 9) and that effective `ask_timeout`, so its digest binds the rules
 and timeout that decide its requests.
+
+Amendment (2026-11-05, rollout step 6, #299): in this build a child agent's
+asks reach neither the extension reviewers nor the guardian. A companion
+child holds the session decider for its lifetime and asks it directly, so
+core policy (rules, floor, `ask_timeout`, and the person's answer) still
+decides its requests, but no reviewer sees them. Until #299 routes child
+asks through the root session's reviewers, the child's profile lists no
+`extension_reviewers`, so its `agent.spawn` record names only reviewers that
+review its asks. It still keeps the parent's `reviewer`.
 
 ### 7. Project overlay
 

@@ -71,10 +71,10 @@ pub(crate) fn review_deadline() -> std::time::Duration {
 
 /// Upper bound on verdict rationale text retained in events and teaching
 /// messages; guardian output beyond this is model verbosity, not signal.
-const MAX_RATIONALE_BYTES: usize = 512;
+pub(crate) const MAX_RATIONALE_BYTES: usize = 512;
 /// Upper bound on command/path text quoted into the guardian task brief.
 /// The full command stays visible to the guardian in the canvas tool call.
-const MAX_TASK_FIELD_BYTES: usize = 2 * 1024;
+pub(crate) const MAX_TASK_FIELD_BYTES: usize = 2 * 1024;
 
 /// Intrinsic risk of the reviewed action. Order matters: derived comparisons
 /// implement the threshold policy.
@@ -373,7 +373,7 @@ pub(crate) fn guardian_decision_payload(
     payload
 }
 
-fn bounded_text(text: &str, max_bytes: usize) -> String {
+pub(crate) fn bounded_text(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
     }

@@ -111,7 +111,7 @@ fn run_interactive(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
-    wire_session_extensions(&mut session);
+    wire_session_extensions(&mut session)?;
     report_sandbox_status(&session);
     let result = run_stdin_loop(&mut session, live_session.refresh.as_ref());
     print_running_background_jobs(&session);
@@ -316,7 +316,7 @@ pub(super) fn run_tui(provenance: LiveProvenance, run: RunArgs) -> Result<()> {
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
-    wire_session_extensions(&mut session);
+    wire_session_extensions(&mut session)?;
     report_sandbox_status(&session);
     let mut app = App::enter_with_options(
         session,
@@ -469,7 +469,7 @@ pub(super) fn run_exec(provenance: LiveProvenance, exec: ExecArgs) -> Result<()>
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
-    wire_session_extensions(&mut session);
+    wire_session_extensions(&mut session)?;
     report_sandbox_status(&session);
     apply_auto_approve(auto_approve, &mut session);
     let turn_result = run_turn_streaming(&mut session, &prompt);
@@ -1039,7 +1039,7 @@ where
     if let Some((_, extension)) = observer {
         session.set_observer_extension(extension);
     }
-    wire_session_extensions(&mut session);
+    wire_session_extensions(&mut session)?;
     report_sandbox_status(&session);
     Ok(ResumeCliOutcome {
         session,

@@ -6,6 +6,31 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Execution profiles: extension reviewers
+
+- **New**: a profile's `extension_reviewers` is enforced (ADR 0027, rollout
+  step 6). An extension declares a deny-only reviewer with a top-level
+  `"permission_reviewer": {"command": "<agent-only command>"}` in its
+  manifest (`Extension::permission_reviewer()` for native extensions). A
+  profile that names it as `<extension-id>.<command>` sends every ask on
+  the root session's routes (core tool calls, extension operations, and
+  project-tier extension config writes), floor asks included, to that
+  reviewer before the guardian and the person. A reviewer can deny or
+  defer, never allow. Its deny covers that one request, is recorded with
+  `decision_source: "reviewer"` and the reviewer's reason, and the agent
+  carries on.
+- A reviewer that fails, passes its budget (10 seconds, 30 per ask), lacks
+  standing authority, or returns a malformed verdict defers; the decision
+  lists it in `reviewers_degraded`. While a reviewer runs, an ask raised
+  by its own host calls or by agents it spawns is denied without review.
+- A child agent's asks reach neither the extension reviewers nor the
+  guardian yet (#299, recorded as an ADR 0027 section 6 amendment), so a
+  child's recorded profile lists no `extension_reviewers`.
+- New blocks: reviewer denies, and a startup error when the profile names
+  a reviewer whose extension is not installed and enabled or declares no
+  such reviewer (before, any profile with `extension_reviewers` was
+  refused as not enforced). No new prompts.
+
 ### Execution profiles: `ask_timeout`, a guardian deadline, and request-scoped denies
 
 - **New**: `ask_timeout` is enforced (ADR 0027, rollout step 5). When it

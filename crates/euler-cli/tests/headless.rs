@@ -665,6 +665,131 @@ fn linked_python_session_contributions_run_on_fresh_launch_and_resume() {
     );
 }
 
+/// ADR 0027 section 5: a linked managed-process extension whose manifest
+/// declares a permission reviewer runs for a profile that names it. Its
+/// deny settles a headless ask for that request only; the ask it defers
+/// goes on to the never-prompt decider.
+#[cfg(unix)]
+#[test]
+fn linked_python_permission_reviewer_denies_a_headless_ask() {
+    let exe = env!("CARGO_BIN_EXE_euler");
+    let home = isolated_home();
+    let root = repository_tempdir();
+    let extension_dir = tempfile::tempdir().expect("extension dir");
+    let manifest = serde_json::json!({
+        "version": 1,
+        "id": "policy-check",
+        "display_name": "Policy check",
+        "extension_version": "0.1.0",
+        "runtime_kind": "managed-process",
+        "entrypoint": {"command": ["python3", "-B", "-u", "extension.py"]},
+        "capabilities": [],
+        "commands": [{
+            "name": "review",
+            "display_name": "Review",
+            "summary": "Review a permission ask.",
+            "required_capabilities": [],
+            "invocation": "agent-only"
+        }],
+        "permission_reviewer": {"command": "review"}
+    });
+    fs::write(
+        extension_dir
+            .path()
+            .join(euler_core::EXTENSION_MANIFEST_FILE),
+        serde_json::to_vec_pretty(&manifest).expect("manifest json"),
+    )
+    .expect("write reviewer manifest");
+    fs::write(
+        extension_dir.path().join("extension.py"),
+        raw_managed_process_script(
+            r#"
+def review(_peer, request):
+    if "one" in request.get("command", ""):
+        return {"verdict": "deny", "reason": "no ones in " + request["profile"]}
+    return {"verdict": "defer"}
+
+serve({"review": review})
+"#,
+        ),
+    )
+    .expect("write reviewer process");
+    configure_linked_extension(exe, &home, extension_dir.path(), "policy-check");
+    fs::write(
+        home.path().join(".euler").join("profiles.json"),
+        r#"{"defaults": {"interactive": "locked"}, "profiles": {"agent": {
+            "extends": "full",
+            "extension_reviewers": ["policy-check.review"],
+            "rules": {"shell": [{"pattern": "printf *", "state": "ask"}]}
+        }}}"#,
+    )
+    .expect("profiles.json");
+    let script = write_fixture_script(
+        root.path(),
+        "reviewed-shell.json",
+        &r#"{
++  "version": 1,
++  "responses": [
++    {"events": [
++      {"tool_call": {"id": "call-one", "name": "run_shell", "input": {"command": "printf one"}}},
++      {"tool_call": {"id": "call-two", "name": "run_shell", "input": {"command": "printf two"}}},
++      {"finished": {"stop_reason": "tool_use"}}
++    ]},
++    {"events": [
++      {"text_delta": "done"},
++      {"finished": {"stop_reason": "completed"}}
++    ]}
++  ]
++}"#
+        .replace("\n+", "\n"),
+    );
+    let log = root.path().join("events.jsonl");
+
+    let output = command_with_home(exe, &home)
+        .current_dir(root.path())
+        .args([
+            "exec",
+            "--profile",
+            "agent",
+            "--provider",
+            "fixture",
+            "--provider-option",
+            &format!("event-script={}", path_str(&script)),
+            "--provenance",
+            path_str(&log),
+            "print",
+        ])
+        .output()
+        .expect("run reviewed session");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let decisions = read_jsonl(&log)
+        .into_iter()
+        .filter(|event| event.kind.as_str() == EventKind::PERMISSION_DECISION)
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(
+        decisions[0].payload.get("decision_source"),
+        Some(&serde_json::json!("reviewer"))
+    );
+    assert_eq!(
+        decisions[0].payload.get("reviewer"),
+        Some(&serde_json::json!({
+            "name": "policy-check.review",
+            "reason": "no ones in agent"
+        }))
+    );
+    assert_eq!(decisions[1].payload.get("decision_source"), None);
+    assert_eq!(
+        decisions[1].payload.get("allowed"),
+        Some(&serde_json::json!(false))
+    );
+    assert_eq!(decisions[1].payload.get("reviewers_degraded"), None);
+}
+
 #[cfg(unix)]
 fn write_session_contribution_extension(directory: &Path) {
     let manifest = serde_json::json!({

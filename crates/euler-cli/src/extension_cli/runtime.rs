@@ -7,7 +7,7 @@ use euler_managed_process::ManagedProcessExtension;
 use euler_sdk::{
     CancellationToken, CommandContext, CommandDescriptor, CommandRegistrar, Extension,
     ExtensionCommand, ExtensionError, ExtensionManifest, HostApi, IdleContributionDescriptor,
-    RequestTickDescriptor,
+    PermissionReviewerDescriptor, RequestTickDescriptor,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,11 +30,12 @@ pub(crate) fn live_linked_extension_arc(id: &str) -> Result<Option<Arc<dyn Exten
         manifest: extension.manifest(),
         idle_contribution: extension.idle_contribution(),
         request_tick: extension.request_tick(),
+        permission_reviewer: extension.permission_reviewer(),
     })))
 }
 
-/// Resolve only packages that contribute to root-session model or idle
-/// boundaries. Ordinary command-only packages remain available through the
+/// Resolve only packages that contribute to root-session model, idle, or
+/// permission review boundaries. Ordinary command-only packages remain available through the
 /// explicit extension-run surfaces and incur no per-request registration.
 pub(crate) fn live_linked_session_extension_arc(id: &str) -> Result<Option<Arc<dyn Extension>>> {
     let registry = extension_registry()?;
@@ -44,6 +45,7 @@ pub(crate) fn live_linked_session_extension_arc(id: &str) -> Result<Option<Arc<d
     let package = load_linked_process_for_action(&linked, "run")?;
     let contributes = package.descriptor.idle_contribution.is_some()
         || package.descriptor.request_tick.is_some()
+        || package.descriptor.permission_reviewer.is_some()
         || package
             .descriptor
             .commands
@@ -60,6 +62,7 @@ pub(crate) fn live_linked_session_extension_arc(id: &str) -> Result<Option<Arc<d
         manifest: extension.manifest(),
         idle_contribution: extension.idle_contribution(),
         request_tick: extension.request_tick(),
+        permission_reviewer: extension.permission_reviewer(),
     })))
 }
 
@@ -70,6 +73,7 @@ struct RevalidatedLinkedExtension {
     manifest: ExtensionManifest,
     idle_contribution: Option<IdleContributionDescriptor>,
     request_tick: Option<RequestTickDescriptor>,
+    permission_reviewer: Option<PermissionReviewerDescriptor>,
 }
 
 impl Extension for RevalidatedLinkedExtension {
@@ -100,6 +104,10 @@ impl Extension for RevalidatedLinkedExtension {
 
     fn request_tick(&self) -> Option<RequestTickDescriptor> {
         self.request_tick.clone()
+    }
+
+    fn permission_reviewer(&self) -> Option<PermissionReviewerDescriptor> {
+        self.permission_reviewer.clone()
     }
 }
 

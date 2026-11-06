@@ -255,14 +255,15 @@ impl<D: PermissionDecider> Session<D> {
     }
 
     /// The registry a child under `profile` uses: `None` when `profile` is
-    /// the session's, so the child shares the session's registry; otherwise
-    /// one with `profile`'s boundary. A boundary this host cannot deliver is
-    /// refused before the spawn is recorded.
+    /// the one a child inherits from the session unchanged, so the child
+    /// shares the session's registry; otherwise one with `profile`'s
+    /// boundary. A boundary this host cannot deliver is refused before the
+    /// spawn is recorded.
     fn child_tool_registry(
         &self,
         profile: &ExecutionProfile,
     ) -> Result<Option<crate::tools::ToolRegistry>, SessionError> {
-        if *profile == self.config.reviewed_execution_profile() {
+        if *profile == self.config.reviewed_execution_profile().child_profile(None) {
             return Ok(None);
         }
         let sandbox = profile
@@ -320,8 +321,11 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
         let run_id = session.active_run.clone();
         let tools = child_tools.unwrap_or(&session.tools);
         let sandbox_enforced = matches!(tools.sandbox_status(), crate::SandboxStatus::Enforced(_));
+        let no_review = session.permissions.no_review();
         let mut permissions = PermissionGate::new_deny_all(session.permissions.decider_mut());
         permissions.set_execution_profile(profile.fields, sandbox_enforced);
+        // A child an extension reviewer spawned is reviewed by no one.
+        permissions.set_no_review(no_review);
         for (capability, mode) in modes {
             permissions.set_mode(capability, mode);
         }
@@ -494,7 +498,7 @@ impl<'a, D: PermissionDecider> CompanionLoop<'a, D> {
             if !decision.allowed() {
                 // A never-prompt decider's deny covers this request only
                 // (ADR 0027 section 4).
-                let never_prompted = needs_prompt && self.permissions.decider_mut().never_prompts();
+                let never_prompted = needs_prompt && self.permissions.never_prompts();
                 if !never_prompted {
                     self.turn_state.record_denial(capability);
                 }

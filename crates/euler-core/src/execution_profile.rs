@@ -436,22 +436,23 @@ impl ExecutionProfile {
     /// The profile a child agent of a session running under `self` gets
     /// (ADR 0026 section 7): `self` when `subagent` is `None`
     /// (`defaults.subagent` unset or `inherit`), otherwise `subagent`
-    /// tightened field by field to be no looser than `self`. A child's asks
-    /// go to the session's ask path, so it keeps `self`'s `reviewer` and
-    /// `extension_reviewers`.
+    /// tightened field by field to be no looser than `self`. It keeps
+    /// `self`'s `reviewer`. It lists no `extension_reviewers`: a child's
+    /// asks do not reach them in this build (ADR 0027 section 6 amendment).
     pub fn child_profile(&self, subagent: Option<&ExecutionProfile>) -> ExecutionProfile {
-        let Some(subagent) = subagent else {
-            return self.clone();
+        let mut child = match subagent {
+            None => self.clone(),
+            Some(subagent) => {
+                let mut fields = subagent.fields.clone().tightened_to(&self.fields);
+                fields.reviewer = self.fields.reviewer;
+                ExecutionProfile {
+                    name: subagent.name.clone(),
+                    fields,
+                }
+            }
         };
-        let mut fields = subagent.fields.clone().tightened_to(&self.fields);
-        fields.reviewer = self.fields.reviewer;
-        fields
-            .extension_reviewers
-            .clone_from(&self.fields.extension_reviewers);
-        ExecutionProfile {
-            name: subagent.name.clone(),
-            fields,
-        }
+        child.fields.extension_reviewers.clear();
+        child
     }
 
     /// Startup notices for this profile's `tools` rules that name an
@@ -610,15 +611,6 @@ impl ResumeProfile {
             profile
                 .fields
                 .join_resumed_policy(&recorded.fields, &resolved.fields);
-            // `resolved` passed, so a refusal here comes from a recorded
-            // value the join kept; name the recording, not profiles.json.
-            profile.check_enforced().map_err(|error| match error {
-                ProfileError::Unenforced { field, .. } => ProfileError::RecordedUnenforced {
-                    profile: recorded.name.clone(),
-                    field,
-                },
-                other => other,
-            })?;
             return Ok(Self {
                 joined_fields: profile
                     .fields
@@ -642,23 +634,7 @@ impl ResumeProfile {
         profile
             .fields
             .join_resumed_policy(&recorded.fields, &resolved.fields);
-        // An ADR 0027 field the recording does not set was joined from the
-        // resolved profile, so the refusal names that profile instead.
-        let recorded_refuses = |field| {
-            matches!(
-                recorded.check_enforced(),
-                Err(ProfileError::Unenforced { field: refused, .. }) if refused == field
-            )
-        };
         profile.check_enforced().map_err(|error| match error {
-            ProfileError::Unenforced { field, .. }
-                if enforced::NOT_ENFORCED_YET.contains(&field) && !recorded_refuses(field) =>
-            {
-                ProfileError::Unenforced {
-                    profile: resolved.name.clone(),
-                    field,
-                }
-            }
             ProfileError::Unenforced { profile, field } => {
                 ProfileError::RecordedUnenforced { profile, field }
             }
@@ -770,12 +746,6 @@ pub enum ProfileError {
 }
 
 fn unenforced_message(profile: &str, field: &str) -> String {
-    if enforced::NOT_ENFORCED_YET.contains(&field) {
-        return format!(
-            "profile \"{profile}\" sets {field}, which this version parses and records but does \
-             not enforce yet; remove {field} to run this profile"
-        );
-    }
     format!(
         "profile \"{profile}\" sets {field} to a value this version cannot enforce on this host; \
          the full, workspace, and locked presets' boundaries are available, and writable_paths \
@@ -784,13 +754,6 @@ fn unenforced_message(profile: &str, field: &str) -> String {
 }
 
 fn recorded_unenforced_message(profile: &str, field: &str) -> String {
-    if enforced::NOT_ENFORCED_YET.contains(&field) {
-        return format!(
-            "this session recorded profile \"{profile}\" with {field}, which this version parses \
-             and records but does not enforce yet, and resume keeps the recorded {field}; pass \
-             --profile to resume under a profile without it"
-        );
-    }
     format!(
         "this session recorded profile \"{profile}\", whose {field} this host cannot enforce, and \
          the newly resolved profile is looser; pass --profile to resume under a profile this \
@@ -799,13 +762,6 @@ fn recorded_unenforced_message(profile: &str, field: &str) -> String {
 }
 
 fn overlay_unenforced_message(profile: &str, field: &str) -> String {
-    if enforced::NOT_ENFORCED_YET.contains(&field) {
-        return format!(
-            "the project overlay {PROJECT_OVERLAY_PATH} sets {field} on profile \"{profile}\", \
-             which this version parses and records but does not enforce yet; remove {field} from \
-             the overlay"
-        );
-    }
     format!(
         "the project overlay {PROJECT_OVERLAY_PATH} sets {field} on profile \"{profile}\" to a \
          value this version cannot enforce on this host; remove that field from the overlay or \
