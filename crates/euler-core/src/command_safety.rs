@@ -1284,8 +1284,13 @@ fn words_are_dangerous(words: &[Option<String>], depth: usize, rule: WalkRule) -
         WalkRule::InterpreterMention => interpreter_mention_verdict(name, &literal),
     };
     if let Some(flagged) = verdict {
-        // `rm $FLAGS file` may be `rm -rf file`.
-        return dynamic_args || flagged;
+        // `rm $FLAGS file` may be `rm -rf file`. A dynamic word the table
+        // never reads (`git commit -m "$MSG"`) cannot change the verdict.
+        let dynamic_args_matter = dynamic_args
+            && !(rule == WalkRule::Danger
+                && name == "git"
+                && git_dynamic_args_are_plain(&words[1..]));
+        return dynamic_args_matter || flagged;
     }
     let Some(spec) = wrapper_spec(name) else {
         return false;
@@ -1378,12 +1383,23 @@ fn edits_in_place(args: &[&str]) -> bool {
     })
 }
 
+/// The `git` subcommands [`git_is_destructive`] can flag. The table reads
+/// no argument of any other subcommand, so a dynamic argument there cannot
+/// change its verdict. An alias or `git-<name>` program is judged by its
+/// literal name, as it is with literal arguments.
+const GIT_DESTRUCTIVE_SUBCOMMANDS: &[&str] = &[
+    "clean", "reset", "rm", "restore", "checkout", "branch", "stash",
+];
+
 /// `git` subcommands that destroy work with no undo and no prompt, judged
 /// by the same criterion as `rm -r`.
 fn git_is_destructive(args: &[&str]) -> bool {
     let Some((subcommand, rest)) = args.split_first() else {
         return false;
     };
+    if !GIT_DESTRUCTIVE_SUBCOMMANDS.contains(subcommand) {
+        return false;
+    }
     let forced = |letters: &str, longs: &[&str]| {
         rest.iter()
             .any(|arg| is_short_cluster_with(arg, letters) || is_long_abbreviation(arg, longs))
@@ -1418,6 +1434,24 @@ fn git_is_destructive(args: &[&str]) -> bool {
     }
 }
 
+/// Whether every dynamic word of a `git` command sits where
+/// [`git_is_destructive`] never reads: after a literal subcommand that has
+/// no destructive form (`git commit -m "$MSG"`). A dynamic word among the
+/// global options or in the subcommand slot (`git $SUB`, `git -C $DIR
+/// clean`) could pick the subcommand, so it is not plain.
+fn git_dynamic_args_are_plain(args: &[Option<String>]) -> bool {
+    // Only the words before the first dynamic one are known, and they must
+    // reach the subcommand on their own.
+    let literal_prefix: Vec<&str> = args.iter().map_while(Option::as_deref).collect();
+    skip_git_global_options(&literal_prefix)
+        .first()
+        .is_some_and(|subcommand| {
+            // `GIT CLEAN` may still reach `git-clean` on a case-insensitive
+            // filesystem, so the plain verdict never widens through case.
+            !GIT_DESTRUCTIVE_SUBCOMMANDS.contains(&subcommand.to_ascii_lowercase().as_str())
+        })
+}
+
 /// Whether an operand is unmistakably a path rather than a ref: the cwd,
 /// its parent, or an explicitly relative or absolute form. `feature/x` and
 /// `v2.0` are valid branch and tag names, so they are not.
@@ -1439,6 +1473,8 @@ fn skip_git_global_options<'a>(args: &[&'a str]) -> Vec<&'a str> {
         "--namespace",
         "--exec-path",
         "--config-env",
+        "--attr-source",
+        "--super-prefix",
     ];
     let mut index = 0usize;
     while index < args.len() {
@@ -3302,6 +3338,68 @@ mod tests {
         // over-flagging every variable would prompt on `echo $HOME`.
         assert!(!contains_dangerous_command("echo $HOME"));
         assert!(!contains_dangerous_command("cat \"$file\""));
+    }
+
+    #[test]
+    fn danger_walk_reads_dynamic_arguments_of_harmless_git_subcommands_as_plain_words() {
+        // Validation battery 2026-11-06: agents commit with a variable
+        // message, and `git commit` has no destructive form, so the message
+        // cannot change the verdict. The non-git commands were already
+        // plain (no table entry) and stay here as guards.
+        for command in [
+            "git commit -m \"$MSG\"",
+            "git commit --allow-empty -m \"$MSG\"",
+            "git commit -m $MSG",
+            "git add \"$F\"",
+            "git -C repo log --format=\"$FMT\"",
+            "cargo test $FLAGS",
+            "echo \"$X\"",
+            "gh pr create --title \"$T\"",
+            "git commit -m \"$(cat msg.txt)\"",
+        ] {
+            assert!(
+                !contains_dangerous_command(command),
+                "expected not dangerous: {command}"
+            );
+        }
+        // A dynamic word that could be or pick the subcommand, a dynamic
+        // argument of a subcommand with a destructive form, a dynamic
+        // command name, and a script built at runtime all stay dangerous.
+        for command in [
+            "$CMD x",
+            "$(echo rm) -rf /",
+            "rm -rf $DIR",
+            "eval \"$X\"",
+            "sh -c \"$X\"",
+            "sudo $X",
+            "git $SUB",
+            "git $OPT commit -m x",
+            "git -C \"$DIR\" clean -fdx",
+            "git -C $DIR commit -m x",
+            "git reset $MODE",
+            "git checkout \"$P\"",
+            "git branch $FLAGS feature",
+            "git stash $ACTION",
+            "git clean $FLAGS",
+            "git rm $FLAGS file",
+            "git restore \"$P\"",
+            "git commit -m \"$(rm -rf /)\"",
+            "git CLEAN $FLAGS",
+            // Global options and their detached values are skipped before
+            // the subcommand is read.
+            "git -C repo clean $FLAGS",
+            "git -C repo $SUB",
+            "git -c a.b=c clean $FLAGS",
+            "git --git-dir .git clean $FLAGS",
+            "git --git-dir=.git reset $MODE",
+            "git --attr-source HEAD clean $FLAGS",
+            "git --attr-source HEAD clean -fdx",
+        ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
     }
 
     #[test]

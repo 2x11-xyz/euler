@@ -6,6 +6,19 @@ pull requests that landed them; deeper design rationale lives in
 
 ## Unreleased
 
+### Command safety: variable arguments of harmless git subcommands
+
+- **Fixed**: the danger walk no longer flags `git commit -m "$MSG"`,
+  `git add "$F"`, or any other `git` command whose dynamic words follow a
+  literal subcommand with no destructive form, so under `full` they no
+  longer ask a person and headless `exec` no longer denies them. A dynamic
+  word that could pick the subcommand (`git $SUB`, `git -C $DIR clean`) or
+  reach a destructive form (`git reset $MODE`, `git checkout "$P"`) still
+  counts as danger, as do `rm -rf $DIR`, `$CMD x`, `eval "$X"`,
+  `sh -c "$X"`, and `sudo $X`. `--attr-source` and `--super-prefix` now
+  count as `git` global options with a value, so `git --attr-source HEAD
+  clean -fdx` is read as `git clean`.
+
 ### Execution profiles: dynamic shell operands ask only near a rule
 
 - **Changed**: a `path` or `outside_workspace` rule no longer turns every
