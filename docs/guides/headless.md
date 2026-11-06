@@ -56,6 +56,144 @@ Flags:
 
 `exec` requires a prompt argument or piped stdin.
 
+## Team profiles
+
+A team can share one `profiles.json`: keep it in a repository and copy it to
+`~/.euler/profiles.json` (or `$EULER_HOME/profiles.json`). A profile extends a
+preset (`full`, `workspace`, or `locked`) and may add permission `rules` and
+an `ask_timeout`. Each repository can tighten it further with
+`.euler/profile-overlay.json`, which may add `ask` and `deny` rules and a lower
+`ask_timeout`, never an `allow`.
+
+```json
+{
+  "defaults": { "interactive": "dev", "headless": "agent", "subagent": "inherit" },
+  "profiles": {
+    "dev": {
+      "extends": "full",
+      "rules": {
+        "shell": [
+          { "pattern": "git push *", "state": "ask" },
+          { "pattern": "git push *--force*", "state": "deny",
+            "reason": "Push a new branch instead of force-pushing." },
+          { "pattern": "terraform apply *", "state": "deny" }
+        ],
+        "path": [
+          { "pattern": "~/.euler/**", "access": "write", "state": "deny" }
+        ]
+      }
+    },
+    "agent": {
+      "extends": "full",
+      "reviewer": "guardian",
+      "ask_timeout": 300,
+      "rules": {
+        "shell": [
+          { "pattern": "git push *", "state": "ask" },
+          { "pattern": "git push *--force*", "state": "deny" },
+          { "pattern": "gh pr merge *", "state": "deny" },
+          { "pattern": "kubectl *", "state": "deny" },
+          { "pattern": "kubectl get *", "state": "allow" }
+        ],
+        "outside_workspace": [
+          { "pattern": "/", "access": "write", "state": "ask" },
+          { "pattern": "/tmp", "access": "write", "state": "allow" },
+          { "pattern": "~/.cache", "access": "write", "state": "allow" }
+        ],
+        "path": [
+          { "pattern": "~/.euler/**", "access": "write", "state": "deny" },
+          { "pattern": "~/.ssh/**", "state": "deny" }
+        ]
+      }
+    },
+    "ci": {
+      "extends": "workspace",
+      "rules": {
+        "shell": [
+          { "pattern": "*", "state": "deny",
+            "reason": "CI runs only the listed cargo commands." },
+          { "pattern": "cargo build *", "state": "allow" },
+          { "pattern": "cargo test *", "state": "allow" },
+          { "pattern": "cargo clippy *", "state": "allow" }
+        ],
+        "tools": [
+          { "pattern": "code-swarm.*", "state": "deny",
+            "reason": "No paid model reviews in CI." }
+        ]
+      }
+    }
+  }
+}
+```
+
+How rules decide:
+
+- Surfaces: `shell` matches each command of a `run_shell` line (each part of
+  a `&&`, `;`, or `|` list, as words, `*` matching anything); `path` matches
+  the paths a tool call or a shell command names (globs, relative to the
+  workspace unless absolute or `~/`); `outside_workspace` matches paths
+  outside the workspace by directory prefix; `tools` matches a core tool name
+  (`run_shell`) or an extension command (`<extension-id>.<command>`).
+  `access` (`read`, `write`, or `any`) narrows a path rule.
+- Within one surface the last matching rule wins, so a carve-out goes after
+  the broad rule it carves out of. Across surfaces the strictest match wins:
+  `deny`, then `ask`, then `allow`.
+- `deny` refuses that one request without asking anyone. The agent gets a
+  tool error with the `reason` and carries on with its other work.
+- `ask` prompts even under `full`, and no saved grant settles it.
+- `allow` only settles an ask that the profile's own approval policy would
+  raise. It never lifts Euler's built-in asks (dangerous commands, sensitive
+  paths, escalation) and never widens the sandbox.
+- Rules guard against mistakes. They see the paths a command names, not
+  every file a program touches; the sandbox of `workspace` and `locked`
+  remains the boundary.
+- A mistake in the file (an unknown key or state, a bad pattern, a core tool
+  name that does not exist) is a startup error naming the file, profile,
+  surface, and index.
+
+The three profiles:
+
+- `dev` is `full` at the keyboard with three hard stops and one review
+  point: `git push` asks, while force pushes and `terraform apply` are
+  denied.
+- `agent` is the default for `euler exec`. Under `full` nothing asks except
+  Euler's built-in asks and the `ask` rules. An ask goes to the guardian,
+  which may allow it once; plain `exec` cannot ask a person, so an ask the
+  guardian does not settle is denied at once. Run interactively (`euler
+  --profile agent`) and left unattended, an ask waits 300 seconds for a
+  person and is then denied. Either way the deny covers that one request.
+  `kubectl` is denied except `kubectl get`. A write outside the workspace
+  asks, except under `/tmp` and `~/.cache`. Writes under `~/.euler` (the
+  default Euler home) are denied, so the agent cannot edit its own rules
+  through a file tool or a shell write Euler can resolve (see the next
+  bullets for the rest), and `~/.ssh` is denied.
+- Patterns match words, not Git semantics. In `dev` and `agent`,
+  `git push --force` and `--force-with-lease` are denied, but `git push -f`
+  still only asks and `git -C dir push --force` matches no rule. Add a
+  pattern per spelling you want covered.
+- A shell word Euler cannot resolve (a variable, `~`, a glob) never matches
+  an `allow`. Where its surface has an `ask` or `deny` rule it asks, so
+  `cat ~/.ssh/id_ed25519` in a shell command asks rather than slipping past
+  the `~/.ssh` deny. Where that surface has a `deny` rule only a person can
+  answer (the guardian does not), so under plain `exec` it is denied.
+- `ci` is `workspace` (sandboxed, network on so cargo can fetch crates) with
+  a catch-all shell `deny` followed by `allow` carve-outs, so only the listed
+  cargo commands run. Every other shell command is denied, including a
+  compound command with one unlisted part and a command Euler cannot
+  resolve. File tools keep the `workspace` behavior. Select it with
+  `euler exec --profile ci`. The `code-swarm.*` deny keeps paid model reviews
+  out of CI; when that extension is not installed, startup prints a notice
+  and keeps the rule.
+- Use `workspace`, not `locked`, for a catch-all CI profile. `locked` asks
+  for every command, so under `exec` the `--auto-approve` tier applies, and
+  its default tier sets shell commands to always-deny. A configured
+  always-deny is checked before any rule, so the `allow` carve-outs would
+  never run a command.
+
+Extension reviewers (`extension_reviewers`, ADR 0027) are not available yet:
+this version refuses at startup a profile that sets them, naming the field.
+Add them once a release lists them as enforced.
+
 ## Brief-file pattern
 
 Use the CLI prompt only as a pointer:

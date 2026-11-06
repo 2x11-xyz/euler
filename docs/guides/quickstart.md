@@ -164,6 +164,10 @@ euler exec \
   'Say hello without tools.'
 ```
 
+To share permission rules across a team (commands to deny, pushes to review,
+a CI profile that runs only listed commands), see
+[Team profiles](headless.md#team-profiles) in the headless guide.
+
 ## Personal instructions
 
 Put standing rules you want in every session (your name, writing preferences)
