@@ -29,6 +29,12 @@ impl EnvGuard {
         env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn remove(key: &'static str) -> Self {
+        let previous = env::var_os(key);
+        env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvGuard {
@@ -91,6 +97,7 @@ fn default_api_key_auth_uses_env_when_stored_entry_is_absent() {
     let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
     let temp = TempDir::new().expect("temp dir");
     let _home = EnvGuard::set_path("HOME", temp.path());
+    let _euler_home = EnvGuard::remove("EULER_HOME");
     let _env = EnvGuard::set("ANTHROPIC_API_KEY", "env-anthropic-secret");
     let auth = StoredApiKeyAuth::new_default();
 
@@ -99,6 +106,63 @@ fn default_api_key_auth_uses_env_when_stored_entry_is_absent() {
     let formatted = format!("{auth:?}");
     assert!(!formatted.contains("env-anthropic-secret"));
     assert!(!formatted.contains(temp.path().to_string_lossy().as_ref()));
+}
+
+#[test]
+fn default_api_key_auth_reads_the_auth_file_under_euler_home() {
+    let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+    let temp = TempDir::new().expect("temp dir");
+    let euler_home = TempDir::new().expect("euler home");
+    fs::write(euler_home.path().join("auth.json"), "not json").expect("seed");
+    let _home = EnvGuard::set_path("HOME", temp.path());
+    let _euler_home = EnvGuard::set_path("EULER_HOME", euler_home.path());
+    let _env = EnvGuard::set("ANTHROPIC_API_KEY", "fallback-anthropic-secret");
+    let auth = StoredApiKeyAuth::new_default();
+
+    let error = load_anthropic_api_key(&auth).expect_err("invalid euler home auth file");
+
+    assert_eq!(
+        error,
+        ProviderError::auth(
+            "Authentication failed for anthropic: auth storage is invalid.\nSet ANTHROPIC_API_KEY or add an api_key credential to auth.json in the Euler home (~/.euler, or $EULER_HOME when set)"
+        )
+    );
+    assert!(!temp.path().join(".euler").exists());
+}
+
+#[test]
+fn default_api_key_auth_reports_an_unresolvable_euler_home() {
+    let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+    let temp = TempDir::new().expect("temp dir");
+    let _home = EnvGuard::set_path("HOME", temp.path());
+    let _euler_home = EnvGuard::set("EULER_HOME", "relative");
+    let _env = EnvGuard::set("ANTHROPIC_API_KEY", "fallback-anthropic-secret");
+    let auth = StoredApiKeyAuth::new_default();
+
+    let error = load_anthropic_api_key(&auth).expect_err("relative EULER_HOME");
+
+    assert_eq!(
+        error,
+        ProviderError::auth(
+            "Authentication failed for anthropic: cannot locate default auth file: EULER_HOME must be an absolute path: relative"
+        )
+    );
+    assert!(!temp.path().join(".euler").exists());
+}
+
+#[test]
+fn default_chatgpt_auth_reports_an_unresolvable_euler_home() {
+    let _lock = crate::TEST_ENV_LOCK.lock().expect("env lock");
+    let temp = TempDir::new().expect("temp dir");
+    let _home = EnvGuard::set_path("HOME", temp.path());
+    let _euler_home = EnvGuard::set("EULER_HOME", "relative");
+    let auth = StoredChatGptAuth::new_default();
+
+    assert_eq!(
+        validation_result(&auth),
+        "Authentication failed for chatgpt: cannot locate default auth file: EULER_HOME must be an absolute path: relative"
+    );
+    assert!(!temp.path().join(".euler").exists());
 }
 
 #[test]
@@ -111,6 +175,7 @@ fn default_api_key_auth_stored_entry_blocks_env_fallback_when_unresolved() {
         .set("anthropic", api_key("$MISSING_ANTHROPIC_TEST_KEY"))
         .expect("set");
     let _home = EnvGuard::set_path("HOME", temp.path());
+    let _euler_home = EnvGuard::remove("EULER_HOME");
     let _env = EnvGuard::set("ANTHROPIC_API_KEY", "fallback-anthropic-secret");
     let auth = StoredApiKeyAuth::new_default();
 
@@ -137,6 +202,7 @@ fn default_api_key_auth_malformed_stored_entry_blocks_env_fallback() {
     )
     .expect("seed");
     let _home = EnvGuard::set_path("HOME", temp.path());
+    let _euler_home = EnvGuard::remove("EULER_HOME");
     let _env = EnvGuard::set("ANTHROPIC_API_KEY", "fallback-anthropic-secret");
     let auth = StoredApiKeyAuth::new_default();
 
@@ -237,6 +303,7 @@ fn openai_default_api_key_auth_uses_provider_keyed_stored_entry_before_env() {
         )
         .expect("set chatgpt");
     let _home = EnvGuard::set_path("HOME", temp.path());
+    let _euler_home = EnvGuard::remove("EULER_HOME");
     let _env = EnvGuard::set("OPENAI_API_KEY", "env-openai-secret");
     let auth = StoredApiKeyAuth::new_default();
 
@@ -261,6 +328,7 @@ fn openai_missing_stored_key_can_use_env_without_chatgpt_cross_auth() {
         )
         .expect("set chatgpt");
     let _home = EnvGuard::set_path("HOME", temp.path());
+    let _euler_home = EnvGuard::remove("EULER_HOME");
     let _env = EnvGuard::set("OPENAI_API_KEY", "env-openai-secret");
     let auth = StoredApiKeyAuth::new_default();
 

@@ -67,7 +67,8 @@ Stored the key for litellm in ~/.euler/auth.json.
 Login asks for the base URL and then the key without echoing it (or reads
 one line each from a pipe), checks both by listing the gateway's models, and
 only then stores the key in `~/.euler/auth.json` and adds the provider to
-`~/.euler/providers.json` with `"discovery": true`. The models then appear in
+`~/.euler/providers.json` with `"discovery": true` (both files live in
+`$EULER_HOME` instead when it is set). The models then appear in
 `/model` and `euler models`, each routed to its API family. A wrong URL or a
 rejected key stores nothing and says why. Running login again for the same
 id offers the current URL as the default and replaces the key.
@@ -188,6 +189,8 @@ Default local state is under `~/.euler`:
 
 - `~/.euler/AGENTS.md`: optional personal instructions loaded into every session.
 - `~/.euler/auth.json` — ChatGPT OAuth credentials and optional stored API-key credentials.
+  It is `$EULER_HOME/auth.json` when `EULER_HOME` is set; `--auth-file` or
+  `EULER_AUTH_FILE` selects another file for a built-in provider run.
 - `~/.euler/sessions/<session-id>/events.jsonl` — interactive session event log.
 - `~/.euler/sessions/<session-id>/blobs/` — large payload blobs for that session.
 - `~/.euler/sessions/<session-id>/session.json` — session sidecar metadata.

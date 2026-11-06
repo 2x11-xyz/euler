@@ -189,7 +189,8 @@ transport observations are never persisted.
 User-owned custom provider transport is read from `providers.json` in the
 Euler home: `$EULER_HOME/providers.json` when `EULER_HOME` is set, otherwise
 `$HOME/.euler/providers.json`. The path resolves through the same Euler home
-resolution as auth, sessions, extensions, and skills. A missing file means no
+resolution as the auth file (`auth.json`, see `secrets.md`), sessions,
+extensions, and skills. A missing file means no
 custom providers. When the Euler home cannot be resolved (for example a
 relative `EULER_HOME`), no custom providers load and line-oriented commands
 print the resolution error as a `warning: ignored provider config:` line on

@@ -16,11 +16,32 @@ use std::thread;
 const STORED_KEY: &str = "!stored-login-key-0123456789";
 
 fn euler(home: &Path, args: &[&str], stdin: &str) -> Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_euler"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_euler"));
+    command.env_remove("EULER_HOME");
+    run_euler(command, home, args, stdin)
+}
+
+/// Runs euler with `EULER_HOME` set and no built-in provider keys in the
+/// environment, so `auth status` reports only stored keys.
+fn euler_with_euler_home(home: &Path, euler_home: &Path, args: &[&str], stdin: &str) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_euler"));
+    command.env("EULER_HOME", euler_home);
+    for name in [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "XAI_API_KEY",
+    ] {
+        command.env_remove(name);
+    }
+    run_euler(command, home, args, stdin)
+}
+
+fn run_euler(mut command: Command, home: &Path, args: &[&str], stdin: &str) -> Output {
+    let mut child = command
         .args(args)
         .current_dir(home)
         .env("HOME", home)
-        .env_remove("EULER_HOME")
         .env_remove("EULER_PROVIDER")
         .env_remove("EULER_MODEL")
         .env_remove("EULER_AUTH_FILE")
@@ -255,4 +276,143 @@ fn login_refuses_an_entry_with_an_api_key_spec_and_stores_nothing() {
     );
     assert!(text(&login.stderr).contains("remove api_key to use a stored key"));
     assert!(!home.path().join(".euler/auth.json").exists());
+}
+
+const HOME_AUTH: &str = r#"{"version": 1, "providers": {"gw": {"type": "api_key", "key": "home-gw-key"}, "openai": {"type": "api_key", "key": "home-openai-key"}}}"#;
+
+/// A home whose `~/.euler/auth.json` holds other keys, and a relocated Euler
+/// home whose `providers.json` points `gw` at `base_url`.
+struct RelocatedHome {
+    home: tempfile::TempDir,
+    euler_home: PathBuf,
+}
+
+impl RelocatedHome {
+    fn new(base_url: &str) -> Self {
+        let home = tempfile::tempdir().expect("home");
+        write_providers(
+            home.path(),
+            r#"{"api_family": "openai_chat_completions", "base_url": "http://127.0.0.1:9/v1", "default_model": "gw-model"}"#,
+        );
+        fs::write(home.path().join(".euler/auth.json"), HOME_AUTH).expect("home auth.json");
+        let euler_home = home.path().join("relocated-euler-home");
+        fs::create_dir_all(&euler_home).expect("euler home");
+        fs::write(
+            euler_home.join("providers.json"),
+            format!(
+                r#"{{"providers": {{"gw": {{"api_family": "openai_chat_completions", "base_url": "{base_url}", "auth_header": true, "default_model": "gw-model"}}}}}}"#
+            ),
+        )
+        .expect("providers.json");
+        Self { home, euler_home }
+    }
+
+    /// Stores a key for `gw` and for the built-in `anthropic` in the
+    /// relocated home.
+    fn with_stored_keys(self) -> Self {
+        fs::write(
+            self.euler_auth(),
+            format!(
+                r#"{{"version": 1, "providers": {{"gw": {{"type": "api_key", "key": "${STORED_KEY}"}}, "anthropic": {{"type": "api_key", "key": "euler-home-anthropic-key"}}}}}}"#
+            ),
+        )
+        .expect("euler home auth.json");
+        self
+    }
+
+    fn euler_auth(&self) -> PathBuf {
+        self.euler_home.join("auth.json")
+    }
+
+    fn run(&self, args: &[&str], stdin: &str) -> Output {
+        euler_with_euler_home(self.home.path(), &self.euler_home, args, stdin)
+    }
+
+    /// A key stored under `$HOME/.euler` is never rewritten while
+    /// `EULER_HOME` points elsewhere.
+    fn assert_home_auth_untouched(&self) {
+        assert_eq!(
+            fs::read_to_string(self.home.path().join(".euler/auth.json")).expect("home auth.json"),
+            HOME_AUTH
+        );
+    }
+}
+
+#[test]
+fn login_under_euler_home_stores_the_key_in_the_euler_home_auth_file() {
+    let (base_url, requests) = spawn_gateway();
+    let relocated = RelocatedHome::new(&base_url);
+
+    let login = relocated.run(&["login", "--provider", "gw"], &format!("\n{STORED_KEY}\n"));
+
+    assert!(login.status.success(), "stderr: {}", text(&login.stderr));
+    requests.try_recv().expect("discovery request");
+    let canonical_euler_auth = fs::canonicalize(&relocated.euler_home)
+        .expect("canonical euler home")
+        .join("auth.json");
+    assert!(
+        text(&login.stdout).contains(&format!(
+            "Stored the key for gw in {}",
+            canonical_euler_auth.display()
+        )),
+        "{}",
+        text(&login.stdout)
+    );
+    let auth = fs::read_to_string(relocated.euler_auth()).expect("euler home auth.json");
+    assert!(auth.contains(&format!("${STORED_KEY}")), "{auth}");
+    relocated.assert_home_auth_untouched();
+}
+
+#[test]
+fn auth_status_under_euler_home_reads_the_euler_home_auth_file() {
+    let relocated = RelocatedHome::new("http://127.0.0.1:9/v1").with_stored_keys();
+
+    let status = relocated.run(&["auth", "status"], "");
+
+    assert!(status.status.success(), "stderr: {}", text(&status.stderr));
+    let status_stdout = text(&status.stdout);
+    for line in [
+        "anthropic: configured=true source=stored status=valid\n",
+        "openai: configured=false",
+        "gw: configured=true source=stored status=valid\n",
+    ] {
+        assert!(status_stdout.contains(line), "{status_stdout}");
+    }
+    relocated.assert_home_auth_untouched();
+}
+
+#[test]
+fn exec_under_euler_home_sends_the_key_from_the_euler_home_auth_file() {
+    let (base_url, requests) = spawn_gateway();
+    let relocated = RelocatedHome::new(&base_url).with_stored_keys();
+
+    let exec = relocated.run(&["exec", "--provider", "gw", "hello"], "");
+
+    assert!(exec.status.success(), "stderr: {}", text(&exec.stderr));
+    let request = requests
+        .try_recv()
+        .expect("gateway request")
+        .to_ascii_lowercase();
+    assert!(
+        request.contains(&format!("authorization: bearer {STORED_KEY}")),
+        "{request}"
+    );
+    relocated.assert_home_auth_untouched();
+}
+
+#[test]
+fn logout_under_euler_home_removes_the_key_from_the_euler_home_auth_file() {
+    let relocated = RelocatedHome::new("http://127.0.0.1:9/v1").with_stored_keys();
+
+    let logout = relocated.run(&["logout", "--provider", "gw"], "");
+
+    assert!(logout.status.success(), "stderr: {}", text(&logout.stderr));
+    assert_eq!(
+        text(&logout.stdout),
+        "Removed the stored key for gw. Its providers.json entry is unchanged.\n"
+    );
+    let auth = fs::read_to_string(relocated.euler_auth()).expect("euler home auth.json");
+    assert!(!auth.contains(STORED_KEY), "{auth}");
+    assert!(auth.contains("euler-home-anthropic-key"), "{auth}");
+    relocated.assert_home_auth_untouched();
 }

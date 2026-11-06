@@ -1,4 +1,5 @@
 use crate::durability::{sync_dir, sync_file_all};
+use crate::EulerHome;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::env;
@@ -13,7 +14,6 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 const CURRENT_VERSION: u64 = 1;
-const DEFAULT_AUTH_PATH: &str = ".euler/auth.json";
 const TEMP_SUFFIX: &str = ".tmp";
 const MAX_AUTH_FILE_BYTES: u64 = 1024 * 1024;
 const OAUTH_REFRESH_MARGIN_MS: u64 = 30_000;
@@ -162,11 +162,21 @@ impl AuthStorage {
         Self::new(Self::default_path()?)
     }
 
+    /// The default auth file lives in the Euler home, so `EULER_HOME`
+    /// relocates it with the rest of the user state.
     pub fn default_path() -> Result<PathBuf, AuthError> {
-        let home = env::var_os("HOME").ok_or_else(|| {
-            AuthError::Invalid("cannot locate default auth file because HOME is unset".to_owned())
-        })?;
-        Ok(PathBuf::from(home).join(DEFAULT_AUTH_PATH))
+        Self::default_path_from_env(env::var_os("HOME"), env::var_os("EULER_HOME"))
+    }
+
+    fn default_path_from_env(
+        home: Option<OsString>,
+        euler_home: Option<OsString>,
+    ) -> Result<PathBuf, AuthError> {
+        EulerHome::resolve_from_env(home, euler_home)
+            .map(|euler_home| euler_home.auth_path())
+            .map_err(|error| {
+                AuthError::Invalid(format!("cannot locate default auth file: {error}"))
+            })
     }
 
     fn with_env_lookup(
