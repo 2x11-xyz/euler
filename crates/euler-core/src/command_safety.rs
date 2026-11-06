@@ -1405,6 +1405,8 @@ fn git_is_destructive(args: &[&str]) -> bool {
             .any(|arg| is_short_cluster_with(arg, letters) || is_long_abbreviation(arg, longs))
     };
     let operands = || rest.iter().filter(|arg| !arg.starts_with('-'));
+    // A new arm must also be listed in `GIT_DESTRUCTIVE_SUBCOMMANDS`, or
+    // the early return above makes it dead.
     match *subcommand {
         "clean" => forced("f", &["--force"]),
         "reset" => forced("", &["--hard"]),
@@ -1475,6 +1477,7 @@ fn skip_git_global_options<'a>(args: &[&'a str]) -> Vec<&'a str> {
         "--config-env",
         "--attr-source",
         "--super-prefix",
+        "--shallow-file",
     ];
     let mut index = 0usize;
     while index < args.len() {
@@ -3394,7 +3397,35 @@ mod tests {
             "git --git-dir=.git reset $MODE",
             "git --attr-source HEAD clean $FLAGS",
             "git --attr-source HEAD clean -fdx",
+            "git --shallow-file commit clean $FLAGS",
+            "git --shallow-file commit clean -fdx",
         ] {
+            assert!(
+                contains_dangerous_command(command),
+                "expected dangerous: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_git_destructive_subcommand_has_a_flagged_literal_form() {
+        // Review x2: the list gates both the table and the plain-word
+        // exemption, so an entry with no destructive arm would deny the
+        // exemption while never flagging a literal form.
+        let samples = [
+            ("clean", "git clean -fdx"),
+            ("reset", "git reset --hard"),
+            ("rm", "git rm -rf dir"),
+            ("restore", "git restore file"),
+            ("checkout", "git checkout -- file"),
+            ("branch", "git branch -D feature"),
+            ("stash", "git stash drop"),
+        ];
+        for subcommand in GIT_DESTRUCTIVE_SUBCOMMANDS {
+            let (_, command) = samples
+                .iter()
+                .find(|(name, _)| name == subcommand)
+                .unwrap_or_else(|| panic!("no sample for git {subcommand}"));
             assert!(
                 contains_dangerous_command(command),
                 "expected dangerous: {command}"

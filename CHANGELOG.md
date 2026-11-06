@@ -15,9 +15,9 @@ pull requests that landed them; deeper design rationale lives in
   word that could pick the subcommand (`git $SUB`, `git -C $DIR clean`) or
   reach a destructive form (`git reset $MODE`, `git checkout "$P"`) still
   counts as danger, as do `rm -rf $DIR`, `$CMD x`, `eval "$X"`,
-  `sh -c "$X"`, and `sudo $X`. `--attr-source` and `--super-prefix` now
-  count as `git` global options with a value, so `git --attr-source HEAD
-  clean -fdx` is read as `git clean`.
+  `sh -c "$X"`, and `sudo $X`. `--attr-source`, `--super-prefix`, and
+  `--shallow-file` now count as `git` global options with a value, so
+  `git --attr-source HEAD clean -fdx` is read as `git clean`.
 
 ### Execution profiles: dynamic shell operands ask only near a rule
 
