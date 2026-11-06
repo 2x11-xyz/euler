@@ -62,6 +62,7 @@ API key:
 Found 42 models from /model/info: 12 anthropic_messages, 3 openai_responses, 27 openai_chat_completions.
 Added provider litellm to ~/.euler/providers.json.
 Stored the key for litellm in ~/.euler/auth.json.
+Default model: claude-sonnet-4 (change with --model or /model)
 ```
 
 Login asks for the base URL and then the key without echoing it (or reads
@@ -69,7 +70,12 @@ one line each from a pipe), checks both by listing the gateway's models, and
 only then stores the key in `~/.euler/auth.json` and adds the provider to
 `~/.euler/providers.json` with `"discovery": true` (both files live in
 `$EULER_HOME` instead when it is set). The models then appear in
-`/model` and `euler models`, each routed to its API family. A wrong URL or a
+`/model` and `euler models`, each routed to its API family. Login also picks
+a default model, preferring a Claude Sonnet model on the Messages API, so
+`euler --provider litellm` works right away; an entry that already sets
+`default_model` keeps it. When the gateway lists no Messages model and no
+chat model that declares tool support, login sets no default, and you pass
+`--model` or pick one with `/model`. A wrong URL or a
 rejected key stores nothing and says why. Running login again for the same
 id offers the current URL as the default and replaces the key.
 

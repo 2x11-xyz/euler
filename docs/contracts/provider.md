@@ -258,6 +258,17 @@ user needs no file edit:
   end of input means yes); yes stores the key unverified, leaves the entry unchanged, and
   names the `base_url` the key is sent to; no stores nothing.
 
+When login writes or updates an entry that has no `default_model`, it sets
+`default_model` to a model picked from the discovered list (a configured
+`models` entry replaces a discovered one with its id, as at launch) and
+prints `Default model: <id> (change with --model or /model)`. The pick
+takes the models in sorted id order: the first `anthropic_messages` model whose id
+contains `sonnet` (ignoring case), else the first `anthropic_messages`
+model, else the first `openai_chat_completions` model that declares tool
+support; a Responses model is never picked, and when none qualifies no
+`default_model` is set. An entry's existing `default_model` is never
+replaced.
+
 Login refuses, storing nothing and before any prompt, an id that breaks the
 `providers.json` id rule (lowercase ASCII letters, numbers, `-`, `_`). Base
 URL errors name the problem but never echo the typed text, which may be a
@@ -289,7 +300,12 @@ gateway's models to the provider's. Configured `models` stay listed beside
 discovered ones, a configured entry with a discovered id replaces the
 discovered descriptor whole (so it can override one model's family), and
 `default_model` may name a discovered id; a `default_model` the gateway does
-not list still loads as an unlisted model. A discovery provider's `base_url`
+not list still loads as an unlisted model. A launch that needs the default
+model of a discovery provider without `default_model` (a hand-written entry)
+uses the model login would pick from its listed models and prints to stderr `note:
+provider <id> has no default_model; using <model> (change with --model or
+/model)`; when none qualifies, the launch fails with an error saying the
+provider has no `default_model` and to pass `--model`. A discovery provider's `base_url`
 must end in `/v1` (trailing slashes allowed); any other shape ignores the
 provider with a warning.
 

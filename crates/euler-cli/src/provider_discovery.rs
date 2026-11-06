@@ -11,8 +11,8 @@ use euler_event::{EventEnvelope, EventKind};
 use euler_provider::custom_provider::CustomOpenAiProvider;
 use euler_provider::gateway_discovery::GatewayDiscovery;
 use euler_provider::provider_config::{
-    parse_discovered_models, ApiFamily, CustomProviderConfig, DiscoveredModels, DiscoverySource,
-    ProviderConfigRegistry,
+    parse_discovered_models, ApiFamily, CustomModelConfig, CustomProviderConfig, DiscoveredModels,
+    DiscoverySource, ProviderConfigRegistry,
 };
 use euler_provider::ProviderSet;
 use serde_json::{json, Value};
@@ -208,6 +208,30 @@ pub(crate) fn family_counts(discovery: &GatewayDiscovery) -> String {
         discovery.endpoint,
         counts.join(", ")
     )
+}
+
+/// The model a discovery provider without a `default_model` starts on, from
+/// `models` in their order (sorted by id at both callers): the first
+/// `anthropic_messages` model whose id contains `sonnet` (ignoring case),
+/// else the first `anthropic_messages` model, else the first
+/// `openai_chat_completions` model that declares tool support. A Responses
+/// model is never picked.
+pub(crate) fn pick_default_model<'a>(
+    models: impl Iterator<Item = &'a CustomModelConfig> + Clone,
+) -> Option<&'a str> {
+    let messages = |model: &&CustomModelConfig| model.api_family == ApiFamily::AnthropicMessages;
+    models
+        .clone()
+        .filter(messages)
+        .find(|model| model.id.to_ascii_lowercase().contains("sonnet"))
+        .or_else(|| models.clone().find(messages))
+        .or_else(|| {
+            models.clone().find(|model| {
+                model.api_family == ApiFamily::OpenAiChatCompletions
+                    && model.supports_tools == Some(true)
+            })
+        })
+        .map(|model| model.id.as_str())
 }
 
 pub(crate) fn failure_warning(provider_id: &str, error: &str) -> String {
@@ -625,5 +649,55 @@ mod tests {
                 "note: gw/claude is no longer a discovered model; it is sent as an unlisted model"
             )
         );
+    }
+
+    #[test]
+    fn pick_default_model_prefers_a_messages_sonnet_then_messages_then_a_tool_chat_model() {
+        let model =
+            |id: &str, api_family: ApiFamily, supports_tools: Option<bool>| CustomModelConfig {
+                id: id.to_owned(),
+                display_name: id.to_owned(),
+                api_family,
+                context_window_tokens: None,
+                max_output_tokens: None,
+                supports_tools,
+                supports_reasoning: None,
+                compat: None,
+                discovered: true,
+            };
+        let pick =
+            |models: &[CustomModelConfig]| pick_default_model(models.iter()).map(str::to_owned);
+        let chat_no_tools = model("a-chat", ApiFamily::OpenAiChatCompletions, None);
+        let responses = model("b-codex", ApiFamily::OpenAiResponses, Some(true));
+        let chat_tools = model("c-gpt", ApiFamily::OpenAiChatCompletions, Some(true));
+        let haiku = model("claude-haiku", ApiFamily::AnthropicMessages, None);
+        let sonnet = model("claude-Sonnet-4", ApiFamily::AnthropicMessages, None);
+        let chat_sonnet = model("chat-sonnet", ApiFamily::OpenAiChatCompletions, Some(true));
+        let sonnet_a = model("claude-sonnet-a", ApiFamily::AnthropicMessages, None);
+        let sonnet_b = model("claude-sonnet-b", ApiFamily::AnthropicMessages, None);
+
+        assert_eq!(
+            pick(&[
+                chat_tools.clone(),
+                chat_sonnet.clone(),
+                haiku.clone(),
+                sonnet
+            ])
+            .as_deref(),
+            Some("claude-Sonnet-4")
+        );
+        assert_eq!(
+            pick(&[chat_tools.clone(), chat_sonnet, haiku]).as_deref(),
+            Some("claude-haiku")
+        );
+        assert_eq!(
+            pick(&[chat_no_tools.clone(), responses.clone(), chat_tools.clone()]).as_deref(),
+            Some("c-gpt")
+        );
+        assert_eq!(
+            pick(&[chat_tools, sonnet_a, sonnet_b]).as_deref(),
+            Some("claude-sonnet-a")
+        );
+        assert_eq!(pick(&[chat_no_tools, responses]), None);
     }
 }
